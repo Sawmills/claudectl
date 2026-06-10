@@ -82,9 +82,8 @@ impl AuthStore {
         let mut root = if path.exists() {
             let contents = std::fs::read_to_string(&path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
-            serde_json::from_str(&contents).with_context(|| {
-                format!("refusing to modify malformed {}", path.display())
-            })?
+            serde_json::from_str(&contents)
+                .with_context(|| format!("refusing to modify malformed {}", path.display()))?
         } else {
             serde_json::Value::Object(serde_json::Map::new())
         };
@@ -128,7 +127,10 @@ fn keychain_write(json: &str) -> Result<()> {
         .context("failed to run security(1)")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("failed to write Keychain entry (locked keychain?): {}", stderr.trim());
+        bail!(
+            "failed to write Keychain entry (locked keychain?): {}",
+            stderr.trim()
+        );
     }
     Ok(())
 }

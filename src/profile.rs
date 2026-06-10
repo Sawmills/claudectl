@@ -112,8 +112,7 @@ pub fn save_profile_to(
 ) -> Result<Profile> {
     let alias = validate_alias(alias)?;
     let dir = paths.profiles_dir().join(alias);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
 
     let meta = AccountMeta {
         alias: alias.to_string(),
@@ -131,8 +130,7 @@ pub fn delete_profile_from(paths: &Paths, alias: &str) -> Result<()> {
     if !dir.exists() {
         bail!("profile '{}' not found", alias);
     }
-    std::fs::remove_dir_all(&dir)
-        .with_context(|| format!("failed to remove {}", dir.display()))?;
+    std::fs::remove_dir_all(&dir).with_context(|| format!("failed to remove {}", dir.display()))?;
     Ok(())
 }
 
@@ -306,13 +304,19 @@ mod tests {
 
         let listed = list_profiles_from(&paths).unwrap();
         assert_eq!(
-            listed.iter().map(|p| p.meta.alias.as_str()).collect::<Vec<_>>(),
+            listed
+                .iter()
+                .map(|p| p.meta.alias.as_str())
+                .collect::<Vec<_>>(),
             vec!["a@x", "b@x"]
         );
 
         let p = get_profile_from(&paths, "a@x").unwrap();
         assert_eq!(p.meta.email(), Some("a@x"));
-        assert_eq!(p.read_credentials().unwrap().claude_ai_oauth.access_token, "t1");
+        assert_eq!(
+            p.read_credentials().unwrap().claude_ai_oauth.access_token,
+            "t1"
+        );
 
         delete_profile_from(&paths, "a@x").unwrap();
         assert!(get_profile_from(&paths, "a@x").is_err());
@@ -345,7 +349,14 @@ mod tests {
         let email = switch_to(&store, &paths, "a@x").unwrap();
 
         assert_eq!(email, "a@x");
-        assert_eq!(store.read_credentials().unwrap().claude_ai_oauth.access_token, "t1");
+        assert_eq!(
+            store
+                .read_credentials()
+                .unwrap()
+                .claude_ai_oauth
+                .access_token,
+            "t1"
+        );
         let live = store.read_oauth_account().unwrap().unwrap();
         assert_eq!(live["accountUuid"], "u1");
         assert_eq!(get_active_from(&paths).unwrap(), Some("a@x".to_string()));
@@ -368,7 +379,14 @@ mod tests {
             a.read_credentials().unwrap().claude_ai_oauth.access_token,
             "t1-rotated"
         );
-        assert_eq!(store.read_credentials().unwrap().claude_ai_oauth.access_token, "t2");
+        assert_eq!(
+            store
+                .read_credentials()
+                .unwrap()
+                .claude_ai_oauth
+                .access_token,
+            "t2"
+        );
     }
 
     #[test]
@@ -388,7 +406,10 @@ mod tests {
 
         // a@x's stored tokens must be untouched.
         let a = get_profile_from(&paths, "a@x").unwrap();
-        assert_eq!(a.read_credentials().unwrap().claude_ai_oauth.access_token, "t1");
+        assert_eq!(
+            a.read_credentials().unwrap().claude_ai_oauth.access_token,
+            "t1"
+        );
     }
 
     #[test]
@@ -399,7 +420,14 @@ mod tests {
 
         assert!(switch_to(&store, &paths, "nope").is_err());
         // Live auth unchanged.
-        assert_eq!(store.read_credentials().unwrap().claude_ai_oauth.access_token, "t1");
+        assert_eq!(
+            store
+                .read_credentials()
+                .unwrap()
+                .claude_ai_oauth
+                .access_token,
+            "t1"
+        );
         assert_eq!(get_active_from(&paths).unwrap(), Some("a@x".to_string()));
     }
 }
