@@ -4,7 +4,7 @@
 
 **Goal:** CLI to manage multiple Claude Code accounts — save profiles, switch live auth (Keychain + files), show rate-limit status across all accounts.
 
-**Architecture:** Rust crate mirroring codexctl (`~/Code/codexctl` is the reference implementation — same module layout, same testable-`Paths` pattern). New pieces vs codexctl: a `auth_store` seam because macOS Claude Code keeps credentials in the login Keychain *and* `~/.claude/.credentials.json` plus identity in `~/.claude.json#oauthAccount`; an `oauth` module implementing the Anthropic PKCE login flow; opaque tokens (no JWT decoding — expiry is `expiresAt` ms in the credential blob).
+**Architecture:** Rust crate mirroring codexctl (`~/Code/codexctl` is the reference implementation — same module layout, same testable-`Paths` pattern). New pieces vs codexctl: a `auth_store` seam because macOS Claude Code keeps credentials in the login Keychain _and_ `~/.claude/.credentials.json` plus identity in `~/.claude.json#oauthAccount`; an `oauth` module implementing the Anthropic PKCE login flow; opaque tokens (no JWT decoding — expiry is `expiresAt` ms in the credential blob).
 
 **Tech Stack:** clap 4 + clap_complete, serde/serde_json, reqwest (blocking+async, rustls), tokio, futures, dialoguer (fuzzy-select), comfy-table, chrono, dirs, anyhow, sha2 + base64 + rand (PKCE), tempfile (dev).
 
@@ -28,6 +28,7 @@ pub const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 ### Task 1: Scaffold crate + CLI skeleton
 
 **Files:**
+
 - Create: `Cargo.toml`, `rustfmt.toml`, `.gitignore`, `src/main.rs`, `src/lib.rs`, and empty module files `src/{config,api,auth_store,oauth,profile}.rs`, `src/commands/mod.rs`
 
 - [ ] **Step 1: Cargo.toml** — codexctl's minus PTY deps (`portable-pty`, `vt100`, `crossterm`, `libc`), plus `sha2 = "0.10"`, `rand = "0.9"`, `open = "5"`, `urlencoding = "2"`. Package name `claudectl`, version `0.1.0`, edition 2024, description "Manage multiple Claude Code accounts", license Apache-2.0. Copy `rustfmt.toml` from codexctl. `.gitignore`: `/target`.
@@ -70,6 +71,7 @@ enum Commands {
 ```
 
 `main()` identical shape to codexctl's: `config::ensure_dirs()` then match → `commands::<cmd>::run(...)`, `eprintln!("error: {e:#}")` + exit 1 on Err. Stub each command module with `pub fn run(...) -> anyhow::Result<()> { anyhow::bail!("not implemented") }`.
+
 - [ ] **Step 3: Verify** — `cargo build` then `cargo run -- --help` lists all 9 subcommands.
 - [ ] **Step 4: Commit** — `feat: scaffold claudectl CLI skeleton`
 
@@ -131,6 +133,7 @@ pub struct ExtraUsage { pub is_enabled: Option<bool>, pub used_credits: Option<f
 ```
 
 `UsageWindow::reset_timestamp() -> Option<i64>` parses `resets_at` RFC3339 → unix secs. `OauthCreds::is_expired()` compares `expires_at` ms to `chrono::Utc::now().timestamp_millis()`; `expiry_secs() -> Option<i64>` = `expires_at / 1000`. Skip-serializing nones: add `#[serde(skip_serializing_if = "Option::is_none")]` on optional fields so round-trips don't inject nulls Claude Code never wrote.
+
 - [ ] **Step 3: `cargo test`** → PASS. **Commit** — `feat: credential and usage response types`
 
 ### Task 4: auth_store.rs — live auth read/write seam
@@ -310,6 +313,7 @@ fn select_most_available(c: &[Candidate]) -> Option<&str>
 ```
 
 Tests: picks lowest max-utilization; tie broken by soonest 7d reset; skips errored (MAX) candidates entirely; returns None when all errored.
+
 - [ ] **Step 2: Implement**
   - `use_profile::run(alias: Option<&str>)`: Some → `profile::switch_to`, print `switched to <alias> (<email>)`. None → refresh-then-fetch usages for all profiles (same path as status — extract a shared `fetch_all_usages` helper in `status.rs`), score, select, switch, print `auto-selected most available: <alias> (<email>)`. After either, print the selected account's fresh status row (reuse status rendering on the already-fetched data for auto-select; re-fetch single for direct).
   - `switch::run()`: `dialoguer::FuzzySelect` over `alias (email)` items, default at active, then delegate to `use_profile::run(Some(picked))`. Non-tty → error "no TTY; use 'claudectl use <alias>'".

@@ -19,8 +19,8 @@ v1 scope is **switch + status only**. No PTY wrapper / rate-limit failover launc
   `~/.claude/.credentials.json` (mode 600). They can diverge; the Keychain copy is the
   newer/authoritative one. On Linux only the file exists.
 - Credential shape: `{"claudeAiOauth": {"accessToken": "sk-ant-oat01-...",
-  "refreshToken": "sk-ant-ort01-...", "expiresAt": <ms epoch>, "scopes": [...],
-  "subscriptionType": "team", "rateLimitTier": "..."}}`. Tokens are opaque, not JWTs —
+"refreshToken": "sk-ant-ort01-...", "expiresAt": <ms epoch>, "scopes": [...],
+"subscriptionType": "team", "rateLimitTier": "..."}}`. Tokens are opaque, not JWTs —
   expiry comes from `expiresAt`, identity does NOT come from the token.
 - Identity/metadata lives in `~/.claude.json` top-level key `oauthAccount`:
   `emailAddress`, `accountUuid`, `organizationUuid`, `organizationName`,
@@ -32,16 +32,22 @@ v1 scope is **switch + status only**. No PTY wrapper / rate-limit failover launc
 
   ```json
   {
-    "five_hour":  {"utilization": 6.0, "resets_at": "2026-06-10T07:30:00Z"},
-    "seven_day":  {"utilization": 1.0, "resets_at": "2026-06-14T07:00:00Z"},
-    "seven_day_opus":   null,
-    "seven_day_sonnet": {"utilization": 0.0, "resets_at": null},
-    "extra_usage": {"is_enabled": true, "monthly_limit": null,
-                    "used_credits": 0.0, "utilization": null, "currency": "USD"}
+    "five_hour": { "utilization": 6.0, "resets_at": "2026-06-10T07:30:00Z" },
+    "seven_day": { "utilization": 1.0, "resets_at": "2026-06-14T07:00:00Z" },
+    "seven_day_opus": null,
+    "seven_day_sonnet": { "utilization": 0.0, "resets_at": null },
+    "extra_usage": {
+      "is_enabled": true,
+      "monthly_limit": null,
+      "used_credits": 0.0,
+      "utilization": null,
+      "currency": "USD"
+    }
   }
   ```
 
   (plus other nullable experiment fields — parser must tolerate unknown/null keys).
+
 - Claude Code refreshes/rotates tokens on its own while running, so a profile snapshot
   goes stale while it is the active account. Same problem codexctl solves with
   capture-before-switch.
@@ -87,7 +93,7 @@ the account email.
 Single seam for "the live Claude Code auth". Trait with two impls:
 
 - **macOS (real)**: read = Keychain first (`security find-generic-password -s
-  "Claude Code-credentials" -w`), fall back to `~/.claude/.credentials.json`.
+"Claude Code-credentials" -w`), fall back to `~/.claude/.credentials.json`.
   Write = both Keychain (`security add-generic-password -U`) and the file, atomically
   (temp file + rename, mode 600). Also reads/writes the `oauthAccount` key inside
   `~/.claude.json` (preserving all other keys in that file).
@@ -100,6 +106,7 @@ Single seam for "the live Claude Code auth". Trait with two impls:
 ## Commands
 
 ### `login <alias>`
+
 Own OAuth 2.0 PKCE flow — never runs the `claude` binary, never risks clobbering
 another seat:
 
@@ -125,10 +132,12 @@ printed instructions: "run `claude /login`, then `claudectl save <alias>`" — t
 of the tool is unaffected.
 
 ### `save [alias]`
+
 Snapshot live auth (via auth_store) + `oauthAccount` into a profile. Default alias =
 `oauthAccount.emailAddress`. Errors if no live auth found.
 
 ### `use [alias]`
+
 1. **Capture**: if `~/.claudectl/active` names a managed profile, read live auth and
    write it back into that profile (picks up tokens Claude Code rotated). Skip capture
    if the live account's `accountUuid`/email no longer matches the profile (user
@@ -144,15 +153,17 @@ lowest `max(five_hour, seven_day)` utilization; tie-break on soonest 7d reset. P
 what it picked and why.
 
 ### `switch`
+
 `dialoguer` fuzzy picker over profiles → `use <picked>`.
 
 ### `status`
+
 Fetch usage for all profiles in parallel (tokio). Before fetching, auto-refresh any
 **non-active** profile whose access token is expired (see Token refresh). Table
 (comfy-table, UTF8_FULL_CONDENSED), sorted most-available first:
 
-| Account | 5h | 5h Reset | 7d | 7d Reset | Opus 7d | Sonnet 7d | Token |
-|---------|----|----------|----|----------|---------|-----------|-------|
+| Account | 5h  | 5h Reset | 7d  | 7d Reset | Opus 7d | Sonnet 7d | Token |
+| ------- | --- | -------- | --- | -------- | ------- | --------- | ----- |
 
 - Account: alias, `*` prefix on active.
 - Percent columns colored: <50 green, <80 yellow, ≥80 red. Opus/Sonnet columns shown
@@ -162,6 +173,7 @@ Fetch usage for all profiles in parallel (tokio). Before fetching, auto-refresh 
 - Fetch failure for one account: show `error` row, don't fail the whole table.
 
 ### `list`, `whoami`, `remove <alias>`, `completions <shell>`
+
 As in codexctl: enumerate profiles; print active alias; delete profile dir (refuses
 nothing — but warns if removing the active profile and clears `active`); clap_complete
 for zsh/bash/fish.
@@ -181,6 +193,7 @@ holder of that refresh token.
 ## Error handling
 
 `anyhow` with context strings, as in codexctl. Specific cases:
+
 - No Keychain entry and no credentials file → "no live Claude Code login found".
 - `security` binary errors (locked keychain, denied) surfaced verbatim with a hint.
 - Usage endpoint 401 → render as `expired/invalid` in status rather than aborting.
