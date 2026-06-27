@@ -55,11 +55,27 @@ impl AuthStore {
     }
 
     pub fn write_credentials(&self, creds: &CredentialsFile) -> Result<()> {
+        self.write_credentials_after_live_commit(creds, || {})
+    }
+
+    pub(crate) fn write_credentials_after_live_commit<F>(
+        &self,
+        creds: &CredentialsFile,
+        after_live_commit: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(),
+    {
         let json = serde_json::to_string(creds)?;
         if self.keychain {
             keychain_write(&json)?;
+            after_live_commit();
+            write_atomic_0600(&self.paths.claude_credentials_file(), &json)
+        } else {
+            write_atomic_0600(&self.paths.claude_credentials_file(), &json)?;
+            after_live_commit();
+            Ok(())
         }
-        write_atomic_0600(&self.paths.claude_credentials_file(), &json)
     }
 
     /// The `oauthAccount` blob from ~/.claude.json, if present.
@@ -92,6 +108,21 @@ impl AuthStore {
         };
         obj.insert("oauthAccount".to_string(), account.clone());
         write_atomic_0600(&path, &serde_json::to_string_pretty(&root)?)
+    }
+
+    pub(crate) fn preflight_oauth_account_write(&self) -> Result<()> {
+        let path = self.paths.claude_json();
+        if !path.exists() {
+            return Ok(());
+        }
+        let contents = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let root: serde_json::Value = serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let serde_json::Value::Object(_) = root else {
+            bail!("refusing to modify {}: not a JSON object", path.display());
+        };
+        Ok(())
     }
 }
 
@@ -127,12 +158,20 @@ fn keychain_write(json: &str) -> Result<()> {
         .context("failed to run security(1)")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "failed to write Keychain entry (locked keychain?): {}",
-            stderr.trim()
-        );
+        bail!("{}", keychain_write_error(stderr.trim()));
     }
     Ok(())
+}
+
+fn keychain_write_error(stderr: &str) -> String {
+    if stderr.contains("User interaction is not allowed") {
+        return format!(
+            "failed to write Keychain entry: macOS denied non-interactive access. \
+             run from an unlocked local macOS terminal so Keychain can prompt, then retry. \
+             security(1): {stderr}"
+        );
+    }
+    format!("failed to write Keychain entry (locked keychain?): {stderr}")
 }
 
 fn write_atomic_0600(path: &Path, contents: &str) -> Result<()> {
@@ -188,6 +227,46 @@ mod tests {
     }
 
     #[test]
+    fn write_credentials_after_live_commit_runs_after_successful_write() {
+        let (_tmp, store) = store();
+        let called = std::cell::Cell::new(false);
+
+        store
+            .write_credentials_after_live_commit(&test_creds("tok"), || called.set(true))
+            .unwrap();
+
+        assert!(called.get());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_credentials_after_live_commit_skips_callback_when_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (tmp, store) = store();
+        let claude_dir = Paths::from_home(tmp.path().to_path_buf())
+            .claude_credentials_file()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let original_mode = std::fs::metadata(&claude_dir).unwrap().permissions().mode();
+        std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let called = std::cell::Cell::new(false);
+
+        let result =
+            store.write_credentials_after_live_commit(&test_creds("tok"), || called.set(true));
+        std::fs::set_permissions(
+            &claude_dir,
+            std::fs::Permissions::from_mode(original_mode & 0o777),
+        )
+        .unwrap();
+
+        assert!(result.is_err());
+        assert!(!called.get());
+    }
+
+    #[test]
     #[cfg(unix)]
     fn write_credentials_sets_0600() {
         use std::os::unix::fs::PermissionsExt;
@@ -239,6 +318,18 @@ mod tests {
         assert!(err.contains("malformed"), "got: {err}");
         // Original content untouched.
         assert_eq!(std::fs::read_to_string(&claude_json).unwrap(), "{not json");
+    }
+
+    #[test]
+    fn keychain_write_error_explains_noninteractive_denial() {
+        let err = keychain_write_error(
+            "security: SecKeychainItemModifyContent: User interaction is not allowed.",
+        );
+
+        assert!(
+            err.contains("run from an unlocked local macOS terminal"),
+            "got: {err}"
+        );
     }
 
     #[test]
