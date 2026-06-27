@@ -127,12 +127,20 @@ fn keychain_write(json: &str) -> Result<()> {
         .context("failed to run security(1)")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "failed to write Keychain entry (locked keychain?): {}",
-            stderr.trim()
-        );
+        bail!("{}", keychain_write_error(stderr.trim()));
     }
     Ok(())
+}
+
+fn keychain_write_error(stderr: &str) -> String {
+    if stderr.contains("User interaction is not allowed") {
+        return format!(
+            "failed to write Keychain entry: macOS denied non-interactive access. \
+             run from an unlocked local macOS terminal so Keychain can prompt, then retry. \
+             security(1): {stderr}"
+        );
+    }
+    format!("failed to write Keychain entry (locked keychain?): {stderr}")
 }
 
 fn write_atomic_0600(path: &Path, contents: &str) -> Result<()> {
@@ -239,6 +247,18 @@ mod tests {
         assert!(err.contains("malformed"), "got: {err}");
         // Original content untouched.
         assert_eq!(std::fs::read_to_string(&claude_json).unwrap(), "{not json");
+    }
+
+    #[test]
+    fn keychain_write_error_explains_noninteractive_denial() {
+        let err = keychain_write_error(
+            "security: SecKeychainItemModifyContent: User interaction is not allowed.",
+        );
+
+        assert!(
+            err.contains("run from an unlocked local macOS terminal"),
+            "got: {err}"
+        );
     }
 
     #[test]

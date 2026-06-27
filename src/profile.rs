@@ -168,10 +168,13 @@ pub fn switch_to(store: &AuthStore, paths: &Paths, alias: &str) -> Result<String
 
     // Fold tokens Claude Code rotated back into the outgoing profile before we
     // overwrite the live auth; otherwise they're lost and the profile later
-    // looks expired even though the seat is fine.
-    capture_outgoing(store, paths);
+    // looks expired even though the seat is fine. Keep the capture in memory
+    // until the target write succeeds, so a failed switch does not mutate the
+    // outgoing saved profile.
+    let outgoing = prepare_outgoing_capture(store, paths);
 
     store.write_credentials(&creds)?;
+    persist_outgoing_capture(outgoing);
     match &profile.meta.oauth_account {
         Some(account) => store.write_oauth_account(account)?,
         None => eprintln!(
@@ -182,18 +185,24 @@ pub fn switch_to(store: &AuthStore, paths: &Paths, alias: &str) -> Result<String
     Ok(profile.meta.email().unwrap_or("unknown").to_string())
 }
 
-/// Best-effort capture of the live (possibly rotated) tokens into the active
+struct OutgoingCapture {
+    profile: Profile,
+    live_creds: CredentialsFile,
+    live_account: Option<serde_json::Value>,
+}
+
+/// Best-effort read of the live (possibly rotated) tokens for the active
 /// profile. Skipped with a warning when the live identity no longer matches
 /// the profile (the user logged in manually over it). Never blocks a switch.
-fn capture_outgoing(store: &AuthStore, paths: &Paths) {
+fn prepare_outgoing_capture(store: &AuthStore, paths: &Paths) -> Option<OutgoingCapture> {
     let Ok(Some(alias)) = get_active_from(paths) else {
-        return;
+        return None;
     };
     let Ok(profile) = get_profile_from(paths, &alias) else {
-        return;
+        return None;
     };
     let Ok(live_creds) = store.read_credentials() else {
-        return;
+        return None;
     };
     let live_account = store.read_oauth_account().unwrap_or(None);
 
@@ -206,19 +215,31 @@ fn capture_outgoing(store: &AuthStore, paths: &Paths) {
         eprintln!(
             "warning: live login ({live}) does not match active profile '{alias}'; skipping token capture"
         );
-        return;
+        return None;
     }
 
-    if let Err(e) = profile.write_credentials(&live_creds) {
+    Some(OutgoingCapture {
+        profile,
+        live_creds,
+        live_account,
+    })
+}
+
+fn persist_outgoing_capture(capture: Option<OutgoingCapture>) {
+    let Some(capture) = capture else {
+        return;
+    };
+    let alias = capture.profile.meta.alias.as_str();
+    if let Err(e) = capture.profile.write_credentials(&capture.live_creds) {
         eprintln!("warning: failed to capture tokens for profile '{alias}': {e}");
         return;
     }
-    if let Some(account) = live_account {
+    if let Some(account) = capture.live_account {
         let meta = AccountMeta {
             oauth_account: Some(account),
-            ..profile.meta.clone()
+            ..capture.profile.meta.clone()
         };
-        if let Err(e) = write_account_meta(&profile.dir, &meta) {
+        if let Err(e) = write_account_meta(&capture.profile.dir, &meta) {
             eprintln!("warning: failed to update identity for profile '{alias}': {e}");
         }
     }
@@ -410,6 +431,71 @@ mod tests {
             a.read_credentials().unwrap().claude_ai_oauth.access_token,
             "t1"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn switch_does_not_capture_outgoing_when_live_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, paths, store) = setup();
+        save_profile_to(&paths, "a@x", &creds("t1"), Some(account("a@x", "u1"))).unwrap();
+        save_profile_to(&paths, "b@x", &creds("t2"), Some(account("b@x", "u2"))).unwrap();
+        switch_to(&store, &paths, "a@x").unwrap();
+
+        // Simulate Claude Code rotating the live token, then make the live
+        // auth directory unwritable so the switch fails at the final auth write.
+        store.write_credentials(&creds("t1-rotated")).unwrap();
+        let claude_dir = paths.home.join(".claude");
+        let original_mode = std::fs::metadata(&claude_dir).unwrap().permissions().mode();
+        std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = switch_to(&store, &paths, "b@x");
+        std::fs::set_permissions(
+            &claude_dir,
+            std::fs::Permissions::from_mode(original_mode & 0o777),
+        )
+        .unwrap();
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("failed to write"), "got: {err}");
+        let a = get_profile_from(&paths, "a@x").unwrap();
+        assert_eq!(
+            a.read_credentials().unwrap().claude_ai_oauth.access_token,
+            "t1"
+        );
+        assert_eq!(get_active_from(&paths).unwrap(), Some("a@x".to_string()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn switch_captures_outgoing_when_oauth_write_fails_after_live_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, paths, store) = setup();
+        save_profile_to(&paths, "a@x", &creds("t1"), Some(account("a@x", "u1"))).unwrap();
+        save_profile_to(&paths, "b@x", &creds("t2"), Some(account("b@x", "u2"))).unwrap();
+        switch_to(&store, &paths, "a@x").unwrap();
+
+        store.write_credentials(&creds("t1-rotated")).unwrap();
+        let original_mode = std::fs::metadata(&paths.home).unwrap().permissions().mode();
+        std::fs::set_permissions(&paths.home, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = switch_to(&store, &paths, "b@x");
+        std::fs::set_permissions(
+            &paths.home,
+            std::fs::Permissions::from_mode(original_mode & 0o777),
+        )
+        .unwrap();
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("failed to write"), "got: {err}");
+        let a = get_profile_from(&paths, "a@x").unwrap();
+        assert_eq!(
+            a.read_credentials().unwrap().claude_ai_oauth.access_token,
+            "t1-rotated"
+        );
+        assert_eq!(get_active_from(&paths).unwrap(), Some("a@x".to_string()));
     }
 
     #[test]
