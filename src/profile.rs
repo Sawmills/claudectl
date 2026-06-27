@@ -165,6 +165,7 @@ pub fn clear_active_from(paths: &Paths) -> Result<()> {
 pub fn switch_to(store: &AuthStore, paths: &Paths, alias: &str) -> Result<String> {
     let profile = get_profile_from(paths, alias)?;
     let creds = profile.read_credentials()?;
+    preflight_identity_state(store)?;
 
     // Fold tokens Claude Code rotated back into the outgoing profile before we
     // overwrite the live auth; otherwise they're lost and the profile later
@@ -173,8 +174,8 @@ pub fn switch_to(store: &AuthStore, paths: &Paths, alias: &str) -> Result<String
     // outgoing saved profile.
     let outgoing = prepare_outgoing_capture(store, paths);
 
-    store.write_credentials(&creds)?;
-    persist_outgoing_capture(outgoing);
+    store
+        .write_credentials_after_live_commit(&creds, move || persist_outgoing_capture(outgoing))?;
     match &profile.meta.oauth_account {
         Some(account) => store.write_oauth_account(account)?,
         None => eprintln!(
@@ -183,6 +184,10 @@ pub fn switch_to(store: &AuthStore, paths: &Paths, alias: &str) -> Result<String
     }
     set_active_from(paths, alias)?;
     Ok(profile.meta.email().unwrap_or("unknown").to_string())
+}
+
+fn preflight_identity_state(store: &AuthStore) -> Result<()> {
+    store.preflight_oauth_account_write()
 }
 
 struct OutgoingCapture {
@@ -493,6 +498,96 @@ mod tests {
         let a = get_profile_from(&paths, "a@x").unwrap();
         assert_eq!(
             a.read_credentials().unwrap().claude_ai_oauth.access_token,
+            "t1-rotated"
+        );
+        assert_eq!(get_active_from(&paths).unwrap(), Some("a@x".to_string()));
+    }
+
+    #[test]
+    fn switch_fails_before_live_write_when_oauth_account_is_unreadable() {
+        let (_tmp, paths, store) = setup();
+        save_profile_to(&paths, "a@x", &creds("t1"), Some(account("a@x", "u1"))).unwrap();
+        save_profile_to(&paths, "b@x", &creds("t2"), Some(account("b@x", "u2"))).unwrap();
+        switch_to(&store, &paths, "a@x").unwrap();
+
+        store.write_credentials(&creds("t1-rotated")).unwrap();
+        std::fs::write(paths.claude_json(), "{not json").unwrap();
+
+        let err = switch_to(&store, &paths, "b@x").unwrap_err().to_string();
+
+        assert!(err.contains("failed to parse"), "got: {err}");
+        assert_eq!(
+            store
+                .read_credentials()
+                .unwrap()
+                .claude_ai_oauth
+                .access_token,
+            "t1-rotated"
+        );
+        assert_eq!(get_active_from(&paths).unwrap(), Some("a@x".to_string()));
+    }
+
+    #[test]
+    fn switch_fails_before_live_write_when_target_oauth_write_would_fail_without_active_profile() {
+        let (_tmp, paths, store) = setup();
+        save_profile_to(&paths, "b@x", &creds("t2"), Some(account("b@x", "u2"))).unwrap();
+        store.write_credentials(&creds("live-old")).unwrap();
+        std::fs::write(paths.claude_json(), "{not json").unwrap();
+
+        let err = switch_to(&store, &paths, "b@x").unwrap_err().to_string();
+
+        assert!(err.contains("failed to parse"), "got: {err}");
+        assert_eq!(
+            store
+                .read_credentials()
+                .unwrap()
+                .claude_ai_oauth
+                .access_token,
+            "live-old"
+        );
+        assert_eq!(get_active_from(&paths).unwrap(), None);
+    }
+
+    #[test]
+    fn switch_fails_before_live_write_when_claude_json_is_not_an_object() {
+        let (_tmp, paths, store) = setup();
+        save_profile_to(&paths, "b@x", &creds("t2"), Some(account("b@x", "u2"))).unwrap();
+        store.write_credentials(&creds("live-old")).unwrap();
+        std::fs::write(paths.claude_json(), "[]").unwrap();
+
+        let err = switch_to(&store, &paths, "b@x").unwrap_err().to_string();
+
+        assert!(err.contains("not a JSON object"), "got: {err}");
+        assert_eq!(
+            store
+                .read_credentials()
+                .unwrap()
+                .claude_ai_oauth
+                .access_token,
+            "live-old"
+        );
+        assert_eq!(get_active_from(&paths).unwrap(), None);
+    }
+
+    #[test]
+    fn switch_to_identityless_profile_fails_before_live_write_when_oauth_account_is_unreadable() {
+        let (_tmp, paths, store) = setup();
+        save_profile_to(&paths, "a@x", &creds("t1"), Some(account("a@x", "u1"))).unwrap();
+        save_profile_to(&paths, "b@x", &creds("t2"), None).unwrap();
+        switch_to(&store, &paths, "a@x").unwrap();
+
+        store.write_credentials(&creds("t1-rotated")).unwrap();
+        std::fs::write(paths.claude_json(), "{not json").unwrap();
+
+        let err = switch_to(&store, &paths, "b@x").unwrap_err().to_string();
+
+        assert!(err.contains("failed to parse"), "got: {err}");
+        assert_eq!(
+            store
+                .read_credentials()
+                .unwrap()
+                .claude_ai_oauth
+                .access_token,
             "t1-rotated"
         );
         assert_eq!(get_active_from(&paths).unwrap(), Some("a@x".to_string()));
