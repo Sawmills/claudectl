@@ -165,7 +165,7 @@ pub fn clear_active_from(paths: &Paths) -> Result<()> {
 pub fn switch_to(store: &AuthStore, paths: &Paths, alias: &str) -> Result<String> {
     let profile = get_profile_from(paths, alias)?;
     let creds = profile.read_credentials()?;
-    preflight_identity_state(store)?;
+    preflight_identity_state(store, &profile)?;
 
     // Fold tokens Claude Code rotated back into the outgoing profile before we
     // overwrite the live auth; otherwise they're lost and the profile later
@@ -186,8 +186,11 @@ pub fn switch_to(store: &AuthStore, paths: &Paths, alias: &str) -> Result<String
     Ok(profile.meta.email().unwrap_or("unknown").to_string())
 }
 
-fn preflight_identity_state(store: &AuthStore) -> Result<()> {
-    store.preflight_oauth_account_write()
+fn preflight_identity_state(store: &AuthStore, profile: &Profile) -> Result<()> {
+    if profile.meta.oauth_account.is_some() {
+        store.preflight_oauth_account_write()?;
+    }
+    Ok(())
 }
 
 struct OutgoingCapture {
@@ -570,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn switch_to_identityless_profile_fails_before_live_write_when_oauth_account_is_unreadable() {
+    fn switch_to_identityless_profile_allows_unreadable_oauth_account_file() {
         let (_tmp, paths, store) = setup();
         save_profile_to(&paths, "a@x", &creds("t1"), Some(account("a@x", "u1"))).unwrap();
         save_profile_to(&paths, "b@x", &creds("t2"), None).unwrap();
@@ -579,18 +582,22 @@ mod tests {
         store.write_credentials(&creds("t1-rotated")).unwrap();
         std::fs::write(paths.claude_json(), "{not json").unwrap();
 
-        let err = switch_to(&store, &paths, "b@x").unwrap_err().to_string();
+        let switched = switch_to(&store, &paths, "b@x").unwrap();
 
-        assert!(err.contains("failed to parse"), "got: {err}");
+        assert_eq!(switched, "unknown");
         assert_eq!(
             store
                 .read_credentials()
                 .unwrap()
                 .claude_ai_oauth
                 .access_token,
-            "t1-rotated"
+            "t2"
         );
-        assert_eq!(get_active_from(&paths).unwrap(), Some("a@x".to_string()));
+        assert_eq!(get_active_from(&paths).unwrap(), Some("b@x".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(paths.claude_json()).unwrap(),
+            "{not json"
+        );
     }
 
     #[test]
