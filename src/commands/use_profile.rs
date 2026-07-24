@@ -8,7 +8,6 @@ use crate::commands::status::{self, FetchedUsage};
 pub fn run(alias: Option<&str>) -> Result<()> {
     let paths = config::default_paths()?;
     let store = AuthStore::real(paths.clone());
-    store.ensure_keychain_ready()?;
 
     match alias {
         Some(a) => {
@@ -19,6 +18,10 @@ pub fn run(alias: Option<&str>) -> Result<()> {
             status::run_focused(a)
         }
         None => {
+            // Only the auto-select path needs this here: it fetches usage over
+            // the network before it knows which profile to activate, and
+            // `switch_to` already preflights on the explicit-alias path.
+            store.ensure_keychain_ready()?;
             let fetched = status::fetch_all_usages()?;
             if fetched.is_empty() {
                 bail!("no profiles saved. Use 'claudectl save' or 'claudectl login <alias>'.");
