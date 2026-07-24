@@ -123,7 +123,7 @@ fn activation_failed_hint(alias: &str) -> String {
     let alias = shell::quote_arg(alias);
     format!(
         "login succeeded and the profile is saved, but activating it failed. \
-         resolve the cause reported below, then run: claudectl use {alias} — \
+         resolve the cause that follows, then run: claudectl use {alias} — \
          you do not need to log in again"
     )
 }
@@ -146,6 +146,7 @@ mod tests {
     struct FakeLoginFlow {
         events: RefCell<Vec<LoginEvent>>,
         readiness_fails: bool,
+        activation_fails: bool,
     }
 
     impl FakeLoginFlow {
@@ -153,6 +154,7 @@ mod tests {
             Self {
                 events: RefCell::new(Vec::new()),
                 readiness_fails: false,
+                activation_fails: false,
             }
         }
     }
@@ -208,6 +210,9 @@ mod tests {
 
         fn activate(&self, _alias: &str) -> Result<String> {
             self.events.borrow_mut().push(LoginEvent::Activate);
+            if self.activation_fails {
+                anyhow::bail!("activation denied");
+            }
             Ok("work@x".to_string())
         }
     }
@@ -253,5 +258,20 @@ mod tests {
         );
         assert!(hint.contains("profile is saved"), "got: {hint}");
         assert!(hint.contains("do not need to log in again"), "got: {hint}");
+    }
+
+    #[test]
+    fn activation_failure_chain_includes_recovery_command() {
+        let flow = FakeLoginFlow {
+            activation_fails: true,
+            ..FakeLoginFlow::ready()
+        };
+
+        let err = run_with("work account", &flow).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("claudectl use 'work account'"),
+            "got: {err:#}"
+        );
     }
 }

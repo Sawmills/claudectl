@@ -41,7 +41,8 @@ On macOS, claudectl writes live credentials to the Keychain already containing t
 `Claude Code-credentials` item, or to the default Keychain when that item does not
 exist. Every command that writes live credentials (`login`, `use`, `switch`) checks
 that target Keychain is unlocked **first** — for `login` that means before the browser
-opens and before any token is exchanged.
+opens and before any token is exchanged; for `switch`, the check runs immediately
+after you pick a profile.
 
 - **Unlocked** — nothing happens, the command proceeds.
 - **Locked, running in a terminal** — claudectl runs `security unlock-keychain` with the
