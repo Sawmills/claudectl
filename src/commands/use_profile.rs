@@ -8,6 +8,7 @@ use crate::commands::status::{self, FetchedUsage};
 pub fn run(alias: Option<&str>) -> Result<()> {
     let paths = config::default_paths()?;
     let store = AuthStore::real(paths.clone());
+    store.ensure_keychain_ready()?;
 
     match alias {
         Some(a) => {

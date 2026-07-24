@@ -32,6 +32,34 @@ saves the tokens straight into a profile — it never runs the `claude` binary a
 overwrites another account's session. If the flow is ever rejected, fall back to
 logging in with `claude /login` and running `claudectl save <alias>`.
 
+If activation fails after the OAuth flow completed, the profile is still saved. Fix the
+reported problem and run `claudectl use <alias>` — there is no need to log in again.
+
+### macOS Keychain preflight
+
+On macOS, claudectl writes live credentials to the Keychain already containing the
+`Claude Code-credentials` item, or to the default Keychain when that item does not
+exist. Every command that writes live credentials (`login`, `use`, `switch`) checks
+that target Keychain is unlocked **first** — for `login` that means before the browser
+opens and before any token is exchanged.
+
+- **Unlocked** — nothing happens, the command proceeds.
+- **Locked, running in a terminal** — claudectl runs `security unlock-keychain` with the
+  terminal handed straight to `security(1)`, so macOS prompts you for the password
+  itself. claudectl never accepts, passes, stores, or logs your Keychain password.
+  Unlock status is re-checked after the prompt.
+- **Locked, no terminal** (CI, a pipe, a non-interactive shell) — the command fails
+  immediately and tells you exactly what to run:
+
+  ```bash
+  security unlock-keychain '/path/reported/by/claudectl'
+  ```
+
+The unlock check cannot prove that an existing item's access controls will authorize
+claudectl to update it. If macOS denies that write after OAuth, the profile is already
+saved; resolve the reported Keychain access problem and run `claudectl use <alias>`
+without logging in again.
+
 ### Check rate limits
 
 ```bash
@@ -61,7 +89,8 @@ claudectl switch                   # interactive fuzzy picker
 ```
 
 Switching is a pure local operation (Keychain + files); it never contacts Anthropic.
-On macOS it updates the `Claude Code-credentials` Keychain entry,
+It runs the same [Keychain preflight](#macos-keychain-preflight) before touching the
+live auth. On macOS it updates the `Claude Code-credentials` Keychain entry,
 `~/.claude/.credentials.json`, and the `oauthAccount` identity in `~/.claude.json` —
 so Claude Code shows the right account immediately.
 
