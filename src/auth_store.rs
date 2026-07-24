@@ -1,29 +1,36 @@
+use std::cell::RefCell;
+use std::io::IsTerminal;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
 use crate::api::CredentialsFile;
 use crate::config::Paths;
+use crate::shell;
 
 pub const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
 /// Read/write seam for the live Claude Code auth.
 ///
-/// On macOS, Claude Code keeps credentials in the login Keychain AND in
-/// ~/.claude/.credentials.json; the Keychain copy is the read source of truth
-/// and writes must update both. Identity (email/org/tier) lives in
+/// On macOS, Claude Code keeps credentials in a Keychain AND in
+/// ~/.claude/.credentials.json; the Keychain copy is the read source of truth.
+/// Writes target the Keychain containing the existing credentials item, or the
+/// default Keychain when the item does not exist, and must update the file too.
+/// Identity (email/org/tier) lives in
 /// ~/.claude.json under `oauthAccount` and must move together with the
 /// credentials. Tests use `file_only` so the Keychain is never touched.
 pub struct AuthStore {
     paths: Paths,
     keychain: bool,
+    keychain_target: RefCell<Option<String>>,
 }
 
 impl AuthStore {
     pub fn real(paths: Paths) -> Self {
         Self {
             keychain: cfg!(target_os = "macos"),
+            keychain_target: RefCell::new(None),
             paths,
         }
     }
@@ -31,6 +38,7 @@ impl AuthStore {
     pub fn file_only(paths: Paths) -> Self {
         Self {
             keychain: false,
+            keychain_target: RefCell::new(None),
             paths,
         }
     }
@@ -66,9 +74,24 @@ impl AuthStore {
     where
         F: FnOnce(),
     {
+        let runner = ProcessSecurityCommandRunner;
+        let access = SecurityKeychain { runner: &runner };
+        self.write_credentials_after_live_commit_with(creds, after_live_commit, &access)
+    }
+
+    fn write_credentials_after_live_commit_with<F>(
+        &self,
+        creds: &CredentialsFile,
+        after_live_commit: F,
+        access: &dyn KeychainAccess,
+    ) -> Result<()>
+    where
+        F: FnOnce(),
+    {
         let json = serde_json::to_string(creds)?;
         if self.keychain {
-            keychain_write(&json)?;
+            let keychain = self.keychain_target_with(access)?;
+            access.write_credentials(&keychain, &json)?;
             after_live_commit();
             write_atomic_0600(&self.paths.claude_credentials_file(), &json)
         } else {
@@ -110,6 +133,37 @@ impl AuthStore {
         write_atomic_0600(&path, &serde_json::to_string_pretty(&root)?)
     }
 
+    /// Make sure the macOS Keychain targeted by the credentials write is unlocked.
+    ///
+    /// Callers run this *before* anything expensive or irreversible (browser,
+    /// OAuth exchange), so a locked Keychain is discovered before the user
+    /// finishes a login. This does not prove that the existing credentials
+    /// item's ACL will allow claudectl to update it; a late ACL denial remains
+    /// recoverable because login saves the profile before activation. No-op for
+    /// file-only stores.
+    pub fn ensure_keychain_ready(&self) -> Result<()> {
+        if !self.keychain {
+            return Ok(());
+        }
+        let runner = ProcessSecurityCommandRunner;
+        let access = SecurityKeychain { runner: &runner };
+        self.ensure_keychain_ready_with(&access)
+    }
+
+    fn ensure_keychain_ready_with(&self, access: &dyn KeychainAccess) -> Result<()> {
+        let keychain = self.keychain_target_with(access)?;
+        ensure_keychain_unlocked_with(access, &keychain)
+    }
+
+    fn keychain_target_with(&self, access: &dyn KeychainAccess) -> Result<String> {
+        if let Some(keychain) = self.keychain_target.borrow().clone() {
+            return Ok(keychain);
+        }
+        let keychain = access.target_keychain()?;
+        self.keychain_target.replace(Some(keychain.clone()));
+        Ok(keychain)
+    }
+
     pub(crate) fn preflight_oauth_account_write(&self) -> Result<()> {
         let path = self.paths.claude_json();
         if !path.exists() {
@@ -124,6 +178,214 @@ impl AuthStore {
         };
         Ok(())
     }
+}
+
+/// Injectable seam over the Keychain operations used by readiness and writes.
+trait KeychainAccess {
+    /// Existing credentials item's Keychain, or the default Keychain when absent.
+    fn target_keychain(&self) -> Result<String>;
+    /// Whether the target Keychain is unlocked.
+    fn is_unlocked(&self, keychain: &str) -> Result<bool>;
+    /// Whether there is a terminal `security(1)` can prompt on.
+    fn is_interactive(&self) -> bool;
+    /// Ask macOS to unlock the Keychain. claudectl never sees the password.
+    fn unlock(&self, keychain: &str) -> Result<()>;
+    /// Write credentials to the exact Keychain selected by `target_keychain`.
+    fn write_credentials(&self, keychain: &str, json: &str) -> Result<()>;
+}
+
+/// Unlocked → done. Locked with a terminal → let macOS prompt, then re-check.
+/// Locked without a terminal → fail now, while failing is still cheap.
+fn ensure_keychain_unlocked_with(access: &dyn KeychainAccess, keychain: &str) -> Result<()> {
+    if access.is_unlocked(keychain)? {
+        return Ok(());
+    }
+    if !access.is_interactive() {
+        bail!("{}", locked_noninteractively(keychain));
+    }
+    eprintln!("credential Keychain is locked; macOS will prompt for your password to unlock it.");
+    access.unlock(keychain)?;
+    if !access.is_unlocked(keychain)? {
+        bail!("{}", still_locked(keychain));
+    }
+    Ok(())
+}
+
+fn locked_noninteractively(keychain: &str) -> String {
+    let keychain = shell::quote_arg(keychain);
+    format!(
+        "credential Keychain is locked and there is no terminal for macOS to prompt on, \
+         so writing credentials would fail. unlock it first, then retry: \
+         security unlock-keychain {keychain}"
+    )
+}
+
+fn still_locked(keychain: &str) -> String {
+    let keychain = shell::quote_arg(keychain);
+    format!(
+        "credential Keychain is still locked after the unlock attempt. unlock it \
+         (Keychain Access, or: security unlock-keychain {keychain}) and retry"
+    )
+}
+
+struct SecurityCommandOutput {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+trait SecurityCommandRunner {
+    fn output(&self, args: &[&str]) -> Result<SecurityCommandOutput>;
+    fn status_inherited(&self, args: &[&str]) -> Result<bool>;
+}
+
+struct ProcessSecurityCommandRunner;
+
+impl SecurityCommandRunner for ProcessSecurityCommandRunner {
+    fn output(&self, args: &[&str]) -> Result<SecurityCommandOutput> {
+        let output = Command::new("security")
+            .args(args)
+            .output()
+            .context("failed to run security(1)")?;
+        Ok(SecurityCommandOutput {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    fn status_inherited(&self, args: &[&str]) -> Result<bool> {
+        // status(), never output(): security(1) must inherit stdin/stdout/stderr
+        // so it reads the password itself. No password flag, argv, env, or buffer
+        // exists in claudectl.
+        Ok(Command::new("security")
+            .args(args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("failed to run security(1)")?
+            .success())
+    }
+}
+
+struct SecurityKeychain<'a> {
+    runner: &'a dyn SecurityCommandRunner,
+}
+
+impl KeychainAccess for SecurityKeychain<'_> {
+    fn target_keychain(&self) -> Result<String> {
+        let user = std::env::var("USER").context("USER not set; cannot address Keychain entry")?;
+        let existing =
+            self.runner
+                .output(&["find-generic-password", "-a", &user, "-s", KEYCHAIN_SERVICE])?;
+        if existing.success {
+            return parse_item_keychain(&existing).context(
+                "security(1) found the credentials item but reported no containing Keychain",
+            );
+        }
+        if !keychain_item_not_found(&existing.stderr) {
+            bail!(
+                "could not locate the existing credentials item: {}",
+                command_error(&existing)
+            );
+        }
+
+        let default = self.runner.output(&["default-keychain"])?;
+        if !default.success {
+            bail!(
+                "could not locate the default Keychain: {}",
+                command_error(&default)
+            );
+        }
+        let path = parse_keychain_path(&default.stdout);
+        if path.is_empty() {
+            bail!("security(1) reported no default Keychain");
+        }
+        Ok(path)
+    }
+
+    fn is_unlocked(&self, keychain: &str) -> Result<bool> {
+        let output = self.runner.output(&["show-keychain-info", keychain])?;
+        if output.success {
+            return Ok(true);
+        }
+        if keychain_is_locked(&output.stderr) {
+            return Ok(false);
+        }
+        bail!(
+            "failed to inspect credential Keychain {}: {}",
+            keychain,
+            command_error(&output)
+        )
+    }
+
+    fn is_interactive(&self) -> bool {
+        // Conservative: isatty does not prove this process owns the foreground
+        // terminal, so a background job can still stop on SIGTTIN.
+        std::io::stdin().is_terminal()
+    }
+
+    fn unlock(&self, keychain: &str) -> Result<()> {
+        if !self
+            .runner
+            .status_inherited(&["unlock-keychain", keychain])?
+        {
+            bail!("unlocking the credential Keychain was cancelled or failed");
+        }
+        Ok(())
+    }
+
+    fn write_credentials(&self, keychain: &str, json: &str) -> Result<()> {
+        let user = std::env::var("USER").context("USER not set; cannot address Keychain entry")?;
+        let output = self.runner.output(&[
+            "add-generic-password",
+            "-U",
+            "-a",
+            &user,
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-w",
+            json,
+            keychain,
+        ])?;
+        if !output.success {
+            bail!("{}", keychain_write_error(output.stderr.trim()));
+        }
+        Ok(())
+    }
+}
+
+fn parse_item_keychain(output: &SecurityCommandOutput) -> Option<String> {
+    output
+        .stdout
+        .lines()
+        .chain(output.stderr.lines())
+        .find_map(|line| line.trim().strip_prefix("keychain:"))
+        .map(parse_keychain_path)
+        .filter(|path| !path.is_empty())
+}
+
+fn keychain_item_not_found(stderr: &str) -> bool {
+    stderr.contains("The specified item could not be found in the keychain")
+}
+
+fn keychain_is_locked(stderr: &str) -> bool {
+    stderr.contains("User interaction is not allowed")
+}
+
+fn command_error(output: &SecurityCommandOutput) -> &str {
+    let stderr = output.stderr.trim();
+    if stderr.is_empty() {
+        output.stdout.trim()
+    } else {
+        stderr
+    }
+}
+
+/// Keychain-location commands print paths indented and quoted.
+fn parse_keychain_path(stdout: &str) -> String {
+    stdout.trim().trim_matches('"').trim().to_string()
 }
 
 /// Read the Keychain credential blob. Any failure (item missing, locked
@@ -141,37 +403,16 @@ fn keychain_read() -> Option<String> {
     (!raw.is_empty()).then(|| raw.to_string())
 }
 
-fn keychain_write(json: &str) -> Result<()> {
-    let user = std::env::var("USER").context("USER not set; cannot address Keychain entry")?;
-    let output = Command::new("security")
-        .args([
-            "add-generic-password",
-            "-U",
-            "-a",
-            &user,
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-w",
-            json,
-        ])
-        .output()
-        .context("failed to run security(1)")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("{}", keychain_write_error(stderr.trim()));
-    }
-    Ok(())
-}
-
 fn keychain_write_error(stderr: &str) -> String {
     if stderr.contains("User interaction is not allowed") {
         return format!(
             "failed to write Keychain entry: macOS denied non-interactive access. \
-             run from an unlocked local macOS terminal so Keychain can prompt, then retry. \
+             the Keychain is unlocked, but the existing item's access controls may \
+             still require authorization. resolve that in Keychain Access, then retry. \
              security(1): {stderr}"
         );
     }
-    format!("failed to write Keychain entry (locked keychain?): {stderr}")
+    format!("failed to write Keychain entry: {stderr}")
 }
 
 fn write_atomic_0600(path: &Path, contents: &str) -> Result<()> {
@@ -193,6 +434,8 @@ fn write_atomic_0600(path: &Path, contents: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
     use crate::api::OauthCreds;
 
@@ -215,6 +458,126 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(tmp.path().to_path_buf());
         (tmp, AuthStore::file_only(paths))
+    }
+
+    fn keychain_store() -> (tempfile::TempDir, AuthStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().to_path_buf());
+        (
+            tmp,
+            AuthStore {
+                paths,
+                keychain: true,
+                keychain_target: RefCell::new(None),
+            },
+        )
+    }
+
+    const FAKE_KEYCHAIN: &str = "/Users/test/Library/Keychains/login.keychain-db";
+
+    struct FakeKeychain {
+        unlocked: std::cell::Cell<bool>,
+        interactive: bool,
+        /// Whether the unlock attempt actually leaves the Keychain unlocked.
+        unlock_works: bool,
+        probe_error: Option<&'static str>,
+        target_calls: std::cell::Cell<usize>,
+        unlock_calls: std::cell::Cell<usize>,
+        probed_keychains: RefCell<Vec<String>>,
+        written_keychains: RefCell<Vec<String>>,
+    }
+
+    impl FakeKeychain {
+        fn new(unlocked: bool, interactive: bool, unlock_works: bool) -> Self {
+            Self {
+                unlocked: std::cell::Cell::new(unlocked),
+                interactive,
+                unlock_works,
+                probe_error: None,
+                target_calls: std::cell::Cell::new(0),
+                unlock_calls: std::cell::Cell::new(0),
+                probed_keychains: RefCell::new(Vec::new()),
+                written_keychains: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn with_probe_error(message: &'static str) -> Self {
+            Self {
+                probe_error: Some(message),
+                ..Self::new(false, true, true)
+            }
+        }
+    }
+
+    impl KeychainAccess for FakeKeychain {
+        fn target_keychain(&self) -> Result<String> {
+            self.target_calls.set(self.target_calls.get() + 1);
+            Ok(FAKE_KEYCHAIN.to_string())
+        }
+
+        fn is_unlocked(&self, keychain: &str) -> Result<bool> {
+            self.probed_keychains
+                .borrow_mut()
+                .push(keychain.to_string());
+            if let Some(message) = self.probe_error {
+                bail!("{message}");
+            }
+            Ok(self.unlocked.get())
+        }
+
+        fn is_interactive(&self) -> bool {
+            self.interactive
+        }
+
+        fn unlock(&self, _keychain: &str) -> Result<()> {
+            self.unlock_calls.set(self.unlock_calls.get() + 1);
+            self.unlocked.set(self.unlock_works);
+            Ok(())
+        }
+
+        fn write_credentials(&self, keychain: &str, _json: &str) -> Result<()> {
+            self.written_keychains
+                .borrow_mut()
+                .push(keychain.to_string());
+            Ok(())
+        }
+    }
+
+    struct RecordingRunner {
+        outputs: RefCell<VecDeque<SecurityCommandOutput>>,
+        output_calls: RefCell<Vec<Vec<String>>>,
+        status_calls: RefCell<Vec<Vec<String>>>,
+        status_success: bool,
+    }
+
+    impl RecordingRunner {
+        fn new(outputs: Vec<SecurityCommandOutput>, status_success: bool) -> Self {
+            Self {
+                outputs: RefCell::new(outputs.into()),
+                output_calls: RefCell::new(Vec::new()),
+                status_calls: RefCell::new(Vec::new()),
+                status_success,
+            }
+        }
+    }
+
+    impl SecurityCommandRunner for RecordingRunner {
+        fn output(&self, args: &[&str]) -> Result<SecurityCommandOutput> {
+            self.output_calls
+                .borrow_mut()
+                .push(args.iter().map(|arg| (*arg).to_string()).collect());
+            self.outputs
+                .borrow_mut()
+                .pop_front()
+                .context("unexpected captured-output security command")
+        }
+
+        fn status_inherited(&self, args: &[&str]) -> Result<bool> {
+            self.status_calls
+                .borrow_mut()
+                .push(args.iter().map(|arg| (*arg).to_string()).collect());
+            Ok(self.status_success)
+        }
     }
 
     #[test]
@@ -321,14 +684,250 @@ mod tests {
     }
 
     #[test]
-    fn keychain_write_error_explains_noninteractive_denial() {
+    fn keychain_write_error_explains_late_item_acl_denial() {
         let err = keychain_write_error(
             "security: SecKeychainItemModifyContent: User interaction is not allowed.",
         );
 
         assert!(
-            err.contains("run from an unlocked local macOS terminal"),
+            err.contains("existing item's access controls"),
             "got: {err}"
+        );
+        assert!(err.contains("Keychain Access"), "got: {err}");
+    }
+
+    #[test]
+    fn keychain_preflight_passes_without_prompting_when_unlocked() {
+        let (_tmp, store) = keychain_store();
+        let fake = FakeKeychain::new(true, true, true);
+
+        store.ensure_keychain_ready_with(&fake).unwrap();
+
+        assert_eq!(fake.unlock_calls.get(), 0);
+    }
+
+    #[test]
+    fn keychain_preflight_unlocks_interactively_when_locked() {
+        let (_tmp, store) = keychain_store();
+        let fake = FakeKeychain::new(false, true, true);
+
+        store.ensure_keychain_ready_with(&fake).unwrap();
+
+        assert_eq!(fake.unlock_calls.get(), 1);
+    }
+
+    #[test]
+    fn keychain_preflight_fails_without_prompting_when_not_interactive() {
+        let (_tmp, store) = keychain_store();
+        let fake = FakeKeychain::new(false, false, true);
+
+        let err = store
+            .ensure_keychain_ready_with(&fake)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains(&format!("security unlock-keychain '{FAKE_KEYCHAIN}'")),
+            "got: {err}"
+        );
+        assert_eq!(fake.unlock_calls.get(), 0);
+    }
+
+    #[test]
+    fn keychain_preflight_fails_when_still_locked_after_unlock() {
+        let (_tmp, store) = keychain_store();
+        let fake = FakeKeychain::new(false, true, false);
+
+        let err = store
+            .ensure_keychain_ready_with(&fake)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("still locked"), "got: {err}");
+        assert_eq!(fake.unlock_calls.get(), 1);
+    }
+
+    #[test]
+    fn keychain_preflight_surfaces_probe_errors_without_unlocking() {
+        let (_tmp, store) = keychain_store();
+        let fake = FakeKeychain::with_probe_error("keychain database is corrupt");
+
+        let err = store
+            .ensure_keychain_ready_with(&fake)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("database is corrupt"), "got: {err}");
+        assert_eq!(fake.unlock_calls.get(), 0);
+    }
+
+    #[test]
+    fn keychain_target_is_resolved_once_and_reused_for_probe_and_write() {
+        let (_tmp, store) = keychain_store();
+        let fake = FakeKeychain::new(true, true, true);
+
+        store.ensure_keychain_ready_with(&fake).unwrap();
+        store
+            .write_credentials_after_live_commit_with(&test_creds("tok"), || {}, &fake)
+            .unwrap();
+
+        assert_eq!(fake.target_calls.get(), 1);
+        assert_eq!(
+            fake.probed_keychains.borrow().as_slice(),
+            &[FAKE_KEYCHAIN.to_string()]
+        );
+        assert_eq!(
+            fake.written_keychains.borrow().as_slice(),
+            &[FAKE_KEYCHAIN.to_string()]
+        );
+    }
+
+    #[test]
+    fn target_keychain_prefers_existing_credentials_item() {
+        let runner = RecordingRunner::new(
+            vec![SecurityCommandOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: format!("keychain: \"{FAKE_KEYCHAIN}\"\nversion: 512\n"),
+            }],
+            true,
+        );
+        let access = SecurityKeychain { runner: &runner };
+
+        assert_eq!(access.target_keychain().unwrap(), FAKE_KEYCHAIN);
+        assert_eq!(
+            runner.output_calls.borrow().as_slice(),
+            &[vec![
+                "find-generic-password".to_string(),
+                "-a".to_string(),
+                std::env::var("USER").unwrap(),
+                "-s".to_string(),
+                KEYCHAIN_SERVICE.to_string()
+            ]]
+        );
+    }
+
+    #[test]
+    fn target_keychain_falls_back_to_default_when_credentials_item_is_absent() {
+        let runner = RecordingRunner::new(
+            vec![
+                SecurityCommandOutput {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "The specified item could not be found in the keychain.".to_string(),
+                },
+                SecurityCommandOutput {
+                    success: true,
+                    stdout: format!("    \"{FAKE_KEYCHAIN}\"\n"),
+                    stderr: String::new(),
+                },
+            ],
+            true,
+        );
+        let access = SecurityKeychain { runner: &runner };
+
+        assert_eq!(access.target_keychain().unwrap(), FAKE_KEYCHAIN);
+        assert_eq!(
+            runner.output_calls.borrow().as_slice(),
+            &[
+                vec![
+                    "find-generic-password".to_string(),
+                    "-a".to_string(),
+                    std::env::var("USER").unwrap(),
+                    "-s".to_string(),
+                    KEYCHAIN_SERVICE.to_string()
+                ],
+                vec!["default-keychain".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn keychain_probe_classifies_interaction_denied_as_locked() {
+        let runner = RecordingRunner::new(
+            vec![SecurityCommandOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "SecKeychainCopySettings: User interaction is not allowed.".to_string(),
+            }],
+            true,
+        );
+        let access = SecurityKeychain { runner: &runner };
+
+        assert!(!access.is_unlocked(FAKE_KEYCHAIN).unwrap());
+    }
+
+    #[test]
+    fn keychain_probe_surfaces_non_lock_security_error() {
+        let runner = RecordingRunner::new(
+            vec![SecurityCommandOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "SecKeychainCopySettings: invalid database".to_string(),
+            }],
+            true,
+        );
+        let access = SecurityKeychain { runner: &runner };
+
+        let err = access.is_unlocked(FAKE_KEYCHAIN).unwrap_err().to_string();
+
+        assert!(err.contains("invalid database"), "got: {err}");
+    }
+
+    #[test]
+    fn unlock_uses_inherited_status_without_password_argument() {
+        let runner = RecordingRunner::new(Vec::new(), true);
+        let access = SecurityKeychain { runner: &runner };
+
+        access.unlock(FAKE_KEYCHAIN).unwrap();
+
+        assert!(runner.output_calls.borrow().is_empty());
+        assert_eq!(
+            runner.status_calls.borrow().as_slice(),
+            &[vec![
+                "unlock-keychain".to_string(),
+                FAKE_KEYCHAIN.to_string()
+            ]]
+        );
+        assert!(
+            runner.status_calls.borrow()[0]
+                .iter()
+                .all(|arg| arg != "-p")
+        );
+    }
+
+    #[test]
+    fn credential_write_explicitly_targets_resolved_keychain() {
+        let runner = RecordingRunner::new(
+            vec![SecurityCommandOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }],
+            true,
+        );
+        let access = SecurityKeychain { runner: &runner };
+
+        access.write_credentials(FAKE_KEYCHAIN, "{}").unwrap();
+
+        let calls = runner.output_calls.borrow();
+        let args = calls.first().unwrap();
+        assert_eq!(args.last().unwrap(), FAKE_KEYCHAIN);
+        assert_eq!(args[0], "add-generic-password");
+        assert!(args.iter().any(|arg| arg == "-U"));
+    }
+
+    #[test]
+    fn file_only_store_skips_the_keychain_preflight() {
+        let (_tmp, store) = store();
+        store.ensure_keychain_ready().unwrap();
+    }
+
+    #[test]
+    fn parse_keychain_path_strips_quotes_and_indentation() {
+        assert_eq!(
+            parse_keychain_path("    \"/Users/test/Library/Keychains/login.keychain-db\"\n"),
+            FAKE_KEYCHAIN
         );
     }
 

@@ -165,6 +165,7 @@ pub fn clear_active_from(paths: &Paths) -> Result<()> {
 pub fn switch_to(store: &AuthStore, paths: &Paths, alias: &str) -> Result<String> {
     let profile = get_profile_from(paths, alias)?;
     let creds = profile.read_credentials()?;
+    store.ensure_keychain_ready()?;
     preflight_identity_state(store, &profile)?;
 
     // Fold tokens Claude Code rotated back into the outgoing profile before we
