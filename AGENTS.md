@@ -1,5 +1,3 @@
-READ ${CODE_ROOT:-$HOME/Code}/agent-scripts/AGENTS.md BEFORE ANYTHING (skip if missing). If missing, also try: $HOME/repos/agent-scripts/AGENTS.md
-
 # AGENTS.md
 
 ## Project
@@ -29,7 +27,7 @@ READ ${CODE_ROOT:-$HOME/Code}/agent-scripts/AGENTS.md BEFORE ANYTHING (skip if m
 - Lint: `cargo clippy --all-targets`
 - Test: `cargo test --all-targets`
 - Release build: `cargo build --release`
-- Locked target release build: `cargo build --release --locked --target ${{ matrix.target }}`
+- Locked target release build: `cargo build --release --locked --target <target-triple>`
 - Install from Git: `cargo install --git https://github.com/Sawmills/claudectl`
 
 ## Rules
