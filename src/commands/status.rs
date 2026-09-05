@@ -152,7 +152,7 @@ pub fn fetch_all_usages() -> Result<Vec<FetchedUsage>> {
                         return FetchedUsage {
                             alias,
                             usage: None,
-                            token_expiry_secs: None,
+                            token_expiry_secs,
                             is_active,
                             error: Some("missing access token; log in again".to_string()),
                         };
