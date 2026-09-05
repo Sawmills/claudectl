@@ -68,18 +68,22 @@ claudectl status
 ```
 
 ```
-Live status fetched at Tue Jun 09 20:02:47
+Usage checked at Fri Sep 04 17:06:50
 
-┌─────────────────────┬─────┬───────────┬────┬─────────────────────────────┬─────────┬───────────┬────────┐
-│ Account             ┆ 5h  ┆ 5h Reset  ┆ 7d ┆ 7d Reset                    ┆ Opus 7d ┆ Sonnet 7d ┆ Token  │
-╞═════════════════════╪═════╪═══════════╪════╪═════════════════════════════╪═════════╪═══════════╪════════╡
-│ * amir2@sawmills.ai ┆ 22% ┆ in 4h 27m ┆ 3% ┆ in 4d 3h (Sun Jun 14 00:00) ┆ -       ┆ 0%        ┆ 7h 29m │
-└─────────────────────┴─────┴───────────┴────┴─────────────────────────────┴─────────┴───────────┴────────┘
+┌─────────────────────┬────┬──────────┬────┬──────────┬──────────────┬──────────────────────────────────────────┐
+│ Account             ┆ 5h ┆ 5h Reset ┆ 7d ┆ 7d Reset ┆ Token expiry ┆ Usage status                             │
+╞═════════════════════╪════╪══════════╪════╪══════════╪══════════════╪══════════════════════════════════════════╡
+│ * amir2@sawmills.ai  ┆ -  ┆ -        ┆ -  ┆ -        ┆ 7h 29m       ┆ rate limited (HTTP 429); retry in 207s     │
+└─────────────────────┴────┴──────────┴────┴──────────┴──────────────┴──────────────────────────────────────────┘
 ```
 
 All accounts are fetched live in parallel and sorted most-available first. `*` marks
-the active account. The `Token` column shows how long the stored access token lasts;
-non-active profiles with an expired token are refreshed automatically during `status`.
+the active account. `Token expiry` shows the time remaining until the stored token
+expires, or `unknown` when expiry is unavailable. `Usage status` shows `ok` or the
+reason usage could not be fetched. For example, `rate limited (HTTP 429); retry in
+207s` means the usage endpoint asked you to wait before retrying. Token expiry
+remains visible when usage requests fail. Non-active profiles with an expired token
+are refreshed automatically during `status`.
 
 ### Switch accounts
 
