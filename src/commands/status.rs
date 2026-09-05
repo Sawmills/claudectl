@@ -130,7 +130,7 @@ pub fn fetch_all_usages() -> Result<Vec<FetchedUsage>> {
                                 usage: None,
                                 token_expiry_secs: None,
                                 is_active,
-                                error: Some("bad credentials".to_string()),
+                                error: Some("credentials unavailable or invalid".to_string()),
                             };
                         }
                     };
@@ -148,6 +148,15 @@ pub fn fetch_all_usages() -> Result<Vec<FetchedUsage>> {
                     }
 
                     let token_expiry_secs = creds.claude_ai_oauth.expiry_secs();
+                    if creds.claude_ai_oauth.access_token.trim().is_empty() {
+                        return FetchedUsage {
+                            alias,
+                            usage: None,
+                            token_expiry_secs,
+                            is_active,
+                            error: Some("missing access token; log in again".to_string()),
+                        };
+                    }
                     match api::fetch_usage_async(&client, &creds.claude_ai_oauth.access_token).await
                     {
                         Ok(usage) => FetchedUsage {
@@ -157,20 +166,13 @@ pub fn fetch_all_usages() -> Result<Vec<FetchedUsage>> {
                             is_active,
                             error: None,
                         },
-                        Err(e) => {
-                            let msg = if e.to_string() == "expired" {
-                                "expired"
-                            } else {
-                                "error"
-                            };
-                            FetchedUsage {
-                                alias,
-                                usage: None,
-                                token_expiry_secs,
-                                is_active,
-                                error: Some(msg.to_string()),
-                            }
-                        }
+                        Err(e) => FetchedUsage {
+                            alias,
+                            usage: None,
+                            token_expiry_secs,
+                            is_active,
+                            error: Some(e.to_string()),
+                        },
                     }
                 }
             })
@@ -212,10 +214,7 @@ fn to_account_status(f: &FetchedUsage) -> AccountStatus {
 
 fn print_fetched_at() {
     let local = chrono::Local::now();
-    println!(
-        "Live status fetched at {}",
-        local.format("%a %b %d %H:%M:%S")
-    );
+    println!("Usage checked at {}", local.format("%a %b %d %H:%M:%S"));
     println!();
 }
 
@@ -231,7 +230,8 @@ fn print_table(accounts: &[AccountStatus]) {
         header.push("Opus 7d");
         header.push("Sonnet 7d");
     }
-    header.push("Token");
+    header.push("Token expiry");
+    header.push("Usage status");
     table.set_header(header);
 
     for account in accounts {
@@ -251,7 +251,8 @@ fn render_row(s: &AccountStatus, show_models: bool) -> Vec<Cell> {
         let mut row = vec![Cell::new(alias)];
         let cols = if show_models { 6 } else { 4 };
         row.extend(std::iter::repeat_with(|| Cell::new("-")).take(cols));
-        row.push(token_cell(s.token_expiry_secs, true, &s.error_msg));
+        row.push(token_cell(s.token_expiry_secs));
+        row.push(Cell::new(&s.error_msg).fg(Color::Red));
         return row;
     }
 
@@ -266,18 +267,15 @@ fn render_row(s: &AccountStatus, show_models: bool) -> Vec<Cell> {
         row.push(colorize_usage_pct(s.opus_pct));
         row.push(colorize_usage_pct(s.sonnet_pct));
     }
-    row.push(token_cell(s.token_expiry_secs, false, &s.error_msg));
+    row.push(token_cell(s.token_expiry_secs));
+    row.push(Cell::new("ok"));
     row
 }
 
-/// The "Token" column: how long the stored access token is good for without a
-/// refresh, or — for an errored row — what went wrong.
-fn token_cell(expiry_secs: Option<i64>, is_error: bool, error_msg: &str) -> Cell {
-    if is_error {
-        return Cell::new(error_msg).fg(Color::Red);
-    }
+/// Stored expiry is independent of whether the usage API accepted the request.
+fn token_cell(expiry_secs: Option<i64>) -> Cell {
     match expiry_secs {
-        None => Cell::new("-"),
+        None => Cell::new("unknown"),
         Some(exp) => {
             let diff = exp - chrono::Utc::now().timestamp();
             if diff <= 0 {
@@ -390,12 +388,28 @@ mod tests {
     #[test]
     fn render_row_column_count() {
         let a = account(Some(10.0), Some(20.0), false);
-        assert_eq!(render_row(&a, false).len(), 6);
-        assert_eq!(render_row(&a, true).len(), 8);
+        assert_eq!(render_row(&a, false).len(), 7);
+        assert_eq!(render_row(&a, true).len(), 9);
 
         let e = account(None, None, true);
-        assert_eq!(render_row(&e, false).len(), 6);
-        assert_eq!(render_row(&e, true).len(), 8);
+        assert_eq!(render_row(&e, false).len(), 7);
+        assert_eq!(render_row(&e, true).len(), 9);
+    }
+
+    #[test]
+    fn rate_limit_does_not_replace_token_expiry() {
+        let mut a = account(None, None, true);
+        a.token_expiry_secs = Some(chrono::Utc::now().timestamp() + 7200);
+        a.error_msg = "rate limited (HTTP 429); retry in 207s".into();
+        for show_models in [false, true] {
+            let row = render_row(&a, show_models);
+            assert!(row[row.len() - 2].content().contains('h'));
+            assert_eq!(row[row.len() - 1].content(), a.error_msg);
+        }
+        a.token_expiry_secs = Some(1);
+        let row = render_row(&a, false);
+        assert_eq!(row[5].content(), "expired");
+        assert_eq!(row[6].content(), a.error_msg);
     }
 
     #[test]

@@ -96,13 +96,40 @@ pub async fn fetch_usage_async(
         .await
         .context("failed to reach usage API")?;
     let status = resp.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        bail!("expired");
-    }
     if !status.is_success() {
-        bail!("API returned {status}");
+        bail!(usage_http_error(status, resp.headers(), chrono::Utc::now()));
     }
     resp.json().await.context("failed to parse usage response")
+}
+
+// Use only controlled messages and parsed headers. Response bodies can contain
+// sensitive data and must never reach the status table.
+fn usage_http_error(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    match status {
+        reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            let delay = headers
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| {
+                    value.parse::<u64>().ok().or_else(|| {
+                        chrono::DateTime::parse_from_rfc2822(value)
+                            .ok()
+                            .map(|date| (date.timestamp() - now.timestamp()).max(0) as u64)
+                    })
+                });
+            match delay {
+                Some(seconds) => format!("rate limited (HTTP 429); retry in {seconds}s"),
+                None => "rate limited (HTTP 429); try again later".into(),
+            }
+        }
+        reqwest::StatusCode::UNAUTHORIZED => "authentication rejected (HTTP 401)".into(),
+        reqwest::StatusCode::FORBIDDEN => "access denied (HTTP 403)".into(),
+        _ => format!("usage API error (HTTP {})", status.as_u16()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -204,6 +231,48 @@ fn map_profile_to_oauth_account(profile: &serde_json::Value) -> serde_json::Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_errors_distinguish_rate_limits_and_authentication() {
+        use reqwest::{
+            StatusCode,
+            header::{HeaderMap, HeaderValue, RETRY_AFTER},
+        };
+        let now = chrono::DateTime::parse_from_rfc2822("Fri, 04 Sep 2026 17:00:00 GMT")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut headers = HeaderMap::new();
+        for (value, expected) in [
+            ("207", "rate limited (HTTP 429); retry in 207s"),
+            (
+                "Fri, 04 Sep 2026 17:03:00 GMT",
+                "rate limited (HTTP 429); retry in 180s",
+            ),
+            (
+                "Fri, 04 Sep 2026 16:00:00 GMT",
+                "rate limited (HTTP 429); retry in 0s",
+            ),
+            ("invalid", "rate limited (HTTP 429); try again later"),
+        ] {
+            headers.insert(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+            assert_eq!(
+                usage_http_error(StatusCode::TOO_MANY_REQUESTS, &headers, now),
+                expected
+            );
+        }
+        headers.clear();
+        for (code, expected) in [
+            (429, "rate limited (HTTP 429); try again later"),
+            (401, "authentication rejected (HTTP 401)"),
+            (403, "access denied (HTTP 403)"),
+            (503, "usage API error (HTTP 503)"),
+        ] {
+            assert_eq!(
+                usage_http_error(StatusCode::from_u16(code).unwrap(), &headers, now),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn credentials_round_trip_preserves_unknown_fields() {

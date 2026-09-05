@@ -1,6 +1,53 @@
 use assert_cmd::Command;
 
 #[test]
+fn status_reports_missing_token_separately_from_expiry() {
+    let home = tempfile::tempdir().unwrap();
+    let profile = home.path().join(".claudectl/profiles/missing");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(
+        profile.join("account.json"),
+        r#"{"alias":"missing","saved_at":"2026-09-04T00:00:00Z"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        profile.join("credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":""}}"#,
+    )
+    .unwrap();
+    let output = Command::cargo_bin("claudectl")
+        .unwrap()
+        .env("HOME", home.path())
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Usage checked at"));
+    assert!(stdout.contains("Token expiry"));
+    assert!(stdout.contains("Usage status"));
+    assert!(stdout.contains("unknown"));
+    assert!(stdout.contains("missing access token; log in again"));
+
+    std::fs::write(
+        profile.join("credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"","expiresAt":1}}"#,
+    )
+    .unwrap();
+    let output = Command::cargo_bin("claudectl")
+        .unwrap()
+        .env("HOME", home.path())
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("expired"));
+    assert!(!stdout.contains("unknown"));
+    assert!(stdout.contains("missing access token; log in again"));
+}
+
+#[test]
 fn help_shows_all_subcommands() {
     let mut cmd = Command::cargo_bin("claudectl").unwrap();
     let output = cmd.arg("--help").output().unwrap();
