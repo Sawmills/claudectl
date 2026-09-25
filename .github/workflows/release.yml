@@ -169,7 +169,6 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           TAG: ${{ needs.setup.outputs.tag }}
-          VERSION: ${{ needs.setup.outputs.version }}
           SHA_DARWIN_ARM64: ${{ needs.release.outputs.sha_darwin_arm64 }}
           SHA_DARWIN_X86_64: ${{ needs.release.outputs.sha_darwin_x86_64 }}
           SHA_LINUX_X86_64: ${{ needs.release.outputs.sha_linux_x86_64 }}
@@ -187,7 +186,6 @@ jobs:
           class Claudectl < Formula
             desc "Manage multiple Claude Code accounts"
             homepage "https://github.com/Sawmills/claudectl"
-            version "${VERSION}"
             license "Apache-2.0"
 
             on_macos do
