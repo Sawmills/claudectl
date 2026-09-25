@@ -68,22 +68,25 @@ claudectl status
 ```
 
 ```
-Usage checked at Fri Sep 04 17:06:50
+Usage checked at Fri Sep 25 13:54:06
 
-┌─────────────────────┬────┬──────────┬────┬──────────┬──────────────┬──────────────────────────────────────────┐
-│ Account             ┆ 5h ┆ 5h Reset ┆ 7d ┆ 7d Reset ┆ Token expiry ┆ Usage status                             │
-╞═════════════════════╪════╪══════════╪════╪══════════╪══════════════╪══════════════════════════════════════════╡
-│ * amir2@sawmills.ai  ┆ -  ┆ -        ┆ -  ┆ -        ┆ 7h 29m       ┆ rate limited (HTTP 429); retry in 207s     │
-└─────────────────────┴────┴──────────┴────┴──────────┴──────────────┴──────────────────────────────────────────┘
+┌─────────────────────┬────┬───────────┬─────┬──────────────────────────────┬──────────┬──────────────┬──────────────────────────────────────────┐
+│ Account             ┆ 5h ┆ 5h Reset  ┆ 7d  ┆ 7d Reset                     ┆ Fable 7d ┆ Token expiry ┆ Usage status                             │
+╞═════════════════════╪════╪═══════════╪═════╪══════════════════════════════╪══════════╪══════════════╪══════════════════════════════════════════╡
+│ * amir2@sawmills.ai ┆ 6% ┆ in 1h 25m ┆ 62% ┆ in 1d 10h (Sun Sep 27 00:00) ┆ 100%     ┆ 29m          ┆ ok                                       │
+│ amir3@sawmills.ai   ┆ -  ┆ -         ┆ -   ┆ -                            ┆ -        ┆ 7h 29m       ┆ rate limited (HTTP 429); retry in 207s   │
+└─────────────────────┴────┴───────────┴─────┴──────────────────────────────┴──────────┴──────────────┴──────────────────────────────────────────┘
 ```
 
 All accounts are fetched live in parallel and sorted most-available first. `*` marks
-the active account. `Token expiry` shows the time remaining until the stored token
-expires, or `unknown` when expiry is unavailable. `Usage status` shows `ok` or the
-reason usage could not be fetched. For example, `rate limited (HTTP 429); retry in
-207s` means the usage endpoint asked you to wait before retrying. Token expiry
-remains visible when usage requests fail. Non-active profiles with an expired token
-are refreshed automatically during `status`.
+the active account. `Fable 7d` shows weekly Fable usage when the usage endpoint
+reports a Fable limit; the column is hidden when no account has one. `Token expiry`
+shows the time remaining until the stored token expires, or `unknown` when expiry is
+unavailable. `Usage status` shows `ok` or the reason usage could not be fetched. For
+example, `rate limited (HTTP 429); retry in 207s` means the usage endpoint asked you
+to wait before retrying. Token expiry remains visible when usage requests fail.
+Non-active profiles with an expired token are refreshed automatically during
+`status`.
 
 ### Switch accounts
 
