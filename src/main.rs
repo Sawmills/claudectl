@@ -5,7 +5,11 @@ use clap_complete::Shell;
 use claudectl::config;
 
 #[derive(Parser)]
-#[command(name = "claudectl", about = "Manage multiple Claude Code accounts")]
+#[command(
+    name = "claudectl",
+    version,
+    about = "Manage multiple Claude Code accounts"
+)]
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -49,12 +53,13 @@ enum Commands {
 }
 
 fn main() {
+    // Parse first so --help and --version work without a writable home.
+    let cli = Cli::parse();
+
     if let Err(e) = config::ensure_dirs() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
-
-    let cli = Cli::parse();
 
     let result = match cli.command {
         Commands::Status => commands::status::run(),
