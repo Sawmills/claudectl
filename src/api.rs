@@ -75,16 +75,15 @@ pub struct UsageResponse {
     pub seven_day_opus: Option<UsageWindow>,
     pub seven_day_sonnet: Option<UsageWindow>,
     pub extra_usage: Option<ExtraUsage>,
-    #[serde(default)]
-    pub limits: Vec<UsageLimit>,
+    pub limits: Option<Vec<UsageLimit>>,
 }
 
 impl UsageResponse {
     /// The weekly Fable limit. The endpoint reports it only as a model-scoped
     /// entry in `limits`, with a null model id, so match on the display name.
     pub fn fable_weekly(&self) -> Option<&UsageLimit> {
-        self.limits.iter().find(|limit| {
-            limit.kind == "weekly_scoped"
+        self.limits.iter().flatten().find(|limit| {
+            limit.kind.as_deref() == Some("weekly_scoped")
                 && limit
                     .scope
                     .as_ref()
@@ -97,8 +96,7 @@ impl UsageResponse {
 
 #[derive(Deserialize, Clone)]
 pub struct UsageLimit {
-    #[serde(default)]
-    pub kind: String,
+    pub kind: Option<String>,
     pub percent: Option<f64>,
     pub scope: Option<LimitScope>,
 }
@@ -290,6 +288,17 @@ mod tests {
 
         let missing: UsageResponse = serde_json::from_str("{}").unwrap();
         assert!(missing.fable_weekly().is_none());
+
+        let null_limits: UsageResponse = serde_json::from_str(r#"{"limits":null}"#).unwrap();
+        assert!(null_limits.fable_weekly().is_none());
+
+        let no_percent: UsageResponse = serde_json::from_str(
+            r#"{"limits":[{"kind":null,"percent":null,"scope":null},
+                {"kind":"weekly_scoped","percent":null,
+                 "scope":{"model":{"display_name":"Fable"}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(no_percent.fable_weekly().unwrap().percent, None);
     }
 
     #[test]

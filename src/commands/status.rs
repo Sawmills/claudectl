@@ -25,6 +25,7 @@ struct AccountStatus {
     opus_pct: Option<f64>,
     sonnet_pct: Option<f64>,
     fable_pct: Option<f64>,
+    has_fable_limit: bool,
     token_expiry_secs: Option<i64>,
     is_active: bool,
     is_error: bool,
@@ -193,6 +194,7 @@ fn to_account_status(f: &FetchedUsage) -> AccountStatus {
             opus_pct: usage.seven_day_opus.as_ref().and_then(|w| w.utilization),
             sonnet_pct: usage.seven_day_sonnet.as_ref().and_then(|w| w.utilization),
             fable_pct: usage.fable_weekly().and_then(|l| l.percent),
+            has_fable_limit: usage.fable_weekly().is_some(),
             token_expiry_secs: f.token_expiry_secs,
             is_active: f.is_active,
             is_error: false,
@@ -207,6 +209,7 @@ fn to_account_status(f: &FetchedUsage) -> AccountStatus {
             opus_pct: None,
             sonnet_pct: None,
             fable_pct: None,
+            has_fable_limit: false,
             token_expiry_secs: f.token_expiry_secs,
             is_active: f.is_active,
             is_error: true,
@@ -225,7 +228,7 @@ fn print_table(accounts: &[AccountStatus]) {
     let show_models = accounts
         .iter()
         .any(|a| a.opus_pct.is_some() || a.sonnet_pct.is_some());
-    let show_fable = accounts.iter().any(|a| a.fable_pct.is_some());
+    let show_fable = show_fable_column(accounts);
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
@@ -245,6 +248,10 @@ fn print_table(accounts: &[AccountStatus]) {
         table.add_row(render_row(account, show_models, show_fable));
     }
     println!("{table}");
+}
+
+fn show_fable_column(accounts: &[AccountStatus]) -> bool {
+    accounts.iter().any(|a| a.has_fable_limit)
 }
 
 fn render_row(s: &AccountStatus, show_models: bool, show_fable: bool) -> Vec<Cell> {
@@ -373,6 +380,7 @@ mod tests {
             opus_pct: None,
             sonnet_pct: None,
             fable_pct: None,
+            has_fable_limit: false,
             token_expiry_secs: None,
             is_active: false,
             is_error,
@@ -418,6 +426,24 @@ mod tests {
 
         a.fable_pct = None;
         assert_eq!(render_row(&a, false, true)[5].content(), "-");
+    }
+
+    #[test]
+    fn fable_limit_without_percent_still_shows_column() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{"limits":[{"kind":"weekly_scoped","percent":null,
+                "scope":{"model":{"display_name":"Fable"}}}]}"#,
+        )
+        .unwrap();
+        let status = to_account_status(&FetchedUsage {
+            alias: "a@x".to_string(),
+            usage: Some(usage),
+            token_expiry_secs: None,
+            is_active: false,
+            error: None,
+        });
+        assert!(show_fable_column(&[status]));
+        assert!(!show_fable_column(&[account(Some(1.0), Some(1.0), false)]));
     }
 
     #[test]
