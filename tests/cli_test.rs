@@ -48,6 +48,35 @@ fn status_reports_missing_token_separately_from_expiry() {
 }
 
 #[test]
+fn version_flag_prints_package_version() {
+    let expected = format!("claudectl {}\n", env!("CARGO_PKG_VERSION"));
+    for flag in ["--version", "-V"] {
+        let output = Command::cargo_bin("claudectl")
+            .unwrap()
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+}
+
+#[test]
+fn version_and_help_do_not_need_writable_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("not-a-dir");
+    std::fs::write(&home, "").unwrap();
+    for flag in ["--version", "--help"] {
+        Command::cargo_bin("claudectl")
+            .unwrap()
+            .env("HOME", &home)
+            .arg(flag)
+            .assert()
+            .success();
+    }
+}
+
+#[test]
 fn help_shows_all_subcommands() {
     let mut cmd = Command::cargo_bin("claudectl").unwrap();
     let output = cmd.arg("--help").output().unwrap();
