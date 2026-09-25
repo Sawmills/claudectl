@@ -75,6 +75,42 @@ pub struct UsageResponse {
     pub seven_day_opus: Option<UsageWindow>,
     pub seven_day_sonnet: Option<UsageWindow>,
     pub extra_usage: Option<ExtraUsage>,
+    #[serde(default)]
+    pub limits: Vec<UsageLimit>,
+}
+
+impl UsageResponse {
+    /// The weekly Fable limit. The endpoint reports it only as a model-scoped
+    /// entry in `limits`, with a null model id, so match on the display name.
+    pub fn fable_weekly(&self) -> Option<&UsageLimit> {
+        self.limits.iter().find(|limit| {
+            limit.kind == "weekly_scoped"
+                && limit
+                    .scope
+                    .as_ref()
+                    .and_then(|scope| scope.model.as_ref())
+                    .and_then(|model| model.display_name.as_deref())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("fable"))
+        })
+    }
+}
+
+#[derive(Deserialize, Clone)]
+pub struct UsageLimit {
+    #[serde(default)]
+    pub kind: String,
+    pub percent: Option<f64>,
+    pub scope: Option<LimitScope>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct LimitScope {
+    pub model: Option<LimitModel>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct LimitModel {
+    pub display_name: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -231,6 +267,30 @@ fn map_profile_to_oauth_account(profile: &serde_json::Value) -> serde_json::Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fable_weekly_reads_model_scoped_limit() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{"limits":[
+                {"kind":"session","percent":52,"scope":null},
+                {"kind":"weekly_all","percent":69,"scope":null},
+                {"kind":"weekly_scoped","percent":100,"severity":"critical",
+                 "scope":{"model":{"id":null,"display_name":"Fable"},"surface":null}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.fable_weekly().unwrap().percent, Some(100.0));
+
+        let other: UsageResponse = serde_json::from_str(
+            r#"{"limits":[{"kind":"weekly_scoped","percent":40,
+                "scope":{"model":{"display_name":"Opus"}}}]}"#,
+        )
+        .unwrap();
+        assert!(other.fable_weekly().is_none());
+
+        let missing: UsageResponse = serde_json::from_str("{}").unwrap();
+        assert!(missing.fable_weekly().is_none());
+    }
 
     #[test]
     fn usage_errors_distinguish_rate_limits_and_authentication() {

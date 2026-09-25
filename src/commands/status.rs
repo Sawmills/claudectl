@@ -24,6 +24,7 @@ struct AccountStatus {
     d7_reset: String,
     opus_pct: Option<f64>,
     sonnet_pct: Option<f64>,
+    fable_pct: Option<f64>,
     token_expiry_secs: Option<i64>,
     is_active: bool,
     is_error: bool,
@@ -191,6 +192,7 @@ fn to_account_status(f: &FetchedUsage) -> AccountStatus {
             d7_reset: format_window_reset(usage.seven_day.as_ref()),
             opus_pct: usage.seven_day_opus.as_ref().and_then(|w| w.utilization),
             sonnet_pct: usage.seven_day_sonnet.as_ref().and_then(|w| w.utilization),
+            fable_pct: usage.fable_weekly().and_then(|l| l.percent),
             token_expiry_secs: f.token_expiry_secs,
             is_active: f.is_active,
             is_error: false,
@@ -204,6 +206,7 @@ fn to_account_status(f: &FetchedUsage) -> AccountStatus {
             d7_reset: "-".to_string(),
             opus_pct: None,
             sonnet_pct: None,
+            fable_pct: None,
             token_expiry_secs: f.token_expiry_secs,
             is_active: f.is_active,
             is_error: true,
@@ -222,6 +225,7 @@ fn print_table(accounts: &[AccountStatus]) {
     let show_models = accounts
         .iter()
         .any(|a| a.opus_pct.is_some() || a.sonnet_pct.is_some());
+    let show_fable = accounts.iter().any(|a| a.fable_pct.is_some());
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
@@ -230,17 +234,20 @@ fn print_table(accounts: &[AccountStatus]) {
         header.push("Opus 7d");
         header.push("Sonnet 7d");
     }
+    if show_fable {
+        header.push("Fable 7d");
+    }
     header.push("Token expiry");
     header.push("Usage status");
     table.set_header(header);
 
     for account in accounts {
-        table.add_row(render_row(account, show_models));
+        table.add_row(render_row(account, show_models, show_fable));
     }
     println!("{table}");
 }
 
-fn render_row(s: &AccountStatus, show_models: bool) -> Vec<Cell> {
+fn render_row(s: &AccountStatus, show_models: bool, show_fable: bool) -> Vec<Cell> {
     let alias = if s.is_active {
         format!("* {}", s.alias)
     } else {
@@ -249,7 +256,7 @@ fn render_row(s: &AccountStatus, show_models: bool) -> Vec<Cell> {
 
     if s.is_error {
         let mut row = vec![Cell::new(alias)];
-        let cols = if show_models { 6 } else { 4 };
+        let cols = 4 + if show_models { 2 } else { 0 } + usize::from(show_fable);
         row.extend(std::iter::repeat_with(|| Cell::new("-")).take(cols));
         row.push(token_cell(s.token_expiry_secs));
         row.push(Cell::new(&s.error_msg).fg(Color::Red));
@@ -266,6 +273,9 @@ fn render_row(s: &AccountStatus, show_models: bool) -> Vec<Cell> {
     if show_models {
         row.push(colorize_usage_pct(s.opus_pct));
         row.push(colorize_usage_pct(s.sonnet_pct));
+    }
+    if show_fable {
+        row.push(colorize_usage_pct(s.fable_pct));
     }
     row.push(token_cell(s.token_expiry_secs));
     row.push(Cell::new("ok"));
@@ -362,6 +372,7 @@ mod tests {
             d7_reset: "-".to_string(),
             opus_pct: None,
             sonnet_pct: None,
+            fable_pct: None,
             token_expiry_secs: None,
             is_active: false,
             is_error,
@@ -387,13 +398,26 @@ mod tests {
 
     #[test]
     fn render_row_column_count() {
-        let a = account(Some(10.0), Some(20.0), false);
-        assert_eq!(render_row(&a, false).len(), 7);
-        assert_eq!(render_row(&a, true).len(), 9);
+        for a in [
+            account(Some(10.0), Some(20.0), false),
+            account(None, None, true),
+        ] {
+            assert_eq!(render_row(&a, false, false).len(), 7);
+            assert_eq!(render_row(&a, true, false).len(), 9);
+            assert_eq!(render_row(&a, false, true).len(), 8);
+            assert_eq!(render_row(&a, true, true).len(), 10);
+        }
+    }
 
-        let e = account(None, None, true);
-        assert_eq!(render_row(&e, false).len(), 7);
-        assert_eq!(render_row(&e, true).len(), 9);
+    #[test]
+    fn fable_column_shows_weekly_usage() {
+        let mut a = account(Some(10.0), Some(20.0), false);
+        a.fable_pct = Some(100.0);
+        assert_eq!(render_row(&a, false, true)[5].content(), "100%");
+        assert_eq!(render_row(&a, true, true)[7].content(), "100%");
+
+        a.fable_pct = None;
+        assert_eq!(render_row(&a, false, true)[5].content(), "-");
     }
 
     #[test]
@@ -402,12 +426,12 @@ mod tests {
         a.token_expiry_secs = Some(chrono::Utc::now().timestamp() + 7200);
         a.error_msg = "rate limited (HTTP 429); retry in 207s".into();
         for show_models in [false, true] {
-            let row = render_row(&a, show_models);
+            let row = render_row(&a, show_models, false);
             assert!(row[row.len() - 2].content().contains('h'));
             assert_eq!(row[row.len() - 1].content(), a.error_msg);
         }
         a.token_expiry_secs = Some(1);
-        let row = render_row(&a, false);
+        let row = render_row(&a, false, false);
         assert_eq!(row[5].content(), "expired");
         assert_eq!(row[6].content(), a.error_msg);
     }
