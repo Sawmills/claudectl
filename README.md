@@ -110,6 +110,9 @@ Aliases with the same refresh token share one refresh result per check. An alias
 that shares the live login's refresh token also leaves refresh to Claude Code.
 If the authoritative live credentials are unavailable, status does not refresh
 saved tokens. On macOS, a file fallback cannot prove Keychain token ownership.
+Account changes and token refresh share a separate lock. Status reads ownership
+under that lock and releases it before usage requests. A busy account update
+returns an error that asks you to retry after the other command finishes.
 
 ### Switch accounts
 

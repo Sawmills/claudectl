@@ -134,21 +134,6 @@ fn fetch_usages_with_refresh(
         return Ok(vec![]);
     }
     let mut cache = UsageCache::open(&paths.claudectl_dir())?;
-    let active = profile::get_active_from(paths)?;
-    let refresh_owner = store.read_refresh_owner();
-    let refresh_owner_known = refresh_owner.is_ok();
-    let live_creds = match refresh_owner {
-        Ok(creds) => creds,
-        // The fallback remains usable for display, but cannot authorize refresh.
-        Err(_) => store.read_credentials().ok(),
-    };
-    let live_grant_key = live_creds.as_ref().and_then(|creds| {
-        creds
-            .claude_ai_oauth
-            .refresh_token
-            .as_deref()
-            .map(UsageCache::key)
-    });
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let client = reqwest::Client::builder()
@@ -157,6 +142,21 @@ fn fetch_usages_with_refresh(
         let mut fetched = Vec::new();
         let mut refreshes = std::collections::HashMap::<String, Result<api::OauthCreds>>::new();
         for profile in profiles {
+            // Switching and saved-profile mutations use this same lock. Read
+            // ownership and credentials only after acquiring it, and retain it
+            // through refresh and persistence. Usage GETs do not hold it.
+            let auth_lock = store.lock_auth_state()?;
+            let active = profile::get_active_from(paths)?;
+            let refresh_owner = store.read_refresh_owner();
+            let refresh_owner_known = refresh_owner.is_ok();
+            let live_creds = match refresh_owner {
+                Ok(creds) => creds,
+                // A fallback remains usable for display, never for refresh authority.
+                Err(_) => store.read_credentials().ok(),
+            };
+            let live_grant_key = live_creds.as_ref().and_then(|creds| {
+                creds.claude_ai_oauth.refresh_token.as_deref().map(UsageCache::key)
+            });
             let is_active = active.as_deref() == Some(profile.meta.alias.as_str());
             let mut result = FetchedUsage {
                 alias: profile.meta.alias.clone(),
@@ -257,6 +257,7 @@ fn fetch_usages_with_refresh(
                     }
                 }
             }
+            drop(auth_lock);
             result.snapshot = cache
                 .get(
                     &client,
@@ -797,6 +798,8 @@ mod tests {
             async |_, old| {
                 calls += 1;
                 let mut rotated = old.clone();
+                let switched = profile::switch_to(&store, &paths, "one");
+                assert!(switched.is_err(), "switch must not commit during refresh");
                 rotated.access_token = "rotated-test-access".into();
                 rotated.refresh_token = Some(format!("rotated-test-grant-{calls}"));
                 rotated.expires_at = Some(chrono::Utc::now().timestamp_millis() + 3600000);

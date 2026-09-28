@@ -43,6 +43,29 @@ impl AuthStore {
         }
     }
 
+    /// Serialize claudectl account mutations and refresh ownership checks.
+    /// Keep the returned file alive through the corresponding writes.
+    pub fn lock_auth_state(&self) -> Result<std::fs::File> {
+        let root = self.paths.claudectl_dir();
+        std::fs::create_dir_all(&root)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let mut options = std::fs::File::options();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options.open(root.join("auth-state.lock"))?;
+        lock.try_lock()
+            .context("account update in progress; retry after it finishes")?;
+        Ok(lock)
+    }
+
     pub fn read_credentials(&self) -> Result<CredentialsFile> {
         if self.keychain
             && let Some(raw) = keychain_read()
@@ -93,6 +116,7 @@ impl AuthStore {
     }
 
     pub fn write_credentials(&self, creds: &CredentialsFile) -> Result<()> {
+        let _auth_lock = self.lock_auth_state()?;
         self.write_credentials_after_live_commit(creds, || {})
     }
 
@@ -504,6 +528,16 @@ mod tests {
     }
 
     const FAKE_KEYCHAIN: &str = "/Users/test/Library/Keychains/login.keychain-db";
+
+    #[test]
+    fn account_lock_blocks_mutation_and_is_released_on_drop() {
+        let (_tmp, store) = store();
+        let lock = store.lock_auth_state().unwrap();
+        assert!(store.lock_auth_state().is_err());
+        assert!(store.write_credentials(&test_creds("test-access")).is_err());
+        drop(lock);
+        store.write_credentials(&test_creds("test-access")).unwrap();
+    }
 
     #[test]
     fn refresh_ownership_never_uses_stale_file_when_keychain_is_unavailable() {
