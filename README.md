@@ -96,8 +96,10 @@ A corrupt or unwritable cache produces an error.
 HTTP 429 pauses usage checks for all profiles on this machine. The delay is at
 least five minutes and at least the server's `Retry-After` value. Repeated 429s
 increase the local delay up to one hour. A longer server delay still applies.
-Other fetch failures and token-refresh failures delay retries for that token. These controls reduce requests;
-they do not guarantee that Anthropic will accept the next request. Other clients
+Other HTTP errors on usage fetches or token refreshes delay retries for that token.
+Network errors, timeouts, and invalid responses add no per-token retry delay.
+These controls reduce requests; they do not guarantee that Anthropic will accept
+the next request. Other clients
 and older claudectl versions do not share these controls.
 
 `--refresh` bypasses recent successful data, but never bypasses a cooldown.
