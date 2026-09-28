@@ -10,13 +10,7 @@ pub fn run(alias: Option<&str>) -> Result<()> {
     let store = AuthStore::real(paths.clone());
 
     match alias {
-        Some(a) => {
-            let a = profile::validate_alias(a)?;
-            let email = profile::switch_to(&store, &paths, a)?;
-            println!("switched to {a} ({email})");
-            println!();
-            status::run_focused(a)
-        }
+        Some(a) => switch_explicit(&store, &paths, profile::validate_alias(a)?),
         None => {
             // Only the auto-select path needs this here: it fetches usage over
             // the network before it knows which profile to activate, and
@@ -28,15 +22,28 @@ pub fn run(alias: Option<&str>) -> Result<()> {
             }
             let candidates: Vec<Candidate> = fetched.iter().map(candidate_from).collect();
             let Some(best) = select_most_available(&candidates) else {
-                bail!("no usable accounts found (all expired or errored)");
+                bail!(
+                    "no accounts with fresh usage below the general limits; run claudectl status"
+                );
             };
             let best = best.to_string();
             let email = profile::switch_to(&store, &paths, &best)?;
             println!("auto-selected most available: {best} ({email})");
             println!();
-            status::run_focused(&best)
+            status::print_focused(&fetched, &best);
+            Ok(())
         }
     }
+}
+
+fn switch_explicit(store: &AuthStore, paths: &config::Paths, alias: &str) -> Result<()> {
+    let email = profile::switch_to(store, paths, alias)?;
+    println!("switched to {alias} ({email})");
+    println!();
+    if let Err(error) = status::run_focused(store, paths, alias) {
+        eprintln!("warning: profile switch completed; cached usage unavailable: {error}");
+    }
+    Ok(())
 }
 
 struct Candidate {
@@ -49,17 +56,17 @@ struct Candidate {
 
 fn candidate_from(f: &FetchedUsage) -> Candidate {
     match &f.usage {
-        Some(u) => {
+        Some(u) if f.snapshot.is_fresh_at(chrono::Utc::now().timestamp()) && f.error.is_none() => {
             let h5 = u
                 .five_hour
                 .as_ref()
                 .and_then(|w| w.utilization)
-                .unwrap_or(0.0);
+                .unwrap_or(f64::MAX);
             let d7 = u
                 .seven_day
                 .as_ref()
                 .and_then(|w| w.utilization)
-                .unwrap_or(0.0);
+                .unwrap_or(f64::MAX);
             Candidate {
                 alias: f.alias.clone(),
                 score: h5.max(d7),
@@ -70,7 +77,7 @@ fn candidate_from(f: &FetchedUsage) -> Candidate {
                     .unwrap_or(i64::MAX),
             }
         }
-        None => Candidate {
+        _ => Candidate {
             alias: f.alias.clone(),
             score: f64::MAX,
             d7_reset_ts: i64::MAX,
@@ -83,7 +90,7 @@ fn candidate_from(f: &FetchedUsage) -> Candidate {
 fn select_most_available(candidates: &[Candidate]) -> Option<&str> {
     candidates
         .iter()
-        .filter(|c| c.score < f64::MAX)
+        .filter(|c| c.score < 100.0)
         .min_by_key(|c| ((c.score * 2.0).round() as i64, c.d7_reset_ts))
         .map(|c| c.alias.as_str())
 }
@@ -98,6 +105,68 @@ mod tests {
             score,
             d7_reset_ts,
         }
+    }
+
+    fn fetched(fresh: bool, usage: &str) -> FetchedUsage {
+        FetchedUsage {
+            alias: "candidate".into(),
+            usage: Some(serde_json::from_str(usage).unwrap()),
+            snapshot: claudectl::usage_cache::Snapshot {
+                fresh,
+                fetched_at: Some(0),
+                valid_until: Some(i64::MAX),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn switch_fixture() -> (tempfile::TempDir, config::Paths, AuthStore) {
+        let root = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_home(root.path().to_path_buf());
+        let creds = serde_json::from_str(r#"{"claudeAiOauth":{"accessToken":"test-only-switch"}}"#)
+            .unwrap();
+        profile::save_profile_to(&paths, "chosen", &creds, None).unwrap();
+        let store = AuthStore::file_only(paths.clone());
+        (root, paths, store)
+    }
+
+    #[test]
+    fn switch_succeeds_when_another_process_holds_usage_lock() {
+        let (_root, paths, store) = switch_fixture();
+        let _lock = claudectl::usage_cache::UsageCache::open(&paths.claudectl_dir()).unwrap();
+
+        let result = switch_explicit(&store, &paths, "chosen");
+
+        assert!(result.is_ok());
+        assert_eq!(
+            profile::get_active_from(&paths).unwrap().as_deref(),
+            Some("chosen")
+        );
+    }
+
+    #[test]
+    fn stale_usage_never_becomes_a_candidate() {
+        let status = fetched(
+            false,
+            r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":2}}"#,
+        );
+        assert!(select_most_available(&[candidate_from(&status)]).is_none());
+    }
+
+    #[test]
+    fn missing_usage_is_not_zero_usage() {
+        let status = fetched(true, "{}");
+        assert!(select_most_available(&[candidate_from(&status)]).is_none());
+    }
+
+    #[test]
+    fn exhausted_general_limit_is_not_selected() {
+        let status = fetched(
+            true,
+            r#"{"five_hour":{"utilization":0},"seven_day":{"utilization":100}}"#,
+        );
+        assert!(select_most_available(&[candidate_from(&status)]).is_none());
     }
 
     #[test]
@@ -123,4 +192,25 @@ mod tests {
         let c = vec![candidate("a", f64::MAX, 0), candidate("b", f64::MAX, 0)];
         assert_eq!(select_most_available(&c), None);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn snapshot_that_expires_during_batch_is_not_selected() {
+    let status = FetchedUsage {
+        usage: Some(
+            serde_json::from_str(
+                r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":2}}"#,
+            )
+            .unwrap(),
+        ),
+        snapshot: claudectl::usage_cache::Snapshot {
+            fresh: true,
+            fetched_at: Some(1),
+            valid_until: Some(2),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(select_most_available(&[candidate_from(&status)]).is_none());
 }

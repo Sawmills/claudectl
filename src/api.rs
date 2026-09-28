@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -50,7 +50,7 @@ pub struct CredentialsFile {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct UsageWindow {
     pub utilization: Option<f64>,
     pub resets_at: Option<String>,
@@ -68,7 +68,7 @@ impl UsageWindow {
 
 /// Response of GET /api/oauth/usage. The endpoint also returns nullable
 /// experiment fields we ignore; serde skips unknown keys by default.
-#[derive(Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct UsageResponse {
     pub five_hour: Option<UsageWindow>,
     pub seven_day: Option<UsageWindow>,
@@ -94,24 +94,24 @@ impl UsageResponse {
     }
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct UsageLimit {
     pub kind: Option<String>,
     pub percent: Option<f64>,
     pub scope: Option<LimitScope>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct LimitScope {
     pub model: Option<LimitModel>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct LimitModel {
     pub display_name: Option<String>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ExtraUsage {
     pub is_enabled: Option<bool>,
     pub used_credits: Option<f64>,
@@ -122,8 +122,16 @@ pub async fn fetch_usage_async(
     client: &reqwest::Client,
     access_token: &str,
 ) -> Result<UsageResponse> {
+    fetch_usage_at(client, access_token, USAGE_URL).await
+}
+
+pub(crate) async fn fetch_usage_at(
+    client: &reqwest::Client,
+    access_token: &str,
+    url: &str,
+) -> Result<UsageResponse> {
     let resp = client
-        .get(USAGE_URL)
+        .get(url)
         .bearer_auth(access_token)
         .header(OAUTH_BETA_HEADER.0, OAUTH_BETA_HEADER.1)
         .send()
@@ -131,9 +139,44 @@ pub async fn fetch_usage_async(
         .context("failed to reach usage API")?;
     let status = resp.status();
     if !status.is_success() {
-        bail!(usage_http_error(status, resp.headers(), chrono::Utc::now()));
+        return Err(UsageHttpError {
+            status: status.as_u16(),
+            retry_after: retry_after(resp.headers(), chrono::Utc::now()),
+            message: usage_http_error(status, resp.headers(), chrono::Utc::now()),
+        }
+        .into());
     }
     resp.json().await.context("failed to parse usage response")
+}
+
+#[derive(Debug)]
+pub struct UsageHttpError {
+    pub status: u16,
+    pub retry_after: Option<u64>,
+    message: String,
+}
+
+impl std::fmt::Display for UsageHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for UsageHttpError {}
+
+fn retry_after(
+    headers: &reqwest::header::HeaderMap,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<u64> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    value.parse::<u64>().ok().or_else(|| {
+        chrono::DateTime::parse_from_rfc2822(value)
+            .ok()
+            .map(|date| date.timestamp().saturating_sub(now.timestamp()).max(0) as u64)
+    })
 }
 
 // Use only controlled messages and parsed headers. Response bodies can contain
@@ -145,16 +188,7 @@ fn usage_http_error(
 ) -> String {
     match status {
         reqwest::StatusCode::TOO_MANY_REQUESTS => {
-            let delay = headers
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| {
-                    value.parse::<u64>().ok().or_else(|| {
-                        chrono::DateTime::parse_from_rfc2822(value)
-                            .ok()
-                            .map(|date| (date.timestamp() - now.timestamp()).max(0) as u64)
-                    })
-                });
+            let delay = retry_after(headers, now);
             match delay {
                 Some(seconds) => format!("rate limited (HTTP 429); retry in {seconds}s"),
                 None => "rate limited (HTTP 429); try again later".into(),
@@ -177,7 +211,7 @@ struct TokenGrantResponse {
 ///
 /// CALLER CONTRACT: never call for the active profile. Claude Code owns that
 /// refresh token; rotating it out from under Claude Code logs the user out.
-/// Non-active profiles are safe — claudectl's copy is the only holder.
+/// Also exclude saved aliases that share the live login's refresh token.
 pub async fn refresh_credentials_async(
     client: &reqwest::Client,
     old: &OauthCreds,
@@ -199,7 +233,12 @@ pub async fn refresh_credentials_async(
         .context("failed to reach token endpoint")?;
     let status = resp.status();
     if !status.is_success() {
-        bail!("token refresh failed ({status})");
+        return Err(UsageHttpError {
+            status: status.as_u16(),
+            retry_after: retry_after(resp.headers(), chrono::Utc::now()),
+            message: format!("token refresh failed ({status})"),
+        }
+        .into());
     }
     let grant: TokenGrantResponse = resp
         .json()

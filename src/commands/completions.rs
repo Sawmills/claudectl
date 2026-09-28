@@ -28,7 +28,7 @@ _claudectl_profiles() {
 }
 "#;
 
-        // Complete profile aliases for use and remove
+        // Complete profile aliases for use, remove, and status.
         // `use`'s alias is optional, so clap emits a double-colon spec.
         script = script.replace(
             "'::alias -- Profile alias to switch to (auto-selects most available if omitted):_default'",
@@ -37,6 +37,10 @@ _claudectl_profiles() {
         script = script.replace(
             "':alias -- Profile alias to remove:_default'",
             "':alias -- Profile alias to remove:_claudectl_profiles'",
+        );
+        script = script.replace(
+            "'::alias -- Check only this saved profile:_default'",
+            "'::alias -- Check only this saved profile:_claudectl_profiles'",
         );
 
         print!("{profile_fn}{script}");
@@ -54,11 +58,12 @@ _claudectl_profiles() {
         println!(r#"}}"#);
         println!(r#"complete -F _claudectl_profiles claudectl use"#);
         println!(r#"complete -F _claudectl_profiles claudectl remove"#);
+        println!(r#"complete -F _claudectl_profiles claudectl status"#);
     } else if shell == Shell::Fish {
         generate(shell, &mut cmd, name, &mut std::io::stdout());
         println!();
         println!(
-            r#"complete -c claudectl -n '__fish_seen_subcommand_from use remove' -xa '(ls ~/.claudectl/profiles/ 2>/dev/null)'"#
+            r#"complete -c claudectl -n '__fish_seen_subcommand_from use remove status' -xa '(ls ~/.claudectl/profiles/ 2>/dev/null)'"#
         );
     } else {
         generate(shell, &mut cmd, name, &mut std::io::stdout());

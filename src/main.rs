@@ -18,7 +18,16 @@ pub struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Show rate limit status for all accounts
-    Status,
+    Status {
+        /// Check only this saved profile
+        alias: Option<String>,
+        /// Use saved usage data without network requests or token refresh
+        #[arg(long, conflicts_with = "refresh")]
+        cached: bool,
+        /// Refresh recent data, while still obeying saved cooldowns
+        #[arg(long)]
+        refresh: bool,
+    },
     /// Log into a Claude account via OAuth and save it as a profile
     Login {
         /// Profile alias to save the login as
@@ -62,7 +71,20 @@ fn main() {
     }
 
     let result = match cli.command {
-        Commands::Status => commands::status::run(),
+        Commands::Status {
+            ref alias,
+            cached,
+            refresh,
+        } => commands::status::run(
+            alias.as_deref(),
+            if cached {
+                claudectl::usage_cache::FetchMode::Cached
+            } else if refresh {
+                claudectl::usage_cache::FetchMode::Refresh
+            } else {
+                claudectl::usage_cache::FetchMode::Normal
+            },
+        ),
         Commands::Login { ref alias } => commands::login::run(alias),
         Commands::Save { ref alias } => commands::save::run(alias.as_deref()),
         Commands::Use { ref alias } => commands::use_profile::run(alias.as_deref()),

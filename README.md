@@ -61,32 +61,60 @@ claudectl to update it. If macOS denies that write after OAuth, the profile is a
 saved; resolve the reported Keychain access problem and run `claudectl use <alias>`
 without logging in again.
 
-### Check rate limits
+### Check usage and capacity
 
 ```bash
-claudectl status
+claudectl status                  # all profiles; reuse data for up to five minutes
+claudectl status work-main        # one profile
+claudectl status --cached         # no network requests or token refresh
+claudectl status --refresh        # request fresh data; obey saved cooldowns
 ```
 
-```
-Usage checked at Fri Sep 25 13:54:06
+The table separates usage data from the result of the fetch:
 
-┌─────────────────────┬────┬───────────┬─────┬──────────────────────────────┬──────────┬──────────────┬──────────────────────────────────────────┐
-│ Account             ┆ 5h ┆ 5h Reset  ┆ 7d  ┆ 7d Reset                     ┆ Fable 7d ┆ Token expiry ┆ Usage status                             │
-╞═════════════════════╪════╪═══════════╪═════╪══════════════════════════════╪══════════╪══════════════╪══════════════════════════════════════════╡
-│ * amir2@sawmills.ai ┆ 6% ┆ in 1h 25m ┆ 62% ┆ in 1d 10h (Sun Sep 27 00:00) ┆ 100%     ┆ 29m          ┆ ok                                       │
-│ amir3@sawmills.ai   ┆ -  ┆ -         ┆ -   ┆ -                            ┆ -        ┆ 7h 29m       ┆ rate limited (HTTP 429); retry in 207s   │
-└─────────────────────┴────┴───────────┴─────┴──────────────────────────────┴──────────┴──────────────┴──────────────────────────────────────────┘
-```
+- `5h`, `7d`, and model columns show the percentage of capacity used.
+- `Account capacity` shows a general or model limit, or `below reported limits`.
+  Missing or stale data gives an unknown capacity. A successful fetch does not
+  prove that a model request will succeed.
+- `Usage fetch` shows `live`, `cached`, `failed`, or `cooldown`. HTTP 429 means that
+  Anthropic limited requests for usage data. A cooldown skips the request.
+  Neither state proves exhausted capacity.
+- `Data age` shows the age of the last successful result. After a failed fetch,
+  the table retains old percentages and marks their age as stale.
+- `Next fetch` shows when another check can contact the endpoint. It is separate
+  from the account's five-hour and weekly reset times.
+- `Token expiry` shows the stored token expiry, independently of fetch errors.
+  `*` marks the active profile. Model columns appear when the endpoint reports them.
 
-All accounts are fetched live in parallel and sorted most-available first. `*` marks
-the active account. `Fable 7d` shows weekly Fable usage when the usage endpoint
-reports a Fable limit; the column is hidden when no account has one. `Token expiry`
-shows the time remaining until the stored token expires, or `unknown` when expiry is
-unavailable. `Usage status` shows `ok` or the reason usage could not be fetched. For
-example, `rate limited (HTTP 429); retry in 207s` means the usage endpoint asked you
-to wait before retrying. Token expiry remains visible when usage requests fail.
-Non-active profiles with an expired token are refreshed automatically during
-`status`.
+All commands share a cache and an operating-system lock under `~/.claudectl/usage/`.
+Requests run one at a time, with a one-second gap. A concurrent command stops with
+an explicit message instead of starting another batch. Cache files contain usage
+data and token digests, never credential values. Token changes isolate the cache
+from an old login. Entries unused for a day are removed on the next cache update.
+A corrupt or unwritable cache produces an error.
+
+HTTP 429 pauses usage checks for all profiles on this machine. The delay is at
+least five minutes and at least the server's `Retry-After` value. Repeated 429s
+increase the local delay up to one hour. A longer server delay still applies.
+Other HTTP errors on usage fetches or token refreshes delay retries for that token.
+Network errors, timeouts, and invalid responses add no per-token retry delay.
+These controls reduce requests; they do not guarantee that Anthropic will accept
+the next request. Other clients
+and older claudectl versions do not share these controls.
+
+`--refresh` bypasses recent successful data, but never bypasses a cooldown.
+`--cached` and `--refresh` cannot be combined. A general usage window reset ends
+its cache validity early. Non-active expired tokens refresh only when a network
+check is due. Claude Code remains the sole owner of refresh for the active profile.
+Aliases with the same refresh token share one refresh result per check.
+They also share saved refresh cooldowns across separate checks.
+Selection and display recheck cache expiry after the batch completes. An alias
+that shares the live login's refresh token also leaves refresh to Claude Code.
+If the authoritative live credentials are unavailable, status does not refresh
+saved tokens. On macOS, a file fallback cannot prove Keychain token ownership.
+Account changes and token refresh share a separate lock. Status reads ownership
+under that lock and releases it before usage requests. A busy account update
+returns an error that asks you to retry after the other command finishes.
 
 ### Switch accounts
 
@@ -96,14 +124,19 @@ claudectl use                      # auto-select the most available account
 claudectl switch                   # interactive fuzzy picker
 ```
 
-Switching is a pure local operation (Keychain + files); it never contacts Anthropic.
+Explicit switching is a local operation (Keychain + files), with cached usage
+and no requests to Anthropic. Automatic selection checks usage once and reuses
+that result after the switch. If the cached display fails after an explicit switch,
+the command reports the completed switch and a separate warning.
 It runs the same [Keychain preflight](#macos-keychain-preflight) before touching the
 live auth. On macOS it updates the `Claude Code-credentials` Keychain entry,
 `~/.claude/.credentials.json`, and the `oauthAccount` identity in `~/.claude.json` —
 so Claude Code shows the right account immediately.
 
-Auto-select picks the profile with the lowest `max(5h, 7d)` utilization, breaking
-near-ties toward the soonest 7d reset.
+Auto-select uses only fresh, successful results with known five-hour and weekly
+usage below 100%. It picks the lowest `max(5h, 7d)` utilization and breaks near-ties
+toward the soonest weekly reset. Model-specific limits remain visible in the table;
+automatic selection does not choose for a particular model.
 
 ### Housekeeping
 
@@ -139,7 +172,7 @@ Two safety rules are baked in:
   the outgoing profile (only when the live identity still matches it).
 - **The active profile is never auto-refreshed.** Claude Code owns the active refresh
   token; rotating it underneath Claude Code would log you out. Only non-active
-  profiles are refreshed, and claudectl is the only holder of those tokens.
+  profiles with a different refresh token from the live login can be refreshed.
 
 If a profile shows `expired` in `status`, just `claudectl use` it (or wait for the
 auto-refresh) before reaching for a fresh `claude /login`.

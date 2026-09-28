@@ -37,6 +37,7 @@ fn run_with(alias: &str, flow: &dyn LoginFlow) -> Result<()> {
     let input = flow.read_authorization_code()?;
     let (code, code_state) = oauth::parse_pasted_code(&input, &state);
 
+    let auth_lock = flow.lock_auth_state()?;
     let creds_oauth = flow.exchange_code(code, code_state, &pkce.verifier)?;
     let account = flow.fetch_oauth_account(&creds_oauth.access_token);
     if account.is_none() {
@@ -48,6 +49,7 @@ fn run_with(alias: &str, flow: &dyn LoginFlow) -> Result<()> {
         extra: serde_json::Map::new(),
     };
     flow.save_profile(alias, &creds, account)?;
+    drop(auth_lock);
     let email = flow
         .activate(alias)
         .with_context(|| activation_failed_hint(alias))?;
@@ -59,6 +61,7 @@ trait LoginFlow {
     fn ensure_keychain_ready(&self) -> Result<()>;
     fn open_browser(&self, url: &str);
     fn read_authorization_code(&self) -> Result<String>;
+    fn lock_auth_state(&self) -> Result<Option<std::fs::File>>;
     fn exchange_code(&self, code: &str, state: &str, verifier: &str) -> Result<api::OauthCreds>;
     fn fetch_oauth_account(&self, access_token: &str) -> Option<serde_json::Value>;
     fn save_profile(
@@ -92,6 +95,10 @@ impl LoginFlow for SystemLoginFlow<'_> {
             .read_line(&mut input)
             .context("failed to read authorization code")?;
         Ok(input)
+    }
+
+    fn lock_auth_state(&self) -> Result<Option<std::fs::File>> {
+        self.store.lock_auth_state().map(Some)
     }
 
     fn exchange_code(&self, code: &str, state: &str, verifier: &str) -> Result<api::OauthCreds> {
@@ -146,6 +153,7 @@ mod tests {
     struct FakeLoginFlow {
         events: RefCell<Vec<LoginEvent>>,
         readiness_fails: bool,
+        lock_fails: bool,
         activation_fails: bool,
     }
 
@@ -154,6 +162,7 @@ mod tests {
             Self {
                 events: RefCell::new(Vec::new()),
                 readiness_fails: false,
+                lock_fails: false,
                 activation_fails: false,
             }
         }
@@ -174,6 +183,13 @@ mod tests {
 
         fn read_authorization_code(&self) -> Result<String> {
             Ok("code".to_string())
+        }
+
+        fn lock_auth_state(&self) -> Result<Option<std::fs::File>> {
+            if self.lock_fails {
+                anyhow::bail!("account update in progress");
+            }
+            Ok(None)
         }
 
         fn exchange_code(
@@ -215,6 +231,20 @@ mod tests {
             }
             Ok("work@x".to_string())
         }
+    }
+
+    #[test]
+    fn busy_account_lock_prevents_token_exchange() {
+        let flow = FakeLoginFlow {
+            lock_fails: true,
+            ..FakeLoginFlow::ready()
+        };
+        let err = run_with("work@x", &flow).unwrap_err();
+        assert!(err.to_string().contains("account update in progress"));
+        assert_eq!(
+            flow.events.into_inner(),
+            vec![LoginEvent::Readiness, LoginEvent::Browser]
+        );
     }
 
     #[test]

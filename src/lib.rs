@@ -4,3 +4,4 @@ pub mod config;
 pub mod oauth;
 pub mod profile;
 pub mod shell;
+pub mod usage_cache;

@@ -6,6 +6,7 @@ use claudectl::profile;
 pub fn run(alias: Option<&str>) -> Result<()> {
     let paths = config::default_paths()?;
     let store = AuthStore::real(paths.clone());
+    let _auth_lock = store.lock_auth_state()?;
 
     let creds = store.read_credentials()?;
     let account = store.read_oauth_account()?;

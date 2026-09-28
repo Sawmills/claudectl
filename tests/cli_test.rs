@@ -25,7 +25,7 @@ fn status_reports_missing_token_separately_from_expiry() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Usage checked at"));
     assert!(stdout.contains("Token expiry"));
-    assert!(stdout.contains("Usage status"));
+    assert!(stdout.contains("Usage fetch"));
     assert!(stdout.contains("unknown"));
     assert!(stdout.contains("missing access token; log in again"));
 
@@ -43,7 +43,6 @@ fn status_reports_missing_token_separately_from_expiry() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("expired"));
-    assert!(!stdout.contains("unknown"));
     assert!(stdout.contains("missing access token; log in again"));
 }
 
@@ -121,5 +120,80 @@ fn zsh_completions_wire_alias_args_to_profile_completer() {
     let mut cmd = Command::cargo_bin("claudectl").unwrap();
     let output = cmd.args(["completions", "zsh"]).output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(stdout.matches("_claudectl_profiles'").count(), 2);
+    assert_eq!(stdout.matches("_claudectl_profiles'").count(), 3);
+}
+
+#[test]
+fn cached_status_needs_no_network_or_saved_profiles() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("claudectl")
+        .unwrap()
+        .env("HOME", home.path())
+        .args(["status", "--cached"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("no profiles saved")
+    );
+}
+
+fn saved_profile(home: &std::path::Path, alias: &str) {
+    let paths = claudectl::config::Paths::from_home(home.to_path_buf());
+    let creds =
+        serde_json::from_str(r#"{"claudeAiOauth":{"accessToken":"test-only-cli"}}"#).unwrap();
+    claudectl::profile::save_profile_to(&paths, alias, &creds, None).unwrap();
+}
+
+#[test]
+fn cached_status_filters_before_loading_other_profiles() {
+    let home = tempfile::tempdir().unwrap();
+    saved_profile(home.path(), "chosen");
+    saved_profile(home.path(), "other");
+    let output = Command::cargo_bin("claudectl")
+        .unwrap()
+        .env("HOME", home.path())
+        .args(["status", "chosen", "--cached"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success());
+    assert!(stdout.contains("chosen"));
+    assert!(!stdout.contains("other"));
+}
+
+#[test]
+fn concurrent_cli_fails_without_starting_another_check() {
+    let home = tempfile::tempdir().unwrap();
+    saved_profile(home.path(), "chosen");
+    let _lock = claudectl::usage_cache::UsageCache::open(&home.path().join(".claudectl")).unwrap();
+
+    let output = Command::cargo_bin("claudectl")
+        .unwrap()
+        .env("HOME", home.path())
+        .arg("status")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("usage check already in progress")
+    );
+}
+
+#[test]
+fn cached_and_refresh_flags_conflict() {
+    let home = tempfile::tempdir().unwrap();
+
+    Command::cargo_bin("claudectl")
+        .unwrap()
+        .env("HOME", home.path())
+        .args(["status", "--cached", "--refresh"])
+        .assert()
+        .failure();
 }

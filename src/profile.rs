@@ -163,6 +163,7 @@ pub fn clear_active_from(paths: &Paths) -> Result<()> {
 /// Switch the live Claude Code auth to `alias`. Returns the profile's email
 /// for display. Pure local operation — never contacts Anthropic.
 pub fn switch_to(store: &AuthStore, paths: &Paths, alias: &str) -> Result<String> {
+    let _auth_lock = store.lock_auth_state()?;
     let profile = get_profile_from(paths, alias)?;
     let creds = profile.read_credentials()?;
     store.ensure_keychain_ready()?;
