@@ -106,6 +106,8 @@ and older claudectl versions do not share these controls.
 `--cached` and `--refresh` cannot be combined. A general usage window reset ends
 its cache validity early. Non-active expired tokens refresh only when a network
 check is due. Claude Code remains the sole owner of refresh for the active profile.
+Aliases with the same refresh token share one refresh result per check. An alias
+that shares the live login's refresh token also leaves refresh to Claude Code.
 
 ### Switch accounts
 
@@ -163,7 +165,7 @@ Two safety rules are baked in:
   the outgoing profile (only when the live identity still matches it).
 - **The active profile is never auto-refreshed.** Claude Code owns the active refresh
   token; rotating it underneath Claude Code would log you out. Only non-active
-  profiles are refreshed, and claudectl is the only holder of those tokens.
+  profiles with a different refresh token from the live login can be refreshed.
 
 If a profile shows `expired` in `status`, just `claudectl use` it (or wait for the
 auto-refresh) before reaching for a fresh `claude /login`.

@@ -253,9 +253,11 @@ impl UsageCache {
         now: i64,
     ) -> Result<Snapshot> {
         let key = Self::key(token);
-        self.record_failure(&key, error, now, "token refresh");
-        self.prune(now);
-        self.save()?;
+        if self.checked.insert(key.clone()) {
+            self.record_failure(&key, error, now, "token refresh");
+            self.prune(now);
+            self.save()?;
+        }
         let mut snapshot = self.snapshot(&key, now);
         snapshot.source = "failed";
         snapshot.error = self.state.entries.get(&key).and_then(|e| e.error.clone());

@@ -211,7 +211,7 @@ struct TokenGrantResponse {
 ///
 /// CALLER CONTRACT: never call for the active profile. Claude Code owns that
 /// refresh token; rotating it out from under Claude Code logs the user out.
-/// Non-active profiles are safe — claudectl's copy is the only holder.
+/// Also exclude saved aliases that share the live login's refresh token.
 pub async fn refresh_credentials_async(
     client: &reqwest::Client,
     old: &OauthCreds,

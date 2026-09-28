@@ -113,6 +113,16 @@ fn fetch_usages_from(
     alias: Option<&str>,
     mode: FetchMode,
 ) -> Result<Vec<FetchedUsage>> {
+    fetch_usages_with_refresh(store, paths, alias, mode, api::refresh_credentials_async)
+}
+
+fn fetch_usages_with_refresh(
+    store: &AuthStore,
+    paths: &config::Paths,
+    alias: Option<&str>,
+    mode: FetchMode,
+    mut refresh: impl AsyncFnMut(&reqwest::Client, &api::OauthCreds) -> Result<api::OauthCreds>,
+) -> Result<Vec<FetchedUsage>> {
     let profiles = match alias {
         Some(alias) => vec![profile::get_profile_from(
             paths,
@@ -125,12 +135,21 @@ fn fetch_usages_from(
     }
     let mut cache = UsageCache::open(&paths.claudectl_dir())?;
     let active = profile::get_active_from(paths)?;
+    let live_creds = store.read_credentials().ok();
+    let live_grant_key = live_creds.as_ref().and_then(|creds| {
+        creds
+            .claude_ai_oauth
+            .refresh_token
+            .as_deref()
+            .map(UsageCache::key)
+    });
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()?;
         let mut fetched = Vec::new();
+        let mut refreshes = std::collections::HashMap::<String, Result<api::OauthCreds>>::new();
         for profile in profiles {
             let is_active = active.as_deref() == Some(profile.meta.alias.as_str());
             let mut result = FetchedUsage {
@@ -139,7 +158,9 @@ fn fetch_usages_from(
                 ..FetchedUsage::default()
             };
             let creds = if is_active {
-                store.read_credentials()
+                live_creds
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("live credentials unavailable"))
             } else {
                 profile.read_credentials()
             };
@@ -159,19 +180,56 @@ fn fetch_usages_from(
             }
             let now = chrono::Utc::now().timestamp();
             let mut profile_save_error = None;
+            let grant_key = creds
+                .claude_ai_oauth
+                .refresh_token
+                .as_deref()
+                .map(UsageCache::key);
+            // A saved alias can hold the same grant as the live login. Its name
+            // does not transfer refresh ownership away from Claude Code.
+            if creds.claude_ai_oauth.is_expired()
+                && (is_active || (grant_key.is_some() && grant_key == live_grant_key))
+            {
+                result.snapshot = cache
+                    .get(
+                        &client,
+                        &creds.claude_ai_oauth.access_token,
+                        FetchMode::Cached,
+                        now,
+                    )
+                    .await?;
+                result.usage = result.snapshot.usage.clone();
+                result.error = result.snapshot.error.clone().or_else(|| {
+                    (!result.snapshot.fresh).then(|| {
+                        "expired token belongs to live login; let Claude Code refresh it".into()
+                    })
+                });
+                fetched.push(result);
+                continue;
+            }
             // Claude Code owns refresh for the active profile. Cached and cooldown
             // paths do not contact either the usage endpoint or the token endpoint.
             if !is_active
                 && creds.claude_ai_oauth.is_expired()
                 && creds.claude_ai_oauth.refresh_token.is_some()
-                && cache.should_request(&creds.claude_ai_oauth.access_token, mode, now)
+                && (grant_key
+                    .as_ref()
+                    .is_some_and(|key| refreshes.contains_key(key))
+                    || cache.should_request(&creds.claude_ai_oauth.access_token, mode, now))
             {
-                match api::refresh_credentials_async(&client, &creds.claude_ai_oauth).await {
+                let key = grant_key.expect("refresh token checked above");
+                let refreshed = match refreshes.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(refresh(&client, &creds.claude_ai_oauth).await)
+                    }
+                };
+                match refreshed {
                     Ok(rotated) => {
-                        creds.claude_ai_oauth = rotated;
+                        creds.claude_ai_oauth = rotated.clone();
                         if let Err(error) = profile.write_credentials(&creds) {
                             profile_save_error = Some(format!(
-                                "token refreshed but profile save failed; usage data is not persisted ({error})"
+                                "token refreshed but profile save failed; log in again ({error})"
                             ));
                         }
                         result.token_expiry_secs = creds.claude_ai_oauth.expiry_secs();
@@ -179,7 +237,7 @@ fn fetch_usages_from(
                     Err(error) => {
                         result.snapshot = cache.refresh_failed(
                             &creds.claude_ai_oauth.access_token,
-                            &error,
+                            error,
                             chrono::Utc::now().timestamp(),
                         )?;
                         result.usage = result.snapshot.usage.clone();
@@ -314,7 +372,7 @@ fn render_row(s: &AccountStatus, show_models: bool, show_fable: bool) -> Vec<Cel
             .fetched_at
             .map(|at| {
                 let age = format!("{}s", now.saturating_sub(at).max(0));
-                if s.snapshot.fresh && !s.is_error {
+                if s.snapshot.fresh {
                     age
                 } else {
                     format!("{age} (stale)")
@@ -452,6 +510,158 @@ fn format_duration(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_alias_cannot_refresh_the_live_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_home(tmp.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let store = AuthStore::file_only(paths.clone());
+        let creds: api::CredentialsFile = serde_json::from_value(serde_json::json!({
+            "claudeAiOauth": {"accessToken": "test-live-access", "refreshToken": "test-live-grant", "expiresAt": 1}
+        })).unwrap();
+        store.write_credentials(&creds).unwrap();
+        for alias in ["active", "duplicate"] {
+            profile::save_profile_to(&paths, alias, &creds, None).unwrap();
+        }
+        profile::set_active_from(&paths, "active").unwrap();
+        for mode in [FetchMode::Normal, FetchMode::Refresh, FetchMode::Cached] {
+            let fetched = fetch_usages_with_refresh(&store, &paths, None, mode, async |_, _| {
+                panic!("Claude Code owns the live grant")
+            })
+            .unwrap();
+            assert_eq!(fetched.len(), 2);
+            assert!(
+                fetched
+                    .iter()
+                    .all(|f| f.error.as_deref().unwrap().contains("live login"))
+            );
+        }
+        let live = store.read_credentials().unwrap();
+        assert_eq!(
+            live.claude_ai_oauth.refresh_token.as_deref(),
+            Some("test-live-grant")
+        );
+    }
+
+    #[test]
+    fn data_age_reports_freshness_separately_from_profile_errors() {
+        let mut status = account(Some(10.0), Some(20.0), true);
+        status.snapshot.fetched_at = Some(chrono::Utc::now().timestamp());
+        status.snapshot.fresh = true;
+        assert!(
+            !render_row(&status, false, false)[7]
+                .content()
+                .contains("stale")
+        );
+        status.snapshot.fresh = false;
+        assert!(
+            render_row(&status, false, false)[7]
+                .content()
+                .contains("stale")
+        );
+    }
+
+    #[test]
+    fn shared_refresh_failure_is_not_retried_for_another_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_home(tmp.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let store = AuthStore::file_only(paths.clone());
+        for alias in ["one", "two"] {
+            let creds: api::CredentialsFile = serde_json::from_value(serde_json::json!({
+                "claudeAiOauth": {"accessToken": alias, "refreshToken": "shared-test-grant", "expiresAt": 1}
+            })).unwrap();
+            profile::save_profile_to(&paths, alias, &creds, None).unwrap();
+        }
+        let mut calls = 0;
+        let fetched =
+            fetch_usages_with_refresh(&store, &paths, None, FetchMode::Refresh, async |_, _| {
+                calls += 1;
+                anyhow::bail!("test refresh unavailable")
+            })
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(fetched.len(), 2);
+        assert!(
+            fetched
+                .iter()
+                .all(|f| f.error.is_some() && f.usage.is_none())
+        );
+        let state: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(paths.claudectl_dir().join("usage/cache-v1.json")).unwrap(),
+        )
+        .unwrap();
+        for alias in ["one", "two"] {
+            assert_eq!(state["entries"][UsageCache::key(alias)]["failures"], 1);
+        }
+        let cached =
+            fetch_usages_with_refresh(&store, &paths, None, FetchMode::Cached, async |_, _| {
+                panic!("cached status must not refresh")
+            })
+            .unwrap();
+        assert_eq!(cached.len(), 2);
+    }
+
+    #[test]
+    fn shared_refresh_grant_is_rotated_once_and_saved_to_both_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_home(tmp.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let store = AuthStore::file_only(paths.clone());
+        let live: api::CredentialsFile = serde_json::from_value(serde_json::json!({
+            "claudeAiOauth": {"accessToken": "different-live-access", "refreshToken": "different-live-grant", "expiresAt": 1}
+        })).unwrap();
+        store.write_credentials(&live).unwrap();
+        let creds: api::CredentialsFile = serde_json::from_value(serde_json::json!({
+            "claudeAiOauth": {"accessToken": "old-test-access", "refreshToken": "test-grant", "expiresAt": 1}
+        })).unwrap();
+        for alias in ["one", "two"] {
+            profile::save_profile_to(&paths, alias, &creds, None).unwrap();
+        }
+        // A cached result for the new token isolates the token endpoint boundary.
+        std::fs::create_dir_all(paths.claudectl_dir().join("usage")).unwrap();
+        let key = UsageCache::key("rotated-test-access");
+        std::fs::write(
+            paths.claudectl_dir().join("usage/cache-v1.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "entries": {key: {"usage": {"five_hour": {"utilization": 10}},
+                    "fetched_at": chrono::Utc::now().timestamp(), "next_attempt": 0,
+                    "failures": 0, "error": null}},
+                "rate_until": 0, "rate_failures": 0, "next_request_ms": 0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut calls = 0;
+        let fetched =
+            fetch_usages_with_refresh(&store, &paths, None, FetchMode::Normal, async |_, old| {
+                calls += 1;
+                let mut rotated = old.clone();
+                rotated.access_token = "rotated-test-access".into();
+                rotated.refresh_token = Some(format!("rotated-test-grant-{calls}"));
+                rotated.expires_at = Some(chrono::Utc::now().timestamp_millis() + 3600000);
+                Ok(rotated)
+            })
+            .unwrap();
+        assert_eq!(calls, 1, "aliases must share one refresh grant");
+        assert_eq!(fetched.len(), 2);
+        assert!(
+            fetched
+                .iter()
+                .all(|f| f.snapshot.fresh && f.error.is_none())
+        );
+        for alias in ["one", "two"] {
+            let saved = profile::get_profile_from(&paths, alias)
+                .unwrap()
+                .read_credentials()
+                .unwrap();
+            assert_eq!(
+                saved.claude_ai_oauth.refresh_token.as_deref(),
+                Some("rotated-test-grant-1")
+            );
+        }
+    }
 
     fn account(h5: Option<f64>, d7: Option<f64>, is_error: bool) -> AccountStatus {
         AccountStatus {

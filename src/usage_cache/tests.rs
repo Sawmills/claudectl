@@ -361,6 +361,16 @@ async fn when_token_endpoint_is_limited_then_other_accounts_remain_eligible() {
     assert!(cache.should_request("test-only-b", FetchMode::Normal, 1001));
     assert!(!cache.should_request("test-only-a", FetchMode::Refresh, 1001));
     assert_eq!(result.next_fetch_at, Some(1900));
+    cache.refresh_failed("test-only-a", &error, 1001).unwrap();
+    assert_eq!(
+        cache.state.entries[&UsageCache::key("test-only-a")].failures,
+        1
+    );
+    cache.refresh_failed("test-only-b", &error, 1001).unwrap();
+    drop(cache);
+    let reopened = UsageCache::open(h.root.path()).unwrap();
+    assert!(!reopened.should_request("test-only-a", FetchMode::Refresh, 1002));
+    assert!(!reopened.should_request("test-only-b", FetchMode::Refresh, 1002));
 }
 
 #[tokio::test]

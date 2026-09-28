@@ -120,7 +120,7 @@ fn zsh_completions_wire_alias_args_to_profile_completer() {
     let mut cmd = Command::cargo_bin("claudectl").unwrap();
     let output = cmd.args(["completions", "zsh"]).output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(stdout.matches("_claudectl_profiles'").count(), 2);
+    assert_eq!(stdout.matches("_claudectl_profiles'").count(), 3);
 }
 
 #[test]
