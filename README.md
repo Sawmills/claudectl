@@ -106,7 +106,9 @@ and older claudectl versions do not share these controls.
 `--cached` and `--refresh` cannot be combined. A general usage window reset ends
 its cache validity early. Non-active expired tokens refresh only when a network
 check is due. Claude Code remains the sole owner of refresh for the active profile.
-Aliases with the same refresh token share one refresh result per check. An alias
+Aliases with the same refresh token share one refresh result per check.
+They also share saved refresh cooldowns across separate checks.
+Selection and display recheck cache expiry after the batch completes. An alias
 that shares the live login's refresh token also leaves refresh to Claude Code.
 If the authoritative live credentials are unavailable, status does not refresh
 saved tokens. On macOS, a file fallback cannot prove Keychain token ownership.

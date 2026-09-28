@@ -383,3 +383,85 @@ async fn when_old_tokens_are_unused_for_a_day_then_prune_their_entries() {
 
     assert!(result.usage.is_none());
 }
+
+#[tokio::test]
+async fn refresh_cooldown_survives_reopen_for_a_different_access_token() {
+    let root = tempfile::tempdir().unwrap();
+    let h = Harness::new(vec![response(429, "Retry-After: 600\r\n", "{}")]);
+    let error = api::fetch_usage_at(
+        &reqwest::Client::new(),
+        "test-access",
+        &format!("http://{}", h.server.address),
+    )
+    .await
+    .err()
+    .unwrap();
+    let mut cache = UsageCache::open(root.path()).unwrap();
+    cache
+        .refresh_failed_for_grant("access-one", "shared-grant", &error, 1000)
+        .unwrap();
+    drop(cache);
+    let cache = UsageCache::open(root.path()).unwrap();
+    let blocked = cache
+        .refresh_cooldown("access-two", "shared-grant", 1001)
+        .unwrap();
+    assert_eq!(blocked.next_fetch_at, Some(1600));
+    assert!(blocked.error.unwrap().contains("429"));
+    assert!(
+        cache
+            .refresh_cooldown("access-two", "other-grant", 1001)
+            .is_none()
+    );
+    assert!(
+        cache
+            .refresh_cooldown("access-two", "shared-grant", 1600)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn failed_alias_reports_the_full_shared_grant_delay() {
+    let h = Harness::new(vec![response(503, "", "{}")]);
+    let error = api::fetch_usage_at(
+        &reqwest::Client::new(),
+        "test-access",
+        &format!("http://{}", h.server.address),
+    )
+    .await
+    .err()
+    .unwrap();
+    let mut cache = UsageCache::open(h.root.path()).unwrap();
+    cache
+        .refresh_failed_for_grant("access-one", "shared-grant", &error, 1000)
+        .unwrap();
+    drop(cache);
+    let mut cache = UsageCache::open(h.root.path()).unwrap();
+    let failed = cache
+        .refresh_failed_for_grant("access-two", "shared-grant", &error, 1300)
+        .unwrap();
+    assert_eq!(failed.next_fetch_at, Some(1900));
+}
+
+#[tokio::test]
+async fn recovered_grant_starts_a_new_failure_backoff() {
+    let h = Harness::new(vec![response(503, "", "{}")]);
+    let error = api::fetch_usage_at(
+        &reqwest::Client::new(),
+        "test-access",
+        &format!("http://{}", h.server.address),
+    )
+    .await
+    .err()
+    .unwrap();
+    let mut cache = UsageCache::open(h.root.path()).unwrap();
+    cache
+        .refresh_failed_for_grant("access-one", "shared-grant", &error, 1000)
+        .unwrap();
+    cache.refresh_succeeded("shared-grant").unwrap();
+    drop(cache);
+    let mut cache = UsageCache::open(h.root.path()).unwrap();
+    let failed = cache
+        .refresh_failed_for_grant("access-two", "shared-grant", &error, 2000)
+        .unwrap();
+    assert_eq!(failed.next_fetch_at, Some(2300));
+}

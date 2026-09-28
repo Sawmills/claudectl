@@ -31,6 +31,15 @@ pub struct Snapshot {
     pub source: &'static str,
     pub error: Option<String>,
     pub fresh: bool,
+    pub valid_until: Option<i64>,
+}
+
+impl Snapshot {
+    pub fn is_fresh_at(&self, now: i64) -> bool {
+        self.fresh
+            && self.fetched_at.is_some_and(|at| now >= at)
+            && self.valid_until.is_some_and(|until| now < until)
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -164,6 +173,7 @@ impl UsageCache {
             },
             error,
             fresh,
+            valid_until,
         }
     }
 
@@ -246,6 +256,50 @@ impl UsageCache {
         }
         Ok(snapshot)
     }
+    pub fn refresh_succeeded(&mut self, grant: &str) -> Result<()> {
+        if self
+            .state
+            .entries
+            .remove(&format!("refresh:{}", Self::key(grant)))
+            .is_some()
+        {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    pub fn refresh_failed_for_grant(
+        &mut self,
+        token: &str,
+        grant: &str,
+        error: &anyhow::Error,
+        now: i64,
+    ) -> Result<Snapshot> {
+        let key = format!("refresh:{}", Self::key(grant));
+        if self.checked.insert(key.clone()) {
+            self.record_failure(&key, error, now, "token refresh");
+        }
+        let mut snapshot = self.refresh_failed(token, error, now)?;
+        if let Some(entry) = self.state.entries.get(&key) {
+            snapshot.next_fetch_at =
+                Some(snapshot.next_fetch_at.unwrap_or(0).max(entry.next_attempt));
+        }
+        Ok(snapshot)
+    }
+
+    pub fn refresh_cooldown(&self, token: &str, grant: &str, now: i64) -> Option<Snapshot> {
+        let key = format!("refresh:{}", Self::key(grant));
+        let entry = self.state.entries.get(&key)?;
+        if entry.next_attempt <= now {
+            return None;
+        }
+        let mut snapshot = self.snapshot(&Self::key(token), now);
+        snapshot.error = entry.error.clone();
+        snapshot.next_fetch_at = Some(snapshot.next_fetch_at.unwrap_or(0).max(entry.next_attempt));
+        snapshot.source = "cooldown";
+        Some(snapshot)
+    }
+
     pub fn refresh_failed(
         &mut self,
         token: &str,

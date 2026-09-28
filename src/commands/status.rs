@@ -217,6 +217,16 @@ fn fetch_usages_with_refresh(
                 fetched.push(result);
                 continue;
             }
+            if creds.claude_ai_oauth.is_expired()
+                && let Some(grant) = creds.claude_ai_oauth.refresh_token.as_deref()
+                && let Some(snapshot) = cache.refresh_cooldown(&creds.claude_ai_oauth.access_token, grant, now)
+            {
+                result.usage = snapshot.usage.clone();
+                result.error = snapshot.error.clone();
+                result.snapshot = snapshot;
+                fetched.push(result);
+                continue;
+            }
             // Claude Code owns refresh for the active profile. Cached and cooldown
             // paths do not contact either the usage endpoint or the token endpoint.
             if !is_active
@@ -227,6 +237,7 @@ fn fetch_usages_with_refresh(
                     .is_some_and(|key| refreshes.contains_key(key))
                     || cache.should_request(&creds.claude_ai_oauth.access_token, mode, now))
             {
+                let key_for_grant = creds.claude_ai_oauth.refresh_token.clone().expect("refresh token checked above");
                 let key = grant_key.expect("refresh token checked above");
                 let refreshed = match refreshes.entry(key.clone()) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -242,11 +253,13 @@ fn fetch_usages_with_refresh(
                                 "token refreshed but saving profiles failed; affected aliases may need login ({error})"
                             ));
                         }
+                        cache.refresh_succeeded(&key_for_grant)?;
                         result.token_expiry_secs = creds.claude_ai_oauth.expiry_secs();
                     }
                     Err(error) => {
-                        result.snapshot = cache.refresh_failed(
+                        result.snapshot = cache.refresh_failed_for_grant(
                             &creds.claude_ai_oauth.access_token,
+                            creds.claude_ai_oauth.refresh_token.as_deref().expect("refresh token checked"),
                             error,
                             chrono::Utc::now().timestamp(),
                         )?;
@@ -340,7 +353,7 @@ fn to_account_status(f: &FetchedUsage) -> AccountStatus {
             has_fable_limit: usage.fable_weekly().is_some(),
             token_expiry_secs: f.token_expiry_secs,
             is_active: f.is_active,
-            is_error: f.error.is_some() || !f.snapshot.fresh,
+            is_error: f.error.is_some() || !f.snapshot.is_fresh_at(chrono::Utc::now().timestamp()),
             error_msg: f.error.clone().unwrap_or_default(),
         },
         (None, err) => AccountStatus {
@@ -431,7 +444,7 @@ fn render_row(s: &AccountStatus, show_models: bool, show_fable: bool) -> Vec<Cel
             .fetched_at
             .map(|at| {
                 let age = format!("{}s", now.saturating_sub(at).max(0));
-                if s.snapshot.fresh {
+                if s.snapshot.is_fresh_at(now) {
                     age
                 } else {
                     format!("{age} (stale)")
@@ -668,17 +681,46 @@ mod tests {
         let mut status = account(Some(10.0), Some(20.0), true);
         status.snapshot.fetched_at = Some(chrono::Utc::now().timestamp());
         status.snapshot.fresh = true;
+        status.snapshot.valid_until = Some(i64::MAX);
         assert!(
             !render_row(&status, false, false)[7]
                 .content()
                 .contains("stale")
         );
-        status.snapshot.fresh = false;
+        status.snapshot.valid_until = Some(chrono::Utc::now().timestamp() - 1);
         assert!(
             render_row(&status, false, false)[7]
                 .content()
                 .contains("stale")
         );
+    }
+
+    #[test]
+    fn focused_status_obeys_saved_grant_cooldown_for_another_access_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_home(tmp.path().to_path_buf());
+        let store = AuthStore::file_only(paths.clone());
+        let creds: api::CredentialsFile = serde_json::from_value(serde_json::json!({
+            "claudeAiOauth": {"accessToken": "different-access", "refreshToken": "shared-test-grant", "expiresAt": 1}
+        })).unwrap();
+        profile::save_profile_to(&paths, "two", &creds, None).unwrap();
+        drop(UsageCache::open(&paths.claudectl_dir()).unwrap());
+        let key = format!("refresh:{}", UsageCache::key("shared-test-grant"));
+        let now = chrono::Utc::now().timestamp();
+        std::fs::write(paths.claudectl_dir().join("usage/cache-v1.json"), serde_json::to_vec(&serde_json::json!({
+            "entries": {key: {"usage": null, "fetched_at": null, "next_attempt": now + 600, "failures": 1, "error": "token refresh fetch failed (HTTP 429)"}},
+            "rate_until": 0, "rate_failures": 0, "next_request_ms": 0
+        })).unwrap()).unwrap();
+        let fetched = fetch_usages_with_refresh(
+            &store,
+            &paths,
+            Some("two"),
+            FetchMode::Refresh,
+            async |_, _| panic!("saved shared-grant cooldown must prevent token refresh"),
+        )
+        .unwrap();
+        assert_eq!(fetched[0].snapshot.source, "cooldown");
+        assert_eq!(fetched[0].snapshot.next_fetch_at, Some(now + 600));
     }
 
     #[test]

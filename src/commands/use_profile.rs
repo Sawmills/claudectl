@@ -56,7 +56,7 @@ struct Candidate {
 
 fn candidate_from(f: &FetchedUsage) -> Candidate {
     match &f.usage {
-        Some(u) if f.snapshot.fresh && f.error.is_none() => {
+        Some(u) if f.snapshot.is_fresh_at(chrono::Utc::now().timestamp()) && f.error.is_none() => {
             let h5 = u
                 .five_hour
                 .as_ref()
@@ -113,6 +113,8 @@ mod tests {
             usage: Some(serde_json::from_str(usage).unwrap()),
             snapshot: claudectl::usage_cache::Snapshot {
                 fresh,
+                fetched_at: Some(0),
+                valid_until: Some(i64::MAX),
                 ..Default::default()
             },
             ..Default::default()
@@ -190,4 +192,25 @@ mod tests {
         let c = vec![candidate("a", f64::MAX, 0), candidate("b", f64::MAX, 0)];
         assert_eq!(select_most_available(&c), None);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn snapshot_that_expires_during_batch_is_not_selected() {
+    let status = FetchedUsage {
+        usage: Some(
+            serde_json::from_str(
+                r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":2}}"#,
+            )
+            .unwrap(),
+        ),
+        snapshot: claudectl::usage_cache::Snapshot {
+            fresh: true,
+            fetched_at: Some(1),
+            valid_until: Some(2),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(select_most_available(&[candidate_from(&status)]).is_none());
 }
