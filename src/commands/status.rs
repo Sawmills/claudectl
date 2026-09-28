@@ -135,7 +135,13 @@ fn fetch_usages_with_refresh(
     }
     let mut cache = UsageCache::open(&paths.claudectl_dir())?;
     let active = profile::get_active_from(paths)?;
-    let live_creds = store.read_credentials().ok();
+    let refresh_owner = store.read_refresh_owner();
+    let refresh_owner_known = refresh_owner.is_ok();
+    let live_creds = match refresh_owner {
+        Ok(creds) => creds,
+        // The fallback remains usable for display, but cannot authorize refresh.
+        Err(_) => store.read_credentials().ok(),
+    };
     let live_grant_key = live_creds.as_ref().and_then(|creds| {
         creds
             .claude_ai_oauth
@@ -188,7 +194,7 @@ fn fetch_usages_with_refresh(
             // A saved alias can hold the same grant as the live login. Its name
             // does not transfer refresh ownership away from Claude Code.
             if creds.claude_ai_oauth.is_expired()
-                && (is_active || (grant_key.is_some() && grant_key == live_grant_key))
+                && (!refresh_owner_known || is_active || (grant_key.is_some() && grant_key == live_grant_key))
             {
                 result.snapshot = cache
                     .get(
@@ -201,7 +207,11 @@ fn fetch_usages_with_refresh(
                 result.usage = result.snapshot.usage.clone();
                 result.error = result.snapshot.error.clone().or_else(|| {
                     (!result.snapshot.fresh).then(|| {
-                        "expired token belongs to live login; let Claude Code refresh it".into()
+                        if refresh_owner_known {
+                            "expired token belongs to live login; let Claude Code refresh it".into()
+                        } else {
+                            "live refresh ownership unknown; check Claude Code login or Keychain access".into()
+                        }
                     })
                 });
                 fetched.push(result);
@@ -558,6 +568,43 @@ fn format_duration(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_live_owner_blocks_saved_token_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_home(tmp.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let store = AuthStore::file_only(paths.clone());
+        let creds: api::CredentialsFile = serde_json::from_value(serde_json::json!({
+            "claudeAiOauth": {"accessToken": "test-saved-access", "refreshToken": "test-saved-grant", "expiresAt": 1}
+        })).unwrap();
+        profile::save_profile_to(&paths, "saved", &creds, None).unwrap();
+        std::fs::create_dir_all(paths.claude_credentials_file().parent().unwrap()).unwrap();
+        std::fs::write(paths.claude_credentials_file(), "invalid test data").unwrap();
+        let fetched =
+            fetch_usages_with_refresh(&store, &paths, None, FetchMode::Refresh, async |_, _| {
+                panic!("unknown live ownership must prevent refresh")
+            })
+            .unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert!(
+            fetched[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("ownership unknown")
+        );
+        assert_eq!(
+            profile::get_profile_from(&paths, "saved")
+                .unwrap()
+                .read_credentials()
+                .unwrap()
+                .claude_ai_oauth
+                .refresh_token
+                .as_deref(),
+            Some("test-saved-grant")
+        );
+    }
 
     #[test]
     fn saved_alias_cannot_refresh_the_live_grant() {

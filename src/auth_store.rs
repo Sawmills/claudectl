@@ -62,6 +62,36 @@ impl AuthStore {
             .with_context(|| format!("failed to parse {}", path.display()))
     }
 
+    /// Refresh ownership needs the authoritative copy. A file fallback on macOS
+    /// can be stale and must never authorize rotating a saved refresh grant.
+    pub fn read_refresh_owner(&self) -> Result<Option<CredentialsFile>> {
+        self.read_refresh_owner_with(keychain_read)
+    }
+
+    fn read_refresh_owner_with(
+        &self,
+        read_keychain: impl FnOnce() -> Option<String>,
+    ) -> Result<Option<CredentialsFile>> {
+        let creds: CredentialsFile = if self.keychain {
+            let raw = read_keychain().context("authoritative Keychain credentials unavailable")?;
+            serde_json::from_str(&raw).context("invalid authoritative Keychain credentials")?
+        } else {
+            if !self.paths.claude_credentials_file().try_exists()? {
+                return Ok(None);
+            }
+            self.read_credentials()?
+        };
+        anyhow::ensure!(
+            creds
+                .claude_ai_oauth
+                .refresh_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty()),
+            "live refresh token unavailable; refresh ownership unknown"
+        );
+        Ok(Some(creds))
+    }
+
     pub fn write_credentials(&self, creds: &CredentialsFile) -> Result<()> {
         self.write_credentials_after_live_commit(creds, || {})
     }
@@ -474,6 +504,38 @@ mod tests {
     }
 
     const FAKE_KEYCHAIN: &str = "/Users/test/Library/Keychains/login.keychain-db";
+
+    #[test]
+    fn refresh_ownership_never_uses_stale_file_when_keychain_is_unavailable() {
+        let (_tmp, store) = keychain_store();
+        write_atomic_0600(
+            &store.paths.claude_credentials_file(),
+            &serde_json::to_string(&test_creds("stale-test-access")).unwrap(),
+        )
+        .unwrap();
+        assert!(store.read_refresh_owner_with(|| None).is_err());
+        assert!(
+            store
+                .read_refresh_owner_with(|| Some("invalid test data".into()))
+                .is_err()
+        );
+        let authoritative = serde_json::to_string(&test_creds("live-test-access")).unwrap();
+        let owner = store
+            .read_refresh_owner_with(|| Some(authoritative))
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner.claude_ai_oauth.access_token, "live-test-access");
+    }
+
+    #[test]
+    fn file_refresh_owner_distinguishes_absent_from_invalid_credentials() {
+        let (_tmp, store) = store();
+        assert!(store.read_refresh_owner().unwrap().is_none());
+        store.write_credentials(&test_creds("test-access")).unwrap();
+        assert!(store.read_refresh_owner().unwrap().is_some());
+        write_atomic_0600(&store.paths.claude_credentials_file(), "invalid test data").unwrap();
+        assert!(store.read_refresh_owner().is_err());
+    }
 
     struct FakeKeychain {
         unlocked: std::cell::Cell<bool>,
