@@ -218,7 +218,7 @@ fn fetch_usages_with_refresh(
                     || cache.should_request(&creds.claude_ai_oauth.access_token, mode, now))
             {
                 let key = grant_key.expect("refresh token checked above");
-                let refreshed = match refreshes.entry(key) {
+                let refreshed = match refreshes.entry(key.clone()) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         entry.insert(refresh(&client, &creds.claude_ai_oauth).await)
@@ -227,9 +227,9 @@ fn fetch_usages_with_refresh(
                 match refreshed {
                     Ok(rotated) => {
                         creds.claude_ai_oauth = rotated.clone();
-                        if let Err(error) = profile.write_credentials(&creds) {
+                        if let Err(error) = persist_rotated_grant(paths, active.as_deref(), &profile, &creds, &key) {
                             profile_save_error = Some(format!(
-                                "token refreshed but profile save failed; log in again ({error})"
+                                "token refreshed but saving profiles failed; affected aliases may need login ({error})"
                             ));
                         }
                         result.token_expiry_secs = creds.claude_ai_oauth.expiry_secs();
@@ -264,6 +264,54 @@ fn fetch_usages_with_refresh(
         }
         Ok(fetched)
     })
+}
+
+fn persist_rotated_grant(
+    paths: &config::Paths,
+    active: Option<&str>,
+    origin: &profile::Profile,
+    rotated: &api::CredentialsFile,
+    original_grant_key: &str,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    if origin.write_credentials(rotated).is_err() {
+        failures.push(origin.meta.alias.clone());
+    }
+    // Rotation changes the grant for every saved copy, including unexpired
+    // aliases and aliases excluded by a focused status request.
+    for sibling in profile::list_profiles_from(paths)? {
+        if sibling.meta.alias == origin.meta.alias || active == Some(sibling.meta.alias.as_str()) {
+            continue;
+        }
+        let mut creds = match sibling.read_credentials() {
+            Ok(creds) => creds,
+            // An unreadable profile cannot be identified as a matching grant.
+            // Its status row reports that error independently.
+            Err(_) => continue,
+        };
+        if creds
+            .claude_ai_oauth
+            .refresh_token
+            .as_deref()
+            .map(UsageCache::key)
+            .as_deref()
+            != Some(original_grant_key)
+        {
+            continue;
+        }
+        creds.claude_ai_oauth.access_token = rotated.claude_ai_oauth.access_token.clone();
+        creds.claude_ai_oauth.refresh_token = rotated.claude_ai_oauth.refresh_token.clone();
+        creds.claude_ai_oauth.expires_at = rotated.claude_ai_oauth.expires_at;
+        if sibling.write_credentials(&creds).is_err() {
+            failures.push(sibling.meta.alias.clone());
+        }
+    }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "could not update saved aliases: {}",
+        failures.join(", ")
+    );
+    Ok(())
 }
 
 fn to_account_status(f: &FetchedUsage) -> AccountStatus {
@@ -542,6 +590,29 @@ mod tests {
             live.claude_ai_oauth.refresh_token.as_deref(),
             Some("test-live-grant")
         );
+        let key = UsageCache::key("test-live-access");
+        std::fs::write(
+            paths.claudectl_dir().join("usage/cache-v1.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "entries": {key: {"usage": {"five_hour": {"utilization": 10}},
+                    "fetched_at": chrono::Utc::now().timestamp(), "next_attempt": 0,
+                    "failures": 0, "error": null}},
+                "rate_until": 0, "rate_failures": 0, "next_request_ms": 0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let fresh =
+            fetch_usages_with_refresh(&store, &paths, None, FetchMode::Refresh, async |_, _| {
+                panic!("Claude Code owns the live grant")
+            })
+            .unwrap();
+        assert_eq!(fresh.len(), 2);
+        assert!(
+            fresh
+                .iter()
+                .all(|f| f.snapshot.fresh && f.usage.is_some() && f.error.is_none())
+        );
     }
 
     #[test]
@@ -605,6 +676,17 @@ mod tests {
 
     #[test]
     fn shared_refresh_grant_is_rotated_once_and_saved_to_both_aliases() {
+        check_shared_refresh(None, None);
+    }
+
+    #[test]
+    fn rotation_updates_unexpired_siblings_in_either_order_and_focused_status() {
+        check_shared_refresh(Some("one"), None);
+        check_shared_refresh(Some("two"), None);
+        check_shared_refresh(Some("one"), Some("one"));
+    }
+
+    fn check_shared_refresh(expired_alias: Option<&str>, focused: Option<&str>) {
         let tmp = tempfile::tempdir().unwrap();
         let paths = config::Paths::from_home(tmp.path().to_path_buf());
         paths.ensure_dirs().unwrap();
@@ -617,38 +699,70 @@ mod tests {
             "claudeAiOauth": {"accessToken": "old-test-access", "refreshToken": "test-grant", "expiresAt": 1}
         })).unwrap();
         for alias in ["one", "two"] {
+            let mut creds = creds.clone();
+            creds
+                .extra
+                .insert("aliasMarker".into(), serde_json::json!(alias));
+            if expired_alias.is_some_and(|expired| expired != alias) {
+                creds.claude_ai_oauth.access_token = "valid-test-access".into();
+                creds.claude_ai_oauth.expires_at =
+                    Some(chrono::Utc::now().timestamp_millis() + 3600000);
+            }
             profile::save_profile_to(&paths, alias, &creds, None).unwrap();
         }
+        profile::save_profile_to(&paths, "broken", &live, None).unwrap();
+        std::fs::write(
+            paths.profiles_dir().join("broken/credentials.json"),
+            "invalid test data",
+        )
+        .unwrap();
         // A cached result for the new token isolates the token endpoint boundary.
         std::fs::create_dir_all(paths.claudectl_dir().join("usage")).unwrap();
-        let key = UsageCache::key("rotated-test-access");
+        let entries: serde_json::Map<String, serde_json::Value> =
+            ["rotated-test-access", "valid-test-access"]
+                .into_iter()
+                .map(|token| {
+                    (
+                        UsageCache::key(token),
+                        serde_json::json!({
+                            "usage": {"five_hour": {"utilization": 10}},
+                            "fetched_at": chrono::Utc::now().timestamp(), "next_attempt": 0,
+                            "failures": 0, "error": null
+                        }),
+                    )
+                })
+                .collect();
         std::fs::write(
             paths.claudectl_dir().join("usage/cache-v1.json"),
             serde_json::to_vec(&serde_json::json!({
-                "entries": {key: {"usage": {"five_hour": {"utilization": 10}},
-                    "fetched_at": chrono::Utc::now().timestamp(), "next_attempt": 0,
-                    "failures": 0, "error": null}},
+                "entries": entries,
                 "rate_until": 0, "rate_failures": 0, "next_request_ms": 0
             }))
             .unwrap(),
         )
         .unwrap();
         let mut calls = 0;
-        let fetched =
-            fetch_usages_with_refresh(&store, &paths, None, FetchMode::Normal, async |_, old| {
+        let fetched = fetch_usages_with_refresh(
+            &store,
+            &paths,
+            focused,
+            FetchMode::Normal,
+            async |_, old| {
                 calls += 1;
                 let mut rotated = old.clone();
                 rotated.access_token = "rotated-test-access".into();
                 rotated.refresh_token = Some(format!("rotated-test-grant-{calls}"));
                 rotated.expires_at = Some(chrono::Utc::now().timestamp_millis() + 3600000);
                 Ok(rotated)
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(calls, 1, "aliases must share one refresh grant");
-        assert_eq!(fetched.len(), 2);
+        assert_eq!(fetched.len(), if focused.is_some() { 1 } else { 3 });
         assert!(
             fetched
                 .iter()
+                .filter(|f| f.alias != "broken")
                 .all(|f| f.snapshot.fresh && f.error.is_none())
         );
         for alias in ["one", "two"] {
@@ -656,6 +770,7 @@ mod tests {
                 .unwrap()
                 .read_credentials()
                 .unwrap();
+            assert_eq!(saved.extra["aliasMarker"], alias);
             assert_eq!(
                 saved.claude_ai_oauth.refresh_token.as_deref(),
                 Some("rotated-test-grant-1")
