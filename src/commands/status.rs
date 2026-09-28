@@ -1,14 +1,17 @@
-use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Result;
-use claudectl::api::{self, CredentialsFile, UsageResponse, UsageWindow};
+use claudectl::api::{self, UsageResponse, UsageWindow};
 use claudectl::auth_store::AuthStore;
 use claudectl::config;
 use claudectl::profile;
+use claudectl::usage_cache::{FetchMode, Snapshot, UsageCache};
 use comfy_table::{Cell, Color, Table, presets::UTF8_FULL_CONDENSED};
 
 /// One profile's fetched usage, shared by `status` and `use` auto-select.
+#[derive(Default)]
 pub struct FetchedUsage {
+    pub snapshot: Snapshot,
     pub alias: String,
     pub usage: Option<UsageResponse>,
     pub token_expiry_secs: Option<i64>,
@@ -17,6 +20,7 @@ pub struct FetchedUsage {
 }
 
 struct AccountStatus {
+    snapshot: Snapshot,
     alias: String,
     h5_pct: Option<f64>,
     d7_pct: Option<f64>,
@@ -53,8 +57,8 @@ impl AccountStatus {
     }
 }
 
-pub fn run() -> Result<()> {
-    let fetched = fetch_all_usages()?;
+pub fn run(alias: Option<&str>, mode: FetchMode) -> Result<()> {
+    let fetched = fetch_usages(alias, mode)?;
     if fetched.is_empty() {
         println!("no profiles saved. Use 'claudectl save' or 'claudectl login <alias>'.");
         return Ok(());
@@ -72,121 +76,143 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Print a single account's status (used after a switch).
-pub fn run_focused(alias: &str) -> Result<()> {
-    let fetched = fetch_all_usages()?;
-    let accounts: Vec<AccountStatus> = fetched
-        .iter()
-        .filter(|f| f.alias == alias)
-        .map(to_account_status)
-        .collect();
-    if accounts.is_empty() {
-        println!("status unavailable for {alias}");
-        return Ok(());
-    }
-    print_table(&accounts);
+/// Explicit switching stays local: show only this account's cached data.
+pub fn run_focused(store: &AuthStore, paths: &config::Paths, alias: &str) -> Result<()> {
+    let fetched = fetch_usages_from(store, paths, Some(alias), FetchMode::Cached)?;
+    print_focused(&fetched, alias);
     Ok(())
 }
 
-/// Fetch usage for every profile in parallel. The active profile is read from
-/// the live auth store (Claude Code keeps it fresh); non-active profiles with
-/// an expired access token get a refresh first, persisted back to the profile.
-/// The active profile is NEVER refreshed here — Claude Code owns its refresh
-/// token, and rotating it would log the user out.
+/// Reuse the selection snapshot after switching; never issue a second batch.
+pub fn print_focused(fetched: &[FetchedUsage], alias: &str) {
+    let accounts: Vec<_> = fetched
+        .iter()
+        .filter(|f| f.alias == alias)
+        .map(|f| {
+            let mut account = to_account_status(f);
+            account.is_active = true;
+            account
+        })
+        .collect();
+    print_table(&accounts);
+}
+
 pub fn fetch_all_usages() -> Result<Vec<FetchedUsage>> {
+    fetch_usages(None, FetchMode::Normal)
+}
+
+fn fetch_usages(alias: Option<&str>, mode: FetchMode) -> Result<Vec<FetchedUsage>> {
     let paths = config::default_paths()?;
     let store = AuthStore::real(paths.clone());
-    let profiles = profile::list_profiles_from(&paths)?;
+    fetch_usages_from(&store, &paths, alias, mode)
+}
+
+fn fetch_usages_from(
+    store: &AuthStore,
+    paths: &config::Paths,
+    alias: Option<&str>,
+    mode: FetchMode,
+) -> Result<Vec<FetchedUsage>> {
+    let profiles = match alias {
+        Some(alias) => vec![profile::get_profile_from(
+            paths,
+            profile::validate_alias(alias)?,
+        )?],
+        None => profile::list_profiles_from(paths)?,
+    };
     if profiles.is_empty() {
         return Ok(vec![]);
     }
-    let active = profile::get_active_from(&paths)?;
-
-    // Pre-read credentials synchronously; only network work goes async.
-    let inputs: Vec<(String, bool, anyhow::Result<CredentialsFile>, PathBuf)> = profiles
-        .iter()
-        .map(|p| {
-            let is_active = active.as_deref() == Some(p.meta.alias.as_str());
+    let mut cache = UsageCache::open(&paths.claudectl_dir())?;
+    let active = profile::get_active_from(paths)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()?;
+        let mut fetched = Vec::new();
+        for profile in profiles {
+            let is_active = active.as_deref() == Some(profile.meta.alias.as_str());
+            let mut result = FetchedUsage {
+                alias: profile.meta.alias.clone(),
+                is_active,
+                ..FetchedUsage::default()
+            };
             let creds = if is_active {
                 store.read_credentials()
             } else {
-                p.read_credentials()
+                profile.read_credentials()
             };
-            (p.meta.alias.clone(), is_active, creds, p.credentials_path())
-        })
-        .collect();
-
-    let rt = tokio::runtime::Runtime::new()?;
-    Ok(rt.block_on(async {
-        let client = reqwest::Client::new();
-        let futures: Vec<_> = inputs
-            .into_iter()
-            .map(|(alias, is_active, creds, creds_path)| {
-                let client = client.clone();
-                async move {
-                    let mut creds = match creds {
-                        Ok(c) => c,
-                        Err(_) => {
-                            return FetchedUsage {
-                                alias,
-                                usage: None,
-                                token_expiry_secs: None,
-                                is_active,
-                                error: Some("credentials unavailable or invalid".to_string()),
-                            };
-                        }
-                    };
-
-                    if !is_active
-                        && creds.claude_ai_oauth.is_expired()
-                        && creds.claude_ai_oauth.refresh_token.is_some()
-                        && let Ok(rotated) =
-                            api::refresh_credentials_async(&client, &creds.claude_ai_oauth).await
-                    {
+            let mut creds = match creds {
+                Ok(creds) => creds,
+                Err(_) => {
+                    result.error = Some("credentials unavailable or invalid".into());
+                    fetched.push(result);
+                    continue;
+                }
+            };
+            result.token_expiry_secs = creds.claude_ai_oauth.expiry_secs();
+            if creds.claude_ai_oauth.access_token.trim().is_empty() {
+                result.error = Some("missing access token; log in again".into());
+                fetched.push(result);
+                continue;
+            }
+            let now = chrono::Utc::now().timestamp();
+            let mut profile_save_error = None;
+            // Claude Code owns refresh for the active profile. Cached and cooldown
+            // paths do not contact either the usage endpoint or the token endpoint.
+            if !is_active
+                && creds.claude_ai_oauth.is_expired()
+                && creds.claude_ai_oauth.refresh_token.is_some()
+                && cache.should_request(&creds.claude_ai_oauth.access_token, mode, now)
+            {
+                match api::refresh_credentials_async(&client, &creds.claude_ai_oauth).await {
+                    Ok(rotated) => {
                         creds.claude_ai_oauth = rotated;
-                        if let Ok(json) = serde_json::to_string(&creds) {
-                            let _ = std::fs::write(&creds_path, json);
+                        if let Err(error) = profile.write_credentials(&creds) {
+                            profile_save_error = Some(format!(
+                                "token refreshed but profile save failed; usage data is not persisted ({error})"
+                            ));
                         }
+                        result.token_expiry_secs = creds.claude_ai_oauth.expiry_secs();
                     }
-
-                    let token_expiry_secs = creds.claude_ai_oauth.expiry_secs();
-                    if creds.claude_ai_oauth.access_token.trim().is_empty() {
-                        return FetchedUsage {
-                            alias,
-                            usage: None,
-                            token_expiry_secs,
-                            is_active,
-                            error: Some("missing access token; log in again".to_string()),
-                        };
-                    }
-                    match api::fetch_usage_async(&client, &creds.claude_ai_oauth.access_token).await
-                    {
-                        Ok(usage) => FetchedUsage {
-                            alias,
-                            usage: Some(usage),
-                            token_expiry_secs,
-                            is_active,
-                            error: None,
-                        },
-                        Err(e) => FetchedUsage {
-                            alias,
-                            usage: None,
-                            token_expiry_secs,
-                            is_active,
-                            error: Some(e.to_string()),
-                        },
+                    Err(error) => {
+                        result.snapshot = cache.refresh_failed(
+                            &creds.claude_ai_oauth.access_token,
+                            &error,
+                            chrono::Utc::now().timestamp(),
+                        )?;
+                        result.usage = result.snapshot.usage.clone();
+                        result.error = result.snapshot.error.clone();
+                        fetched.push(result);
+                        continue;
                     }
                 }
-            })
-            .collect();
-        futures::future::join_all(futures).await
-    }))
+            }
+            result.snapshot = cache
+                .get(
+                    &client,
+                    &creds.claude_ai_oauth.access_token,
+                    mode,
+                    chrono::Utc::now().timestamp(),
+                )
+                .await?;
+            result.usage = result.snapshot.usage.clone();
+            result.error = profile_save_error.or_else(|| result.snapshot.error.clone());
+            if result.usage.is_none() && result.error.is_none() {
+                result.error = Some("no cached data; run claudectl status".into());
+            }
+            fetched.push(result);
+        }
+        Ok(fetched)
+    })
 }
 
 fn to_account_status(f: &FetchedUsage) -> AccountStatus {
     match (&f.usage, &f.error) {
         (Some(usage), _) => AccountStatus {
             alias: f.alias.clone(),
+            snapshot: f.snapshot.clone(),
             h5_pct: usage.five_hour.as_ref().and_then(|w| w.utilization),
             d7_pct: usage.seven_day.as_ref().and_then(|w| w.utilization),
             h5_reset: format_window_reset(usage.five_hour.as_ref()),
@@ -197,11 +223,12 @@ fn to_account_status(f: &FetchedUsage) -> AccountStatus {
             has_fable_limit: usage.fable_weekly().is_some(),
             token_expiry_secs: f.token_expiry_secs,
             is_active: f.is_active,
-            is_error: false,
-            error_msg: String::new(),
+            is_error: f.error.is_some() || !f.snapshot.fresh,
+            error_msg: f.error.clone().unwrap_or_default(),
         },
         (None, err) => AccountStatus {
             alias: f.alias.clone(),
+            snapshot: f.snapshot.clone(),
             h5_pct: None,
             d7_pct: None,
             h5_reset: "-".to_string(),
@@ -241,13 +268,17 @@ fn print_table(accounts: &[AccountStatus]) {
         header.push("Fable 7d");
     }
     header.push("Token expiry");
-    header.push("Usage status");
+    header.extend(["Account capacity", "Data age", "Next fetch", "Usage fetch"]);
     table.set_header(header);
 
     for account in accounts {
         table.add_row(render_row(account, show_models, show_fable));
     }
     println!("{table}");
+    println!("Percentages are used capacity. Fetch success does not prove model access.");
+    println!(
+        "Cached data can lag by 5m. HTTP 429 limits usage checks, not proof of exhausted capacity."
+    );
 }
 
 fn show_fable_column(accounts: &[AccountStatus]) -> bool {
@@ -260,15 +291,6 @@ fn render_row(s: &AccountStatus, show_models: bool, show_fable: bool) -> Vec<Cel
     } else {
         s.alias.clone()
     };
-
-    if s.is_error {
-        let mut row = vec![Cell::new(alias)];
-        let cols = 4 + if show_models { 2 } else { 0 } + usize::from(show_fable);
-        row.extend(std::iter::repeat_with(|| Cell::new("-")).take(cols));
-        row.push(token_cell(s.token_expiry_secs));
-        row.push(Cell::new(&s.error_msg).fg(Color::Red));
-        return row;
-    }
 
     let mut row = vec![
         Cell::new(alias),
@@ -285,8 +307,69 @@ fn render_row(s: &AccountStatus, show_models: bool, show_fable: bool) -> Vec<Cel
         row.push(colorize_usage_pct(s.fable_pct));
     }
     row.push(token_cell(s.token_expiry_secs));
-    row.push(Cell::new("ok"));
+    row.push(Cell::new(capacity(s)));
+    let now = chrono::Utc::now().timestamp();
+    row.push(Cell::new(
+        s.snapshot
+            .fetched_at
+            .map(|at| {
+                let age = format!("{}s", now.saturating_sub(at).max(0));
+                if s.snapshot.fresh && !s.is_error {
+                    age
+                } else {
+                    format!("{age} (stale)")
+                }
+            })
+            .unwrap_or_else(|| "unknown".into()),
+    ));
+    row.push(Cell::new(
+        s.snapshot
+            .next_fetch_at
+            .map(|at| {
+                if at > now {
+                    format!("in {}s", at.saturating_sub(now))
+                } else {
+                    "on next check".into()
+                }
+            })
+            .unwrap_or_else(|| "-".into()),
+    ));
+    let fetch = if s.error_msg.is_empty() {
+        s.snapshot.source.to_string()
+    } else if s.snapshot.source.is_empty() {
+        s.error_msg.clone()
+    } else {
+        format!("{}: {}", s.snapshot.source, s.error_msg)
+    };
+    row.push(Cell::new(fetch));
     row
+}
+
+fn capacity(s: &AccountStatus) -> String {
+    if s.is_error {
+        return "unknown; see last data".into();
+    }
+    if s.d7_pct.is_some_and(|pct| pct >= 100.0) {
+        return "weekly limit reached".into();
+    }
+    if s.h5_pct.is_some_and(|pct| pct >= 100.0) {
+        return "5h limit reached".into();
+    }
+    let models: Vec<_> = [
+        ("Fable", s.fable_pct),
+        ("Opus", s.opus_pct),
+        ("Sonnet", s.sonnet_pct),
+    ]
+    .into_iter()
+    .filter_map(|(name, pct)| pct.filter(|p| *p >= 100.0).map(|_| name))
+    .collect();
+    if !models.is_empty() {
+        return format!("{} limit reached", models.join("/"));
+    }
+    if s.h5_pct.is_none() || s.d7_pct.is_none() {
+        return "unknown".into();
+    }
+    "below reported limits".into()
 }
 
 /// Stored expiry is independent of whether the usage API accepted the request.
@@ -373,6 +456,11 @@ mod tests {
     fn account(h5: Option<f64>, d7: Option<f64>, is_error: bool) -> AccountStatus {
         AccountStatus {
             alias: "a@x".to_string(),
+            snapshot: Snapshot {
+                fresh: !is_error,
+                source: "live",
+                ..Snapshot::default()
+            },
             h5_pct: h5,
             d7_pct: d7,
             h5_reset: "-".to_string(),
@@ -386,6 +474,16 @@ mod tests {
             is_error,
             error_msg: String::new(),
         }
+    }
+
+    #[test]
+    fn weekly_exhaustion_is_distinct_from_fetch_success() {
+        let a = account(Some(0.0), Some(100.0), false);
+        let cells: Vec<_> = render_row(&a, false, false)
+            .into_iter()
+            .map(|c| c.content())
+            .collect();
+        assert!(cells.iter().any(|c| c == "weekly limit reached"));
     }
 
     #[test]
@@ -410,10 +508,10 @@ mod tests {
             account(Some(10.0), Some(20.0), false),
             account(None, None, true),
         ] {
-            assert_eq!(render_row(&a, false, false).len(), 7);
-            assert_eq!(render_row(&a, true, false).len(), 9);
-            assert_eq!(render_row(&a, false, true).len(), 8);
-            assert_eq!(render_row(&a, true, true).len(), 10);
+            assert_eq!(render_row(&a, false, false).len(), 10);
+            assert_eq!(render_row(&a, true, false).len(), 12);
+            assert_eq!(render_row(&a, false, true).len(), 11);
+            assert_eq!(render_row(&a, true, true).len(), 13);
         }
     }
 
@@ -441,6 +539,7 @@ mod tests {
             token_expiry_secs: None,
             is_active: false,
             error: None,
+            ..FetchedUsage::default()
         });
         assert!(show_fable_column(&[status]));
         assert!(!show_fable_column(&[account(Some(1.0), Some(1.0), false)]));
@@ -453,13 +552,13 @@ mod tests {
         a.error_msg = "rate limited (HTTP 429); retry in 207s".into();
         for show_models in [false, true] {
             let row = render_row(&a, show_models, false);
-            assert!(row[row.len() - 2].content().contains('h'));
-            assert_eq!(row[row.len() - 1].content(), a.error_msg);
+            assert!(row[row.len() - 5].content().contains('h'));
+            assert!(row[row.len() - 1].content().ends_with(&a.error_msg));
         }
         a.token_expiry_secs = Some(1);
         let row = render_row(&a, false, false);
         assert_eq!(row[5].content(), "expired");
-        assert_eq!(row[6].content(), a.error_msg);
+        assert!(row[9].content().ends_with(&a.error_msg));
     }
 
     #[test]
