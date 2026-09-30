@@ -255,6 +255,16 @@ pub fn prepare(
 /// A receipt failure before the spawn starts no child; after the spawn it
 /// stops the child and fails.
 pub fn run(paths: &Paths, prepared: Prepared, req: &ExecRequest) -> Result<i32, ExecError> {
+    let receipt = Receipt::open(req.receipt.as_deref())?;
+    run_with_receipt(paths, prepared, req, receipt)
+}
+
+fn run_with_receipt(
+    paths: &Paths,
+    prepared: Prepared,
+    req: &ExecRequest,
+    mut receipt: Receipt,
+) -> Result<i32, ExecError> {
     let config_dir = fresh_config_dir(paths, &prepared.alias)?;
     let (reader, mut writer) =
         std::io::pipe().map_err(|e| ExecError::Spawn(format!("cannot create token pipe: {e}")))?;
@@ -264,7 +274,6 @@ pub fn run(paths: &Paths, prepared: Prepared, req: &ExecRequest) -> Result<i32, 
     drop(writer);
     let fd = inheritable_fd(&reader)?;
 
-    let mut receipt = Receipt::open(req.receipt.as_deref())?;
     let base = receipt_base(&prepared, config_dir.path(), req);
     receipt.write(&with(&base, "prepared", serde_json::json!({})))?;
 
@@ -342,13 +351,14 @@ fn with(base: &serde_json::Value, event: &str, extra: serde_json::Value) -> serd
 }
 
 struct Receipt {
-    file: Option<std::fs::File>,
+    sink: Box<dyn Write>,
+    sync: Option<std::fs::File>,
 }
 
 impl Receipt {
     fn open(path: Option<&Path>) -> Result<Self, ExecError> {
         let Some(path) = path else {
-            return Ok(Self { file: None });
+            return Ok(Self::from_writer(Box::new(std::io::stderr())));
         };
         let mut options = std::fs::File::options();
         options.create(true).append(true);
@@ -360,20 +370,26 @@ impl Receipt {
         let file = options
             .open(path)
             .map_err(|e| ExecError::Receipt(format!("{}: {e}", path.display())))?;
-        Ok(Self { file: Some(file) })
+        let sync = file
+            .try_clone()
+            .map_err(|e| ExecError::Receipt(format!("{}: {e}", path.display())))?;
+        Ok(Self {
+            sink: Box::new(file),
+            sync: Some(sync),
+        })
+    }
+
+    fn from_writer(sink: Box<dyn Write>) -> Self {
+        Self { sink, sync: None }
     }
 
     fn write(&mut self, record: &serde_json::Value) -> Result<(), ExecError> {
         let line = format!("{record}\n");
-        match &mut self.file {
-            Some(file) => file
-                .write_all(line.as_bytes())
-                .and_then(|()| file.sync_data())
-                .map_err(|e| ExecError::Receipt(e.to_string())),
-            None => std::io::stderr()
-                .write_all(line.as_bytes())
-                .map_err(|e| ExecError::Receipt(e.to_string())),
-        }
+        self.sink
+            .write_all(line.as_bytes())
+            .and_then(|()| self.sink.flush())
+            .and_then(|()| self.sync.as_ref().map_or(Ok(()), |file| file.sync_data()))
+            .map_err(|e| ExecError::Receipt(e.to_string()))
     }
 }
 

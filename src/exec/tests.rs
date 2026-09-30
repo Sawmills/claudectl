@@ -469,3 +469,71 @@ fn parses_durations() {
     assert!(parse_duration("5d").is_err());
     assert!(parse_duration("abc").is_err());
 }
+
+/// Accepts `ok_writes` records, then fails every write.
+struct FailingSink {
+    ok_writes: usize,
+    written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl std::io::Write for FailingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Keep every attempted record, failed ones too, so the test can see
+        // whether a spawn was attempted.
+        self.written.lock().unwrap().extend_from_slice(buf);
+        if buf.ends_with(b"\n") {
+            if self.ok_writes == 0 {
+                return Err(std::io::Error::other("disk full"));
+            }
+            self.ok_writes -= 1;
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn receipt_write_failure_fails_closed_before_and_after_spawn() {
+    for (ok_writes, child_may_start) in [(0, false), (1, true)] {
+        let (home, paths, store) = setup();
+        save(
+            &paths,
+            "work",
+            "uuid-work",
+            &creds("a-work", "r-work", 2 * HOUR_MS),
+        );
+        let out = home.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let child = fake_child(home.path(), &out, 0);
+        let req = request("work", &child);
+        let prepared = prepare(
+            &paths,
+            &store,
+            &req,
+            &ok_identity("uuid-work"),
+            self_identity(),
+        )
+        .unwrap();
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let receipt = Receipt::from_writer(Box::new(FailingSink {
+            ok_writes,
+            written: written.clone(),
+        }));
+        let error = run_with_receipt(&paths, prepared, &req, receipt).unwrap_err();
+        assert!(matches!(error, ExecError::Receipt(_)), "{error}");
+        let attempted = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        let spawned = attempted.contains("\"started\"");
+        assert_eq!(
+            spawned, child_may_start,
+            "a failed prepared record must stop the spawn"
+        );
+        if child_may_start {
+            assert!(
+                !attempted.contains("\"exited\""),
+                "a failed started record stops the run"
+            );
+        }
+    }
+}

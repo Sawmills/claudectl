@@ -166,6 +166,37 @@ usage below 100%. It picks the lowest `max(5h, 7d)` utilization and breaks near-
 toward the soonest weekly reset. Model-specific limits remain visible in the table;
 automatic selection does not choose for a particular model.
 
+### Run one command on a saved account
+
+```bash
+claudectl exec --profile amir+2@example.com -- claude -p "review this diff"
+claudectl launcher --profile amir+2@example.com --claude "$(command -v claude)" --out ./claude-amir2
+```
+
+`exec` runs one command on a saved profile and leaves the live login alone.
+The child gets the saved access token through an inherited pipe
+(`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`) and a fresh private
+`CLAUDE_CONFIG_DIR` that is removed when the run ends. The Keychain entry,
+`~/.claude/.credentials.json`, `~/.claude.json` and the active marker are not
+written.
+
+`exec` never refreshes a token. It refuses, and starts no child, when:
+
+- the profile is the active profile, or shares its refresh grant with the live login (exit 5);
+- the token expires within `--min-valid` (default `30m`; run `claudectl status <alias>` to refresh a non-active profile) (exit 5);
+- the token's account differs from the saved `accountUuid` or `--expect-account` (exit 3);
+- the executable's SHA-256 differs from `--expect-sha256` (exit 4);
+- a receipt record cannot be written (exit 6).
+
+Otherwise it exits with the child's exit code. `--receipt <file>` appends JSON
+records `prepared`, `started` (with the child PID) and `exited`, or
+`spawn_failed`. Each names the profile, account, executable path and SHA-256,
+and the claudectl path, SHA-256 and version. Receipts never contain tokens.
+
+`launcher` writes a script for tools that take a `--claude-bin` path. The script
+pins the profile's account, the executable's SHA-256 and this claudectl binary's
+SHA-256, and refuses to run if any of them changes.
+
 ### Housekeeping
 
 ```bash

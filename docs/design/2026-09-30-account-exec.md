@@ -1,6 +1,16 @@
 # Design: per-process saved-account execution (`claudectl exec`)
 
-Status: proposal, not implemented. Ticket: SAW-11554 (tooling dependency).
+Status: accepted with required changes (Architect HQ, 2026-09-30); implemented on branch `amiri/claudectl-account-exec`. Ticket: SAW-11554 (tooling dependency).
+
+## Accepted changes to the first proposal
+
+1. `exec` refuses the active alias and any saved grant shared with the live login. It starts no child and refreshes nothing. It never refreshes any token; a non-active profile is refreshed with `claudectl status <alias>`.
+2. `--min-valid` defaults to 30 minutes, which covers a 900 s review. A shorter lifetime is refused; the value is never lowered.
+3. Each run gets a fresh private 0700 config dir under `~/.claudectl/run/<alias>/`, removed after the run.
+4. The receipt separates `prepared` from `started`. The PID appears only after a successful spawn; a failed spawn writes `spawn_failed`. It names the executable path and SHA-256 and claudectl's path, SHA-256 and version. No `--version` subprocess runs. A failed receipt write before the spawn starts no child; after the spawn it stops the child.
+5. Tests compare token bytes in memory and print no credential. The identity lookup is a trait; tests inject a fake through the library only, and the binary always uses the production endpoint.
+6. README gains one section. AGENTS.md is unchanged.
+7. The fd and config-dir names are hypotheses from the binary until a real-binary smoke run proves them. That run needs Architect HQ admission of the exact non-active alias, accountUuid, pinned binary, command and duration.
 
 ## Problem
 
