@@ -102,6 +102,12 @@ asks you to use another model or account.
 `Usage used` shows percentages only when recent data is available and the latest
 check succeeded. Old data and failed checks show `Unknown`. The `Data` column
 shows whether saved data is old or recent. `*` marks the active account.
+In a terminal, the active account and headers are cyan. Green status means usage
+is within limits. Red status means a reached limit, a required login, denied
+access, or a profile save failure. Other checks that need attention are yellow.
+Usage color follows the highest reported percentage:
+green below 50%, yellow from 50%, and red from 80%. Colors are disabled when
+output is redirected or `NO_COLOR` has a nonempty value.
 An expired access token alone does not mean you must log in again.
 
 Use `--details` to see the full table, including old percentages, model limits,
