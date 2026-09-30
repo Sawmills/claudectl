@@ -6,7 +6,11 @@ use claudectl::auth_store::AuthStore;
 use claudectl::config;
 use claudectl::profile;
 use claudectl::usage_cache::{FetchMode, Snapshot, UsageCache};
-use comfy_table::{Cell, Color, Table, presets::UTF8_FULL_CONDENSED};
+use comfy_table::{
+    Attribute, Cell, Color, Table,
+    modifiers::UTF8_ROUND_CORNERS,
+    presets::{UTF8_FULL, UTF8_FULL_CONDENSED},
+};
 
 /// One profile's fetched usage, shared by `status` and `use` auto-select.
 #[derive(Default)]
@@ -395,6 +399,9 @@ fn print_table(accounts: &[AccountStatus]) {
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
+    if std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
+        table.force_no_tty();
+    }
     let mut header = vec!["Account", "5h", "5h Reset", "7d", "7d Reset"];
     if show_models {
         header.push("Opus 7d");
@@ -546,7 +553,7 @@ fn summary_row(s: &AccountStatus) -> Vec<Cell> {
             ("Sonnet", s.sonnet_pct),
         ]
         .into_iter()
-        .filter_map(|(name, pct)| pct.map(|p| format!("{name}: {p:.0}%")))
+        .filter_map(|(name, pct)| pct.map(|p| format!("{name}: {}", usage_percent(p))))
         .collect::<Vec<_>>()
         .join("\n")
     } else {
@@ -565,23 +572,74 @@ fn summary_row(s: &AccountStatus) -> Vec<Cell> {
     } else {
         "No data".into()
     };
+    let status_color = if status == "Within usage limits" {
+        Color::Green
+    } else if status.ends_with("limit reached")
+        || matches!(
+            status.as_str(),
+            "Login needed" | "Access denied" | "Profile save failed"
+        )
+    {
+        Color::Red
+    } else {
+        Color::Yellow
+    };
+    // One color for the usage group: the most-used reported window wins.
+    let usage_color = if s.is_error || !s.snapshot.is_fresh_at(now) {
+        Color::Yellow
+    } else {
+        usage_color(
+            [s.h5_pct, s.d7_pct, s.fable_pct, s.opus_pct, s.sonnet_pct]
+                .into_iter()
+                .flatten()
+                .reduce(f64::max)
+                .unwrap_or(0.0),
+        )
+    };
+    let alias = if s.is_active {
+        Cell::new(alias)
+            .fg(Color::Cyan)
+            .add_attribute(Attribute::Bold)
+    } else {
+        Cell::new(alias)
+    };
     vec![
-        Cell::new(alias),
-        Cell::new(status),
-        Cell::new(usage),
-        Cell::new(data),
+        alias,
+        Cell::new(status)
+            .fg(status_color)
+            .add_attribute(Attribute::Bold),
+        Cell::new(usage).fg(usage_color),
+        Cell::new(data).add_attribute(Attribute::Dim),
         Cell::new(action),
     ]
 }
 
-fn print_summary(accounts: &[AccountStatus]) {
+fn summary_table(accounts: &[AccountStatus], no_color: bool) -> Table {
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(["Account", "Status", "Usage used", "Data", "Next step"]);
+    table.load_preset(UTF8_FULL);
+    table.style_text_only();
+    table.apply_modifier(UTF8_ROUND_CORNERS);
+    if no_color {
+        table.force_no_tty();
+    }
+    table.set_header(
+        ["Account", "Status", "Usage used", "Data", "Next step"].map(|label| {
+            Cell::new(label)
+                .fg(Color::Cyan)
+                .add_attribute(Attribute::Bold)
+        }),
+    );
     for account in accounts {
         table.add_row(summary_row(account));
     }
+    table
+}
+
+fn print_summary(accounts: &[AccountStatus]) {
+    let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+    let table = summary_table(accounts, no_color);
     println!("{table}");
+    println!();
     println!("* Active account. Old or failed-check usage is hidden. Cache can lag by 5 minutes.");
     println!(
         "Expired tokens alone do not mean login is needed. Usage checks do not test model access."
@@ -705,14 +763,26 @@ fn colorize_usage_pct(pct: Option<f64>) -> Cell {
     let Some(pct) = pct else {
         return Cell::new("-");
     };
-    let color = if pct >= 80.0 {
+    Cell::new(usage_percent(pct)).fg(usage_color(pct))
+}
+
+fn usage_percent(pct: f64) -> String {
+    // Do not round a window that still has capacity up to a full limit.
+    if (99.5..100.0).contains(&pct) {
+        "<100%".into()
+    } else {
+        format!("{pct:.0}%")
+    }
+}
+
+fn usage_color(pct: f64) -> Color {
+    if pct >= 80.0 {
         Color::Red
     } else if pct >= 50.0 {
         Color::Yellow
     } else {
         Color::Green
-    };
-    Cell::new(format!("{pct:.0}%")).fg(color)
+    }
 }
 
 fn format_window_reset(window: Option<&UsageWindow>) -> String {
@@ -760,6 +830,73 @@ fn format_duration(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fresh_account(h5: Option<f64>, d7: Option<f64>, is_error: bool) -> AccountStatus {
+        let mut a = account(h5, d7, is_error);
+        let now = chrono::Utc::now().timestamp();
+        a.snapshot.fetched_at = Some(now);
+        a.snapshot.valid_until = Some(now + 300);
+        a
+    }
+
+    #[test]
+    fn summary_styles_active_account_capacity_and_unknown_data() {
+        let mut a = fresh_account(Some(20.0), Some(30.0), false);
+        a.is_active = true;
+        let row = summary_row(&a);
+        assert_eq!(
+            row[0],
+            Cell::new("* a@x")
+                .fg(Color::Cyan)
+                .add_attribute(Attribute::Bold)
+        );
+        assert_eq!(
+            row[1],
+            Cell::new("Within usage limits")
+                .fg(Color::Green)
+                .add_attribute(Attribute::Bold)
+        );
+        assert_eq!(row[2], Cell::new("5h: 20%\nweek: 30%").fg(Color::Green));
+        a.d7_pct = Some(100.0);
+        assert_eq!(
+            summary_row(&a)[1],
+            Cell::new("Weekly limit reached")
+                .fg(Color::Red)
+                .add_attribute(Attribute::Bold)
+        );
+        assert_eq!(
+            summary_row(&a)[2],
+            Cell::new("5h: 20%\nweek: 100%").fg(Color::Red)
+        );
+        a.is_error = true;
+        assert_eq!(summary_row(&a)[2], Cell::new("Unknown").fg(Color::Yellow));
+    }
+
+    #[test]
+    fn summary_color_is_optional_and_plain_output_keeps_all_advice() {
+        let a = fresh_account(Some(20.0), Some(30.0), false);
+        let mut colored = summary_table(&[a], false);
+        colored.enforce_styling();
+        assert!(colored.to_string().contains("\x1b["));
+        let plain =
+            summary_table(&[fresh_account(Some(20.0), Some(30.0), false)], true).to_string();
+        assert!(!plain.contains("\x1b["));
+        assert!(plain.contains("Within usage limits"));
+        assert!(plain.contains("No action needed for reported usage"));
+        assert!(plain.starts_with('╭'));
+    }
+
+    #[test]
+    fn nearly_full_usage_is_not_displayed_as_a_reached_limit() {
+        assert_eq!(usage_percent(99.6), "<100%");
+        assert_eq!(usage_percent(100.0), "100%");
+        assert_eq!(usage_color(49.0), Color::Green);
+        assert_eq!(usage_color(50.0), Color::Yellow);
+        assert_eq!(usage_color(80.0), Color::Red);
+        let a = fresh_account(Some(99.6), Some(20.0), false);
+        assert_eq!(next_step(&a).0, "Within usage limits");
+        assert!(summary_row(&a)[2].content().contains("5h: <100%"));
+    }
 
     #[test]
     fn expired_live_token_reports_current_blocker_before_cached_throttling() {
