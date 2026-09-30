@@ -791,10 +791,11 @@ fn a_cancel_while_waiting_for_the_final_lock_starts_no_child() {
     drop(held);
     let error = runner.join().unwrap().unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("cancelled before the child started"),
-        "{error}"
+        error.to_string().contains(&format!(
+            "cancelled by signal {} before the child started",
+            libc::SIGTERM
+        )),
+        "the refusal names the signal it received: {error}"
     );
     assert!(
         !out.join("token").exists(),

@@ -323,7 +323,16 @@ fn run_with_receipt(
     req: &ExecRequest,
     mut receipt: Receipt,
 ) -> Result<i32, ExecError> {
-    let config_dir = fresh_config_dir(paths, &prepared.alias)?;
+    // Handle cancellation for the whole life of the private directory, so a
+    // signal cannot skip its removal.
+    signals::install();
+    let config_dir = match fresh_config_dir(paths, &prepared.alias) {
+        Ok(dir) => dir,
+        Err(error) => {
+            signals::reset();
+            return Err(error);
+        }
+    };
     let dir_path = config_dir.path().to_path_buf();
     let mut base = receipt_base(&prepared, &dir_path, req);
     let outcome = run_in_dir(
@@ -337,7 +346,9 @@ fn run_with_receipt(
     );
     // Remove the private directory on every path, and never hide a removal
     // failure behind another error.
-    match config_dir.close() {
+    let closed = config_dir.close();
+    signals::reset();
+    match closed {
         Ok(()) => outcome,
         Err(error) => {
             let earlier = match &outcome {
@@ -402,7 +413,6 @@ fn run_in_dir(
     // group that reads the terminal is stopped by the terminal driver.
     set_process_group(&mut command);
 
-    signals::install();
     let spawned = {
         // Hold the lock from the final ownership check through the spawn, so
         // no `use` can make this grant live in between.
@@ -415,17 +425,22 @@ fn run_in_dir(
                 Some((&prepared.token, &prepared.account_uuid)),
                 req.min_valid,
             )?;
-            if signals::pending() {
-                return Err(ExecError::Spawn(
-                    "cancelled before the child started".into(),
-                ));
+            signals::block();
+            if let Some(signal) = signals::pending() {
+                signals::unblock();
+                return Err(ExecError::Spawn(format!(
+                    "cancelled by signal {signal} before the child started"
+                )));
             }
-            Ok(command.spawn())
+            let spawned = command.spawn();
+            if spawned.is_err() {
+                signals::unblock();
+            }
+            Ok(spawned)
         });
         match checked {
             Ok(spawned) => spawned,
             Err(error) => {
-                signals::reset();
                 receipt.write(&with(
                     base,
                     "refused",
@@ -439,7 +454,6 @@ fn run_in_dir(
     let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
-            signals::reset();
             receipt
                 .write(&with(
                     base,
@@ -453,19 +467,10 @@ fn run_in_dir(
         }
     };
     let pid = child.id();
+    // Held signals are released here and forwarded once, with their own
+    // numbers, now that the child is registered.
     signals::watch(pid);
-    // A signal that arrived between the final check and `watch` was not
-    // forwarded; deliver it now. The child did start, so its PID and outcome
-    // are still recorded below.
-    let cancelled = signals::pending();
-    if cancelled {
-        terminate(pid, SIGTERM);
-    }
-    let started = receipt.write(&with(
-        base,
-        "started",
-        serde_json::json!({ "pid": pid, "cancelled_at_start": cancelled }),
-    ));
+    let started = receipt.write(&with(base, "started", serde_json::json!({ "pid": pid })));
     if started.is_err() {
         terminate(pid, SIGKILL);
     }
@@ -479,7 +484,7 @@ fn run_in_dir(
         Descendants::Unknown
     };
     let status = child.wait();
-    signals::reset();
+    signals::unwatch();
     waited.map_err(|e| ExecError::Spawn(format!("cannot wait for child {pid}: {e}")))?;
     let status = status.map_err(|e| ExecError::Spawn(format!("cannot reap child {pid}: {e}")))?;
     let code = exit_code_of(&status);
@@ -495,10 +500,18 @@ fn run_in_dir(
     ));
     started?;
     exited?;
-    if matches!(descendants, Descendants::Survived | Descendants::Unknown) {
-        return Err(ExecError::Cleanup(format!(
-            "child {pid} exited with {code}, but its descendants survived SIGKILL"
-        )));
+    match descendants {
+        Descendants::Survived => {
+            return Err(ExecError::Cleanup(format!(
+                "child {pid} exited with {code}, but its descendants survived SIGKILL"
+            )));
+        }
+        Descendants::Unverified | Descendants::Unknown => {
+            return Err(ExecError::Cleanup(format!(
+                "child {pid} exited with {code}, but descendant termination could not be verified"
+            )));
+        }
+        _ => {}
     }
     Ok(code)
 }
@@ -508,6 +521,7 @@ enum Descendants {
     Terminated,
     Killed,
     Survived,
+    Unverified,
     Unknown,
 }
 
@@ -518,6 +532,7 @@ impl Descendants {
             Descendants::Terminated => "terminated",
             Descendants::Killed => "killed",
             Descendants::Survived => "survived",
+            Descendants::Unverified => "signalled_unverified",
             Descendants::Unknown => "unknown",
         }
     }
@@ -526,8 +541,16 @@ impl Descendants {
 /// Bounded TERM-to-KILL teardown of the child's process group. The caller
 /// keeps the leader unreaped for the whole call.
 fn teardown_group(leader: u32) -> Descendants {
-    let Ok(members) = descendants_in_group(leader) else {
-        return Descendants::Unknown;
+    let members = match descendants_in_group(leader) {
+        Ok(members) => members,
+        Err(_) => {
+            // Membership is unknown, but the leader is still reserved, so
+            // signalling its group is safe. Tear down blind and say so.
+            terminate(leader, SIGTERM);
+            std::thread::sleep(Duration::from_secs(2));
+            terminate(leader, SIGKILL);
+            return Descendants::Unverified;
+        }
     };
     if members.is_empty() {
         return Descendants::None;
@@ -709,10 +732,16 @@ fn map_token_fd(command: &mut Command, reader: &std::io::PipeReader) {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     let source = reader.as_raw_fd();
-    // SAFETY: runs in the forked child before exec; dup2 and fcntl are
-    // async-signal-safe and touch only this child's descriptor table.
+    let held = signals::forwarded_set();
+    // SAFETY: runs in the forked child before exec; dup2, fcntl and
+    // sigprocmask are async-signal-safe and touch only this child's state.
     unsafe {
         command.pre_exec(move || {
+            // The parent holds the forwarded signals during the spawn; the
+            // child must not inherit that mask.
+            if libc::sigprocmask(libc::SIG_UNBLOCK, &held, std::ptr::null_mut()) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             if source == CHILD_TOKEN_FD {
                 if libc::fcntl(source, libc::F_SETFD, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
@@ -732,26 +761,28 @@ fn map_token_fd(_command: &mut Command, _reader: &std::io::PipeReader) {}
 /// cancels the run and cleanup still happens.
 #[cfg(unix)]
 mod signals {
-    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicI32, Ordering};
 
     static CHILD: AtomicI32 = AtomicI32::new(0);
-    static PENDING: AtomicBool = AtomicBool::new(false);
+    /// The first signal received while no child was registered; 0 if none.
+    static PENDING: AtomicI32 = AtomicI32::new(0);
     const SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
 
     extern "C" fn forward(signal: libc::c_int) {
-        // Record every signal, so a signal that races `watch` is not lost.
-        PENDING.store(true, Ordering::SeqCst);
         let pid = CHILD.load(Ordering::SeqCst);
         if pid > 0 {
             // SAFETY: kill is async-signal-safe. The child leads its own
             // process group, so this reaches its descendants too.
             unsafe { libc::kill(-pid, signal) };
+        } else {
+            let _ = PENDING.compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
         }
     }
 
+    /// Install the handlers for the whole run, before any private state exists.
     pub fn install() {
         CHILD.store(0, Ordering::SeqCst);
-        PENDING.store(false, Ordering::SeqCst);
+        PENDING.store(0, Ordering::SeqCst);
         for signal in SIGNALS {
             // SAFETY: installs a handler that only uses async-signal-safe
             // calls. SA_RESTART keeps interrupted system calls in other
@@ -766,12 +797,54 @@ mod signals {
         }
     }
 
-    pub fn watch(pid: u32) {
-        CHILD.store(i32::try_from(pid).unwrap_or(0), Ordering::SeqCst);
+    /// The set of signals claudectl forwards.
+    pub fn forwarded_set() -> libc::sigset_t {
+        // SAFETY: builds a signal set in local memory.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            for signal in SIGNALS {
+                libc::sigaddset(&mut set, signal);
+            }
+            set
+        }
     }
 
-    pub fn pending() -> bool {
-        PENDING.load(Ordering::SeqCst)
+    fn mask(how: libc::c_int) {
+        let set = forwarded_set();
+        // SAFETY: changes only this thread's signal mask.
+        unsafe { libc::pthread_sigmask(how, &set, std::ptr::null_mut()) };
+    }
+
+    /// Hold the forwarded signals on this thread from the last cancellation
+    /// check through the spawn. The spawned child starts with an empty signal
+    /// mask: the pre-exec step unblocks these signals.
+    pub fn block() {
+        mask(libc::SIG_BLOCK);
+    }
+
+    pub fn unblock() {
+        mask(libc::SIG_UNBLOCK);
+    }
+
+    /// The signal received before a child was registered, if any.
+    pub fn pending() -> Option<libc::c_int> {
+        match PENDING.load(Ordering::SeqCst) {
+            0 => None,
+            signal => Some(signal),
+        }
+    }
+
+    /// Register the child, then release held signals. Each held signal is
+    /// delivered to the handler once and forwarded with its own number.
+    pub fn watch(pid: u32) {
+        CHILD.store(i32::try_from(pid).unwrap_or(0), Ordering::SeqCst);
+        unblock();
+    }
+
+    /// Stop forwarding once teardown is done; keep recording until reset.
+    pub fn unwatch() {
+        CHILD.store(0, Ordering::SeqCst);
     }
 
     pub fn reset() {
@@ -786,10 +859,13 @@ mod signals {
 #[cfg(not(unix))]
 mod signals {
     pub fn install() {}
-    pub fn watch(_pid: u32) {}
-    pub fn pending() -> bool {
-        false
+    pub fn block() {}
+    pub fn unblock() {}
+    pub fn pending() -> Option<i32> {
+        None
     }
+    pub fn watch(_pid: u32) {}
+    pub fn unwatch() {}
     pub fn reset() {}
 }
 
