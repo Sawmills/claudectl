@@ -57,7 +57,7 @@ impl AccountStatus {
     }
 }
 
-pub fn run(alias: Option<&str>, mode: FetchMode) -> Result<()> {
+pub fn run(alias: Option<&str>, mode: FetchMode, details: bool) -> Result<()> {
     let fetched = fetch_usages(alias, mode)?;
     if fetched.is_empty() {
         println!("no profiles saved. Use 'claudectl save' or 'claudectl login <alias>'.");
@@ -72,7 +72,11 @@ pub fn run(alias: Option<&str>, mode: FetchMode) -> Result<()> {
     });
 
     print_fetched_at();
-    print_table(&accounts);
+    if details {
+        print_table(&accounts);
+    } else {
+        print_summary(&accounts);
+    }
     Ok(())
 }
 
@@ -94,7 +98,7 @@ pub fn print_focused(fetched: &[FetchedUsage], alias: &str) {
             account
         })
         .collect();
-    print_table(&accounts);
+    print_summary(&accounts);
 }
 
 pub fn fetch_all_usages() -> Result<Vec<FetchedUsage>> {
@@ -205,15 +209,17 @@ fn fetch_usages_with_refresh(
                     )
                     .await?;
                 result.usage = result.snapshot.usage.clone();
-                result.error = result.snapshot.error.clone().or_else(|| {
-                    (!result.snapshot.fresh).then(|| {
-                        if refresh_owner_known {
-                            "expired token belongs to live login; let Claude Code refresh it".into()
-                        } else {
-                            "live refresh ownership unknown; check Claude Code login or Keychain access".into()
-                        }
+                // No request was sent. Report the current refresh blocker before
+                // any historical fetch error retained in the usage cache.
+                result.error = if !result.snapshot.is_fresh_at(now) {
+                    Some(if refresh_owner_known {
+                        "expired token belongs to live login; let Claude Code refresh it".into()
+                    } else {
+                        "live refresh ownership unknown; check Claude Code login or Keychain access".into()
                     })
-                });
+                } else {
+                    result.snapshot.error.clone()
+                };
                 fetched.push(result);
                 continue;
             }
@@ -411,6 +417,178 @@ fn print_table(accounts: &[AccountStatus]) {
     );
 }
 
+/// Describe the next action without treating expired tokens or API throttling
+/// as proof that an account needs login or has exhausted its allowance.
+fn next_step(s: &AccountStatus) -> (String, String) {
+    let error = s.error_msg.as_str();
+    if error.contains("ownership unknown") {
+        return (
+            "Check live login".into(),
+            "Check Keychain access and Claude Code login".into(),
+        );
+    }
+    if error.contains("belongs to live login") {
+        return (
+            "Let Claude refresh".into(),
+            "Open Claude Code; login only if refresh fails".into(),
+        );
+    }
+    if error.contains("missing access token") || error.contains("authentication rejected") {
+        let action = if s.is_active {
+            "Open Claude Code and run /login".into()
+        } else {
+            format!("claudectl login {}", claudectl::shell::quote_arg(&s.alias))
+        };
+        return ("Login needed".into(), action);
+    }
+    if error.contains("saving profiles failed") {
+        return (
+            "Profile save failed".into(),
+            "Check file permissions; log in again if needed".into(),
+        );
+    }
+    if error.contains("HTTP 429") {
+        let label = if error.contains("token refresh") {
+            "Refresh throttled"
+        } else {
+            "Usage check throttled"
+        };
+        return (label.into(), retry_step(s));
+    }
+    if error.contains("HTTP 403") {
+        return (
+            "Access denied".into(),
+            "Check account permissions in Claude Code".into(),
+        );
+    }
+    if error.contains("credentials unavailable") {
+        return if s.is_active {
+            (
+                "Cannot read login".into(),
+                "Check Claude Code login and Keychain access".into(),
+            )
+        } else {
+            (
+                "Cannot read saved login".into(),
+                "Check saved file permissions; re-save or log in".into(),
+            )
+        };
+    }
+    if !error.is_empty() && !error.contains("no cached data") {
+        return (
+            "Check failed".into(),
+            format!("{}; see --details", retry_step(s)),
+        );
+    }
+    if s.is_error || !s.snapshot.is_fresh_at(chrono::Utc::now().timestamp()) {
+        return ("Usage unknown".into(), retry_step(s));
+    }
+    if s.d7_pct.is_some_and(|pct| pct >= 100.0) {
+        return ("Weekly limit reached".into(), reset_step(&s.d7_reset));
+    }
+    if s.h5_pct.is_some_and(|pct| pct >= 100.0) {
+        return ("5-hour limit reached".into(), reset_step(&s.h5_reset));
+    }
+    let limited = capacity(s);
+    if limited.ends_with("limit reached") {
+        return (limited, "Use another model or account".into());
+    }
+    if s.h5_pct.is_none() || s.d7_pct.is_none() {
+        return (
+            "Usage unknown".into(),
+            "Check model access in Claude Code".into(),
+        );
+    }
+    (
+        "Within usage limits".into(),
+        "No action needed for reported usage".into(),
+    )
+}
+
+fn retry_step(s: &AccountStatus) -> String {
+    let now = chrono::Utc::now().timestamp();
+    match s.snapshot.next_fetch_at {
+        Some(at) if at > now => format!("Run status in {}", short_duration(at - now)),
+        _ => "Run claudectl status again".into(),
+    }
+}
+
+fn short_duration(seconds: i64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format_duration(seconds)
+    }
+}
+
+fn reset_step(reset: &str) -> String {
+    match reset.split(" (").next().unwrap_or(reset) {
+        "-" => "Wait for reset or use another account".into(),
+        "now" => "Run status again to check reset".into(),
+        relative => format!("Resets {relative}; or use another account"),
+    }
+}
+
+fn summary_row(s: &AccountStatus) -> Vec<Cell> {
+    let (status, action) = next_step(s);
+    let alias = if s.is_active {
+        format!("* {}", s.alias)
+    } else {
+        s.alias.clone()
+    };
+    let now = chrono::Utc::now().timestamp();
+    let usage = if !s.is_error && s.snapshot.is_fresh_at(now) {
+        [
+            ("5h", s.h5_pct),
+            ("week", s.d7_pct),
+            ("Fable", s.fable_pct),
+            ("Opus", s.opus_pct),
+            ("Sonnet", s.sonnet_pct),
+        ]
+        .into_iter()
+        .filter_map(|(name, pct)| pct.map(|p| format!("{name}: {p:.0}%")))
+        .collect::<Vec<_>>()
+        .join("\n")
+    } else {
+        "Unknown".into()
+    };
+    let data = if s.snapshot.is_fresh_at(now) && !s.is_error {
+        if s.snapshot.source == "live" {
+            "Live".into()
+        } else {
+            "Recent cache".into()
+        }
+    } else if s.snapshot.is_fresh_at(now) {
+        "Recent; check failed".into()
+    } else if let Some(at) = s.snapshot.fetched_at {
+        format!("Old: {} ago", short_duration(now.saturating_sub(at).max(0)))
+    } else {
+        "No data".into()
+    };
+    vec![
+        Cell::new(alias),
+        Cell::new(status),
+        Cell::new(usage),
+        Cell::new(data),
+        Cell::new(action),
+    ]
+}
+
+fn print_summary(accounts: &[AccountStatus]) {
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(["Account", "Status", "Usage used", "Data", "Next step"]);
+    for account in accounts {
+        table.add_row(summary_row(account));
+    }
+    println!("{table}");
+    println!("* Active account. Old or failed-check usage is hidden. Cache can lag by 5 minutes.");
+    println!(
+        "Expired tokens alone do not mean login is needed. Usage checks do not test model access."
+    );
+    println!("Use claudectl status --details for token expiry, old usage, and fetch errors.");
+}
+
 fn show_fable_column(accounts: &[AccountStatus]) -> bool {
     accounts.iter().any(|a| a.has_fable_limit)
 }
@@ -548,11 +726,11 @@ fn format_window_reset(window: Option<&UsageWindow>) -> String {
     } else if diff_secs >= 86400 {
         format!(
             "in {} ({})",
-            format_duration(diff_secs),
+            short_duration(diff_secs),
             format_reset_timestamp(reset_ts)
         )
     } else {
-        format!("in {}", format_duration(diff_secs))
+        format!("in {}", short_duration(diff_secs))
     }
 }
 
@@ -582,6 +760,164 @@ fn format_duration(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_live_token_reports_current_blocker_before_cached_throttling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_home(tmp.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let store = AuthStore::file_only(paths.clone());
+        let creds: api::CredentialsFile = serde_json::from_value(serde_json::json!({
+            "claudeAiOauth": {"accessToken":"test-expired-access", "refreshToken":"test-live-grant", "expiresAt":1}
+        })).unwrap();
+        profile::save_profile_to(&paths, "live", &creds, None).unwrap();
+        profile::set_active_from(&paths, "live").unwrap();
+        store.write_credentials(&creds).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let key = UsageCache::key("test-expired-access");
+        std::fs::create_dir_all(paths.claudectl_dir().join("usage")).unwrap();
+        std::fs::write(
+            paths.claudectl_dir().join("usage/cache-v1.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "entries": {key: {"usage":null,"fetched_at":now-3600,"next_attempt":now-1,
+                    "failures":1,"error":"usage fetch failed (HTTP 429)"}},
+                "rate_until":0,"rate_failures":0,"next_request_ms":0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        for expected in ["Let Claude refresh", "Check live login"] {
+            let fetched =
+                fetch_usages_with_refresh(&store, &paths, None, FetchMode::Normal, async |_, _| {
+                    panic!("live-owned token must not refresh")
+                })
+                .unwrap();
+            assert_eq!(next_step(&to_account_status(&fetched[0])).0, expected);
+            profile::set_active_from(&paths, "other").unwrap();
+            std::fs::write(paths.claude_credentials_file(), "invalid test data").unwrap();
+        }
+    }
+
+    #[test]
+    fn summary_reset_advice_uses_seconds_below_one_minute() {
+        let window = UsageWindow {
+            utilization: Some(100.0),
+            resets_at: Some((chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339()),
+        };
+        let reset = format_window_reset(Some(&window));
+        let step = reset_step(&reset);
+        assert!(step.contains("s; or use another account"), "{step}");
+        assert!(!step.contains("0m"), "{step}");
+    }
+
+    #[test]
+    fn summary_distinguishes_recent_failed_checks_and_short_retries() {
+        let now = chrono::Utc::now().timestamp();
+        let mut a = account(Some(100.0), Some(100.0), true);
+        a.snapshot.fresh = true;
+        a.snapshot.fetched_at = Some(now - 30);
+        a.snapshot.valid_until = Some(now + 270);
+        a.snapshot.next_fetch_at = Some(now + 30);
+        a.error_msg = "usage fetch failed (HTTP 429)".into();
+        let row = summary_row(&a);
+        assert_eq!(row[3].content(), "Recent; check failed");
+        assert!(row[4].content().ends_with('s'));
+        a.error_msg = "token refresh fetch failed (HTTP 429)".into();
+        assert_eq!(next_step(&a).0, "Refresh throttled");
+        a.error_msg =
+            "token refreshed but saving profiles failed; affected aliases may need login".into();
+        assert_eq!(next_step(&a).0, "Profile save failed");
+        assert!(next_step(&a).1.contains("permissions"));
+    }
+
+    #[test]
+    fn summary_separates_login_refresh_and_usage_failures() {
+        let mut a = account(Some(100.0), Some(100.0), true);
+        for (error, label) in [
+            (
+                "live refresh ownership unknown; check Claude Code login or Keychain access",
+                "Check live login",
+            ),
+            (
+                "expired token belongs to live login; let Claude Code refresh it",
+                "Let Claude refresh",
+            ),
+            ("missing access token; log in again", "Login needed"),
+            (
+                "token refresh: authentication rejected (HTTP 401)",
+                "Login needed",
+            ),
+            (
+                "shared HTTP 429 delay; no request sent",
+                "Usage check throttled",
+            ),
+            ("usage: access denied (HTTP 403)", "Access denied"),
+            (
+                "token refresh failed (network or invalid response)",
+                "Check failed",
+            ),
+            (
+                "credentials unavailable or invalid",
+                "Cannot read saved login",
+            ),
+            ("no cached data; run claudectl status", "Usage unknown"),
+            (
+                "token refreshed but saving profiles failed",
+                "Profile save failed",
+            ),
+        ] {
+            a.error_msg = error.into();
+            assert_eq!(next_step(&a).0, label);
+            assert_eq!(summary_row(&a)[2].content(), "Unknown");
+        }
+        a.is_active = true;
+        a.error_msg = "missing access token; log in again".into();
+        assert_eq!(next_step(&a).1, "Open Claude Code and run /login");
+        a.error_msg = "credentials unavailable or invalid".into();
+        assert_eq!(next_step(&a).0, "Cannot read login");
+        assert!(next_step(&a).1.contains("Keychain"));
+        a.is_active = false;
+        assert_eq!(next_step(&a).0, "Cannot read saved login");
+        assert!(next_step(&a).1.contains("saved file permissions"));
+    }
+
+    #[test]
+    fn summary_hides_stale_limits_and_preserves_cooldown_action() {
+        let mut a = account(Some(100.0), Some(100.0), false);
+        let now = chrono::Utc::now().timestamp();
+        a.snapshot.fetched_at = Some(now - 3600);
+        a.snapshot.valid_until = Some(now - 1);
+        a.snapshot.next_fetch_at = Some(now + 600);
+        let row = summary_row(&a);
+        assert_eq!(row[1].content(), "Usage unknown");
+        assert_eq!(row[2].content(), "Unknown");
+        assert!(row[3].content().starts_with("Old:"));
+        assert!(row[4].content().starts_with("Run status in"));
+    }
+
+    #[test]
+    fn summary_reports_fresh_limits_and_keeps_token_expiry_out_of_login_advice() {
+        let mut a = account(Some(100.0), Some(67.0), false);
+        let now = chrono::Utc::now().timestamp();
+        a.snapshot.fetched_at = Some(now);
+        a.snapshot.valid_until = Some(now + 300);
+        a.token_expiry_secs = Some(1);
+        a.h5_reset = "in 3h 20m (Wed Sep 30 18:00)".into();
+        let row = summary_row(&a);
+        assert_eq!(row[1].content(), "5-hour limit reached");
+        assert!(row[2].content().contains("5h: 100%"));
+        assert_eq!(row[4].content(), "Resets in 3h 20m; or use another account");
+        a.h5_pct = Some(0.0);
+        assert_eq!(next_step(&a).0, "Within usage limits");
+        a.d7_pct = Some(100.0);
+        assert_eq!(next_step(&a).0, "Weekly limit reached");
+        a.d7_pct = Some(10.0);
+        a.fable_pct = Some(100.0);
+        assert_eq!(next_step(&a).0, "Fable limit reached");
+        a.d7_pct = None;
+        a.fable_pct = None;
+        assert_eq!(next_step(&a).0, "Usage unknown");
+    }
 
     #[test]
     fn unknown_live_owner_blocks_saved_token_refresh() {

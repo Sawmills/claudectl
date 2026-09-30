@@ -18,7 +18,7 @@ fn status_reports_missing_token_separately_from_expiry() {
     let output = Command::cargo_bin("claudectl")
         .unwrap()
         .env("HOME", home.path())
-        .arg("status")
+        .args(["status", "--details"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -37,7 +37,7 @@ fn status_reports_missing_token_separately_from_expiry() {
     let output = Command::cargo_bin("claudectl")
         .unwrap()
         .env("HOME", home.path())
-        .arg("status")
+        .args(["status", "--details"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -196,4 +196,29 @@ fn cached_and_refresh_flags_conflict() {
         .args(["status", "--cached", "--refresh"])
         .assert()
         .failure();
+}
+
+#[test]
+fn status_default_explains_login_without_token_columns() {
+    let home = tempfile::tempdir().unwrap();
+    saved_profile(home.path(), "missing");
+    std::fs::write(
+        home.path()
+            .join(".claudectl/profiles/missing/credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":""}}"#,
+    )
+    .unwrap();
+    let output = Command::cargo_bin("claudectl")
+        .unwrap()
+        .env("HOME", home.path())
+        .args(["status", "--cached"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Login needed"), "{text}");
+    assert!(text.contains("claudectl login 'missing'"), "{text}");
+    assert!(text.contains("Next step"), "{text}");
+    assert!(!text.contains("Token expiry"), "{text}");
+    assert!(!text.contains("Usage fetch"), "{text}");
 }

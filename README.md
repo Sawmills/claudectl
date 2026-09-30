@@ -68,23 +68,45 @@ claudectl status                  # all profiles; reuse data for up to five minu
 claudectl status work-main        # one profile
 claudectl status --cached         # no network requests or token refresh
 claudectl status --refresh        # request fresh data; obey saved cooldowns
+claudectl status --details        # token expiry, old usage, and fetch diagnostics
 ```
 
-The table separates usage data from the result of the fetch:
+The default table shows each account's status and next step:
 
-- `5h`, `7d`, and model columns show the percentage of capacity used.
-- `Account capacity` shows a general or model limit, or `below reported limits`.
-  Missing or stale data gives an unknown capacity. A successful fetch does not
-  prove that a model request will succeed.
-- `Usage fetch` shows `live`, `cached`, `failed`, or `cooldown`. HTTP 429 means that
-  Anthropic limited requests for usage data. A cooldown skips the request.
-  Neither state proves exhausted capacity.
-- `Data age` shows the age of the last successful result. After a failed fetch,
-  the table retains old percentages and marks their age as stale.
-- `Next fetch` shows when another check can contact the endpoint. It is separate
-  from the account's five-hour and weekly reset times.
-- `Token expiry` shows the stored token expiry, independently of fetch errors.
-  `*` marks the active profile. Model columns appear when the endpoint reports them.
+- `Login needed`: the login is missing or authentication was rejected. Follow the
+  command in `Next step`.
+- `Check live login`: claudectl cannot confirm which login owns token refresh.
+  Check Keychain access and the Claude Code login before logging into saved accounts.
+- `Let Claude refresh`: the expired token belongs to the live Claude Code login.
+  Open Claude Code. Log in again only if Claude cannot refresh it.
+- `Usage check throttled`: wait until the next check. HTTP 429 limits usage checks;
+  it does not prove that the account has exhausted its allowance.
+- `Refresh throttled`: wait until the next check. The token refresh service limited
+  requests before claudectl could check usage.
+- `Profile save failed`: check file permissions. Token refresh succeeded, but
+  claudectl could not save the new tokens. A saved account may need a fresh login.
+- `5-hour limit reached` or `Weekly limit reached`: wait for the displayed reset
+  or use another account.
+- `Within usage limits`: recent data shows available general usage. A model request
+  can still fail or have a separate limit.
+
+Other statuses also include a next step. `Access denied` asks you to check account
+permissions. `Cannot read login` asks you to check Claude Code and Keychain access.
+`Cannot read saved login` asks you to check the saved profile's file permissions,
+then repair it with `claudectl save <alias>` from the correct live account or
+`claudectl login <alias>`.
+`Check failed` points to `--details` for the error. `Usage unknown` asks you to run
+another check or verify model access. A model limit, such as `Fable limit reached`,
+asks you to use another model or account.
+
+`Usage used` shows percentages only when recent data is available and the latest
+check succeeded. Old data and failed checks show `Unknown`. The `Data` column
+shows whether saved data is old or recent. `*` marks the active account.
+An expired access token alone does not mean you must log in again.
+
+Use `--details` to see the full table, including old percentages, model limits,
+token expiry, exact fetch errors, and retry times. Recent cached data can lag by
+five minutes. Both views use the same data and refresh rules.
 
 All commands share a cache and an operating-system lock under `~/.claudectl/usage/`.
 Requests run one at a time, with a one-second gap. A concurrent command stops with
@@ -174,5 +196,6 @@ Two safety rules are baked in:
   token; rotating it underneath Claude Code would log you out. Only non-active
   profiles with a different refresh token from the live login can be refreshed.
 
-If a profile shows `expired` in `status`, just `claudectl use` it (or wait for the
-auto-refresh) before reaching for a fresh `claude /login`.
+If `status --details` shows an expired token, follow the default view's `Next step`.
+Claude Code refreshes the active login. Status can refresh saved accounts when
+refresh ownership is known. Log in again when the login is missing or rejected.
