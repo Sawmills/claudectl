@@ -150,6 +150,7 @@ fn main() {
                 receipt,
                 program,
                 args: command,
+                terminal: None,
             }))
         }
         Commands::Launcher {

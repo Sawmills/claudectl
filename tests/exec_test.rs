@@ -111,6 +111,7 @@ fn request(alias: &str, program: &Path) -> ExecRequest {
         receipt: None,
         program: program.as_os_str().to_owned(),
         args: vec!["-p".into(), "hello".into()],
+        terminal: Some(false),
     }
 }
 
@@ -217,6 +218,10 @@ fn refuses_a_token_that_expires_before_min_valid() {
     ));
     assert!(matches!(error, ExecError::Refused(_)), "{error}");
     assert!(error.to_string().contains("30 min required"));
+    assert!(
+        error.to_string().contains("claudectl login work"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -931,4 +936,171 @@ fn a_config_dir_that_cannot_be_removed_is_an_error() {
     assert!(error.to_string().contains("exited with 0"), "{error}");
     let text = std::fs::read_to_string(home.path().join("receipt.jsonl")).unwrap();
     assert!(text.contains("\"exited\"") && text.contains("\"cleanup_failed\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_descendant_that_ignores_sigterm_is_killed_before_the_run_returns() {
+    let _guard = run_guard();
+    let (home, paths, store, out, _child) = work_setup();
+    let child = script_child(
+        home.path(),
+        "stubborn",
+        &format!(
+            "trap '' TERM\nsleep 30 &\necho $! > '{}/bg_pid'\nexit 0",
+            out.display()
+        ),
+    );
+    let mut req = request("work", &child);
+    req.receipt = Some(home.path().join("receipt.jsonl"));
+    let prepared = prepare(
+        &paths,
+        &store,
+        &req,
+        &ok_identity("uuid-work"),
+        self_identity(),
+    )
+    .unwrap();
+    let code = run(&paths, &store, prepared, &req).unwrap();
+    assert_eq!(code, 0);
+    let bg: i32 = std::fs::read_to_string(out.join("bg_pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        !process_alive(bg),
+        "a SIGTERM-ignoring descendant outlived the run"
+    );
+    let text = std::fs::read_to_string(home.path().join("receipt.jsonl")).unwrap();
+    let exited: serde_json::Value =
+        serde_json::from_str(text.lines().find(|l| l.contains("\"exited\"")).unwrap()).unwrap();
+    assert_eq!(exited["descendants"], "killed");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_terminal_run_does_not_deliver_a_terminal_interrupt_twice() {
+    let _guard = run_guard();
+    let (home, paths, store, out, _child) = work_setup();
+    let child = script_child(
+        home.path(),
+        "interruptible",
+        &format!(
+            "trap 'echo int >> {o}/ints' INT\n: > '{o}/ready'\ni=0\nwhile [ $i -lt 20 ]; do sleep 0.1; i=$((i+1)); done\nexit 0",
+            o = out.display()
+        ),
+    );
+    let mut req = request("work", &child);
+    req.terminal = Some(true);
+    req.receipt = Some(home.path().join("receipt.jsonl"));
+    let prepared = prepare(
+        &paths,
+        &store,
+        &req,
+        &ok_identity("uuid-work"),
+        self_identity(),
+    )
+    .unwrap();
+    let runner = {
+        let paths = paths.clone();
+        std::thread::spawn(move || {
+            let store = AuthStore::file_only(paths.clone());
+            run(&paths, &store, prepared, &req)
+        })
+    };
+    let started = std::time::Instant::now();
+    while !out.join("ready").exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "child did not start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let text = std::fs::read_to_string(home.path().join("receipt.jsonl")).unwrap();
+    let started_record: serde_json::Value =
+        serde_json::from_str(text.lines().find(|l| l.contains("\"started\"")).unwrap()).unwrap();
+    let child_pid = started_record["pid"].as_i64().unwrap() as i32;
+    // A terminal Ctrl-C reaches both processes of the foreground group. Deliver
+    // the child's copy first and let it handle it, so a forwarded duplicate
+    // shows up as a second handler run instead of merging with the first.
+    // SAFETY: the child is alive.
+    unsafe { libc::kill(child_pid, libc::SIGINT) };
+    let waited = std::time::Instant::now();
+    while std::fs::read_to_string(out.join("ints"))
+        .unwrap_or_default()
+        .lines()
+        .count()
+        < 1
+    {
+        assert!(
+            waited.elapsed() < Duration::from_secs(5),
+            "child never handled SIGINT"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    {
+        use std::os::unix::thread::JoinHandleExt;
+        // SAFETY: the runner thread is alive and has the handler installed.
+        unsafe { libc::pthread_kill(runner.as_pthread_t() as libc::pthread_t, libc::SIGINT) };
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let code = runner.join().unwrap().unwrap();
+    assert_eq!(code, 0);
+    let ints = std::fs::read_to_string(out.join("ints")).unwrap_or_default();
+    assert_eq!(
+        ints.lines().count(),
+        1,
+        "the child saw one interrupt, not two"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_receipt_failure_does_not_hide_a_cleanup_failure() {
+    let _guard = run_guard();
+    let (home, paths, store, out, _child) = work_setup();
+    let child = script_child(
+        home.path(),
+        "locker",
+        &format!(
+            "mkdir \"$CLAUDE_CONFIG_DIR/locked\" && : > \"$CLAUDE_CONFIG_DIR/locked/f\" && chmod 000 \"$CLAUDE_CONFIG_DIR/locked\"\nprintf '%s' \"$CLAUDE_CONFIG_DIR\" > '{}/config_dir'\nexit 0",
+            out.display()
+        ),
+    );
+    let req = request("work", &child);
+    let prepared = prepare(
+        &paths,
+        &store,
+        &req,
+        &ok_identity("uuid-work"),
+        self_identity(),
+    )
+    .unwrap();
+    let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    // prepared and started succeed; exited fails.
+    let sink: Box<dyn std::io::Write> = Box::new(FailingSink {
+        ok_writes: 2,
+        written: written.clone(),
+    });
+    let error = run_with_writer(&paths, &store, prepared, &req, sink).unwrap_err();
+    let config_dir =
+        std::path::PathBuf::from(std::fs::read_to_string(out.join("config_dir")).unwrap());
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            config_dir.join("locked"),
+            std::fs::Permissions::from_mode(0o700),
+        );
+    }
+    assert!(matches!(error, ExecError::Cleanup(_)), "{error}");
+    let message = error.to_string();
+    assert!(
+        message.contains("receipt write failed"),
+        "the receipt failure is kept: {message}"
+    );
+    assert!(
+        message.contains("removing"),
+        "the cleanup failure is kept: {message}"
+    );
 }

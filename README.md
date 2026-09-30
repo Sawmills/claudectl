@@ -176,21 +176,28 @@ claudectl launcher --profile amir+2@example.com --claude "$(command -v claude)" 
 `exec` runs one command on a saved profile and leaves the live login alone.
 The child gets the saved access token through an inherited pipe
 (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`) and a fresh private
-`CLAUDE_CONFIG_DIR` that is removed when the run ends. The Keychain entry,
+`CLAUDE_CONFIG_DIR` that is removed when the run ends. Without a terminal, the
+child runs in its own process group: `SIGTERM`, `SIGINT` and `SIGHUP` reach the
+whole group, and descendants left after the child exits get `SIGTERM`, then
+`SIGKILL`. At a terminal the child keeps the terminal's process group, so
+Ctrl-C reaches it once, directly. The Keychain entry,
 `~/.claude/.credentials.json`, `~/.claude.json` and the active marker are not
 written.
 
 `exec` never refreshes a token. It refuses, and starts no child, when:
 
 - the profile is the active profile, or shares its refresh grant with the live login (exit 5);
-- the token expires within `--min-valid` (default `30m`; run `claudectl status <alias>` to refresh a non-active profile) (exit 5);
+- the token has expired (run `claudectl status <alias>` to refresh it), or expires within `--min-valid` (default `30m`). claudectl refreshes a saved token only after it expires, so for a near-expiry token run `claudectl login <alias>` (exit 5);
 - the token's account differs from the saved `accountUuid` or `--expect-account` (exit 3);
 - the executable's SHA-256 differs from `--expect-sha256` (exit 4);
 - a receipt record cannot be written (exit 6).
 
+A run that started but whose private config directory could not be removed, or whose descendant processes survived `SIGKILL`, exits 8 and names the child's exit code.
+
 Otherwise it exits with the child's exit code. `--receipt <file>` appends JSON
-records `prepared`, `started` (with the child PID) and `exited`, or
-`spawn_failed`. Each names the profile, account, executable path and SHA-256,
+records `prepared`, `started` (with the child PID), `exited` (with the
+exit code, signal and descendant teardown result), or `refused`,
+`spawn_failed` and `cleanup_failed`. Each names the profile, account, executable path and SHA-256,
 and the claudectl path, SHA-256 and version. Receipts never contain tokens.
 
 `launcher` writes a script for tools that take a `--claude-bin` path. The script

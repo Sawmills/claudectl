@@ -45,6 +45,11 @@ pub struct ExecRequest {
     pub receipt: Option<PathBuf>,
     pub program: OsString,
     pub args: Vec<OsString>,
+    /// Whether the run is attached to a terminal. `None` detects it from
+    /// stdin. A terminal run shares the terminal's process group, so
+    /// terminal-generated signals already reach the child and are not
+    /// forwarded again.
+    pub terminal: Option<bool>,
 }
 
 /// Account lookup for the identity check. Production uses the OAuth profile
@@ -272,10 +277,15 @@ fn check_ownership(
         .ok_or_else(|| ExecError::Refused(format!("'{alias}' has no token expiry")))?;
     let remaining_ms = expires_at_ms - chrono::Utc::now().timestamp_millis();
     let needed_ms = i64::try_from(min_valid.as_millis()).unwrap_or(i64::MAX);
+    if remaining_ms <= 0 {
+        return Err(ExecError::Refused(format!(
+            "'{alias}' token has expired; run `claudectl status {alias}` to refresh it"
+        )));
+    }
     if remaining_ms < needed_ms {
         return Err(ExecError::Refused(format!(
-            "'{alias}' token is valid for {} min, {} min required; run `claudectl status {alias}` to refresh it",
-            (remaining_ms.max(0)) / 60_000,
+            "'{alias}' token is valid for {} min, {} min required. claudectl refreshes a saved token only after it expires; run `claudectl login {alias}` for a fresh token, or retry after it expires and run `claudectl status {alias}`",
+            remaining_ms / 60_000,
             needed_ms / 60_000
         )));
     }
@@ -319,9 +329,49 @@ fn run_with_receipt(
     mut receipt: Receipt,
 ) -> Result<i32, ExecError> {
     let config_dir = fresh_config_dir(paths, &prepared.alias)?;
+    let dir_path = config_dir.path().to_path_buf();
+    let mut base = receipt_base(&prepared, &dir_path, req);
+    let outcome = run_in_dir(
+        paths,
+        store,
+        &prepared,
+        req,
+        &mut receipt,
+        &dir_path,
+        &mut base,
+    );
+    // Remove the private directory on every path, and never hide a removal
+    // failure behind another error.
+    match config_dir.close() {
+        Ok(()) => outcome,
+        Err(error) => {
+            let earlier = match &outcome {
+                Ok(code) => format!("child exited with {code}"),
+                Err(e) => e.to_string(),
+            };
+            let message = format!("{earlier}; removing {} failed: {error}", dir_path.display());
+            let _ = receipt.write(&with(
+                &base,
+                "cleanup_failed",
+                serde_json::json!({ "error": error.to_string(), "earlier": earlier }),
+            ));
+            Err(ExecError::Cleanup(message))
+        }
+    }
+}
+
+fn run_in_dir(
+    paths: &Paths,
+    store: &AuthStore,
+    prepared: &Prepared,
+    req: &ExecRequest,
+    receipt: &mut Receipt,
+    config_dir: &Path,
+    base: &mut serde_json::Value,
+) -> Result<i32, ExecError> {
     // Execute a private copy, so the bytes that run are the bytes that were
     // hashed, even if the original path is replaced during the run.
-    let snapshot = snapshot_executable(&prepared.program, config_dir.path())?;
+    let snapshot = snapshot_executable(&prepared.program, config_dir)?;
     let snapshot_sha256 = sha256_file(&snapshot)?;
     if snapshot_sha256 != prepared.program_sha256 {
         return Err(ExecError::Pin(format!(
@@ -338,9 +388,8 @@ fn run_with_receipt(
         .map_err(|e| ExecError::Spawn(format!("cannot write token pipe: {e}")))?;
     drop(writer);
 
-    let mut base = receipt_base(&prepared, config_dir.path(), req);
     base["executed_snapshot"] = serde_json::json!(snapshot);
-    receipt.write(&with(&base, "prepared", serde_json::json!({})))?;
+    receipt.write(&with(base, "prepared", serde_json::json!({})))?;
 
     let mut command = Command::new(&snapshot);
     command.args(&req.args);
@@ -348,14 +397,18 @@ fn run_with_receipt(
     for name in SCRUBBED_ENV {
         command.env_remove(name);
     }
-    command.env(CONFIG_DIR_ENV, config_dir.path());
+    command.env(CONFIG_DIR_ENV, config_dir);
     command.env(TOKEN_FD_ENV, CHILD_TOKEN_FD.to_string());
     map_token_fd(&mut command, &reader);
 
-    // A separate process group lets cancellation reach the child's
-    // descendants. An interactive run keeps the terminal's group so the child
-    // can read the terminal; job control then covers its descendants.
-    let group = !std::io::stdin().is_terminal();
+    // A non-terminal run gets its own process group, so cancellation and
+    // teardown reach the child's descendants. A terminal run keeps the
+    // terminal's group so the child can read the terminal; job control then
+    // covers its descendants.
+    let terminal = req
+        .terminal
+        .unwrap_or_else(|| std::io::stdin().is_terminal());
+    let group = !terminal;
     if group {
         set_process_group(&mut command);
     }
@@ -385,7 +438,7 @@ fn run_with_receipt(
             Err(error) => {
                 signals::reset();
                 receipt.write(&with(
-                    &base,
+                    base,
                     "refused",
                     serde_json::json!({ "error": error.to_string() }),
                 ))?;
@@ -400,7 +453,7 @@ fn run_with_receipt(
             signals::reset();
             receipt
                 .write(&with(
-                    &base,
+                    base,
                     "spawn_failed",
                     serde_json::json!({ "error": error.to_string() }),
                 ))
@@ -420,47 +473,151 @@ fn run_with_receipt(
         terminate(pid, group, SIGTERM);
     }
     let started = receipt.write(&with(
-        &base,
+        base,
         "started",
         serde_json::json!({ "pid": pid, "cancelled_at_start": cancelled }),
     ));
     if started.is_err() {
         terminate(pid, group, SIGKILL);
     }
+    // Wait for the exit without reaping: while the child is an unreaped
+    // zombie, its PID stays reserved, so signalling its process group
+    // cannot reach an unrelated process.
+    let waited = wait_exit_no_reap(pid);
+    let teardown = if group {
+        Some(teardown_group_begin(pid))
+    } else {
+        None
+    };
     let status = child.wait();
     signals::reset();
-    let status =
-        status.map_err(|e| ExecError::Spawn(format!("cannot wait for child {pid}: {e}")))?;
-    // Stop descendants the child left behind; they would keep the token and
-    // the config directory.
-    let descendants_signalled = group && terminate(pid, group, SIGTERM);
+    waited.map_err(|e| ExecError::Spawn(format!("cannot wait for child {pid}: {e}")))?;
+    let status = status.map_err(|e| ExecError::Spawn(format!("cannot reap child {pid}: {e}")))?;
+    // After the reap, the group exists only while descendants remain in it,
+    // and a PID that is still a group id cannot be reused.
+    let descendants = match teardown {
+        Some(signalled) => teardown_group_finish(pid, signalled),
+        None => Descendants::NotManaged,
+    };
     let code = exit_code_of(&status);
     let exited = receipt.write(&with(
-        &base,
+        base,
         "exited",
         serde_json::json!({
             "pid": pid,
             "exit_code": status.code(),
             "signal": signal_of(&status),
-            "descendants_signalled": descendants_signalled,
+            "descendants": descendants.as_str(),
         }),
     ));
     started?;
     exited?;
-    let dir_path = config_dir.path().to_path_buf();
-    if let Err(error) = config_dir.close() {
-        let message = format!(
-            "child {pid} exited with {code}, but removing {} failed: {error}",
-            dir_path.display()
-        );
-        receipt.write(&with(
-            &base,
-            "cleanup_failed",
-            serde_json::json!({ "pid": pid, "exit_code": status.code(), "error": error.to_string() }),
-        ))?;
-        return Err(ExecError::Cleanup(message));
+    if let Descendants::Survived = descendants {
+        return Err(ExecError::Cleanup(format!(
+            "child {pid} exited with {code}, but its descendants survived SIGKILL"
+        )));
     }
     Ok(code)
+}
+
+enum Descendants {
+    NotManaged,
+    None,
+    Terminated,
+    Killed,
+    Survived,
+}
+
+impl Descendants {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Descendants::NotManaged => "not_managed",
+            Descendants::None => "none",
+            Descendants::Terminated => "terminated",
+            Descendants::Killed => "killed",
+            Descendants::Survived => "survived",
+        }
+    }
+}
+
+/// Send SIGTERM to the group while the leader is still unreaped. Returns
+/// whether any other process received it.
+fn teardown_group_begin(pid: u32) -> bool {
+    terminate(pid, true, SIGTERM)
+}
+
+/// Bounded TERM-to-KILL teardown after the leader is reaped.
+fn teardown_group_finish(pid: u32, signalled: bool) -> Descendants {
+    if !group_alive(pid) {
+        return if signalled {
+            Descendants::Terminated
+        } else {
+            Descendants::None
+        };
+    }
+    if wait_group_gone(pid, Duration::from_secs(2)) {
+        return Descendants::Terminated;
+    }
+    terminate(pid, true, SIGKILL);
+    if wait_group_gone(pid, Duration::from_secs(2)) {
+        Descendants::Killed
+    } else {
+        Descendants::Survived
+    }
+}
+
+fn wait_group_gone(pid: u32, limit: Duration) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < limit {
+        if !group_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    !group_alive(pid)
+}
+
+#[cfg(unix)]
+fn group_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only checks that the group has a member.
+    unsafe { libc::kill(-pid, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn group_alive(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn wait_exit_no_reap(pid: u32) -> std::io::Result<()> {
+    loop {
+        // SAFETY: waitid writes only into `info`; WNOWAIT leaves the child
+        // reapable by Child::wait.
+        let result = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_exit_no_reap(_pid: u32) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -564,6 +721,12 @@ mod signals {
     extern "C" fn forward(signal: libc::c_int) {
         // Record every signal, so a signal that races `watch` is not lost.
         PENDING.store(true, Ordering::SeqCst);
+        let group = GROUP.load(Ordering::SeqCst);
+        // In a terminal run the child shares the terminal's foreground group,
+        // so the terminal already delivered SIGINT and SIGHUP to it.
+        if !group && (signal == libc::SIGINT || signal == libc::SIGHUP) {
+            return;
+        }
         let pid = CHILD.load(Ordering::SeqCst);
         if pid > 0 {
             let target = if GROUP.load(Ordering::SeqCst) {
