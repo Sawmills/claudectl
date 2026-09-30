@@ -17,7 +17,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show rate limit status for all accounts
+    /// Show account status and what to do next
     Status {
         /// Check only this saved profile
         alias: Option<String>,
@@ -27,6 +27,9 @@ enum Commands {
         /// Refresh recent data, while still obeying saved cooldowns
         #[arg(long)]
         refresh: bool,
+        /// Show token expiry, old usage data, and fetch diagnostics
+        #[arg(long)]
+        details: bool,
     },
     /// Log into a Claude account via OAuth and save it as a profile
     Login {
@@ -75,6 +78,7 @@ fn main() {
             ref alias,
             cached,
             refresh,
+            details,
         } => commands::status::run(
             alias.as_deref(),
             if cached {
@@ -84,6 +88,7 @@ fn main() {
             } else {
                 claudectl::usage_cache::FetchMode::Normal
             },
+            details,
         ),
         Commands::Login { ref alias } => commands::login::run(alias),
         Commands::Save { ref alias } => commands::save::run(alias.as_deref()),
