@@ -10,7 +10,7 @@
 //! refuses a token that expires before `min_valid` runs out.
 
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -78,6 +78,8 @@ pub enum ExecError {
     Receipt(String),
     /// The child could not be started.
     Spawn(String),
+    /// The child ran, but its private config directory could not be removed.
+    Cleanup(String),
 }
 
 impl ExecError {
@@ -88,6 +90,7 @@ impl ExecError {
             ExecError::Refused(_) => 5,
             ExecError::Receipt(_) => 6,
             ExecError::Spawn(_) => 7,
+            ExecError::Cleanup(_) => 8,
         }
     }
 }
@@ -100,6 +103,7 @@ impl std::fmt::Display for ExecError {
             ExecError::Pin(m) => write!(f, "executable pin failed: {m}"),
             ExecError::Receipt(m) => write!(f, "receipt write failed: {m}"),
             ExecError::Spawn(m) => write!(f, "could not start child: {m}"),
+            ExecError::Cleanup(m) => write!(f, "cleanup failed: {m}"),
         }
     }
 }
@@ -138,8 +142,8 @@ impl SelfIdentity {
     }
 }
 
-/// Validate everything before any child exists. Takes the auth lock only for
-/// the reads that decide refresh ownership.
+/// Validate everything before any child exists. `run` repeats the ownership
+/// and lifetime checks under the auth lock right before the spawn.
 pub fn prepare(
     paths: &Paths,
     store: &AuthStore,
@@ -153,54 +157,12 @@ pub fn prepare(
     let saved = profile::get_profile_from(paths, &alias)
         .map_err(|e| ExecError::Refused(format!("{e:#}")))?;
 
-    let (creds, live) = {
+    let creds = {
         let _lock = lock_with_retry(store)?;
-        let active = profile::get_active_from(paths)
-            .map_err(|e| ExecError::Refused(format!("cannot read active profile: {e:#}")))?;
-        if active.as_deref() == Some(alias.as_str()) {
-            return Err(ExecError::Refused(format!(
-                "'{alias}' is the active profile; Claude Code owns its login, run plain claude instead"
-            )));
-        }
-        let creds = saved
-            .read_credentials()
-            .map_err(|e| ExecError::Refused(format!("saved credentials unreadable: {e:#}")))?;
-        let live = store
-            .read_refresh_owner()
-            .map_err(|e| ExecError::Refused(format!("live refresh ownership unknown: {e:#}")))?;
-        (creds, live)
+        check_ownership(paths, store, &alias, None, req.min_valid)?
     };
-
     let oauth = &creds.claude_ai_oauth;
-    if oauth.access_token.trim().is_empty() {
-        return Err(ExecError::Refused(format!(
-            "'{alias}' has no access token; log in again"
-        )));
-    }
-    if let Some(live) = live {
-        let live = &live.claude_ai_oauth;
-        let same_refresh =
-            oauth.refresh_token.is_some() && oauth.refresh_token == live.refresh_token;
-        let same_access = oauth.access_token == live.access_token;
-        if same_refresh || same_access {
-            return Err(ExecError::Refused(format!(
-                "'{alias}' shares its grant with the live login; Claude Code owns that refresh"
-            )));
-        }
-    }
-
-    let expires_at_ms = oauth
-        .expires_at
-        .ok_or_else(|| ExecError::Refused(format!("'{alias}' has no token expiry")))?;
-    let remaining_ms = expires_at_ms - chrono::Utc::now().timestamp_millis();
-    let needed_ms = i64::try_from(req.min_valid.as_millis()).unwrap_or(i64::MAX);
-    if remaining_ms < needed_ms {
-        return Err(ExecError::Refused(format!(
-            "'{alias}' token is valid for {} min, {} min required; run `claudectl status {alias}` to refresh it",
-            (remaining_ms.max(0)) / 60_000,
-            needed_ms / 60_000
-        )));
-    }
+    let expires_at_ms = oauth.expires_at.unwrap_or_default();
 
     let saved_uuid = saved
         .meta
@@ -251,71 +213,412 @@ pub fn prepare(
     })
 }
 
+/// Decide refresh ownership and lifetime. The caller holds the auth lock.
+/// With `expected = (token, account_uuid)`, the saved token and the saved
+/// account identity must still be the ones `prepare` verified.
+fn check_ownership(
+    paths: &Paths,
+    store: &AuthStore,
+    alias: &str,
+    expected: Option<(&str, &str)>,
+    min_valid: Duration,
+) -> Result<crate::api::CredentialsFile, ExecError> {
+    let active = profile::get_active_from(paths)
+        .map_err(|e| ExecError::Refused(format!("cannot read active profile: {e:#}")))?;
+    if active.as_deref() == Some(alias) {
+        return Err(ExecError::Refused(format!(
+            "'{alias}' is the active profile; Claude Code owns its login, run plain claude instead"
+        )));
+    }
+    let saved = profile::get_profile_from(paths, alias)
+        .map_err(|e| ExecError::Refused(format!("{e:#}")))?;
+    let creds = saved
+        .read_credentials()
+        .map_err(|e| ExecError::Refused(format!("saved credentials unreadable: {e:#}")))?;
+    let live = store
+        .read_refresh_owner()
+        .map_err(|e| ExecError::Refused(format!("live refresh ownership unknown: {e:#}")))?;
+    let oauth = &creds.claude_ai_oauth;
+    if oauth.access_token.trim().is_empty() {
+        return Err(ExecError::Refused(format!(
+            "'{alias}' has no access token; log in again"
+        )));
+    }
+    if let Some((token, account)) = expected {
+        if oauth.access_token != token {
+            return Err(ExecError::Refused(format!(
+                "'{alias}' credentials changed during preparation; run again"
+            )));
+        }
+        if saved.meta.account_uuid() != Some(account) {
+            return Err(ExecError::Identity(format!(
+                "'{alias}' saved account identity changed during preparation; run again"
+            )));
+        }
+    }
+    if let Some(live) = live {
+        let live = &live.claude_ai_oauth;
+        let same_refresh =
+            oauth.refresh_token.is_some() && oauth.refresh_token == live.refresh_token;
+        let same_access = oauth.access_token == live.access_token;
+        if same_refresh || same_access {
+            return Err(ExecError::Refused(format!(
+                "'{alias}' shares its grant with the live login; Claude Code owns that refresh"
+            )));
+        }
+    }
+    let expires_at_ms = oauth
+        .expires_at
+        .ok_or_else(|| ExecError::Refused(format!("'{alias}' has no token expiry")))?;
+    let remaining_ms = expires_at_ms - chrono::Utc::now().timestamp_millis();
+    let needed_ms = i64::try_from(min_valid.as_millis()).unwrap_or(i64::MAX);
+    if remaining_ms < needed_ms {
+        return Err(ExecError::Refused(format!(
+            "'{alias}' token is valid for {} min, {} min required; run `claudectl status {alias}` to refresh it",
+            (remaining_ms.max(0)) / 60_000,
+            needed_ms / 60_000
+        )));
+    }
+    Ok(creds)
+}
+
 /// Start the child and wait for it. Returns the exit code to propagate.
 /// A receipt failure before the spawn starts no child; after the spawn it
 /// stops the child and fails.
-pub fn run(paths: &Paths, prepared: Prepared, req: &ExecRequest) -> Result<i32, ExecError> {
+pub fn run(
+    paths: &Paths,
+    store: &AuthStore,
+    prepared: Prepared,
+    req: &ExecRequest,
+) -> Result<i32, ExecError> {
     let receipt = Receipt::open(req.receipt.as_deref())?;
-    run_with_receipt(paths, prepared, req, receipt)
+    run_with_receipt(paths, store, prepared, req, receipt)
 }
+
+/// Like `run`, but writes receipt records to `sink`. For tests that need a
+/// receipt sink which fails.
+#[doc(hidden)]
+pub fn run_with_writer(
+    paths: &Paths,
+    store: &AuthStore,
+    prepared: Prepared,
+    req: &ExecRequest,
+    sink: Box<dyn Write>,
+) -> Result<i32, ExecError> {
+    run_with_receipt(paths, store, prepared, req, Receipt::from_writer(sink))
+}
+
+/// The descriptor number the child reads the token from.
+pub const CHILD_TOKEN_FD: i32 = 3;
 
 fn run_with_receipt(
     paths: &Paths,
+    store: &AuthStore,
     prepared: Prepared,
     req: &ExecRequest,
     mut receipt: Receipt,
 ) -> Result<i32, ExecError> {
     let config_dir = fresh_config_dir(paths, &prepared.alias)?;
+    // Execute a private copy, so the bytes that run are the bytes that were
+    // hashed, even if the original path is replaced during the run.
+    let snapshot = snapshot_executable(&prepared.program, config_dir.path())?;
+    let snapshot_sha256 = sha256_file(&snapshot)?;
+    if snapshot_sha256 != prepared.program_sha256 {
+        return Err(ExecError::Pin(format!(
+            "{} changed after it was verified",
+            prepared.program.display()
+        )));
+    }
+    // The parent keeps FD_CLOEXEC on the pipe, so no other child can inherit
+    // it; only this child's pre-exec step maps it to CHILD_TOKEN_FD.
     let (reader, mut writer) =
         std::io::pipe().map_err(|e| ExecError::Spawn(format!("cannot create token pipe: {e}")))?;
     writer
         .write_all(prepared.token.as_bytes())
         .map_err(|e| ExecError::Spawn(format!("cannot write token pipe: {e}")))?;
     drop(writer);
-    let fd = inheritable_fd(&reader)?;
 
-    let base = receipt_base(&prepared, config_dir.path(), req);
+    let mut base = receipt_base(&prepared, config_dir.path(), req);
+    base["executed_snapshot"] = serde_json::json!(snapshot);
     receipt.write(&with(&base, "prepared", serde_json::json!({})))?;
 
-    let mut command = Command::new(&prepared.program);
+    let mut command = Command::new(&snapshot);
     command.args(&req.args);
+    set_arg0(&mut command, &prepared.program);
     for name in SCRUBBED_ENV {
         command.env_remove(name);
     }
     command.env(CONFIG_DIR_ENV, config_dir.path());
-    command.env(TOKEN_FD_ENV, fd.to_string());
-    let spawned = command.spawn();
+    command.env(TOKEN_FD_ENV, CHILD_TOKEN_FD.to_string());
+    map_token_fd(&mut command, &reader);
+
+    // A separate process group lets cancellation reach the child's
+    // descendants. An interactive run keeps the terminal's group so the child
+    // can read the terminal; job control then covers its descendants.
+    let group = !std::io::stdin().is_terminal();
+    if group {
+        set_process_group(&mut command);
+    }
+
+    signals::install(group);
+    let spawned = {
+        // Hold the lock from the final ownership check through the spawn, so
+        // no `use` can make this grant live in between.
+        let lock = lock_with_retry(store);
+        let checked = lock.and_then(|_lock| {
+            check_ownership(
+                paths,
+                store,
+                &prepared.alias,
+                Some((&prepared.token, &prepared.account_uuid)),
+                req.min_valid,
+            )?;
+            if signals::pending() {
+                return Err(ExecError::Spawn(
+                    "cancelled before the child started".into(),
+                ));
+            }
+            Ok(command.spawn())
+        });
+        match checked {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                signals::reset();
+                receipt.write(&with(
+                    &base,
+                    "refused",
+                    serde_json::json!({ "error": error.to_string() }),
+                ))?;
+                return Err(error);
+            }
+        }
+    };
     drop(reader);
     let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
-            let _ = receipt.write(&with(
-                &base,
-                "spawn_failed",
-                serde_json::json!({ "error": error.to_string() }),
-            ));
+            signals::reset();
+            receipt
+                .write(&with(
+                    &base,
+                    "spawn_failed",
+                    serde_json::json!({ "error": error.to_string() }),
+                ))
+                .map_err(|receipt_error| {
+                    ExecError::Receipt(format!("{receipt_error} (after spawn failure: {error})"))
+                })?;
             return Err(ExecError::Spawn(error.to_string()));
         }
     };
-    if let Err(error) = receipt.write(&with(
+    let pid = child.id();
+    signals::watch(pid);
+    // A signal that arrived between the final check and `watch` was not
+    // forwarded; deliver it now. The child did start, so its PID and outcome
+    // are still recorded below.
+    let cancelled = signals::pending();
+    if cancelled {
+        terminate(pid, group, SIGTERM);
+    }
+    let started = receipt.write(&with(
         &base,
         "started",
-        serde_json::json!({ "pid": child.id() }),
-    )) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
+        serde_json::json!({ "pid": pid, "cancelled_at_start": cancelled }),
+    ));
+    if started.is_err() {
+        terminate(pid, group, SIGKILL);
     }
-    let status = child
-        .wait()
-        .map_err(|e| ExecError::Spawn(format!("cannot wait for child: {e}")))?;
+    let status = child.wait();
+    signals::reset();
+    let status =
+        status.map_err(|e| ExecError::Spawn(format!("cannot wait for child {pid}: {e}")))?;
+    // Stop descendants the child left behind; they would keep the token and
+    // the config directory.
+    let descendants_signalled = group && terminate(pid, group, SIGTERM);
     let code = exit_code_of(&status);
-    receipt.write(&with(
+    let exited = receipt.write(&with(
         &base,
         "exited",
-        serde_json::json!({ "pid": child.id(), "exit_code": status.code(), "signal": signal_of(&status) }),
-    ))?;
+        serde_json::json!({
+            "pid": pid,
+            "exit_code": status.code(),
+            "signal": signal_of(&status),
+            "descendants_signalled": descendants_signalled,
+        }),
+    ));
+    started?;
+    exited?;
+    let dir_path = config_dir.path().to_path_buf();
+    if let Err(error) = config_dir.close() {
+        let message = format!(
+            "child {pid} exited with {code}, but removing {} failed: {error}",
+            dir_path.display()
+        );
+        receipt.write(&with(
+            &base,
+            "cleanup_failed",
+            serde_json::json!({ "pid": pid, "exit_code": status.code(), "error": error.to_string() }),
+        ))?;
+        return Err(ExecError::Cleanup(message));
+    }
     Ok(code)
+}
+
+#[cfg(unix)]
+const SIGTERM: i32 = libc::SIGTERM;
+#[cfg(unix)]
+const SIGKILL: i32 = libc::SIGKILL;
+#[cfg(not(unix))]
+const SIGTERM: i32 = 15;
+#[cfg(not(unix))]
+const SIGKILL: i32 = 9;
+
+/// Signal the child, or its whole process group. Returns whether any process
+/// received the signal.
+#[cfg(unix)]
+fn terminate(pid: u32, group: bool, signal: i32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let target = if group { -pid } else { pid };
+    // SAFETY: kill only sends a signal.
+    unsafe { libc::kill(target, signal) == 0 }
+}
+
+#[cfg(not(unix))]
+fn terminate(_pid: u32, _group: bool, _signal: i32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn set_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn set_process_group(_command: &mut Command) {}
+
+fn snapshot_executable(program: &Path, config_dir: &Path) -> Result<PathBuf, ExecError> {
+    let dir = config_dir.join("bin");
+    std::fs::create_dir(&dir)
+        .map_err(|e| ExecError::Pin(format!("cannot create snapshot dir: {e}")))?;
+    let name = program
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("program"));
+    let snapshot = dir.join(name);
+    std::fs::copy(program, &snapshot)
+        .map_err(|e| ExecError::Pin(format!("cannot snapshot {}: {e}", program.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o500))
+            .map_err(|e| ExecError::Pin(format!("cannot restrict snapshot: {e}")))?;
+    }
+    Ok(snapshot)
+}
+
+#[cfg(unix)]
+fn set_arg0(command: &mut Command, program: &Path) {
+    use std::os::unix::process::CommandExt;
+    command.arg0(program);
+}
+
+#[cfg(not(unix))]
+fn set_arg0(_command: &mut Command, _program: &Path) {}
+
+#[cfg(unix)]
+fn map_token_fd(command: &mut Command, reader: &std::io::PipeReader) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let source = reader.as_raw_fd();
+    // SAFETY: runs in the forked child before exec; dup2 and fcntl are
+    // async-signal-safe and touch only this child's descriptor table.
+    unsafe {
+        command.pre_exec(move || {
+            if source == CHILD_TOKEN_FD {
+                if libc::fcntl(source, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::dup2(source, CHILD_TOKEN_FD) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn map_token_fd(_command: &mut Command, _reader: &std::io::PipeReader) {}
+
+/// Forward SIGTERM, SIGINT and SIGHUP to the child, so cancelling claudectl
+/// cancels the run and cleanup still happens.
+#[cfg(unix)]
+mod signals {
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+    static CHILD: AtomicI32 = AtomicI32::new(0);
+    static PENDING: AtomicBool = AtomicBool::new(false);
+    static GROUP: AtomicBool = AtomicBool::new(false);
+    const SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
+
+    extern "C" fn forward(signal: libc::c_int) {
+        // Record every signal, so a signal that races `watch` is not lost.
+        PENDING.store(true, Ordering::SeqCst);
+        let pid = CHILD.load(Ordering::SeqCst);
+        if pid > 0 {
+            let target = if GROUP.load(Ordering::SeqCst) {
+                -pid
+            } else {
+                pid
+            };
+            // SAFETY: kill is async-signal-safe.
+            unsafe { libc::kill(target, signal) };
+        }
+    }
+
+    pub fn install(group: bool) {
+        CHILD.store(0, Ordering::SeqCst);
+        PENDING.store(false, Ordering::SeqCst);
+        GROUP.store(group, Ordering::SeqCst);
+        for signal in SIGNALS {
+            // SAFETY: installs a handler that only uses async-signal-safe
+            // calls. SA_RESTART keeps interrupted system calls in other
+            // threads from failing with EINTR.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = forward as *const () as libc::sighandler_t;
+                action.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaction(signal, &action, std::ptr::null_mut());
+            }
+        }
+    }
+
+    pub fn watch(pid: u32) {
+        CHILD.store(i32::try_from(pid).unwrap_or(0), Ordering::SeqCst);
+    }
+
+    pub fn pending() -> bool {
+        PENDING.load(Ordering::SeqCst)
+    }
+
+    pub fn reset() {
+        CHILD.store(0, Ordering::SeqCst);
+        for signal in SIGNALS {
+            // SAFETY: restores the default disposition.
+            unsafe { libc::signal(signal, libc::SIG_DFL) };
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod signals {
+    pub fn install(_group: bool) {}
+    pub fn watch(_pid: u32) {}
+    pub fn pending() -> bool {
+        false
+    }
+    pub fn reset() {}
 }
 
 fn receipt_base(prepared: &Prepared, config_dir: &Path, req: &ExecRequest) -> serde_json::Value {
@@ -394,7 +697,8 @@ impl Receipt {
 }
 
 /// A new private directory per run, removed when the run ends.
-fn fresh_config_dir(paths: &Paths, alias: &str) -> Result<tempfile::TempDir, ExecError> {
+#[doc(hidden)]
+pub fn fresh_config_dir(paths: &Paths, alias: &str) -> Result<tempfile::TempDir, ExecError> {
     let root = paths.claudectl_dir().join("run").join(alias);
     std::fs::create_dir_all(&root)
         .map_err(|e| ExecError::Spawn(format!("cannot create {}: {e}", root.display())))?;
@@ -417,26 +721,6 @@ fn fresh_config_dir(paths: &Paths, alias: &str) -> Result<tempfile::TempDir, Exe
             .map_err(|e| ExecError::Spawn(format!("cannot restrict config dir: {e}")))?;
     }
     Ok(dir)
-}
-
-#[cfg(unix)]
-fn inheritable_fd(reader: &std::io::PipeReader) -> Result<i32, ExecError> {
-    use std::os::fd::AsRawFd;
-    let fd = reader.as_raw_fd();
-    // SAFETY: fcntl on a descriptor this process owns; clears only FD_CLOEXEC.
-    let result = unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
-    if result == -1 {
-        return Err(ExecError::Spawn(format!(
-            "cannot make token pipe inheritable: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(fd)
-}
-
-#[cfg(not(unix))]
-fn inheritable_fd(_reader: &std::io::PipeReader) -> Result<i32, ExecError> {
-    Err(ExecError::Spawn("claudectl exec supports Unix only".into()))
 }
 
 fn resolve_program(program: &OsString) -> Result<PathBuf, ExecError> {
@@ -523,8 +807,12 @@ pub fn parse_duration(input: &str) -> Result<Duration, String> {
         .map_err(|_| format!("invalid duration '{input}'"))?;
     let seconds = match unit {
         "s" => value,
-        "m" => value * 60,
-        "h" => value * 3600,
+        "m" => value
+            .checked_mul(60)
+            .ok_or_else(|| format!("duration '{input}' is too large"))?,
+        "h" => value
+            .checked_mul(3600)
+            .ok_or_else(|| format!("duration '{input}' is too large"))?,
         _ => {
             return Err(format!(
                 "invalid duration unit in '{input}' (use s, m or h)"
@@ -533,6 +821,3 @@ pub fn parse_duration(input: &str) -> Result<Duration, String> {
     };
     Ok(Duration::from_secs(seconds))
 }
-
-#[cfg(test)]
-mod tests;

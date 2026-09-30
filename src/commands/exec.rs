@@ -17,5 +17,5 @@ fn run_inner(req: &ExecRequest) -> Result<i32, ExecError> {
     let paths = config::default_paths().map_err(|e| ExecError::Refused(format!("{e:#}")))?;
     let store = AuthStore::real(paths.clone());
     let prepared = exec::prepare(&paths, &store, req, &LiveIdentity, SelfIdentity::current()?)?;
-    exec::run(&paths, prepared, req)
+    exec::run(&paths, &store, prepared, req)
 }

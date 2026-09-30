@@ -1,9 +1,23 @@
+//! `exec` tests start child processes. They live in their own test binary, so a
+//! fork here never copies another unit test's open auth-lock descriptor.
+
 use std::path::Path;
 
-use super::*;
-use crate::api::{CredentialsFile, OauthCreds};
+use std::time::Duration;
+
+use claudectl::api::{CredentialsFile, OauthCreds};
+use claudectl::auth_store::AuthStore;
+use claudectl::config::Paths;
+use claudectl::exec::*;
 
 const HOUR_MS: i64 = 3_600_000;
+
+/// Signal handlers are process-wide; tests that start children run one at a time.
+static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn run_guard() -> std::sync::MutexGuard<'static, ()> {
+    RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 struct FakeIdentity(Result<Option<String>, String>);
 
@@ -33,7 +47,7 @@ fn creds(access: &str, refresh: &str, expires_in_ms: i64) -> CredentialsFile {
 }
 
 fn save(paths: &Paths, alias: &str, uuid: &str, c: &CredentialsFile) {
-    crate::profile::save_profile_to(
+    claudectl::profile::save_profile_to(
         paths,
         alias,
         c,
@@ -67,6 +81,13 @@ printf '%s' "$CLAUDE_CONFIG_DIR" > "$out/config_dir"
 if [ -d "$CLAUDE_CONFIG_DIR" ]; then echo yes > "$out/config_exists"; fi
 env | grep -E '^(CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_OAUTH_REFRESH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN)=' > "$out/leaked_env" || true
 printf '%s ' "$@" > "$out/args"
+printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" > "$out/fd_name"
+: > "$out/extra_fds"
+# A leaked token descriptor is a pipe; the shell's own script fd is a file.
+n=4; while [ $n -le 63 ]; do
+  if [ -p "/dev/fd/$n" ]; then echo "$n" >> "$out/extra_fds"; fi
+  n=$((n+1))
+done
 sleep "${{FAKE_SLEEP:-0}}"
 exit {code}
 "#,
@@ -117,7 +138,7 @@ fn refuses_the_active_alias_without_contacting_identity() {
         "uuid-work",
         &creds("a-work", "r-work", 2 * HOUR_MS),
     );
-    crate::profile::set_active_from(&paths, "work").unwrap();
+    claudectl::profile::set_active_from(&paths, "work").unwrap();
     let child = fake_child(home.path(), home.path(), 0);
     let identity = FakeIdentity(Err("must not be called".into()));
     let error = refused(prepare(
@@ -238,7 +259,8 @@ fn identity_failures_fail_closed() {
 #[test]
 fn a_profile_without_saved_identity_fails_closed() {
     let (home, paths, store) = setup();
-    crate::profile::save_profile_to(&paths, "anon", &creds("a", "r", 2 * HOUR_MS), None).unwrap();
+    claudectl::profile::save_profile_to(&paths, "anon", &creds("a", "r", 2 * HOUR_MS), None)
+        .unwrap();
     let child = fake_child(home.path(), home.path(), 0);
     let error = refused(prepare(
         &paths,
@@ -286,6 +308,7 @@ fn snapshot(paths: &Paths) -> Vec<Option<Vec<u8>>> {
 
 #[test]
 fn runs_the_child_on_the_saved_profile_and_leaves_global_state_alone() {
+    let _guard = run_guard();
     let (home, paths, store) = setup();
     let token = "a-work-secret";
     save(
@@ -306,7 +329,7 @@ fn runs_the_child_on_the_saved_profile_and_leaves_global_state_alone() {
         r#"{"oauthAccount":{"accountUuid":"uuid-live"}}"#,
     )
     .unwrap();
-    crate::profile::set_active_from(&paths, "live").unwrap();
+    claudectl::profile::set_active_from(&paths, "live").unwrap();
     let before = snapshot(&paths);
 
     let out = home.path().join("out");
@@ -325,7 +348,7 @@ fn runs_the_child_on_the_saved_profile_and_leaves_global_state_alone() {
         self_identity(),
     )
     .unwrap();
-    let code = run(&paths, prepared, &req).unwrap();
+    let code = run(&paths, &store, prepared, &req).unwrap();
 
     assert_eq!(code, 7, "child exit code passes through");
     let received = std::fs::read(out.join("token")).unwrap();
@@ -339,6 +362,12 @@ fn runs_the_child_on_the_saved_profile_and_leaves_global_state_alone() {
         "-p hello "
     );
     assert!(out.join("config_exists").exists());
+    assert_eq!(std::fs::read_to_string(out.join("fd_name")).unwrap(), "3");
+    assert_eq!(
+        std::fs::read_to_string(out.join("extra_fds")).unwrap(),
+        "",
+        "the child must inherit no descriptor besides the token fd"
+    );
     let config_dir =
         std::path::PathBuf::from(std::fs::read_to_string(out.join("config_dir")).unwrap());
     assert!(config_dir.starts_with(paths.claudectl_dir().join("run").join("work")));
@@ -359,6 +388,11 @@ fn runs_the_child_on_the_saved_profile_and_leaves_global_state_alone() {
         .map(|e| e["event"].as_str().unwrap())
         .collect();
     assert_eq!(kinds, ["prepared", "started", "exited"]);
+    let executed = events[0]["executed_snapshot"].as_str().unwrap();
+    assert!(
+        std::path::Path::new(executed).starts_with(&config_dir),
+        "the child runs from the private snapshot"
+    );
     assert!(events[0].get("pid").is_none(), "no pid before the spawn");
     assert!(events[1]["pid"].as_u64().is_some());
     assert_eq!(events[2]["exit_code"], 7);
@@ -385,6 +419,7 @@ fn private_config_dir_is_mode_0700() {
 
 #[test]
 fn receipt_failure_before_spawn_starts_no_child() {
+    let _guard = run_guard();
     let (home, paths, store) = setup();
     save(
         &paths,
@@ -405,7 +440,7 @@ fn receipt_failure_before_spawn_starts_no_child() {
         self_identity(),
     )
     .unwrap();
-    let error = run(&paths, prepared, &req).unwrap_err();
+    let error = run(&paths, &store, prepared, &req).unwrap_err();
     assert!(matches!(error, ExecError::Receipt(_)), "{error}");
     assert!(
         !out.join("token").exists(),
@@ -415,6 +450,7 @@ fn receipt_failure_before_spawn_starts_no_child() {
 
 #[test]
 fn concurrent_runs_on_two_aliases_stay_isolated() {
+    let _guard = run_guard();
     let (home, paths, store) = setup();
     save(
         &paths,
@@ -435,6 +471,8 @@ fn concurrent_runs_on_two_aliases_stay_isolated() {
         let out = home.path().join(format!("out-{alias}"));
         std::fs::create_dir(&out).unwrap();
         let child = fake_child(&out, &out, 0);
+        let script = std::fs::read_to_string(&child).unwrap();
+        std::fs::write(&child, script.replace("${FAKE_SLEEP:-0}", "0.5")).unwrap();
         handles.push(std::thread::spawn(move || {
             let store = AuthStore::file_only(paths.clone());
             let mut req = request(alias, &child);
@@ -447,9 +485,11 @@ fn concurrent_runs_on_two_aliases_stay_isolated() {
                 self_identity(),
             )
             .unwrap();
-            run(&paths, prepared, &req).unwrap();
+            run(&paths, &store, prepared, &req).unwrap();
             let token = std::fs::read(out.join("token")).unwrap();
             let dir = std::fs::read_to_string(out.join("config_dir")).unwrap();
+            let extra = std::fs::read_to_string(out.join("extra_fds")).unwrap();
+            assert_eq!(extra, "", "{alias} inherited another descriptor");
             (alias, token == format!("a-{alias}").into_bytes(), dir)
         }));
     }
@@ -468,6 +508,8 @@ fn parses_durations() {
     assert_eq!(parse_duration("45").unwrap(), Duration::from_secs(45));
     assert!(parse_duration("5d").is_err());
     assert!(parse_duration("abc").is_err());
+    assert!(parse_duration("4611686018427387904m").is_err());
+    assert!(parse_duration("5124095576030432h").is_err());
 }
 
 /// Accepts `ok_writes` records, then fails every write.
@@ -496,6 +538,7 @@ impl std::io::Write for FailingSink {
 
 #[test]
 fn receipt_write_failure_fails_closed_before_and_after_spawn() {
+    let _guard = run_guard();
     for (ok_writes, child_may_start) in [(0, false), (1, true)] {
         let (home, paths, store) = setup();
         save(
@@ -517,11 +560,11 @@ fn receipt_write_failure_fails_closed_before_and_after_spawn() {
         )
         .unwrap();
         let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let receipt = Receipt::from_writer(Box::new(FailingSink {
+        let receipt: Box<dyn std::io::Write> = Box::new(FailingSink {
             ok_writes,
             written: written.clone(),
-        }));
-        let error = run_with_receipt(&paths, prepared, &req, receipt).unwrap_err();
+        });
+        let error = run_with_writer(&paths, &store, prepared, &req, receipt).unwrap_err();
         assert!(matches!(error, ExecError::Receipt(_)), "{error}");
         let attempted = String::from_utf8(written.lock().unwrap().clone()).unwrap();
         let spawned = attempted.contains("\"started\"");
@@ -530,10 +573,362 @@ fn receipt_write_failure_fails_closed_before_and_after_spawn() {
             "a failed prepared record must stop the spawn"
         );
         if child_may_start {
-            assert!(
-                !attempted.contains("\"exited\""),
-                "a failed started record stops the run"
-            );
+            // A failed started record kills the child, and the run still
+            // attempts a truthful terminal record for the PID it started.
+            let exited = attempted
+                .lines()
+                .find(|line| line.contains("\"exited\""))
+                .expect("a terminal record is attempted for a started child");
+            let exited: serde_json::Value = serde_json::from_str(exited).unwrap();
+            assert_eq!(exited["signal"], 9, "the child is killed");
+            assert!(exited["pid"].as_u64().is_some());
         }
     }
+}
+
+fn work_setup() -> (
+    tempfile::TempDir,
+    Paths,
+    AuthStore,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let (home, paths, store) = setup();
+    save(
+        &paths,
+        "work",
+        "uuid-work",
+        &creds("a-work", "r-work", 2 * HOUR_MS),
+    );
+    let out = home.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let child = fake_child(home.path(), &out, 0);
+    (home, paths, store, out, child)
+}
+
+#[test]
+fn an_executable_replaced_after_verification_is_refused() {
+    let _guard = run_guard();
+    let (_home, paths, store, out, child) = work_setup();
+    let req = request("work", &child);
+    let prepared = prepare(
+        &paths,
+        &store,
+        &req,
+        &ok_identity("uuid-work"),
+        self_identity(),
+    )
+    .unwrap();
+    let script = std::fs::read_to_string(&child).unwrap();
+    std::fs::write(&child, format!("{script}\n# replaced\n")).unwrap();
+    let error = run(&paths, &store, prepared, &req).unwrap_err();
+    assert!(matches!(error, ExecError::Pin(_)), "{error}");
+    assert!(
+        !out.join("token").exists(),
+        "no child may run replaced bytes"
+    );
+}
+
+#[test]
+fn ownership_is_rechecked_right_before_the_spawn() {
+    let _guard = run_guard();
+    let (home, paths, store, out, child) = work_setup();
+    let mut req = request("work", &child);
+    req.receipt = Some(home.path().join("receipt.jsonl"));
+    let prepared = prepare(
+        &paths,
+        &store,
+        &req,
+        &ok_identity("uuid-work"),
+        self_identity(),
+    )
+    .unwrap();
+    claudectl::profile::set_active_from(&paths, "work").unwrap();
+    let error = run(&paths, &store, prepared, &req).unwrap_err();
+    assert!(matches!(error, ExecError::Refused(_)), "{error}");
+    assert!(
+        !out.join("token").exists(),
+        "no child for a profile that became active"
+    );
+    let receipt = std::fs::read_to_string(home.path().join("receipt.jsonl")).unwrap();
+    assert!(receipt.contains("\"refused\""), "the refusal is recorded");
+    assert!(!receipt.contains("\"started\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_terminate_signal_stops_the_child_and_cleans_up() {
+    let _guard = run_guard();
+    let (_home, paths, store, out, child) = work_setup();
+    let script = std::fs::read_to_string(&child).unwrap();
+    std::fs::write(&child, script.replace("${FAKE_SLEEP:-0}", "30")).unwrap();
+    let req = request("work", &child);
+    let prepared = prepare(
+        &paths,
+        &store,
+        &req,
+        &ok_identity("uuid-work"),
+        self_identity(),
+    )
+    .unwrap();
+    let runner = {
+        let paths = paths.clone();
+        std::thread::spawn(move || {
+            let store = AuthStore::file_only(paths.clone());
+            run(&paths, &store, prepared, &req)
+        })
+    };
+    let started = std::time::Instant::now();
+    while !out.join("extra_fds").exists() || std::fs::read_to_string(out.join("args")).is_err() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "child did not start"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    // Deliver SIGTERM to the runner thread only, so other test threads are
+    // not interrupted. The CLI is single-threaded; there SIGTERM hits run().
+    {
+        use std::os::unix::thread::JoinHandleExt;
+        // SAFETY: the runner thread is alive and has the handler installed.
+        unsafe { libc::pthread_kill(runner.as_pthread_t() as libc::pthread_t, libc::SIGTERM) };
+    }
+    let code = runner.join().unwrap().unwrap();
+    assert_eq!(code, 128 + libc::SIGTERM, "the child was terminated");
+    assert!(started.elapsed() < Duration::from_secs(20));
+    let config_dir = std::fs::read_to_string(out.join("config_dir")).unwrap();
+    assert!(!std::path::Path::new(&config_dir).exists(), "cleanup ran");
+}
+
+/// A child script with a custom body, written to `dir/name`.
+fn script_child(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+    let script = dir.join(name);
+    std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    script
+}
+
+#[test]
+fn a_saved_identity_change_after_prepare_is_refused() {
+    let _guard = run_guard();
+    let (home, paths, store, out, child) = work_setup();
+    let mut req = request("work", &child);
+    req.receipt = Some(home.path().join("receipt.jsonl"));
+    let prepared = prepare(
+        &paths,
+        &store,
+        &req,
+        &ok_identity("uuid-work"),
+        self_identity(),
+    )
+    .unwrap();
+    let account = paths.profiles_dir().join("work").join("account.json");
+    let meta = std::fs::read_to_string(&account).unwrap();
+    std::fs::write(&account, meta.replace("uuid-work", "uuid-intruder")).unwrap();
+    let error = run(&paths, &store, prepared, &req).unwrap_err();
+    assert!(matches!(error, ExecError::Identity(_)), "{error}");
+    assert!(
+        !out.join("token").exists(),
+        "no child after an identity change"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_cancel_while_waiting_for_the_final_lock_starts_no_child() {
+    let _guard = run_guard();
+    let (home, paths, store, out, child) = work_setup();
+    let mut req = request("work", &child);
+    req.receipt = Some(home.path().join("receipt.jsonl"));
+    let prepared = prepare(
+        &paths,
+        &store,
+        &req,
+        &ok_identity("uuid-work"),
+        self_identity(),
+    )
+    .unwrap();
+    let held = store.lock_auth_state().unwrap();
+    let runner = {
+        let paths = paths.clone();
+        std::thread::spawn(move || {
+            let store = AuthStore::file_only(paths.clone());
+            run(&paths, &store, prepared, &req)
+        })
+    };
+    let receipt = home.path().join("receipt.jsonl");
+    let started = std::time::Instant::now();
+    while !std::fs::read_to_string(&receipt)
+        .unwrap_or_default()
+        .contains("\"prepared\"")
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "run never prepared"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    {
+        use std::os::unix::thread::JoinHandleExt;
+        // SAFETY: the runner thread is alive and waits for the auth lock.
+        unsafe { libc::pthread_kill(runner.as_pthread_t() as libc::pthread_t, libc::SIGTERM) };
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    drop(held);
+    let error = runner.join().unwrap().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cancelled before the child started"),
+        "{error}"
+    );
+    assert!(
+        !out.join("token").exists(),
+        "no child may start after a cancel"
+    );
+    let text = std::fs::read_to_string(&receipt).unwrap();
+    assert!(text.contains("\"refused\"") && !text.contains("\"started\""));
+}
+
+fn process_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn wait_dead(pid: i32) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        if !process_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+#[cfg(unix)]
+#[test]
+fn descendants_are_stopped_when_the_child_exits() {
+    let _guard = run_guard();
+    let (home, paths, store, out, _child) = work_setup();
+    let child = script_child(
+        home.path(),
+        "spawner",
+        &format!("sleep 30 &\necho $! > '{}/bg_pid'\nexit 0", out.display()),
+    );
+    let req = request("work", &child);
+    let prepared = prepare(
+        &paths,
+        &store,
+        &req,
+        &ok_identity("uuid-work"),
+        self_identity(),
+    )
+    .unwrap();
+    let code = run(&paths, &store, prepared, &req).unwrap();
+    assert_eq!(code, 0);
+    let bg: i32 = std::fs::read_to_string(out.join("bg_pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(wait_dead(bg), "a background descendant survived the run");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_terminate_signal_also_stops_descendants() {
+    let _guard = run_guard();
+    let (home, paths, store, out, _child) = work_setup();
+    let child = script_child(
+        home.path(),
+        "spawner",
+        &format!(
+            "sleep 30 &\necho $! > '{o}/bg_pid'\n: > '{o}/ready'\nsleep 30",
+            o = out.display()
+        ),
+    );
+    let req = request("work", &child);
+    let prepared = prepare(
+        &paths,
+        &store,
+        &req,
+        &ok_identity("uuid-work"),
+        self_identity(),
+    )
+    .unwrap();
+    let runner = {
+        let paths = paths.clone();
+        std::thread::spawn(move || {
+            let store = AuthStore::file_only(paths.clone());
+            run(&paths, &store, prepared, &req)
+        })
+    };
+    let started = std::time::Instant::now();
+    while !out.join("ready").exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "child did not start"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    {
+        use std::os::unix::thread::JoinHandleExt;
+        // SAFETY: the runner thread is alive and has the handler installed.
+        unsafe { libc::pthread_kill(runner.as_pthread_t() as libc::pthread_t, libc::SIGTERM) };
+    }
+    let code = runner.join().unwrap().unwrap();
+    assert_eq!(code, 128 + libc::SIGTERM);
+    let bg: i32 = std::fs::read_to_string(out.join("bg_pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(wait_dead(bg), "a background descendant survived the cancel");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_config_dir_that_cannot_be_removed_is_an_error() {
+    let _guard = run_guard();
+    let (home, paths, store, out, _child) = work_setup();
+    let child = script_child(
+        home.path(),
+        "locker",
+        &format!(
+            "mkdir \"$CLAUDE_CONFIG_DIR/locked\" && : > \"$CLAUDE_CONFIG_DIR/locked/f\" && chmod 000 \"$CLAUDE_CONFIG_DIR/locked\"\nprintf '%s' \"$CLAUDE_CONFIG_DIR\" > '{}/config_dir'\nexit 0",
+            out.display()
+        ),
+    );
+    let mut req = request("work", &child);
+    req.receipt = Some(home.path().join("receipt.jsonl"));
+    let prepared = prepare(
+        &paths,
+        &store,
+        &req,
+        &ok_identity("uuid-work"),
+        self_identity(),
+    )
+    .unwrap();
+    let error = run(&paths, &store, prepared, &req).unwrap_err();
+    let config_dir =
+        std::path::PathBuf::from(std::fs::read_to_string(out.join("config_dir")).unwrap());
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            config_dir.join("locked"),
+            std::fs::Permissions::from_mode(0o700),
+        );
+    }
+    assert!(matches!(error, ExecError::Cleanup(_)), "{error}");
+    assert_eq!(error.exit_code(), 8);
+    assert!(error.to_string().contains("exited with 0"), "{error}");
+    let text = std::fs::read_to_string(home.path().join("receipt.jsonl")).unwrap();
+    assert!(text.contains("\"exited\"") && text.contains("\"cleanup_failed\""));
 }

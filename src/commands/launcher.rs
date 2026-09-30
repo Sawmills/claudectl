@@ -30,14 +30,22 @@ pub fn run(alias: &str, claude: &Path, out: &Path, min_valid: Duration) -> Resul
     let me = SelfIdentity::current().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let script = render(alias, &account, &claude, &claude_sha, &me, min_valid)?;
-    let tmp = out.with_extension("tmp");
-    std::fs::write(&tmp, script).with_context(|| format!("failed to write {}", tmp.display()))?;
+    let dir = match out.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".claudectl-launcher-")
+        .tempfile_in(dir)
+        .with_context(|| format!("failed to create a temporary file in {}", dir.display()))?;
+    std::io::Write::write_all(&mut tmp, script.as_bytes())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))?;
     }
-    std::fs::rename(&tmp, out).with_context(|| format!("failed to write {}", out.display()))?;
+    tmp.persist(out)
+        .with_context(|| format!("failed to write {}", out.display()))?;
     println!("{}", out.display());
     Ok(())
 }
