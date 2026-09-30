@@ -111,7 +111,6 @@ fn request(alias: &str, program: &Path) -> ExecRequest {
         receipt: None,
         program: program.as_os_str().to_owned(),
         args: vec!["-p".into(), "hello".into()],
-        terminal: Some(false),
     }
 }
 
@@ -219,8 +218,12 @@ fn refuses_a_token_that_expires_before_min_valid() {
     assert!(matches!(error, ExecError::Refused(_)), "{error}");
     assert!(error.to_string().contains("30 min required"));
     assert!(
-        error.to_string().contains("claudectl login work"),
+        error.to_string().contains("claudectl status work"),
         "{error}"
+    );
+    assert!(
+        error.to_string().contains("claudectl use <previous>"),
+        "login activates the profile, so the message says how to switch back: {error}"
     );
 }
 
@@ -980,7 +983,7 @@ fn a_descendant_that_ignores_sigterm_is_killed_before_the_run_returns() {
 
 #[cfg(unix)]
 #[test]
-fn a_terminal_run_does_not_deliver_a_terminal_interrupt_twice() {
+fn an_interrupt_sent_to_claudectl_reaches_the_child_once() {
     let _guard = run_guard();
     let (home, paths, store, out, _child) = work_setup();
     let child = script_child(
@@ -991,9 +994,7 @@ fn a_terminal_run_does_not_deliver_a_terminal_interrupt_twice() {
             o = out.display()
         ),
     );
-    let mut req = request("work", &child);
-    req.terminal = Some(true);
-    req.receipt = Some(home.path().join("receipt.jsonl"));
+    let req = request("work", &child);
     let prepared = prepare(
         &paths,
         &store,
@@ -1017,41 +1018,18 @@ fn a_terminal_run_does_not_deliver_a_terminal_interrupt_twice() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    let text = std::fs::read_to_string(home.path().join("receipt.jsonl")).unwrap();
-    let started_record: serde_json::Value =
-        serde_json::from_str(text.lines().find(|l| l.contains("\"started\"")).unwrap()).unwrap();
-    let child_pid = started_record["pid"].as_i64().unwrap() as i32;
-    // A terminal Ctrl-C reaches both processes of the foreground group. Deliver
-    // the child's copy first and let it handle it, so a forwarded duplicate
-    // shows up as a second handler run instead of merging with the first.
-    // SAFETY: the child is alive.
-    unsafe { libc::kill(child_pid, libc::SIGINT) };
-    let waited = std::time::Instant::now();
-    while std::fs::read_to_string(out.join("ints"))
-        .unwrap_or_default()
-        .lines()
-        .count()
-        < 1
-    {
-        assert!(
-            waited.elapsed() < Duration::from_secs(5),
-            "child never handled SIGINT"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
     {
         use std::os::unix::thread::JoinHandleExt;
         // SAFETY: the runner thread is alive and has the handler installed.
         unsafe { libc::pthread_kill(runner.as_pthread_t() as libc::pthread_t, libc::SIGINT) };
     }
-    std::thread::sleep(Duration::from_millis(500));
     let code = runner.join().unwrap().unwrap();
-    assert_eq!(code, 0);
+    assert_eq!(code, 0, "the child handled the interrupt and finished");
     let ints = std::fs::read_to_string(out.join("ints")).unwrap_or_default();
     assert_eq!(
         ints.lines().count(),
         1,
-        "the child saw one interrupt, not two"
+        "the child saw the interrupt exactly once"
     );
 }
 

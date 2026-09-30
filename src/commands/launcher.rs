@@ -29,7 +29,11 @@ pub fn run(alias: &str, claude: &Path, out: &Path, min_valid: Duration) -> Resul
     let claude_sha = sha256_file(&claude).map_err(|e| anyhow::anyhow!("{e}"))?;
     let me = SelfIdentity::current().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let script = render(alias, &account, &claude, &claude_sha, &me, min_valid)?;
+    // Keep a private copy of this claudectl next to the launcher. The launcher
+    // checks and runs that copy, so a later replacement of the installed
+    // claudectl can neither slip in unchecked nor break the launcher.
+    let pinned = pinned_copy(&me, out)?;
+    let script = render(alias, &account, &claude, &claude_sha, &pinned, min_valid)?;
     let dir = match out.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -48,6 +52,44 @@ pub fn run(alias: &str, claude: &Path, out: &Path, min_valid: Duration) -> Resul
         .with_context(|| format!("failed to write {}", out.display()))?;
     println!("{}", out.display());
     Ok(())
+}
+
+fn pinned_copy(me: &SelfIdentity, out: &Path) -> Result<SelfIdentity> {
+    let mut name = out
+        .file_name()
+        .context("launcher path has no file name")?
+        .to_os_string();
+    name.push(".claudectl");
+    let dir = out.with_file_name(name);
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let path = dir.join(format!("claudectl-{}", &me.sha256[..16]));
+    if !path.exists() {
+        let tmp = dir.join(format!(".claudectl-{}", std::process::id()));
+        std::fs::copy(&me.path, &tmp)
+            .with_context(|| format!("failed to copy {}", me.path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o500))?;
+        }
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    let sha256 = sha256_file(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if sha256 != me.sha256 {
+        bail!("{} does not match the running claudectl", path.display());
+    }
+    let path = path.canonicalize()?;
+    Ok(SelfIdentity {
+        path,
+        sha256,
+        version: me.version.clone(),
+    })
 }
 
 fn quoted(value: &str) -> Result<String> {
@@ -137,5 +179,52 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn launcher_runs_a_private_pinned_copy_of_claudectl() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("claudectl");
+        std::fs::write(&installed, b"claudectl bytes v1").unwrap();
+        let me = SelfIdentity {
+            path: installed.clone(),
+            sha256: sha256_file(&installed).unwrap(),
+            version: "0.1.5".into(),
+        };
+        let out = dir.path().join("claude-work");
+        let pinned = pinned_copy(&me, &out).unwrap();
+        assert!(
+            pinned.path.starts_with(
+                dir.path()
+                    .join("claude-work.claudectl")
+                    .canonicalize()
+                    .unwrap()
+            )
+        );
+        assert_eq!(pinned.sha256, me.sha256);
+        // A later upgrade of the installed binary does not change the copy.
+        std::fs::write(&installed, b"claudectl bytes v2").unwrap();
+        assert_eq!(sha256_file(&pinned.path).unwrap(), me.sha256);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&pinned.path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o500);
+        }
+        let script = render(
+            "work",
+            "uuid-work",
+            Path::new("/opt/claude"),
+            "b",
+            &pinned,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(script.contains(&pinned.path.display().to_string()));
+        assert!(!script.contains(&format!("CLAUDECTL='{}'", installed.display())));
     }
 }

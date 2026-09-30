@@ -10,7 +10,7 @@
 //! refuses a token that expires before `min_valid` runs out.
 
 use std::ffi::OsString;
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -45,11 +45,6 @@ pub struct ExecRequest {
     pub receipt: Option<PathBuf>,
     pub program: OsString,
     pub args: Vec<OsString>,
-    /// Whether the run is attached to a terminal. `None` detects it from
-    /// stdin. A terminal run shares the terminal's process group, so
-    /// terminal-generated signals already reach the child and are not
-    /// forwarded again.
-    pub terminal: Option<bool>,
 }
 
 /// Account lookup for the identity check. Production uses the OAuth profile
@@ -284,7 +279,7 @@ fn check_ownership(
     }
     if remaining_ms < needed_ms {
         return Err(ExecError::Refused(format!(
-            "'{alias}' token is valid for {} min, {} min required. claudectl refreshes a saved token only after it expires; run `claudectl login {alias}` for a fresh token, or retry after it expires and run `claudectl status {alias}`",
+            "'{alias}' token is valid for {} min, {} min required. claudectl refreshes a saved token only after it expires: retry after that and run `claudectl status {alias}`. `claudectl login {alias}` also gives a fresh token, but it makes '{alias}' the active profile, so switch back with `claudectl use <previous>` before running exec",
             remaining_ms / 60_000,
             needed_ms / 60_000
         )));
@@ -401,19 +396,13 @@ fn run_in_dir(
     command.env(TOKEN_FD_ENV, CHILD_TOKEN_FD.to_string());
     map_token_fd(&mut command, &reader);
 
-    // A non-terminal run gets its own process group, so cancellation and
-    // teardown reach the child's descendants. A terminal run keeps the
-    // terminal's group so the child can read the terminal; job control then
-    // covers its descendants.
-    let terminal = req
-        .terminal
-        .unwrap_or_else(|| std::io::stdin().is_terminal());
-    let group = !terminal;
-    if group {
-        set_process_group(&mut command);
-    }
+    // The child gets its own process group, so cancellation and teardown
+    // reach its descendants and every signal reaches it exactly once, through
+    // claudectl. `exec` is for non-interactive runs; a child in a background
+    // group that reads the terminal is stopped by the terminal driver.
+    set_process_group(&mut command);
 
-    signals::install(group);
+    signals::install();
     let spawned = {
         // Hold the lock from the final ownership check through the spawn, so
         // no `use` can make this grant live in between.
@@ -470,7 +459,7 @@ fn run_in_dir(
     // are still recorded below.
     let cancelled = signals::pending();
     if cancelled {
-        terminate(pid, group, SIGTERM);
+        terminate(pid, SIGTERM);
     }
     let started = receipt.write(&with(
         base,
@@ -478,27 +467,21 @@ fn run_in_dir(
         serde_json::json!({ "pid": pid, "cancelled_at_start": cancelled }),
     ));
     if started.is_err() {
-        terminate(pid, group, SIGKILL);
+        terminate(pid, SIGKILL);
     }
-    // Wait for the exit without reaping: while the child is an unreaped
-    // zombie, its PID stays reserved, so signalling its process group
-    // cannot reach an unrelated process.
+    // Wait for the exit without reaping. While the child is an unreaped
+    // zombie its PID stays reserved, so every signal to its process group,
+    // through the final SIGKILL, can only reach this run's processes.
     let waited = wait_exit_no_reap(pid);
-    let teardown = if group {
-        Some(teardown_group_begin(pid))
+    let descendants = if waited.is_ok() {
+        teardown_group(pid)
     } else {
-        None
+        Descendants::Unknown
     };
     let status = child.wait();
     signals::reset();
     waited.map_err(|e| ExecError::Spawn(format!("cannot wait for child {pid}: {e}")))?;
     let status = status.map_err(|e| ExecError::Spawn(format!("cannot reap child {pid}: {e}")))?;
-    // After the reap, the group exists only while descendants remain in it,
-    // and a PID that is still a group id cannot be reused.
-    let descendants = match teardown {
-        Some(signalled) => teardown_group_finish(pid, signalled),
-        None => Descendants::NotManaged,
-    };
     let code = exit_code_of(&status);
     let exited = receipt.write(&with(
         base,
@@ -512,7 +495,7 @@ fn run_in_dir(
     ));
     started?;
     exited?;
-    if let Descendants::Survived = descendants {
+    if matches!(descendants, Descendants::Survived | Descendants::Unknown) {
         return Err(ExecError::Cleanup(format!(
             "child {pid} exited with {code}, but its descendants survived SIGKILL"
         )));
@@ -521,74 +504,113 @@ fn run_in_dir(
 }
 
 enum Descendants {
-    NotManaged,
     None,
     Terminated,
     Killed,
     Survived,
+    Unknown,
 }
 
 impl Descendants {
     fn as_str(&self) -> &'static str {
         match self {
-            Descendants::NotManaged => "not_managed",
             Descendants::None => "none",
             Descendants::Terminated => "terminated",
             Descendants::Killed => "killed",
             Descendants::Survived => "survived",
+            Descendants::Unknown => "unknown",
         }
     }
 }
 
-/// Send SIGTERM to the group while the leader is still unreaped. Returns
-/// whether any other process received it.
-fn teardown_group_begin(pid: u32) -> bool {
-    terminate(pid, true, SIGTERM)
-}
-
-/// Bounded TERM-to-KILL teardown after the leader is reaped.
-fn teardown_group_finish(pid: u32, signalled: bool) -> Descendants {
-    if !group_alive(pid) {
-        return if signalled {
-            Descendants::Terminated
-        } else {
-            Descendants::None
-        };
+/// Bounded TERM-to-KILL teardown of the child's process group. The caller
+/// keeps the leader unreaped for the whole call.
+fn teardown_group(leader: u32) -> Descendants {
+    let Ok(members) = descendants_in_group(leader) else {
+        return Descendants::Unknown;
+    };
+    if members.is_empty() {
+        return Descendants::None;
     }
-    if wait_group_gone(pid, Duration::from_secs(2)) {
+    terminate(leader, SIGTERM);
+    if wait_descendants_gone(leader, Duration::from_secs(2)) {
         return Descendants::Terminated;
     }
-    terminate(pid, true, SIGKILL);
-    if wait_group_gone(pid, Duration::from_secs(2)) {
+    terminate(leader, SIGKILL);
+    if wait_descendants_gone(leader, Duration::from_secs(2)) {
         Descendants::Killed
     } else {
         Descendants::Survived
     }
 }
 
-fn wait_group_gone(pid: u32, limit: Duration) -> bool {
+fn wait_descendants_gone(leader: u32, limit: Duration) -> bool {
     let started = std::time::Instant::now();
-    while started.elapsed() < limit {
-        if !group_alive(pid) {
-            return true;
+    loop {
+        match descendants_in_group(leader) {
+            Ok(members) if members.is_empty() => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+        if started.elapsed() >= limit {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    !group_alive(pid)
 }
 
-#[cfg(unix)]
-fn group_alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: signal 0 only checks that the group has a member.
-    unsafe { libc::kill(-pid, 0) == 0 }
+/// Live processes in the group led by `leader`, excluding the leader itself
+/// (an unreaped zombie at this point).
+#[cfg(target_os = "macos")]
+fn descendants_in_group(leader: u32) -> std::io::Result<Vec<i32>> {
+    // From <sys/proc_info.h>.
+    const PROC_PGRP_ONLY: u32 = 2;
+    let mut pids = vec![0i32; 4096];
+    let size = i32::try_from(pids.len() * std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
+    // SAFETY: the buffer is valid for `size` bytes.
+    let bytes =
+        unsafe { libc::proc_listpids(PROC_PGRP_ONLY, leader, pids.as_mut_ptr().cast(), size) };
+    if bytes < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let count = usize::try_from(bytes).unwrap_or(0) / std::mem::size_of::<i32>();
+    let leader = i32::try_from(leader).unwrap_or(0);
+    Ok(pids[..count]
+        .iter()
+        .copied()
+        .filter(|&pid| pid > 0 && pid != leader)
+        .collect())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn descendants_in_group(leader: u32) -> std::io::Result<Vec<i32>> {
+    let mut members = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        if u32::try_from(pid).ok() == Some(leader) {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // Fields after the ")" of the command name: state ppid pgrp ...
+        let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if fields.len() > 2 && fields[0] != "Z" && fields[2].parse::<u32>().ok() == Some(leader) {
+            members.push(pid);
+        }
+    }
+    Ok(members)
 }
 
 #[cfg(not(unix))]
-fn group_alive(_pid: u32) -> bool {
-    false
+fn descendants_in_group(_leader: u32) -> std::io::Result<Vec<i32>> {
+    Ok(Vec::new())
 }
 
 #[cfg(unix)]
@@ -629,20 +651,19 @@ const SIGTERM: i32 = 15;
 #[cfg(not(unix))]
 const SIGKILL: i32 = 9;
 
-/// Signal the child, or its whole process group. Returns whether any process
+/// Signal the child's whole process group. Returns whether any process
 /// received the signal.
 #[cfg(unix)]
-fn terminate(pid: u32, group: bool, signal: i32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
+fn terminate(leader: u32, signal: i32) -> bool {
+    let Ok(leader) = i32::try_from(leader) else {
         return false;
     };
-    let target = if group { -pid } else { pid };
     // SAFETY: kill only sends a signal.
-    unsafe { libc::kill(target, signal) == 0 }
+    unsafe { libc::kill(-leader, signal) == 0 }
 }
 
 #[cfg(not(unix))]
-fn terminate(_pid: u32, _group: bool, _signal: i32) -> bool {
+fn terminate(_leader: u32, _signal: i32) -> bool {
     false
 }
 
@@ -715,34 +736,22 @@ mod signals {
 
     static CHILD: AtomicI32 = AtomicI32::new(0);
     static PENDING: AtomicBool = AtomicBool::new(false);
-    static GROUP: AtomicBool = AtomicBool::new(false);
     const SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
 
     extern "C" fn forward(signal: libc::c_int) {
         // Record every signal, so a signal that races `watch` is not lost.
         PENDING.store(true, Ordering::SeqCst);
-        let group = GROUP.load(Ordering::SeqCst);
-        // In a terminal run the child shares the terminal's foreground group,
-        // so the terminal already delivered SIGINT and SIGHUP to it.
-        if !group && (signal == libc::SIGINT || signal == libc::SIGHUP) {
-            return;
-        }
         let pid = CHILD.load(Ordering::SeqCst);
         if pid > 0 {
-            let target = if GROUP.load(Ordering::SeqCst) {
-                -pid
-            } else {
-                pid
-            };
-            // SAFETY: kill is async-signal-safe.
-            unsafe { libc::kill(target, signal) };
+            // SAFETY: kill is async-signal-safe. The child leads its own
+            // process group, so this reaches its descendants too.
+            unsafe { libc::kill(-pid, signal) };
         }
     }
 
-    pub fn install(group: bool) {
+    pub fn install() {
         CHILD.store(0, Ordering::SeqCst);
         PENDING.store(false, Ordering::SeqCst);
-        GROUP.store(group, Ordering::SeqCst);
         for signal in SIGNALS {
             // SAFETY: installs a handler that only uses async-signal-safe
             // calls. SA_RESTART keeps interrupted system calls in other
@@ -776,7 +785,7 @@ mod signals {
 
 #[cfg(not(unix))]
 mod signals {
-    pub fn install(_group: bool) {}
+    pub fn install() {}
     pub fn watch(_pid: u32) {}
     pub fn pending() -> bool {
         false

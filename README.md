@@ -176,18 +176,23 @@ claudectl launcher --profile amir+2@example.com --claude "$(command -v claude)" 
 `exec` runs one command on a saved profile and leaves the live login alone.
 The child gets the saved access token through an inherited pipe
 (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`) and a fresh private
-`CLAUDE_CONFIG_DIR` that is removed when the run ends. Without a terminal, the
-child runs in its own process group: `SIGTERM`, `SIGINT` and `SIGHUP` reach the
-whole group, and descendants left after the child exits get `SIGTERM`, then
-`SIGKILL`. At a terminal the child keeps the terminal's process group, so
-Ctrl-C reaches it once, directly. The Keychain entry,
+`CLAUDE_CONFIG_DIR` that is removed when the run ends. The child runs
+in its own process group: `SIGTERM`, `SIGINT` and `SIGHUP` sent to claudectl
+reach the whole group once, and descendants left after the child exits get
+`SIGTERM`, then `SIGKILL`.
+
+`exec` is for non-interactive runs such as `claude -p`. A child that reads the
+terminal is stopped by the terminal driver, because it runs in a background
+process group. `exec` runs a private copy of the executable, so use it for a
+single-file program such as the Claude Code native binary; a program that loads
+files next to its own path does not find them. The Keychain entry,
 `~/.claude/.credentials.json`, `~/.claude.json` and the active marker are not
 written.
 
 `exec` never refreshes a token. It refuses, and starts no child, when:
 
 - the profile is the active profile, or shares its refresh grant with the live login (exit 5);
-- the token has expired (run `claudectl status <alias>` to refresh it), or expires within `--min-valid` (default `30m`). claudectl refreshes a saved token only after it expires, so for a near-expiry token run `claudectl login <alias>` (exit 5);
+- the token has expired (run `claudectl status <alias>` to refresh it), or expires within `--min-valid` (default `30m`). claudectl refreshes a saved token only after it expires, so retry after it expires and run `claudectl status <alias>`. `claudectl login <alias>` also gives a fresh token, but it makes that profile active; switch back with `claudectl use` before running `exec` (exit 5);
 - the token's account differs from the saved `accountUuid` or `--expect-account` (exit 3);
 - the executable's SHA-256 differs from `--expect-sha256` (exit 4);
 - a receipt record cannot be written (exit 6).
@@ -201,8 +206,9 @@ exit code, signal and descendant teardown result), or `refused`,
 and the claudectl path, SHA-256 and version. Receipts never contain tokens.
 
 `launcher` writes a script for tools that take a `--claude-bin` path. The script
-pins the profile's account, the executable's SHA-256 and this claudectl binary's
-SHA-256, and refuses to run if any of them changes.
+pins the profile's account and the executable's SHA-256. It also keeps a private
+copy of claudectl in `<launcher>.claudectl/`, checks that copy's SHA-256 and runs
+it, so a later claudectl upgrade does not change what the launcher runs.
 
 ### Housekeeping
 
