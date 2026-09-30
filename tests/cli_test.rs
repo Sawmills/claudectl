@@ -222,3 +222,45 @@ fn status_default_explains_login_without_token_columns() {
     assert!(!text.contains("Token expiry"), "{text}");
     assert!(!text.contains("Usage fetch"), "{text}");
 }
+
+#[test]
+fn exec_refuses_the_active_profile_before_any_network_or_child() {
+    let home = tempfile::tempdir().unwrap();
+    let profile = home.path().join(".claudectl/profiles/work");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(
+        profile.join("account.json"),
+        r#"{"alias":"work","saved_at":"2026-09-30T00:00:00Z","oauth_account":{"accountUuid":"uuid-work"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        profile.join("credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"placeholder","refreshToken":"placeholder-r","expiresAt":99999999999999}}"#,
+    )
+    .unwrap();
+    std::fs::write(home.path().join(".claudectl/active"), "work").unwrap();
+    let marker = home.path().join("child-ran");
+    let output = Command::cargo_bin("claudectl")
+        .unwrap()
+        .env("HOME", home.path())
+        .args(["exec", "--profile", "work", "--", "/usr/bin/touch"])
+        .arg(&marker)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("is the active profile"), "{stderr}");
+    assert!(!marker.exists(), "no child may run for the active profile");
+}
+
+#[test]
+fn exec_requires_a_command_after_the_separator() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("claudectl")
+        .unwrap()
+        .env("HOME", home.path())
+        .args(["exec", "--profile", "work"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+}
