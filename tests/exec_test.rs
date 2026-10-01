@@ -134,7 +134,7 @@ out='{out}'
 eval "cat <&$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" > "$out/token"
 printf '%s' "$CLAUDE_CONFIG_DIR" > "$out/config_dir"
 if [ -d "$CLAUDE_CONFIG_DIR" ]; then echo yes > "$out/config_exists"; fi
-env | grep -E '^(CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_OAUTH_REFRESH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY|ANTHROPIC_AWS|ANTHROPIC_GOOGLE_CLOUD|GATEWAY|MANTLE)|ANTHROPIC_(BASE_URL|API_HOST|ASSETS_HOST|CUSTOM_HEADERS)|ANTHROPIC_(AWS|BEDROCK|BEDROCK_MANTLE|FOUNDRY|GOOGLE_CLOUD|VERTEX)_BASE_URL)=' > "$out/leaked_env" || true
+env | cut -d= -f1 | grep -E '^(CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_OAUTH_REFRESH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY|ANTHROPIC_AWS|ANTHROPIC_GOOGLE_CLOUD|GATEWAY|MANTLE)|ANTHROPIC_(BASE_URL|API_HOST|ASSETS_HOST|CUSTOM_HEADERS)|ANTHROPIC_(AWS|BEDROCK|BEDROCK_MANTLE|FOUNDRY|GOOGLE_CLOUD|VERTEX)_BASE_URL)$' > "$out/leaked_env" || true
 if [ -n "${{FAKE_SELF_HUP:-}}" ]; then kill -HUP $$; echo survived > "$out/self_hup"; fi
 printf '%s ' "$@" > "$out/args"
 env | cut -d= -f1 > "$out/env_names"
@@ -418,7 +418,13 @@ fn runs_the_child_on_the_saved_profile_and_leaves_global_state_alone() {
         received == token.as_bytes(),
         "child did not receive the saved token"
     );
-    assert_eq!(std::fs::read_to_string(out.join("leaked_env")).unwrap(), "");
+    // Names only: a failure must never print a credential value.
+    let leaked = std::fs::read_to_string(out.join("leaked_env")).unwrap();
+    assert!(
+        leaked.is_empty(),
+        "child inherited {:?}",
+        leaked.lines().collect::<Vec<_>>()
+    );
     assert_eq!(
         std::fs::read_to_string(out.join("args")).unwrap(),
         "-p hello "
@@ -650,7 +656,13 @@ fn child_env_drops_credentials_provider_selectors_and_endpoint_overrides() {
     ]);
     let status = run_helper(home.path(), "one", &out, &env, false);
     assert!(status.success());
-    assert_eq!(std::fs::read_to_string(out.join("leaked_env")).unwrap(), "");
+    // Names only: a failure must never print a credential value.
+    let leaked = std::fs::read_to_string(out.join("leaked_env")).unwrap();
+    assert!(
+        leaked.is_empty(),
+        "child inherited {:?}",
+        leaked.lines().collect::<Vec<_>>()
+    );
     let names = std::fs::read_to_string(out.join("env_names")).unwrap();
     let leaked: Vec<&str> = names
         .lines()
@@ -660,9 +672,8 @@ fn child_env_drops_credentials_provider_selectors_and_endpoint_overrides() {
     for (name, _) in &env {
         assert!(!names.lines().any(|n| n == *name), "child inherited {name}");
     }
-    assert_eq!(
-        std::fs::read(out.join("token")).unwrap(),
-        b"a-one",
+    assert!(
+        std::fs::read(out.join("token")).unwrap() == b"a-one",
         "test setup: the child ran with the saved token"
     );
 }
@@ -752,6 +763,14 @@ fn settings_that_change_the_login_or_endpoint_are_refused() {
         r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}"#,
     );
     assert!(refused(&project, &managed).contains("CLAUDE_CODE_USE_BEDROCK"));
+
+    // A settings value applies inside the child, after exec sets its own.
+    write_settings(
+        &root.path().join("repo/.claude"),
+        "settings.json",
+        r#"{"env":{"CLAUDE_CONFIG_DIR":"/elsewhere"}}"#,
+    );
+    assert!(refused(&project, &managed).contains("CLAUDE_CONFIG_DIR"));
     std::fs::remove_file(root.path().join("repo/.claude/settings.json")).unwrap();
 
     write_settings(

@@ -145,7 +145,11 @@ pub fn check_settings(cwd: &Path, managed: &Path) -> Result<(), ExecError> {
             .and_then(|env| env.as_object())
             .into_iter()
             .flat_map(|env| env.keys())
-            .filter(|name| is_scrubbed_env(name))
+            // exec sets these two for the child itself; a settings value
+            // would replace them after the spawn.
+            .filter(|name| {
+                is_scrubbed_env(name) || *name == CONFIG_DIR_ENV || *name == TOKEN_FD_ENV
+            })
             .map(String::as_str)
             .chain(
                 SETTINGS_CREDENTIAL_KEYS
