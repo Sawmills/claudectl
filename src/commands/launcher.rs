@@ -20,7 +20,10 @@ pub fn run(alias: &str, claude: &Path, out: &Path, min_valid: Duration) -> Resul
             format!("'{alias}' has no saved accountUuid; run `claudectl login {alias}` again")
         })?
         .to_string();
-    if profile::get_active_from(&paths)?.as_deref() == Some(alias) {
+    if profile::get_active_from(&paths)?
+        .as_deref()
+        .is_some_and(|active| claudectl::exec::same_profile(&paths, active, alias))
+    {
         bail!("'{alias}' is the active profile; a launcher cannot pin it");
     }
     let claude = claude
@@ -120,7 +123,7 @@ if [ "$(sum "$CLAUDECTL" | cut -d' ' -f1)" != {me_sha} ]; then
   echo "claudectl launcher: $CLAUDECTL changed since this launcher was written; refusing" >&2
   exit 4
 fi
-exec "$CLAUDECTL" exec --profile {alias_q} --expect-account {account} --expect-sha256 {claude_sha} \
+exec "$CLAUDECTL" exec --profile={alias_q} --expect-account {account} --expect-sha256 {claude_sha} \
   --min-valid {min_valid}s ${{CLAUDECTL_RECEIPT:+--receipt "$CLAUDECTL_RECEIPT"}} -- {claude} "$@"
 "#,
         version = me.version,
@@ -154,7 +157,18 @@ mod tests {
             Duration::from_secs(1800),
         )
         .unwrap();
-        assert!(script.contains("--profile 'work' --expect-account 'uuid-work'"));
+        assert!(script.contains("--profile='work' --expect-account 'uuid-work'"));
+        // A leading hyphen stays a value: the alias is attached with '='.
+        let dashed = render(
+            "-work",
+            "uuid-work",
+            Path::new("/opt/claude"),
+            &"b".repeat(64),
+            &me,
+            Duration::from_secs(1800),
+        )
+        .unwrap();
+        assert!(dashed.contains("--profile='-work'"));
         assert!(script.contains(&format!("--expect-sha256 '{}'", "b".repeat(64))));
         assert!(script.contains(&format!("!= '{}'", "a".repeat(64))));
         assert!(script.contains("--min-valid 1800s"));

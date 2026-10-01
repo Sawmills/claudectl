@@ -35,6 +35,16 @@ const SCRUBBED_ENV: &[&str] = &[
     "CCR_OAUTH_TOKEN_FILE",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
+    // Provider selectors: with one of these set, Claude Code uses that
+    // provider's credentials instead of the saved account, so the identity
+    // check and the receipt would name the wrong account.
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_GATEWAY",
+    "CLAUDE_CODE_USE_MANTLE",
 ];
 
 pub struct ExecRequest {
@@ -116,6 +126,7 @@ pub struct Prepared {
     email: Option<String>,
     token: String,
     token_expires_at_ms: i64,
+    live_token: Option<String>,
     program: PathBuf,
     program_sha256: String,
     claudectl: SelfIdentity,
@@ -129,17 +140,185 @@ pub struct SelfIdentity {
 }
 
 impl SelfIdentity {
+    /// The running claudectl's path, SHA-256 and version. The hash must
+    /// describe the image that is executing, not a file that replaced it on
+    /// disk after start, so it fails closed when that cannot be shown.
     pub fn current() -> Result<Self, ExecError> {
         let path = std::env::current_exe()
             .and_then(|p| p.canonicalize())
             .map_err(|e| ExecError::Pin(format!("cannot resolve claudectl path: {e}")))?;
-        let sha256 = sha256_file(&path)?;
+        let bytes = running_image_bytes(&path)?;
         Ok(Self {
             path,
-            sha256,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
             version: env!("CARGO_PKG_VERSION").to_string(),
         })
     }
+}
+
+/// Linux: /proc/self/exe opens the executing image even after the path was
+/// replaced.
+#[cfg(target_os = "linux")]
+fn running_image_bytes(_path: &Path) -> Result<Vec<u8>, ExecError> {
+    std::fs::read("/proc/self/exe")
+        .map_err(|e| ExecError::Pin(format!("cannot read the running claudectl image: {e}")))
+}
+
+/// macOS: the path may now name a different file, so compare the file's
+/// build UUID with the UUID of the image loaded in memory.
+#[cfg(target_os = "macos")]
+fn running_image_bytes(path: &Path) -> Result<Vec<u8>, ExecError> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    // Open the path once, then prove that this exact file (device and inode)
+    // is the one the kernel mapped for the running image, and read the bytes
+    // from that same handle.
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| ExecError::Pin(format!("cannot open {}: {e}", path.display())))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| ExecError::Pin(format!("cannot stat {}: {e}", path.display())))?;
+    let (dev, ino) = mapped_image_identity()
+        .ok_or_else(|| ExecError::Pin("cannot read the running claudectl image identity".into()))?;
+    if u64::from(dev) != meta.dev() || ino != meta.ino() {
+        return Err(ExecError::Pin(format!(
+            "{} is not the running claudectl (it was replaced after start)",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| ExecError::Pin(format!("cannot read {}: {e}", path.display())))?;
+    let loaded = loaded_image_uuid()
+        .ok_or_else(|| ExecError::Pin("cannot read the running claudectl build UUID".into()))?;
+    match macho_uuid(&bytes) {
+        Some(file) if file == loaded => Ok(bytes),
+        Some(_) => Err(ExecError::Pin(format!(
+            "{} is not the running claudectl (it was replaced after start)",
+            path.display()
+        ))),
+        None => Err(ExecError::Pin(format!(
+            "cannot read a build UUID from {}",
+            path.display()
+        ))),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn running_image_bytes(_path: &Path) -> Result<Vec<u8>, ExecError> {
+    Err(ExecError::Pin(
+        "cannot bind the claudectl hash to the running image on this platform".into(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    /// dyld's header of loaded image `image_index`; 0 is the main executable.
+    fn _dyld_get_image_header(image_index: u32) -> *const std::ffi::c_void;
+}
+
+/// `struct proc_regioninfo` from <sys/proc_info.h>.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcRegionInfo {
+    protection: u32,
+    max_protection: u32,
+    inheritance: u32,
+    flags: u32,
+    offset: u64,
+    behavior: u32,
+    user_wired_count: u32,
+    user_tag: u32,
+    pages_resident: u32,
+    pages_shared_now_private: u32,
+    pages_swapped_out: u32,
+    pages_dirtied: u32,
+    ref_count: u32,
+    shadow_depth: u32,
+    share_mode: u32,
+    private_pages_resident: u32,
+    shared_pages_resident: u32,
+    obj_id: u32,
+    depth: u32,
+    address: u64,
+    size: u64,
+}
+
+/// `struct proc_regionwithpathinfo` from <sys/proc_info.h>.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcRegionWithPathInfo {
+    region: ProcRegionInfo,
+    vnode: libc::vnode_info_path,
+}
+
+/// Device and inode of the file the kernel mapped for this code: the
+/// running image, whatever its path names now.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub fn mapped_image_identity() -> Option<(u32, u64)> {
+    const PROC_PIDREGIONPATHINFO: libc::c_int = 8;
+    let address = mapped_image_identity as *const () as usize as u64;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
+    unsafe {
+        let mut info: ProcRegionWithPathInfo = std::mem::zeroed();
+        let size = std::mem::size_of::<ProcRegionWithPathInfo>() as libc::c_int;
+        let written = libc::proc_pidinfo(
+            libc::getpid(),
+            PROC_PIDREGIONPATHINFO,
+            address,
+            (&mut info as *mut ProcRegionWithPathInfo).cast(),
+            size,
+        );
+        if written != size {
+            return None;
+        }
+        let stat = &info.vnode.vip_vi.vi_stat;
+        Some((stat.vst_dev, stat.vst_ino))
+    }
+}
+
+/// The LC_UUID of the main executable image loaded in this process.
+#[cfg(target_os = "macos")]
+fn loaded_image_uuid() -> Option<[u8; 16]> {
+    // SAFETY: image 0 is the main executable; dyld keeps its header mapped for
+    // the life of the process. Only its header and load commands are read.
+    unsafe {
+        let header = _dyld_get_image_header(0).cast::<u8>();
+        if header.is_null() {
+            return None;
+        }
+        let fixed = std::slice::from_raw_parts(header, 32);
+        let sizeofcmds = u32::from_le_bytes(fixed[20..24].try_into().ok()?) as usize;
+        let image = std::slice::from_raw_parts(header, 32 + sizeofcmds);
+        macho_uuid(image)
+    }
+}
+
+/// The LC_UUID of a thin 64-bit little-endian Mach-O image, if present.
+#[doc(hidden)]
+pub fn macho_uuid(image: &[u8]) -> Option<[u8; 16]> {
+    const MH_MAGIC_64: u32 = 0xfeed_facf;
+    const LC_UUID: u32 = 0x1b;
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(image.get(at..at + 4)?.try_into().ok()?))
+    };
+    if word(0)? != MH_MAGIC_64 {
+        return None;
+    }
+    let ncmds = word(16)? as usize;
+    let mut at = 32;
+    for _ in 0..ncmds {
+        let (cmd, size) = (word(at)?, word(at + 4)? as usize);
+        if cmd == LC_UUID {
+            return image.get(at + 8..at + 24)?.try_into().ok();
+        }
+        if size < 8 {
+            return None;
+        }
+        at += size;
+    }
+    None
 }
 
 /// Validate everything before any child exists. `run` repeats the ownership
@@ -157,7 +336,7 @@ pub fn prepare(
     let saved = profile::get_profile_from(paths, &alias)
         .map_err(|e| ExecError::Refused(format!("{e:#}")))?;
 
-    let creds = {
+    let (creds, live_token) = {
         let _lock = lock_with_retry(store)?;
         check_ownership(paths, store, &alias, None, req.min_valid)?
     };
@@ -189,6 +368,25 @@ pub fn prepare(
             "'{alias}' token belongs to account {token_uuid}, profile says {saved_uuid}"
         )));
     }
+    // ~/.claude.json and the active marker can lag the live credentials (a
+    // switch that failed half way). Ask the identity service which account
+    // owns the live token itself; refuse when it is this account or unknown.
+    if let Some(live_token) = &live_token {
+        let live_uuid = identity
+            .account_uuid(live_token)
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                ExecError::Refused(
+                    "live refresh ownership unknown: cannot identify the live login's account (if Claude Code is idle, use it once so it refreshes its token, then retry)".into(),
+                )
+            })?;
+        if live_uuid == saved_uuid {
+            return Err(ExecError::Refused(format!(
+                "'{alias}' is the same account as the live login; claudectl cannot prove it holds an independent grant"
+            )));
+        }
+    }
 
     let program = resolve_program(&req.program)?;
     let program_sha256 = sha256_file(&program)?;
@@ -207,6 +405,7 @@ pub fn prepare(
         email: saved.meta.email().map(str::to_string),
         token: oauth.access_token.clone(),
         token_expires_at_ms: expires_at_ms,
+        live_token,
         program,
         program_sha256,
         claudectl,
@@ -222,10 +421,13 @@ fn check_ownership(
     alias: &str,
     expected: Option<(&str, &str)>,
     min_valid: Duration,
-) -> Result<crate::api::CredentialsFile, ExecError> {
+) -> Result<(crate::api::CredentialsFile, Option<String>), ExecError> {
     let active = profile::get_active_from(paths)
         .map_err(|e| ExecError::Refused(format!("cannot read active profile: {e:#}")))?;
-    if active.as_deref() == Some(alias) {
+    if active
+        .as_deref()
+        .is_some_and(|active| same_profile(paths, active, alias))
+    {
         return Err(ExecError::Refused(format!(
             "'{alias}' is the active profile; Claude Code owns its login, run plain claude instead"
         )));
@@ -234,10 +436,20 @@ fn check_ownership(
         .map_err(|e| ExecError::Refused(format!("{e:#}")))?;
     let creds = saved
         .read_credentials()
-        .map_err(|e| ExecError::Refused(format!("saved credentials unreadable: {e:#}")))?;
-    let live = store
-        .read_refresh_owner()
-        .map_err(|e| ExecError::Refused(format!("live refresh ownership unknown: {e:#}")))?;
+        // Never include the parser's message: for a malformed file it can
+        // quote credential values.
+        .map_err(|e| {
+            ExecError::Refused(format!(
+                "saved credentials unreadable ({})",
+                credential_error_category(&e)
+            ))
+        })?;
+    let live = store.read_refresh_owner().map_err(|e| {
+        ExecError::Refused(format!(
+            "live refresh ownership unknown ({})",
+            credential_error_category(&e)
+        ))
+    })?;
     let oauth = &creds.claude_ai_oauth;
     if oauth.access_token.trim().is_empty() {
         return Err(ExecError::Refused(format!(
@@ -256,11 +468,76 @@ fn check_ownership(
             )));
         }
     }
+    // Witnesses of the live grant: the live login itself, and the active
+    // profile's saved copy. After Claude Code rotates the live tokens, a
+    // second saved copy of the same grant still matches the active
+    // profile's saved copy.
+    let live_present = live.is_some();
+    // The live access token, so callers can bind its owner and detect a
+    // change between preparation and spawn. Never logged.
+    let live_token = live
+        .as_ref()
+        .map(|live| live.claude_ai_oauth.access_token.clone());
+    let mut witnesses = Vec::new();
     if let Some(live) = live {
-        let live = &live.claude_ai_oauth;
+        witnesses.push(live.claude_ai_oauth);
+    }
+    if let Some(active) = active.as_deref() {
+        // Fail closed: an unreadable active profile could be the only link
+        // between this saved alias and the live grant.
+        let active_creds = profile::get_profile_from(paths, active)
+            .and_then(|active_profile| active_profile.read_credentials())
+            .map_err(|e| {
+                ExecError::Refused(format!(
+                    "live refresh ownership unknown: active profile credentials unreadable ({})",
+                    credential_error_category(&e)
+                ))
+            })?;
+        witnesses.push(active_creds.claude_ai_oauth);
+    }
+    // Grant lineage is not recorded: after a rotation and `claudectl save`,
+    // an older saved copy of the live grant matches no witness token. Two
+    // saved logins of the same account cannot be shown to hold independent
+    // grants, so refuse any profile of the live login's account.
+    let mut live_accounts: Vec<String> = Vec::new();
+    if let Some(active) = active.as_deref()
+        && let Ok(active_profile) = profile::get_profile_from(paths, active)
+        && let Some(uuid) = active_profile.meta.account_uuid()
+    {
+        live_accounts.push(uuid.to_string());
+    }
+    let live_identity = store.read_oauth_account().map_err(|e| {
+        ExecError::Refused(format!(
+            "live refresh ownership unknown: live identity unreadable ({})",
+            credential_error_category(&e)
+        ))
+    })?;
+    match live_identity
+        .as_ref()
+        .and_then(|account| account.get("accountUuid"))
+        .and_then(|uuid| uuid.as_str())
+    {
+        Some(uuid) => live_accounts.push(uuid.to_string()),
+        // A live login whose account is unknown could be this profile's
+        // account; fail closed instead of skipping the check.
+        None if live_present => {
+            return Err(ExecError::Refused(
+                "live refresh ownership unknown: the live login has no readable accountUuid in ~/.claude.json".into(),
+            ));
+        }
+        None => {}
+    }
+    if let Some(uuid) = saved.meta.account_uuid()
+        && live_accounts.iter().any(|live| live == uuid)
+    {
+        return Err(ExecError::Refused(format!(
+            "'{alias}' is the same account as the live login; claudectl cannot prove it holds an independent grant"
+        )));
+    }
+    for witness in &witnesses {
         let same_refresh =
-            oauth.refresh_token.is_some() && oauth.refresh_token == live.refresh_token;
-        let same_access = oauth.access_token == live.access_token;
+            oauth.refresh_token.is_some() && oauth.refresh_token == witness.refresh_token;
+        let same_access = oauth.access_token == witness.access_token;
         if same_refresh || same_access {
             return Err(ExecError::Refused(format!(
                 "'{alias}' shares its grant with the live login; Claude Code owns that refresh"
@@ -284,7 +561,7 @@ fn check_ownership(
             needed_ms / 60_000
         )));
     }
-    Ok(creds)
+    Ok((creds, live_token))
 }
 
 /// Start the child and wait for it. Returns the exit code to propagate.
@@ -313,6 +590,31 @@ pub fn run_with_writer(
     run_with_receipt(paths, store, prepared, req, Receipt::from_writer(sink))
 }
 
+/// Signal handling is process-wide, so one process runs one `exec` at a time.
+static RUN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct RunSlot;
+
+impl RunSlot {
+    fn take() -> Result<Self, ExecError> {
+        use std::sync::atomic::Ordering;
+        RUN_ACTIVE
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| RunSlot)
+            .map_err(|_| {
+                ExecError::Refused(
+                    "another exec run is active in this process; run one at a time".into(),
+                )
+            })
+    }
+}
+
+impl Drop for RunSlot {
+    fn drop(&mut self) {
+        RUN_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The descriptor number the child reads the token from.
 pub const CHILD_TOKEN_FD: i32 = 3;
 
@@ -323,6 +625,7 @@ fn run_with_receipt(
     req: &ExecRequest,
     mut receipt: Receipt,
 ) -> Result<i32, ExecError> {
+    let _slot = RunSlot::take()?;
     // Handle cancellation for the whole life of the private directory, so a
     // signal cannot skip its removal.
     signals::install();
@@ -418,13 +721,19 @@ fn run_in_dir(
         // no `use` can make this grant live in between.
         let lock = lock_with_retry(store);
         let checked = lock.and_then(|_lock| {
-            check_ownership(
+            let (_, live_now) = check_ownership(
                 paths,
                 store,
                 &prepared.alias,
                 Some((&prepared.token, &prepared.account_uuid)),
                 req.min_valid,
             )?;
+            // The live owner was identified for this exact live token.
+            if live_now != prepared.live_token {
+                return Err(ExecError::Refused(
+                    "the live login changed during preparation; run again".into(),
+                ));
+            }
             signals::block();
             if let Some(signal) = signals::pending() {
                 signals::unblock();
@@ -483,8 +792,10 @@ fn run_in_dir(
     } else {
         Descendants::Unknown
     };
-    let status = child.wait();
+    // Stop forwarding while the leader is still unreaped, so no late signal
+    // can reach a reused PID.
     signals::unwatch();
+    let status = child.wait();
     waited.map_err(|e| ExecError::Spawn(format!("cannot wait for child {pid}: {e}")))?;
     let status = status.map_err(|e| ExecError::Spawn(format!("cannot reap child {pid}: {e}")))?;
     let code = exit_code_of(&status);
@@ -498,21 +809,27 @@ fn run_in_dir(
             "descendants": descendants.as_str(),
         }),
     ));
+    let teardown_failure = match descendants {
+        Descendants::Survived => Some("its descendants survived SIGKILL"),
+        Descendants::Unverified | Descendants::Unknown => {
+            Some("descendant termination could not be verified")
+        }
+        _ => None,
+    };
+    if let Some(failure) = teardown_failure {
+        // A receipt error must not hide this: report both.
+        let receipt_errors: Vec<String> = [&started, &exited]
+            .into_iter()
+            .filter_map(|result| result.as_ref().err().map(ToString::to_string))
+            .collect();
+        let mut message = format!("child {pid} exited with {code}, but {failure}");
+        if !receipt_errors.is_empty() {
+            message.push_str(&format!("; also {}", receipt_errors.join("; ")));
+        }
+        return Err(ExecError::Cleanup(message));
+    }
     started?;
     exited?;
-    match descendants {
-        Descendants::Survived => {
-            return Err(ExecError::Cleanup(format!(
-                "child {pid} exited with {code}, but its descendants survived SIGKILL"
-            )));
-        }
-        Descendants::Unverified | Descendants::Unknown => {
-            return Err(ExecError::Cleanup(format!(
-                "child {pid} exited with {code}, but descendant termination could not be verified"
-            )));
-        }
-        _ => {}
-    }
     Ok(code)
 }
 
@@ -556,27 +873,38 @@ fn teardown_group(leader: u32) -> Descendants {
         return Descendants::None;
     }
     terminate(leader, SIGTERM);
-    if wait_descendants_gone(leader, Duration::from_secs(2)) {
-        return Descendants::Terminated;
+    match wait_descendants_gone(leader, Duration::from_secs(2)) {
+        Remaining::Gone => return Descendants::Terminated,
+        Remaining::ListingFailed => {
+            terminate(leader, SIGKILL);
+            return Descendants::Unverified;
+        }
+        Remaining::Present => {}
     }
     terminate(leader, SIGKILL);
-    if wait_descendants_gone(leader, Duration::from_secs(2)) {
-        Descendants::Killed
-    } else {
-        Descendants::Survived
+    match wait_descendants_gone(leader, Duration::from_secs(2)) {
+        Remaining::Gone => Descendants::Killed,
+        Remaining::Present => Descendants::Survived,
+        Remaining::ListingFailed => Descendants::Unverified,
     }
 }
 
-fn wait_descendants_gone(leader: u32, limit: Duration) -> bool {
+enum Remaining {
+    Gone,
+    Present,
+    ListingFailed,
+}
+
+fn wait_descendants_gone(leader: u32, limit: Duration) -> Remaining {
     let started = std::time::Instant::now();
     loop {
         match descendants_in_group(leader) {
-            Ok(members) if members.is_empty() => return true,
+            Ok(members) if members.is_empty() => return Remaining::Gone,
             Ok(_) => {}
-            Err(_) => return false,
+            Err(_) => return Remaining::ListingFailed,
         }
         if started.elapsed() >= limit {
-            return false;
+            return Remaining::Present;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -593,42 +921,109 @@ fn descendants_in_group(leader: u32) -> std::io::Result<Vec<i32>> {
     // SAFETY: the buffer is valid for `size` bytes.
     let bytes =
         unsafe { libc::proc_listpids(PROC_PGRP_ONLY, leader, pids.as_mut_ptr().cast(), size) };
-    if bytes < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let count = usize::try_from(bytes).unwrap_or(0) / std::mem::size_of::<i32>();
+    // proc_listpids reports some failures as 0 instead of -1. The unreaped
+    // leader is always in its own group, so a real listing is never empty.
+    let count = usize::try_from(bytes.max(0)).unwrap_or(0) / std::mem::size_of::<i32>();
     let leader = i32::try_from(leader).unwrap_or(0);
-    Ok(pids[..count]
-        .iter()
-        .copied()
-        .filter(|&pid| pid > 0 && pid != leader)
-        .collect())
+    group_members_from_listing(&pids[..count.min(pids.len())], leader)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn descendants_in_group(leader: u32) -> std::io::Result<Vec<i32>> {
-    let mut members = Vec::new();
+    let leader = i32::try_from(leader).unwrap_or(0);
+    let mut listed = Vec::new();
     for entry in std::fs::read_dir("/proc")? {
         let entry = entry?;
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
             continue;
         };
-        if u32::try_from(pid).ok() == Some(leader) {
-            continue;
-        }
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
+        // The command name in `stat` is raw bytes, not always UTF-8.
+        let stat = match std::fs::read(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            // The process exited between the directory read and this read.
+            Err(error) if process_gone(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(close) = stat.iter().rposition(|&b| b == b')') else {
+            return Err(std::io::Error::other(format!("malformed /proc/{pid}/stat")));
         };
         // Fields after the ")" of the command name: state ppid pgrp ...
-        let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
-            continue;
-        };
+        let rest = String::from_utf8_lossy(&stat[close + 1..]);
         let fields: Vec<&str> = rest.split_whitespace().collect();
-        if fields.len() > 2 && fields[0] != "Z" && fields[2].parse::<u32>().ok() == Some(leader) {
-            members.push(pid);
+        if fields.len() <= 2 {
+            return Err(std::io::Error::other(format!("malformed /proc/{pid}/stat")));
+        }
+        let in_group = fields[2].parse::<i32>().ok() == Some(leader);
+        // Count the unreaped leader, but not other zombies: they no longer run.
+        if in_group && (pid == leader || fields[0] != "Z") {
+            listed.push(pid);
         }
     }
-    Ok(members)
+    group_members_from_listing(&listed, leader)
+}
+
+/// A secret-safe description of a credential read failure: the I/O error
+/// kind, or "malformed" for any parse error. Parser messages are never used,
+/// because they can quote the credential text.
+fn credential_error_category(error: &anyhow::Error) -> String {
+    match error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+    {
+        Some(io) => format!("read error: {:?}", io.kind()),
+        None => "malformed or unavailable".into(),
+    }
+}
+
+/// Whether two aliases name the same profile directory. Compares the
+/// directories themselves, so `Work` and `work` on a case-insensitive
+/// filesystem, or a symlinked alias, count as the same profile.
+pub fn same_profile(paths: &Paths, a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let dir = |alias: &str| std::fs::metadata(paths.profiles_dir().join(alias));
+    match (dir(a), dir(b)) {
+        (Ok(first), Ok(second)) => same_file(&first, &second),
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_a: &std::fs::Metadata, _b: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Whether a `/proc/<pid>` read failed only because the process exited
+/// during the scan. Linux reports that as ENOENT, or as ESRCH once the file
+/// is open; Rust maps only ENOENT to `NotFound`.
+#[doc(hidden)]
+pub fn process_gone(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || (cfg!(unix) && error.raw_os_error() == Some(libc::ESRCH))
+}
+
+/// The live members of `leader`'s group other than the leader. A listing
+/// without the leader cannot be complete, because the caller keeps the leader
+/// unreaped, so it is an error.
+#[doc(hidden)]
+pub fn group_members_from_listing(listed: &[i32], leader: i32) -> std::io::Result<Vec<i32>> {
+    if !listed.contains(&leader) {
+        return Err(std::io::Error::other(
+            "process listing does not include the unreaped group leader",
+        ));
+    }
+    Ok(listed
+        .iter()
+        .copied()
+        .filter(|&pid| pid > 0 && pid != leader)
+        .collect())
 }
 
 #[cfg(not(unix))]
@@ -760,29 +1155,81 @@ fn map_token_fd(_command: &mut Command, _reader: &std::io::PipeReader) {}
 /// Forward SIGTERM, SIGINT and SIGHUP to the child, so cancelling claudectl
 /// cancels the run and cleanup still happens.
 #[cfg(unix)]
-mod signals {
+#[doc(hidden)]
+pub mod signals {
     use std::sync::atomic::{AtomicI32, Ordering};
 
     static CHILD: AtomicI32 = AtomicI32::new(0);
-    /// The first signal received while no child was registered; 0 if none.
+    /// 1 when SIGCHLD was ignored before install(), so reset() restores it.
+    static SAVED_SIGCHLD: AtomicI32 = AtomicI32::new(0);
+    /// Signals received while no child was registered, one bit per signal.
     static PENDING: AtomicI32 = AtomicI32::new(0);
     const SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
+    /// Handlers currently between reading CHILD and finishing their kill.
+    static IN_FLIGHT: AtomicI32 = AtomicI32::new(0);
 
-    extern "C" fn forward(signal: libc::c_int) {
+    fn bit(signal: libc::c_int) -> i32 {
+        SIGNALS
+            .iter()
+            .position(|&s| s == signal)
+            .map_or(0, |index| 1 << index)
+    }
+
+    /// Forward every signal whose bit is set in `bits`.
+    fn forward_bits(pid: i32, bits: i32) {
+        for signal in SIGNALS {
+            if bits & bit(signal) != 0 {
+                // SAFETY: kill is async-signal-safe.
+                unsafe { libc::kill(-pid, signal) };
+            }
+        }
+    }
+
+    pub extern "C" fn forward(signal: libc::c_int) {
+        IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
         let pid = CHILD.load(Ordering::SeqCst);
         if pid > 0 {
             // SAFETY: kill is async-signal-safe. The child leads its own
             // process group, so this reaches its descendants too.
             unsafe { libc::kill(-pid, signal) };
         } else {
-            let _ = PENDING.compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
+            let mine = bit(signal);
+            PENDING.fetch_or(mine, Ordering::SeqCst);
+            // `watch` may have registered the child after the load above. If
+            // so, exactly one of this handler and `watch` clears this bit and
+            // forwards the signal.
+            let pid = CHILD.load(Ordering::SeqCst);
+            if pid > 0 && PENDING.fetch_and(!mine, Ordering::SeqCst) & mine != 0 {
+                forward_bits(pid, mine);
+            }
         }
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Install the handlers for the whole run, before any private state exists.
     pub fn install() {
         CHILD.store(0, Ordering::SeqCst);
         PENDING.store(0, Ordering::SeqCst);
+        // An inherited "ignore SIGCHLD" makes the kernel reap the child on
+        // exit, which breaks waiting without reaping and the PID
+        // reservation. Use the default disposition for the run.
+        // SAFETY: sigaction with a zeroed default action; the previous
+        // action is saved for reset().
+        unsafe {
+            let mut default: libc::sigaction = std::mem::zeroed();
+            default.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut default.sa_mask);
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(libc::SIGCHLD, &default, &mut previous);
+            SAVED_SIGCHLD.store(
+                if previous.sa_sigaction == libc::SIG_IGN {
+                    1
+                } else {
+                    0
+                },
+                Ordering::SeqCst,
+            );
+        }
         for signal in SIGNALS {
             // SAFETY: installs a handler that only uses async-signal-safe
             // calls. SA_RESTART keeps interrupted system calls in other
@@ -827,24 +1274,32 @@ mod signals {
         mask(libc::SIG_UNBLOCK);
     }
 
-    /// The signal received before a child was registered, if any.
+    /// A signal received before a child was registered, if any.
     pub fn pending() -> Option<libc::c_int> {
-        match PENDING.load(Ordering::SeqCst) {
-            0 => None,
-            signal => Some(signal),
-        }
+        let bits = PENDING.load(Ordering::SeqCst);
+        SIGNALS.into_iter().find(|&signal| bits & bit(signal) != 0)
     }
 
     /// Register the child, then release held signals. Each held signal is
-    /// delivered to the handler once and forwarded with its own number.
+    /// delivered to the handler once and forwarded with its own number. A
+    /// signal another thread recorded before the registration is taken here.
     pub fn watch(pid: u32) {
-        CHILD.store(i32::try_from(pid).unwrap_or(0), Ordering::SeqCst);
+        let pid = i32::try_from(pid).unwrap_or(0);
+        CHILD.store(pid, Ordering::SeqCst);
         unblock();
+        let recorded = PENDING.swap(0, Ordering::SeqCst);
+        if pid > 0 {
+            forward_bits(pid, recorded);
+        }
     }
 
-    /// Stop forwarding once teardown is done; keep recording until reset.
+    /// Stop forwarding, and wait until no handler can still signal the
+    /// child's group. Call while the child is still unreaped.
     pub fn unwatch() {
         CHILD.store(0, Ordering::SeqCst);
+        while IN_FLIGHT.load(Ordering::SeqCst) > 0 {
+            std::hint::spin_loop();
+        }
     }
 
     pub fn reset() {
@@ -853,11 +1308,16 @@ mod signals {
             // SAFETY: restores the default disposition.
             unsafe { libc::signal(signal, libc::SIG_DFL) };
         }
+        if SAVED_SIGCHLD.swap(0, Ordering::SeqCst) == 1 {
+            // SAFETY: restores the inherited "ignore" disposition.
+            unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+        }
     }
 }
 
 #[cfg(not(unix))]
-mod signals {
+#[doc(hidden)]
+pub mod signals {
     pub fn install() {}
     pub fn block() {}
     pub fn unblock() {}
