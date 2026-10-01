@@ -203,7 +203,9 @@ set the same variables. `exec` checks `.claude/settings.json` and
 `.claude/settings.local.json` in the working directory and every parent
 directory (except `~/.claude` below home, which is user scope and replaced by
 the private config dir), and the managed settings (`managed-settings.json` and
-`managed-settings.d/`). If one sets such a variable in `env`, or sets
+`managed-settings.d/`). If one sets such a variable in `env`, sets
+`CLAUDE_CONFIG_DIR` or `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` in `env`
+(they would replace the private directory or the token descriptor), or sets
 `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport` or `gcpAuthRefresh`,
 `exec` refuses; run it from another directory. Arguments after `--` are passed
 as given, so do not pass `--settings` with such values.
@@ -213,7 +215,7 @@ as given, so do not pass `--settings` with such values.
 - the profile is the active profile, shares its refresh grant with the live login, or is the same account as the live login (exit 5);
 - claudectl cannot tell which account the live login uses, or the live login changes while `exec` prepares the run (exit 5);
 - the saved credentials are unreadable, have no access token, or change while `exec` prepares the run (exit 5);
-- a settings file Claude Code would load sets a credential, provider or endpoint, or cannot be read or parsed (exit 5);
+- a settings file Claude Code would load sets a credential, provider or endpoint, sets `CLAUDE_CONFIG_DIR` or the token descriptor variable, or cannot be read or parsed (exit 5);
 - the token has expired (run `claudectl status <alias>` to refresh it), or expires within `--min-valid` (default `30m`). claudectl refreshes a saved token only after it expires, so retry after it expires and run `claudectl status <alias>`. `claudectl login <alias>` also gives a fresh token, but it makes that profile active; switch back with `claudectl use` before running `exec` (exit 5);
 - another `exec` run is active in the same process, or the auth state stays locked (exit 5);
 - the profile has no saved `accountUuid`, the token's account differs from it or from `--expect-account`, or the account lookup fails (exit 3);
