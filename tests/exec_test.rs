@@ -19,6 +19,20 @@ fn run_guard() -> std::sync::MutexGuard<'static, ()> {
     RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Settings that could route the saved token to another host or add headers.
+const ENDPOINT_OVERRIDES: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_HOST",
+    "ANTHROPIC_ASSETS_HOST",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+];
+
 /// Settings that make Claude Code use another provider's credentials.
 const PROVIDER_SELECTORS: &[&str] = &[
     "CLAUDE_CODE_USE_BEDROCK",
@@ -120,7 +134,8 @@ out='{out}'
 eval "cat <&$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" > "$out/token"
 printf '%s' "$CLAUDE_CONFIG_DIR" > "$out/config_dir"
 if [ -d "$CLAUDE_CONFIG_DIR" ]; then echo yes > "$out/config_exists"; fi
-env | grep -E '^(CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_OAUTH_REFRESH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY|ANTHROPIC_AWS|ANTHROPIC_GOOGLE_CLOUD|GATEWAY|MANTLE))=' > "$out/leaked_env" || true
+env | grep -E '^(CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_OAUTH_REFRESH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY|ANTHROPIC_AWS|ANTHROPIC_GOOGLE_CLOUD|GATEWAY|MANTLE)|ANTHROPIC_(BASE_URL|API_HOST|ASSETS_HOST|CUSTOM_HEADERS)|ANTHROPIC_(AWS|BEDROCK|BEDROCK_MANTLE|FOUNDRY|GOOGLE_CLOUD|VERTEX)_BASE_URL)=' > "$out/leaked_env" || true
+if [ -n "${{FAKE_SELF_HUP:-}}" ]; then kill -HUP $$; echo survived > "$out/self_hup"; fi
 printf '%s ' "$@" > "$out/args"
 printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" > "$out/fd_name"
 : > "$out/extra_fds"
@@ -386,15 +401,6 @@ fn runs_the_child_on_the_saved_profile_and_leaves_global_state_alone() {
     let child = fake_child(home.path(), &out, 7);
     let mut req = request("work", &child);
     req.receipt = Some(home.path().join("receipt.jsonl"));
-    // SAFETY: test-only; the scrub must hide credentials and provider
-    // selectors the parent holds.
-    unsafe {
-        std::env::set_var("ANTHROPIC_API_KEY", "parent-key");
-        for selector in PROVIDER_SELECTORS {
-            std::env::set_var(selector, "1");
-        }
-    }
-
     let prepared = prepare(
         &paths,
         &store,
@@ -544,6 +550,108 @@ fn helper_run_one_alias() {
     )
     .unwrap();
     run(&paths, &store, prepared, &req).unwrap();
+    #[cfg(unix)]
+    {
+        // Record the SIGHUP disposition the run leaves behind.
+        // SAFETY: reads the current action only.
+        let ignored = unsafe {
+            let mut current: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut current);
+            current.sa_sigaction == libc::SIG_IGN
+        };
+        std::fs::write(
+            out.join("sighup_after"),
+            if ignored { "ignored" } else { "default" },
+        )
+        .unwrap();
+    }
+}
+
+/// Start `helper_run_one_alias` for `alias` with extra environment, and wait.
+fn run_helper(
+    home: &Path,
+    alias: &str,
+    out: &Path,
+    env: &[(&str, &str)],
+    ignore_sighup: bool,
+) -> std::process::ExitStatus {
+    let mut helper = std::process::Command::new(std::env::current_exe().unwrap());
+    helper
+        .args(["--exact", "helper_run_one_alias", "--test-threads=1"])
+        .env("CLAUDECTL_TEST_HOME", home)
+        .env("CLAUDECTL_TEST_ALIAS", alias)
+        .env("CLAUDECTL_TEST_OUT", out)
+        .envs(env.iter().copied())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if ignore_sighup {
+        // SAFETY: runs in the forked helper before exec; signal() is
+        // async-signal-safe. This is what nohup does.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut helper, || {
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+    }
+    helper.status().unwrap()
+}
+
+#[test]
+fn child_env_drops_credentials_provider_selectors_and_endpoint_overrides() {
+    let (home, paths, _store) = setup();
+    save(
+        &paths,
+        "one",
+        "uuid-one",
+        &creds("a-one", "r-one", 2 * HOUR_MS),
+    );
+    let out = home.path().join("out-env");
+    std::fs::create_dir(&out).unwrap();
+    fake_child(&out, &out, 0);
+    let mut env: Vec<(&str, &str)> = vec![
+        ("ANTHROPIC_API_KEY", "parent-key"),
+        ("ANTHROPIC_AUTH_TOKEN", "parent-token"),
+    ];
+    env.extend(PROVIDER_SELECTORS.iter().map(|name| (*name, "1")));
+    env.extend(
+        ENDPOINT_OVERRIDES
+            .iter()
+            .map(|name| (*name, "https://example.invalid")),
+    );
+    let status = run_helper(home.path(), "one", &out, &env, false);
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(out.join("leaked_env")).unwrap(), "");
+    assert_eq!(
+        std::fs::read(out.join("token")).unwrap(),
+        b"a-one",
+        "test setup: the child ran with the saved token"
+    );
+}
+
+#[test]
+fn inherited_ignored_sighup_stays_ignored_for_child_and_after_run() {
+    let (home, paths, _store) = setup();
+    save(
+        &paths,
+        "one",
+        "uuid-one",
+        &creds("a-one", "r-one", 2 * HOUR_MS),
+    );
+    let out = home.path().join("out-hup");
+    std::fs::create_dir(&out).unwrap();
+    fake_child(&out, &out, 0);
+    let status = run_helper(home.path(), "one", &out, &[("FAKE_SELF_HUP", "1")], true);
+    assert!(status.success());
+    assert!(
+        out.join("self_hup").exists(),
+        "the child must inherit SIGHUP as ignored, as under nohup"
+    );
+    assert_eq!(
+        std::fs::read_to_string(out.join("sighup_after")).unwrap(),
+        "ignored",
+        "the run must restore the inherited ignored SIGHUP"
+    );
 }
 
 #[test]

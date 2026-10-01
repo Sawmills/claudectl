@@ -189,21 +189,35 @@ files next to its own path does not find them. The Keychain entry,
 `~/.claude/.credentials.json`, `~/.claude.json` and the active marker are not
 written.
 
+The child's environment drops other credentials and routing settings:
+`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`,
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, the `CLAUDE_CODE_USE_*` provider
+selectors, and the endpoint and header overrides (`ANTHROPIC_BASE_URL`,
+`ANTHROPIC_API_HOST`, `ANTHROPIC_ASSETS_HOST`, `ANTHROPIC_CUSTOM_HEADERS` and
+the provider `*_BASE_URL` settings). A signal that claudectl inherits as
+ignored, for example `SIGHUP` under `nohup`, stays ignored for the child.
+
 `exec` never refreshes a token. It refuses, and starts no child, when:
 
-- the profile is the active profile, or shares its refresh grant with the live login (exit 5);
+- the profile is the active profile, shares its refresh grant with the live login, or is the same account as the live login (exit 5);
+- claudectl cannot tell which account the live login uses, or the live login changes while `exec` prepares the run (exit 5);
+- the saved credentials are unreadable, have no access token, or change while `exec` prepares the run (exit 5);
 - the token has expired (run `claudectl status <alias>` to refresh it), or expires within `--min-valid` (default `30m`). claudectl refreshes a saved token only after it expires, so retry after it expires and run `claudectl status <alias>`. `claudectl login <alias>` also gives a fresh token, but it makes that profile active; switch back with `claudectl use` before running `exec` (exit 5);
-- the token's account differs from the saved `accountUuid` or `--expect-account` (exit 3);
-- the executable's SHA-256 differs from `--expect-sha256` (exit 4);
-- a receipt record cannot be written (exit 6).
+- another `exec` run is active in the same process, or the auth state stays locked (exit 5);
+- the profile has no saved `accountUuid`, the token's account differs from it or from `--expect-account`, or the account lookup fails (exit 3);
+- the executable's SHA-256 differs from `--expect-sha256`, the executable changes after it is hashed, or the running claudectl does not match its own path (exit 4);
+- a receipt record cannot be written (exit 6);
+- the token pipe, the private config directory or the child process cannot be created (exit 7).
 
 A run that started but whose private config directory could not be removed, or whose descendant processes survived `SIGKILL`, exits 8 and names the child's exit code.
 
-Otherwise it exits with the child's exit code. `--receipt <file>` appends JSON
-records `prepared`, `started` (with the child PID), `exited` (with the
-exit code, signal and descendant teardown result), or `refused`,
-`spawn_failed` and `cleanup_failed`. Each names the profile, account, executable path and SHA-256,
-and the claudectl path, SHA-256 and version. Receipts never contain tokens.
+Otherwise it exits with the child's exit code. `exec` writes JSON receipt
+records to stderr, or appends them to `--receipt <file>`: `prepared`,
+`started` (with the child PID), `exited` (with the exit code, signal and
+descendant teardown result), or `refused`, `spawn_failed` and
+`cleanup_failed`. Each names the profile, account, executable path and
+SHA-256, and the claudectl path, SHA-256 and version. Receipts never contain
+tokens.
 
 `launcher` writes a script for tools that take a `--claude-bin` path. The script
 pins the profile's account and the executable's SHA-256. It also keeps a private

@@ -34,61 +34,59 @@ Status: accepted with required changes (Architect HQ, 2026-09-30); implemented o
 
 ## Mechanism
 
-Claude Code 2.1.x reads an OAuth access token from an inherited file descriptor when `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` is set. `CLAUDE_CONFIG_DIR` also moves its config, and so its stored login, away from `~/.claude`. Both names appear in the shipped binary, 2.1.285. Step 1 of the plan confirms the behavior with a fake-free, non-active test profile.
+Claude Code 2.1.x reads an OAuth access token from an inherited file descriptor when `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` is set. `CLAUDE_CONFIG_DIR` also moves its config, and so its stored login, away from `~/.claude`. Both names appear in the shipped binary, 2.1.285. A real-binary smoke run confirms them only after admission (accepted change 7).
 
-`claudectl exec` does this:
+`claudectl exec --profile <alias> [--expect-account <uuid>] [--expect-sha256 <sha>] [--min-valid 30m] [--receipt <file>] -- <program> [args]` does this:
 
-1. Resolve the alias with `get_profile_from`, then read the saved credentials.
-2. Take `lock_auth_state` only for the token step:
-   - If the profile is not active, does not share the live grant, and its token expires within `--min-valid` (default 30 minutes), refresh it with the same rules as `status`. Then persist the rotated grant with `persist_rotated_grant`.
-   - If the profile is active or shares the live grant, never refresh. If its token expires within `--min-valid`, exit with an error.
-   - Release the lock before the child starts.
-3. Identity check, fail closed:
-   - Call `fetch_oauth_account` with the token.
-   - The returned `accountUuid` must equal `account.json`'s `account_uuid`, and `--expect-account <uuid>` when that flag is given.
-   - On any mismatch, missing field, or HTTP failure, exit 3 and start no child.
-4. Executable pin:
-   - Resolve the child program to its real path and hash it with SHA-256.
-   - If `--expect-sha256` is given and does not match, exit 4.
-5. Start the child:
-   - Write the access token into a pipe. The child inherits the read end as fd N.
-   - Set `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=N` and `CLAUDE_CONFIG_DIR=~/.claudectl/run/<alias>/config`, a private directory with mode 0700.
-   - Remove `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` from the child's environment, so no other credential can win.
-   - Forward stdin, stdout and stderr. Exit with the child's exit code.
+1. Prepare, under the auth lock:
+   - Refuse the active alias, compared by directory identity.
+   - Refuse a saved grant that the live login or the active profile's saved credentials share. If either is unreadable, refuse.
+   - Refuse the live login's account: the active profile's account plus the `accountUuid` in `~/.claude.json`. If live credentials exist but that uuid is missing, refuse.
+   - Refuse a token that has expired or expires within `--min-valid`. `exec` never refreshes any token.
+2. Identity check, fail closed:
+   - Look up the account of the profile's token. The result must equal the saved `accountUuid`, and `--expect-account` when given. Otherwise exit 3.
+   - Look up the account of the live login's token. If it is the profile's account, or the lookup fails, refuse (exit 5).
+3. Executable pin:
+   - Resolve the program on `PATH` to its real path and hash it with SHA-256. If `--expect-sha256` does not match, exit 4.
+   - Copy the program into the run's private directory, hash the copy again, and run the copy with `argv[0]` set to the original path.
+   - Bind claudectl's own path and SHA-256 to the running image: `/proc/self/exe` on Linux, image device, inode and build UUID on macOS.
+4. Start the child:
+   - Create a fresh private 0700 config directory under `~/.claudectl/run/<alias>/`.
+   - Write the access token into a pipe. The parent keeps close-on-exec on it; only the child's pre-exec step maps it to fd 3. Set `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=3` and `CLAUDE_CONFIG_DIR`.
+   - Remove other credentials, the `CLAUDE_CODE_USE_*` provider selectors, and the endpoint and header overrides from the child's environment.
+   - Under the auth lock, check ownership again and check that the live token did not change since step 2. Then spawn.
+5. Run and tear down:
+   - The child leads its own process group. `SIGTERM`, `SIGINT` and `SIGHUP` reach the group once. A signal inherited as ignored stays ignored, and the child inherits that.
+   - When the child exits, claudectl waits without reaping it, sends `SIGTERM` and then `SIGKILL` to descendants left in the group, then reaps it and removes the config directory.
+   - Exit with the child's exit code, or 8 when cleanup fails.
 6. Receipt:
-   - Before the child starts, write one JSON line to `--receipt <path>`, or to stderr when no path is given.
-   - It holds `alias`, `account_uuid`, `email`, `executable`, `sha256`, `claude_version` (from `--version` when the program is Claude), `token_expires_at`, `refreshed`, `config_dir`, `pid` and `started_at`.
-   - It never holds a token.
+   - JSON lines go to `--receipt <file>`, or to stderr.
+   - `prepared` comes before the spawn; `started` names the PID; `exited` names the exit code, signal and descendant teardown. Failures write `refused`, `spawn_failed` or `cleanup_failed`.
+   - Each record names the alias, account, email, executable path and SHA-256, the executed snapshot, the token expiry, the config directory, and claudectl's path, SHA-256 and version. It never holds a token.
 
-`claudectl launcher --profile <alias> --claude <path> --out <file>` writes a two-line executable script for `--claude-bin`. The script calls `claudectl exec --profile <alias> --expect-account <uuid> --expect-sha256 <sha> -- <path> "$@"`. The account and hash are pinned when the script is written, so a later profile or binary change fails closed.
+`claudectl launcher --profile <alias> --claude <path> --out <file>` writes a script for `--claude-bin`. It pins the alias, the account, the executable's SHA-256 and `--min-valid`. It keeps a private 0500 copy of claudectl in `<file>.claudectl/`, checks that copy's SHA-256, and runs it. A later profile, binary or claudectl change fails closed.
 
 ## Config directory
 
-The child uses a per-alias `CLAUDE_CONFIG_DIR` so it neither reads nor writes the global `~/.claude.json` identity or the global Keychain login. The directory starts empty. `--inherit-settings` symlinks `settings.json`, `CLAUDE.md`, `agents/`, `commands/` and `skills/` from `~/.claude` into it; the default is off. Step 1 must confirm that a fresh config dir with an fd token runs `claude -p` without an onboarding prompt.
+Each run gets a new empty directory, so the child neither reads nor writes the global `~/.claude.json` identity or the global Keychain login. No settings are copied or linked into it.
 
 ## Concurrency
 
-- Runs on different aliases share no writable state: each has its own config dir and pipe.
-- Two runs on the same alias share the config dir, the way two terminals share `~/.claude`.
-- The auth lock covers only refresh and persist. Refresh follows `status`: one refresh per grant.
+- Each run has its own config directory and pipe, so runs share no writable state, also on the same alias.
+- The auth lock covers the ownership checks and the spawn. It is not held while the child runs.
+- One process runs one `exec` at a time; an overlapping run in the same process is refused.
 
 ## Tests
 
-- **Fake Claude:** a test binary reads fd N and prints `sha256(token)`, its config dir, and whether the forbidden env vars are set. Assert the right token hash, the right dir, no token in env or argv, and exit-code pass-through.
-- **Identity:** a local HTTP fake behind a URL override. Assert that a mismatched `accountUuid`, a missing field and HTTP 500 each exit 3 with no child started, and that the receipt has no token.
-- **Refresh ownership:** reuse the `status` fixtures. The active alias and a shared live grant never refresh; a near-expiry active token exits with an error.
-- **Concurrency:** start two runs on two aliases together, and assert each child sees only its own token hash and config dir.
-- **Global state:** snapshot the Keychain stub, `.credentials.json`, `.claude.json` and `active` before and after `exec`, and assert they are unchanged.
+- **Fake child:** a script reads fd 3 and records the token, its config directory, leaked environment names and extra pipe descriptors. Tests compare token bytes in memory and print no credential.
+- **Identity:** a fake identity source through the library. Mismatched, missing and failed lookups exit 3 with no child; the live login's account is refused.
+- **Refresh ownership:** the active alias, a shared grant, the live login's account and a near-expiry token are refused, and nothing is refreshed.
+- **Concurrency:** two helper processes run two aliases together and each sees only its own token and directory.
+- **Global state:** the Keychain stub, `.credentials.json`, `.claude.json` and `active` are unchanged after a run.
+- **Signals and teardown:** forwarding once per signal, signals that arrive before the child registers, an inherited ignored `SIGCHLD` and `SIGHUP`, and descendant teardown.
 
 ## Plan
 
-1. Verify the mechanism on the real binary with a non-active saved profile after this design is accepted: the fd token, a fresh config dir, and the global login unchanged.
-2. Add `exec` and `launcher` with URL overrides for tests.
-3. Add the tests above.
-4. Update the README and AGENTS.md map.
-5. Review, CI, then a release through the existing tap.
-
-## Open questions
-
-- Should `exec` refuse the active alias entirely? Plain `claude` already covers it. The current proposal allows it with no refresh.
-- Is `--min-valid` of 30 minutes right for autoreview runs?
+1. Implement `exec` and `launcher` with the tests above. Done on the branch.
+2. Review, CI, then a release through the existing tap.
+3. Run the real-binary smoke run after admission (accepted change 7).

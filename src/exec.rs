@@ -45,6 +45,19 @@ const SCRUBBED_ENV: &[&str] = &[
     "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
     "CLAUDE_CODE_USE_GATEWAY",
     "CLAUDE_CODE_USE_MANTLE",
+    // Endpoint and header overrides: they could route the saved OAuth token
+    // to another host or add authorization headers. Names taken from the
+    // Claude Code binary.
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_HOST",
+    "ANTHROPIC_ASSETS_HOST",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
 ];
 
 pub struct ExecRequest {
@@ -1164,6 +1177,10 @@ pub mod signals {
     static SAVED_SIGCHLD: AtomicI32 = AtomicI32::new(0);
     /// Signals received while no child was registered, one bit per signal.
     static PENDING: AtomicI32 = AtomicI32::new(0);
+    /// Forwarded signals that were ignored before install(), one bit per
+    /// signal. They stay ignored for the run (as under nohup), and the child
+    /// inherits that, so reset() restores them.
+    static SAVED_IGNORED: AtomicI32 = AtomicI32::new(0);
     const SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
     /// Handlers currently between reading CHILD and finishing their kill.
     static IN_FLIGHT: AtomicI32 = AtomicI32::new(0);
@@ -1230,7 +1247,18 @@ pub mod signals {
                 Ordering::SeqCst,
             );
         }
+        let mut ignored = 0;
         for signal in SIGNALS {
+            // SAFETY: reads the current action only.
+            let current = unsafe {
+                let mut current: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(signal, std::ptr::null(), &mut current);
+                current.sa_sigaction
+            };
+            if current == libc::SIG_IGN {
+                ignored |= bit(signal);
+                continue;
+            }
             // SAFETY: installs a handler that only uses async-signal-safe
             // calls. SA_RESTART keeps interrupted system calls in other
             // threads from failing with EINTR.
@@ -1242,6 +1270,7 @@ pub mod signals {
                 libc::sigaction(signal, &action, std::ptr::null_mut());
             }
         }
+        SAVED_IGNORED.store(ignored, Ordering::SeqCst);
     }
 
     /// The set of signals claudectl forwards.
@@ -1304,9 +1333,15 @@ pub mod signals {
 
     pub fn reset() {
         CHILD.store(0, Ordering::SeqCst);
+        let ignored = SAVED_IGNORED.swap(0, Ordering::SeqCst);
         for signal in SIGNALS {
-            // SAFETY: restores the default disposition.
-            unsafe { libc::signal(signal, libc::SIG_DFL) };
+            let action = if ignored & bit(signal) != 0 {
+                libc::SIG_IGN
+            } else {
+                libc::SIG_DFL
+            };
+            // SAFETY: restores the disposition claudectl started with.
+            unsafe { libc::signal(signal, action) };
         }
         if SAVED_SIGCHLD.swap(0, Ordering::SeqCst) == 1 {
             // SAFETY: restores the inherited "ignore" disposition.

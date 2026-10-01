@@ -2,7 +2,7 @@ use claudectl::auth_store::AuthStore;
 use claudectl::config;
 use claudectl::exec::{self, ExecError, ExecRequest, LiveIdentity, SelfIdentity};
 
-/// Returns the process exit code: the child's code, or 3-7 for a refusal.
+/// Returns the process exit code: the child's code, or 3-8 when exec fails.
 pub fn run(req: ExecRequest) -> i32 {
     match run_inner(&req) {
         Ok(code) => code,
