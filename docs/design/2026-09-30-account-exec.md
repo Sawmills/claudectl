@@ -53,8 +53,9 @@ Claude Code 2.1.x reads an OAuth access token from an inherited file descriptor 
 4. Start the child:
    - Create a fresh private 0700 config directory under `~/.claudectl/run/<alias>/`.
    - Write the access token into a pipe. The parent keeps close-on-exec on it; only the child's pre-exec step maps it to fd 3. Set `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=3` and `CLAUDE_CONFIG_DIR`.
-   - Remove other credentials, the `CLAUDE_CODE_USE_*` provider selectors, and the endpoint and header overrides from the child's environment.
-   - Under the auth lock, check ownership again and check that the live token did not change since step 2. Then spawn.
+   - Remove from the child's environment every `ANTHROPIC_*` and `CLAUDE_CODE_*` variable that selects a provider (`CLAUDE_CODE_USE_*`) or ends in `_API_KEY`, `_TOKEN`, `_FILE_DESCRIPTOR`, `_BASE_URL`, `_HOST`, `_HEADERS` or `_HELPER`. Name rules, not a fixed list, so a new variable with the same shape is covered.
+   - Refuse when a project, local or managed settings file in the working directory or a parent sets such a variable in `env`, sets a credential helper (`apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh`), or cannot be parsed. The private config dir removes user settings only.
+   - Under the auth lock, check ownership and the settings files again, and check that the live token did not change since step 2. Then spawn.
 5. Run and tear down:
    - The child leads its own process group. `SIGTERM`, `SIGINT` and `SIGHUP` reach the group once. A signal inherited as ignored stays ignored, and the child inherits that.
    - When the child exits, claudectl waits without reaping it, sends `SIGTERM` and then `SIGKILL` to descendants left in the group, then reaps it and removes the config directory.
@@ -83,6 +84,7 @@ Each run gets a new empty directory, so the child neither reads nor writes the g
 - **Refresh ownership:** the active alias, a shared grant, the live login's account and a near-expiry token are refused, and nothing is refreshed.
 - **Concurrency:** two helper processes run two aliases together and each sees only its own token and directory.
 - **Global state:** the Keychain stub, `.credentials.json`, `.claude.json` and `active` are unchanged after a run.
+- **Settings:** project, local, parent-directory and managed settings that set a credential, provider, endpoint or helper are refused, and an unparsable file fails closed. A helper process started in such a project starts no child.
 - **Signals and teardown:** forwarding once per signal, signals that arrive before the child registers, an inherited ignored `SIGCHLD` and `SIGHUP`, and descendant teardown.
 
 ## Plan

@@ -189,19 +189,30 @@ files next to its own path does not find them. The Keychain entry,
 `~/.claude/.credentials.json`, `~/.claude.json` and the active marker are not
 written.
 
-The child's environment drops other credentials and routing settings:
-`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`,
-`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, the `CLAUDE_CODE_USE_*` provider
-selectors, and the endpoint and header overrides (`ANTHROPIC_BASE_URL`,
-`ANTHROPIC_API_HOST`, `ANTHROPIC_ASSETS_HOST`, `ANTHROPIC_CUSTOM_HEADERS` and
-the provider `*_BASE_URL` settings). A signal that claudectl inherits as
-ignored, for example `SIGHUP` under `nohup`, stays ignored for the child.
+The child's environment drops other credentials and routing settings: every
+`ANTHROPIC_*` or `CLAUDE_CODE_*` variable that selects a provider
+(`CLAUDE_CODE_USE_*`) or whose name ends in `_API_KEY`, `_TOKEN`,
+`_FILE_DESCRIPTOR`, `_BASE_URL`, `_HOST`, `_HEADERS` or `_HELPER`, for example
+`ANTHROPIC_API_KEY`, `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` and
+`ANTHROPIC_BASE_URL`. Other variables, such as `ANTHROPIC_MODEL`, pass
+through. A signal that claudectl inherits as ignored, for example `SIGHUP`
+under `nohup`, stays ignored for the child.
+
+Claude Code also reads project, local and managed settings files, which can
+set the same variables. `exec` checks `.claude/settings.json` and
+`.claude/settings.local.json` in the working directory and every parent
+directory, and the managed settings (`managed-settings.json` and
+`managed-settings.d/`). If one sets such a variable in `env`, or sets
+`apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport` or `gcpAuthRefresh`,
+`exec` refuses; run it from another directory. Arguments after `--` are passed
+as given, so do not pass `--settings` with such values.
 
 `exec` never refreshes a token. It refuses, and starts no child, when:
 
 - the profile is the active profile, shares its refresh grant with the live login, or is the same account as the live login (exit 5);
 - claudectl cannot tell which account the live login uses, or the live login changes while `exec` prepares the run (exit 5);
 - the saved credentials are unreadable, have no access token, or change while `exec` prepares the run (exit 5);
+- a settings file Claude Code would load sets a credential, provider or endpoint, or cannot be read or parsed (exit 5);
 - the token has expired (run `claudectl status <alias>` to refresh it), or expires within `--min-valid` (default `30m`). claudectl refreshes a saved token only after it expires, so retry after it expires and run `claudectl status <alias>`. `claudectl login <alias>` also gives a fresh token, but it makes that profile active; switch back with `claudectl use` before running `exec` (exit 5);
 - another `exec` run is active in the same process, or the auth state stays locked (exit 5);
 - the profile has no saved `accountUuid`, the token's account differs from it or from `--expect-account`, or the account lookup fails (exit 3);

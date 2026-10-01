@@ -137,6 +137,7 @@ if [ -d "$CLAUDE_CONFIG_DIR" ]; then echo yes > "$out/config_exists"; fi
 env | grep -E '^(CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_OAUTH_REFRESH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY|ANTHROPIC_AWS|ANTHROPIC_GOOGLE_CLOUD|GATEWAY|MANTLE)|ANTHROPIC_(BASE_URL|API_HOST|ASSETS_HOST|CUSTOM_HEADERS)|ANTHROPIC_(AWS|BEDROCK|BEDROCK_MANTLE|FOUNDRY|GOOGLE_CLOUD|VERTEX)_BASE_URL)=' > "$out/leaked_env" || true
 if [ -n "${{FAKE_SELF_HUP:-}}" ]; then kill -HUP $$; echo survived > "$out/self_hup"; fi
 printf '%s ' "$@" > "$out/args"
+env | cut -d= -f1 > "$out/env_names"
 printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" > "$out/fd_name"
 : > "$out/extra_fds"
 # A leaked token descriptor is a pipe; the shell's own script fd is a file.
@@ -575,7 +576,22 @@ fn run_helper(
     env: &[(&str, &str)],
     ignore_sighup: bool,
 ) -> std::process::ExitStatus {
+    run_helper_in(home, alias, out, env, ignore_sighup, None)
+}
+
+/// `run_helper` with the helper started in `cwd` when given.
+fn run_helper_in(
+    home: &Path,
+    alias: &str,
+    out: &Path,
+    env: &[(&str, &str)],
+    ignore_sighup: bool,
+    cwd: Option<&Path>,
+) -> std::process::ExitStatus {
     let mut helper = std::process::Command::new(std::env::current_exe().unwrap());
+    if let Some(cwd) = cwd {
+        helper.current_dir(cwd);
+    }
     helper
         .args(["--exact", "helper_run_one_alias", "--test-threads=1"])
         .env("CLAUDECTL_TEST_HOME", home)
@@ -619,14 +635,173 @@ fn child_env_drops_credentials_provider_selectors_and_endpoint_overrides() {
             .iter()
             .map(|name| (*name, "https://example.invalid")),
     );
+    // Found in the Claude Code 2.1.286 binary; not in the fixed lists above.
+    env.extend([
+        ("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", "5"),
+        ("CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR", "6"),
+        ("CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR", "7"),
+        ("ANTHROPIC_AWS_API_KEY", "parent-aws"),
+        ("ANTHROPIC_FOUNDRY_API_KEY", "parent-foundry"),
+        ("ANTHROPIC_FOUNDRY_AUTH_TOKEN", "parent-foundry-token"),
+        ("CLAUDE_CODE_API_BASE_URL", "https://example.invalid"),
+        ("CLAUDE_CODE_PROXY_HOST", "example.invalid"),
+        ("CLAUDE_CODE_ENABLE_PROXY_AUTH_HELPER", "1"),
+        ("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1"),
+    ]);
     let status = run_helper(home.path(), "one", &out, &env, false);
     assert!(status.success());
     assert_eq!(std::fs::read_to_string(out.join("leaked_env")).unwrap(), "");
+    let names = std::fs::read_to_string(out.join("env_names")).unwrap();
+    let leaked: Vec<&str> = names
+        .lines()
+        .filter(|name| is_scrubbed_env(name) && *name != TOKEN_FD_ENV)
+        .collect();
+    assert!(leaked.is_empty(), "child inherited {leaked:?}");
+    for (name, _) in &env {
+        assert!(!names.lines().any(|n| n == *name), "child inherited {name}");
+    }
     assert_eq!(
         std::fs::read(out.join("token")).unwrap(),
         b"a-one",
         "test setup: the child ran with the saved token"
     );
+}
+
+#[test]
+fn scrubbed_env_names_cover_credentials_providers_and_endpoints() {
+    for name in ENDPOINT_OVERRIDES.iter().chain(PROVIDER_SELECTORS) {
+        assert!(is_scrubbed_env(name), "{name}");
+    }
+    for name in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+        "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+        "CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR",
+        "ANTHROPIC_AWS_API_KEY",
+        "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+        "CLAUDE_CODE_API_BASE_URL",
+        "CLAUDE_CODE_GATEWAY_HINT_HEADERS",
+        "CLAUDE_CODE_ENABLE_PROXY_AUTH_HELPER",
+        "CLAUDE_CODE_OAUTH_SCOPES",
+        "CCR_OAUTH_TOKEN_FILE",
+    ] {
+        assert!(is_scrubbed_env(name), "{name}");
+    }
+    for name in [
+        "PATH",
+        "HOME",
+        "CLAUDE_CONFIG_DIR",
+        "ANTHROPIC_MODEL",
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "MY_API_KEY",
+    ] {
+        assert!(!is_scrubbed_env(name), "{name}");
+    }
+}
+
+fn write_settings(dir: &Path, name: &str, body: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join(name), body).unwrap();
+}
+
+#[test]
+fn settings_that_change_the_login_or_endpoint_are_refused() {
+    let refused = |cwd: &Path, managed: &Path| match check_settings(cwd, managed) {
+        Err(error @ ExecError::Refused(_)) => error.to_string(),
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let managed = root.path().join("managed");
+    let project = root.path().join("repo/sub");
+    std::fs::create_dir_all(&project).unwrap();
+    // No settings, or settings that change nothing about the login, pass.
+    check_settings(&project, &managed).unwrap();
+    write_settings(
+        &project.join(".claude"),
+        "settings.json",
+        r#"{"env":{"ANTHROPIC_MODEL":"m"},"model":"x"}"#,
+    );
+    check_settings(&project, &managed).unwrap();
+
+    write_settings(
+        &project.join(".claude"),
+        "settings.json",
+        r#"{"env":{"ANTHROPIC_API_KEY":"secret-value"}}"#,
+    );
+    let message = refused(&project, &managed);
+    assert!(message.contains("ANTHROPIC_API_KEY"), "{message}");
+    assert!(!message.contains("secret-value"), "{message}");
+    std::fs::remove_file(project.join(".claude/settings.json")).unwrap();
+
+    write_settings(
+        &project.join(".claude"),
+        "settings.local.json",
+        r#"{"apiKeyHelper":"/bin/echo"}"#,
+    );
+    assert!(refused(&project, &managed).contains("apiKeyHelper"));
+    std::fs::remove_file(project.join(".claude/settings.local.json")).unwrap();
+
+    // A parent directory's settings count too.
+    write_settings(
+        &root.path().join("repo/.claude"),
+        "settings.json",
+        r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}"#,
+    );
+    assert!(refused(&project, &managed).contains("CLAUDE_CODE_USE_BEDROCK"));
+    std::fs::remove_file(root.path().join("repo/.claude/settings.json")).unwrap();
+
+    write_settings(
+        &managed,
+        "managed-settings.json",
+        r#"{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid"}}"#,
+    );
+    assert!(refused(&project, &managed).contains("ANTHROPIC_BASE_URL"));
+    std::fs::remove_file(managed.join("managed-settings.json")).unwrap();
+
+    write_settings(
+        &managed.join("managed-settings.d"),
+        "10-auth.json",
+        r#"{"awsAuthRefresh":"aws sso login"}"#,
+    );
+    assert!(refused(&project, &managed).contains("awsAuthRefresh"));
+    std::fs::remove_file(managed.join("managed-settings.d/10-auth.json")).unwrap();
+
+    // A file that cannot be parsed fails closed and quotes nothing.
+    write_settings(
+        &project.join(".claude"),
+        "settings.json",
+        r#"{"env":{"ANTHROPIC_API_KEY":"secret-value""#,
+    );
+    let message = refused(&project, &managed);
+    assert!(message.contains("cannot parse"), "{message}");
+    assert!(!message.contains("secret-value"), "{message}");
+}
+
+#[test]
+fn exec_refuses_to_start_in_a_project_whose_settings_set_a_credential() {
+    let (home, paths, _store) = setup();
+    save(
+        &paths,
+        "one",
+        "uuid-one",
+        &creds("a-one", "r-one", 2 * HOUR_MS),
+    );
+    let out = home.path().join("out-settings");
+    std::fs::create_dir(&out).unwrap();
+    fake_child(&out, &out, 0);
+    let project = home.path().join("project");
+    write_settings(
+        &project.join(".claude"),
+        "settings.json",
+        r#"{"env":{"ANTHROPIC_API_KEY":"project-key"}}"#,
+    );
+    let status = run_helper_in(home.path(), "one", &out, &[], false, Some(&project));
+    assert!(!status.success(), "the run must be refused");
+    assert!(!out.join("token").exists(), "no child may start");
 }
 
 #[test]

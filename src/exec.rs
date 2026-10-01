@@ -25,40 +25,154 @@ use crate::profile;
 pub const TOKEN_FD_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR";
 pub const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 
-/// Credential sources the child must not inherit, so the saved profile is the
-/// only login it can use.
+/// Credential sources the child must not inherit that `is_scrubbed_env`'s
+/// name rules do not cover.
 const SCRUBBED_ENV: &[&str] = &[
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
     "CLAUDE_CODE_OAUTH_SCOPES",
     "CLAUDE_CODE_HOST_CREDS_FILE",
     "CCR_OAUTH_TOKEN_FILE",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    // Provider selectors: with one of these set, Claude Code uses that
-    // provider's credentials instead of the saved account, so the identity
-    // check and the receipt would name the wrong account.
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-    "CLAUDE_CODE_USE_GATEWAY",
-    "CLAUDE_CODE_USE_MANTLE",
-    // Endpoint and header overrides: they could route the saved OAuth token
-    // to another host or add authorization headers. Names taken from the
-    // Claude Code binary.
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_API_HOST",
-    "ANTHROPIC_ASSETS_HOST",
-    "ANTHROPIC_CUSTOM_HEADERS",
-    "ANTHROPIC_AWS_BASE_URL",
-    "ANTHROPIC_BEDROCK_BASE_URL",
-    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
-    "ANTHROPIC_FOUNDRY_BASE_URL",
-    "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
-    "ANTHROPIC_VERTEX_BASE_URL",
 ];
+
+/// Name endings that mark a credential, a credential descriptor, an endpoint
+/// or extra headers.
+const SCRUBBED_SUFFIXES: &[&str] = &[
+    "_API_KEY",
+    "_TOKEN",
+    "_FILE_DESCRIPTOR",
+    "_BASE_URL",
+    "_HOST",
+    "_HEADERS",
+    "_HELPER",
+];
+
+/// True for an environment name the child must not inherit (or get from a
+/// settings file), so the saved profile is the only login it can use and the
+/// token goes only to Anthropic. It covers every `ANTHROPIC_*` and
+/// `CLAUDE_CODE_*` name that selects a provider (`CLAUDE_CODE_USE_*`) or ends
+/// in a credential, descriptor, endpoint or header suffix, for example
+/// `ANTHROPIC_API_KEY`, `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` and
+/// `ANTHROPIC_BASE_URL`. Rules, not a list, so a name added in a later
+/// Claude Code release with the same shape is covered too.
+pub fn is_scrubbed_env(name: &str) -> bool {
+    if SCRUBBED_ENV.contains(&name) {
+        return true;
+    }
+    if !(name.starts_with("ANTHROPIC_") || name.starts_with("CLAUDE_CODE_")) {
+        return false;
+    }
+    name.starts_with("CLAUDE_CODE_USE_")
+        || SCRUBBED_SUFFIXES
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+}
+
+/// Top-level settings keys that run a command to get a credential.
+const SETTINGS_CREDENTIAL_KEYS: &[&str] = &[
+    "apiKeyHelper",
+    "awsAuthRefresh",
+    "awsCredentialExport",
+    "gcpAuthRefresh",
+];
+
+/// The directory that holds Claude Code's managed (policy) settings.
+pub fn managed_settings_dir() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        PathBuf::from("/Library/Application Support/ClaudeCode")
+    } else {
+        PathBuf::from("/etc/claude-code")
+    }
+}
+
+/// Refuse when a settings file Claude Code would load in `cwd` could change
+/// the login or the endpoint: an `env` entry `is_scrubbed_env` covers, or a
+/// credential helper. The private config dir has no user settings, but
+/// project, local and managed settings still apply. It checks
+/// `.claude/settings.json` and `.claude/settings.local.json` in `cwd` and
+/// every parent, and `managed-settings.json` plus `managed-settings.d/*.json`
+/// in `managed`. A file that exists but cannot be read or parsed is refused.
+/// Values are never read into the error.
+pub fn check_settings(cwd: &Path, managed: &Path) -> Result<(), ExecError> {
+    let mut files = Vec::new();
+    for dir in cwd.ancestors() {
+        files.push(dir.join(".claude/settings.json"));
+        files.push(dir.join(".claude/settings.local.json"));
+    }
+    files.push(managed.join("managed-settings.json"));
+    match std::fs::read_dir(managed.join("managed-settings.d")) {
+        Ok(entries) => {
+            let mut extra = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    ExecError::Refused(format!("cannot list managed settings ({})", e.kind()))
+                })?;
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "json") {
+                    extra.push(path);
+                }
+            }
+            extra.sort();
+            files.extend(extra);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(ExecError::Refused(format!(
+                "cannot list managed settings ({})",
+                e.kind()
+            )));
+        }
+    }
+    for file in files {
+        let bytes = match std::fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => continue,
+            Err(e) => {
+                return Err(ExecError::Refused(format!(
+                    "cannot read {} ({})",
+                    file.display(),
+                    e.kind()
+                )));
+            }
+        };
+        let settings: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+            ExecError::Refused(format!(
+                "cannot parse {}; exec cannot prove it leaves the login alone",
+                file.display()
+            ))
+        })?;
+        let overrides = settings
+            .get("env")
+            .and_then(|env| env.as_object())
+            .into_iter()
+            .flat_map(|env| env.keys())
+            .filter(|name| is_scrubbed_env(name))
+            .map(String::as_str)
+            .chain(
+                SETTINGS_CREDENTIAL_KEYS
+                    .iter()
+                    .copied()
+                    .filter(|key| settings.get(key).is_some()),
+            )
+            .collect::<Vec<_>>();
+        if !overrides.is_empty() {
+            return Err(ExecError::Refused(format!(
+                "{} sets {}, which can change the login or the endpoint; run from another directory",
+                file.display(),
+                overrides.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `check_settings` for this process's working directory, which the child
+/// inherits.
+fn check_current_settings() -> Result<(), ExecError> {
+    let cwd = std::env::current_dir().map_err(|e| {
+        ExecError::Refused(format!("cannot read the working directory ({})", e.kind()))
+    })?;
+    check_settings(&cwd, &managed_settings_dir())
+}
 
 pub struct ExecRequest {
     pub alias: String,
@@ -349,6 +463,7 @@ pub fn prepare(
     let saved = profile::get_profile_from(paths, &alias)
         .map_err(|e| ExecError::Refused(format!("{e:#}")))?;
 
+    check_current_settings()?;
     let (creds, live_token) = {
         let _lock = lock_with_retry(store)?;
         check_ownership(paths, store, &alias, None, req.min_valid)?
@@ -716,8 +831,10 @@ fn run_in_dir(
     let mut command = Command::new(&snapshot);
     command.args(&req.args);
     set_arg0(&mut command, &prepared.program);
-    for name in SCRUBBED_ENV {
-        command.env_remove(name);
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(is_scrubbed_env) {
+            command.env_remove(&name);
+        }
     }
     command.env(CONFIG_DIR_ENV, config_dir);
     command.env(TOKEN_FD_ENV, CHILD_TOKEN_FD.to_string());
@@ -747,6 +864,7 @@ fn run_in_dir(
                     "the live login changed during preparation; run again".into(),
                 ));
             }
+            check_current_settings()?;
             signals::block();
             if let Some(signal) = signals::pending() {
                 signals::unblock();
