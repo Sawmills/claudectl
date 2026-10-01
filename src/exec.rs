@@ -89,11 +89,18 @@ pub fn managed_settings_dir() -> PathBuf {
 /// project, local and managed settings still apply. It checks
 /// `.claude/settings.json` and `.claude/settings.local.json` in `cwd` and
 /// every parent, and `managed-settings.json` plus `managed-settings.d/*.json`
-/// in `managed`. A file that exists but cannot be read or parsed is refused.
-/// Values are never read into the error.
-pub fn check_settings(cwd: &Path, managed: &Path) -> Result<(), ExecError> {
+/// in `managed`. A parent that is `home` is skipped: its `.claude` holds user
+/// settings, which the private config dir replaces. When `cwd` is `home`
+/// itself, Claude Code reads that directory as the project, so it is checked.
+/// A file that exists but cannot be read or parsed is refused. Values are
+/// never read into the error.
+pub fn check_settings(cwd: &Path, home: &Path, managed: &Path) -> Result<(), ExecError> {
+    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
     let mut files = Vec::new();
     for dir in cwd.ancestors() {
+        if dir != cwd && dir == home {
+            continue;
+        }
         files.push(dir.join(".claude/settings.json"));
         files.push(dir.join(".claude/settings.local.json"));
     }
@@ -171,11 +178,11 @@ pub fn check_settings(cwd: &Path, managed: &Path) -> Result<(), ExecError> {
 
 /// `check_settings` for this process's working directory, which the child
 /// inherits.
-fn check_current_settings() -> Result<(), ExecError> {
+fn check_current_settings(paths: &Paths) -> Result<(), ExecError> {
     let cwd = std::env::current_dir().map_err(|e| {
         ExecError::Refused(format!("cannot read the working directory ({})", e.kind()))
     })?;
-    check_settings(&cwd, &managed_settings_dir())
+    check_settings(&cwd, &paths.home, &managed_settings_dir())
 }
 
 pub struct ExecRequest {
@@ -467,7 +474,7 @@ pub fn prepare(
     let saved = profile::get_profile_from(paths, &alias)
         .map_err(|e| ExecError::Refused(format!("{e:#}")))?;
 
-    check_current_settings()?;
+    check_current_settings(paths)?;
     let (creds, live_token) = {
         let _lock = lock_with_retry(store)?;
         check_ownership(paths, store, &alias, None, req.min_valid)?
@@ -868,7 +875,7 @@ fn run_in_dir(
                     "the live login changed during preparation; run again".into(),
                 ));
             }
-            check_current_settings()?;
+            check_current_settings(paths)?;
             signals::block();
             if let Some(signal) = signals::pending() {
                 signals::unblock();

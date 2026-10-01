@@ -201,7 +201,8 @@ under `nohup`, stays ignored for the child.
 Claude Code also reads project, local and managed settings files, which can
 set the same variables. `exec` checks `.claude/settings.json` and
 `.claude/settings.local.json` in the working directory and every parent
-directory, and the managed settings (`managed-settings.json` and
+directory (except `~/.claude` below home, which is user scope and replaced by
+the private config dir), and the managed settings (`managed-settings.json` and
 `managed-settings.d/`). If one sets such a variable in `env`, or sets
 `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport` or `gcpAuthRefresh`,
 `exec` refuses; run it from another directory. Arguments after `--` are passed

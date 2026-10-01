@@ -54,7 +54,7 @@ Claude Code 2.1.x reads an OAuth access token from an inherited file descriptor 
    - Create a fresh private 0700 config directory under `~/.claudectl/run/<alias>/`.
    - Write the access token into a pipe. The parent keeps close-on-exec on it; only the child's pre-exec step maps it to fd 3. Set `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=3` and `CLAUDE_CONFIG_DIR`.
    - Remove from the child's environment every `ANTHROPIC_*` and `CLAUDE_CODE_*` variable that selects a provider (`CLAUDE_CODE_USE_*`) or ends in `_API_KEY`, `_TOKEN`, `_FILE_DESCRIPTOR`, `_BASE_URL`, `_HOST`, `_HEADERS` or `_HELPER`. Name rules, not a fixed list, so a new variable with the same shape is covered.
-   - Refuse when a project, local or managed settings file in the working directory or a parent sets such a variable in `env`, sets a credential helper (`apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh`), or cannot be parsed. The private config dir removes user settings only.
+   - Refuse when a project, local or managed settings file in the working directory or a parent (not `~/.claude` below home, which is user scope) sets such a variable in `env`, sets a credential helper (`apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh`), or cannot be parsed. The private config dir removes user settings only.
    - Under the auth lock, check ownership and the settings files again, and check that the live token did not change since step 2. Then spawn.
 5. Run and tear down:
    - The child leads its own process group. `SIGTERM`, `SIGINT` and `SIGHUP` reach the group once. A signal inherited as ignored stays ignored, and the child inherits that.

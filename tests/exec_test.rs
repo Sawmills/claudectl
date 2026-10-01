@@ -721,7 +721,11 @@ fn write_settings(dir: &Path, name: &str, body: &str) {
 
 #[test]
 fn settings_that_change_the_login_or_endpoint_are_refused() {
-    let refused = |cwd: &Path, managed: &Path| match check_settings(cwd, managed) {
+    let refused = |cwd: &Path, managed: &Path| match check_settings(
+        cwd,
+        Path::new("/nonexistent-home"),
+        managed,
+    ) {
         Err(error @ ExecError::Refused(_)) => error.to_string(),
         other => panic!("expected a refusal, got {other:?}"),
     };
@@ -730,13 +734,13 @@ fn settings_that_change_the_login_or_endpoint_are_refused() {
     let project = root.path().join("repo/sub");
     std::fs::create_dir_all(&project).unwrap();
     // No settings, or settings that change nothing about the login, pass.
-    check_settings(&project, &managed).unwrap();
+    check_settings(&project, Path::new("/nonexistent-home"), &managed).unwrap();
     write_settings(
         &project.join(".claude"),
         "settings.json",
         r#"{"env":{"ANTHROPIC_MODEL":"m"},"model":"x"}"#,
     );
-    check_settings(&project, &managed).unwrap();
+    check_settings(&project, Path::new("/nonexistent-home"), &managed).unwrap();
 
     write_settings(
         &project.join(".claude"),
@@ -798,6 +802,39 @@ fn settings_that_change_the_login_or_endpoint_are_refused() {
     let message = refused(&project, &managed);
     assert!(message.contains("cannot parse"), "{message}");
     assert!(!message.contains("secret-value"), "{message}");
+}
+
+#[test]
+fn user_settings_in_home_are_skipped_below_home_but_checked_at_home() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let managed = root.join("managed");
+    let project = home.join("code/repo");
+    std::fs::create_dir_all(&project).unwrap();
+    write_settings(
+        &home.join(".claude"),
+        "settings.json",
+        r#"{"apiKeyHelper":"/bin/echo"}"#,
+    );
+    // Below home, ~/.claude/settings.json is user scope, which the private
+    // config dir replaces.
+    check_settings(&project, &home, &managed).unwrap();
+    // At home, Claude Code reads it as the project's settings.
+    assert!(matches!(
+        check_settings(&home, &home, &managed),
+        Err(ExecError::Refused(_))
+    ));
+    // A parent above home still counts.
+    write_settings(
+        &root.join(".claude"),
+        "settings.json",
+        r#"{"apiKeyHelper":"/bin/echo"}"#,
+    );
+    assert!(matches!(
+        check_settings(&project, &home, &managed),
+        Err(ExecError::Refused(_))
+    ));
 }
 
 #[test]
