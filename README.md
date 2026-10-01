@@ -166,6 +166,78 @@ usage below 100%. It picks the lowest `max(5h, 7d)` utilization and breaks near-
 toward the soonest weekly reset. Model-specific limits remain visible in the table;
 automatic selection does not choose for a particular model.
 
+### Run one command on a saved account
+
+```bash
+claudectl exec --profile amir+2@example.com -- claude -p "review this diff"
+claudectl launcher --profile amir+2@example.com --claude "$(command -v claude)" --out ./claude-amir2
+```
+
+`exec` runs one command on a saved profile and leaves the live login alone.
+The child gets the saved access token through an inherited pipe
+(`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`) and a fresh private
+`CLAUDE_CONFIG_DIR` that is removed when the run ends. The child runs
+in its own process group: `SIGTERM`, `SIGINT` and `SIGHUP` sent to claudectl
+reach the whole group once, and descendants left after the child exits get
+`SIGTERM`, then `SIGKILL`.
+
+`exec` is for non-interactive runs such as `claude -p`. A child that reads the
+terminal is stopped by the terminal driver, because it runs in a background
+process group. `exec` runs a private copy of the executable, so use it for a
+single-file program such as the Claude Code native binary; a program that loads
+files next to its own path does not find them. The Keychain entry,
+`~/.claude/.credentials.json`, `~/.claude.json` and the active marker are not
+written.
+
+The child's environment drops other credentials and routing settings: every
+`ANTHROPIC_*` or `CLAUDE_CODE_*` variable that selects a provider
+(`CLAUDE_CODE_USE_*`) or whose name ends in `_API_KEY`, `_TOKEN`,
+`_FILE_DESCRIPTOR`, `_BASE_URL`, `_HOST`, `_HEADERS` or `_HELPER`, for example
+`ANTHROPIC_API_KEY`, `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` and
+`ANTHROPIC_BASE_URL`. Other variables, such as `ANTHROPIC_MODEL`, pass
+through. A signal that claudectl inherits as ignored, for example `SIGHUP`
+under `nohup`, stays ignored for the child.
+
+Claude Code also reads project, local and managed settings files, which can
+set the same variables. `exec` checks `.claude/settings.json` and
+`.claude/settings.local.json` in the working directory and every parent
+directory (except `~/.claude` below home, which is user scope and replaced by
+the private config dir), and the managed settings (`managed-settings.json` and
+`managed-settings.d/`). If one sets such a variable in `env`, sets
+`CLAUDE_CONFIG_DIR` or `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` in `env`
+(they would replace the private directory or the token descriptor), or sets
+`apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport` or `gcpAuthRefresh`,
+`exec` refuses; run it from another directory. Arguments after `--` are passed
+as given, so do not pass `--settings` with such values.
+
+`exec` never refreshes a token. It refuses, and starts no child, when:
+
+- the profile is the active profile, shares its refresh grant with the live login, or is the same account as the live login (exit 5);
+- claudectl cannot tell which account the live login uses, or the live login changes while `exec` prepares the run (exit 5);
+- the saved credentials are unreadable, have no access token, or change while `exec` prepares the run (exit 5);
+- a settings file Claude Code would load sets a credential, provider or endpoint, sets `CLAUDE_CONFIG_DIR` or the token descriptor variable, or cannot be read or parsed (exit 5);
+- the token has expired (run `claudectl status <alias>` to refresh it), or expires within `--min-valid` (default `30m`). claudectl refreshes a saved token only after it expires, so retry after it expires and run `claudectl status <alias>`. `claudectl login <alias>` also gives a fresh token, but it makes that profile active; switch back with `claudectl use` before running `exec` (exit 5);
+- another `exec` run is active in the same process, or the auth state stays locked (exit 5);
+- the profile has no saved `accountUuid`, the token's account differs from it or from `--expect-account`, or the account lookup fails (exit 3);
+- the executable's SHA-256 differs from `--expect-sha256`, the executable changes after it is hashed, or the running claudectl does not match its own path (exit 4);
+- a receipt record cannot be written (exit 6);
+- the token pipe, the private config directory or the child process cannot be created (exit 7).
+
+A run that started but whose private config directory could not be removed, or whose descendant processes survived `SIGKILL`, exits 8 and names the child's exit code.
+
+Otherwise it exits with the child's exit code. `exec` writes JSON receipt
+records to stderr, or appends them to `--receipt <file>`: `prepared`,
+`started` (with the child PID), `exited` (with the exit code, signal and
+descendant teardown result), or `refused`, `spawn_failed` and
+`cleanup_failed`. Each names the profile, account, executable path and
+SHA-256, and the claudectl path, SHA-256 and version. Receipts never contain
+tokens.
+
+`launcher` writes a script for tools that take a `--claude-bin` path. The script
+pins the profile's account and the executable's SHA-256. It also keeps a private
+copy of claudectl in `<launcher>.claudectl/`, checks that copy's SHA-256 and runs
+it, so a later claudectl upgrade does not change what the launcher runs.
+
 ### Housekeeping
 
 ```bash

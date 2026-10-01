@@ -57,6 +57,42 @@ enum Commands {
     },
     /// Show current active account
     Whoami,
+    /// Run one command on a saved profile without switching the live login
+    Exec {
+        /// Saved profile to run on (never the active profile)
+        #[arg(long)]
+        profile: String,
+        /// Refuse unless the profile's accountUuid equals this value
+        #[arg(long)]
+        expect_account: Option<String>,
+        /// Refuse unless the resolved executable has this SHA-256
+        #[arg(long)]
+        expect_sha256: Option<String>,
+        /// Minimum token lifetime left before the run starts (e.g. 30m, 900s)
+        #[arg(long, default_value = "30m", value_parser = claudectl::exec::parse_duration)]
+        min_valid: std::time::Duration,
+        /// Append JSON receipt records here (default: stderr)
+        #[arg(long)]
+        receipt: Option<std::path::PathBuf>,
+        /// Program and arguments, after `--`
+        #[arg(last = true, required = true)]
+        command: Vec<std::ffi::OsString>,
+    },
+    /// Write a launcher script pinned to one saved profile and one executable
+    Launcher {
+        /// Saved profile the launcher runs on
+        #[arg(long)]
+        profile: String,
+        /// Executable the launcher runs (for example the claude binary)
+        #[arg(long)]
+        claude: std::path::PathBuf,
+        /// Where to write the launcher
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Minimum token lifetime passed to `exec`
+        #[arg(long, default_value = "30m", value_parser = claudectl::exec::parse_duration)]
+        min_valid: std::time::Duration,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -97,6 +133,31 @@ fn main() {
         Commands::List => commands::list::run(),
         Commands::Remove { ref alias } => commands::remove::run(alias),
         Commands::Whoami => commands::whoami::run(),
+        Commands::Exec {
+            profile,
+            expect_account,
+            expect_sha256,
+            min_valid,
+            receipt,
+            mut command,
+        } => {
+            let program = command.remove(0);
+            std::process::exit(commands::exec::run(claudectl::exec::ExecRequest {
+                alias: profile,
+                expect_account,
+                expect_sha256,
+                min_valid,
+                receipt,
+                program,
+                args: command,
+            }))
+        }
+        Commands::Launcher {
+            ref profile,
+            ref claude,
+            ref out,
+            min_valid,
+        } => commands::launcher::run(profile, claude, out, min_valid),
         Commands::Completions { shell } => commands::completions::run(shell),
     };
 

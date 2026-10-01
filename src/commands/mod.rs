@@ -1,4 +1,6 @@
 pub mod completions;
+pub mod exec;
+pub mod launcher;
 pub mod list;
 pub mod login;
 pub mod remove;
