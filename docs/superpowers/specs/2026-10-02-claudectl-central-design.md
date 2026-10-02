@@ -7,22 +7,25 @@ server.
 
 ## Recommendation and feasibility
 
-Extend the codexctl account server with an explicit provider dimension and a Claude
-adapter. Reuse company SSO, machine registration, the encrypted vault, authorization,
-and deployment. Keep a server account assigned to exactly one company user. Claude
-Code continues to run tools locally and send inference directly to Anthropic.
+Reuse the codexctl account-server implementation with an explicit provider dimension
+and a Claude adapter. Present and package it as a standalone account server with a
+neutral name, including a Claude-only deployment. Reuse company SSO, machine
+registration, the encrypted vault, authorization, and deployment. Keep a server
+account assigned to exactly one company user. Claude Code continues to run tools
+locally and send inference directly to Anthropic.
 
-Two constraints prevent claiming parity with codexctl today:
+Amir has decided to proceed without making Anthropic approval a prerequisite.
+The provider restriction below remains a recorded risk. The unresolved technical
+question is whether Claude Code can receive replacement access tokens without
+restarting.
 
-1. **Credential intermediation needs resolution with Anthropic.** Its current
+1. **Provider restriction — accepted risk.** Anthropic's current
    documentation says developers “may not collect, store, or intermediate Claude.ai
    credentials or session tokens.” It separately allows an end user to sign into
    the unmodified Claude Code binary with their own subscription. A company vault
-   collecting those credentials is not established as an exception. Obtain explicit
-   confirmation that this proposed own-user arrangement is permitted before building
-   or deploying the subscription broker. Company SSO and the absence of an inference
-   proxy do not themselves settle this restriction. Team subscriptions must not be
-   assumed exempt from the general credential language. [A6]
+   collecting those credentials is not established as an exception. Amir has chosen
+   not to seek prior permission as a condition of this design. That decision does
+   not establish an exception or guarantee continued provider access. [A6]
 2. **No documented subscription equivalent of Codex's renewable provider helper
    was found.** `apiKeyHelper` is documented for API/gateway credentials;
    `CLAUDE_CODE_OAUTH_TOKEN` supplies subscription OAuth but stays fixed for the
@@ -30,11 +33,11 @@ Two constraints prevent claiming parity with codexctl today:
    with a new token on expiry. Updating a credential file during a running session
    is a candidate requiring compatibility evidence, not a promised solution. [A1–A3]
 
-If Anthropic does not permit the vault, retain native per-machine subscription
-login, or pursue the officially documented API-key/gateway route as a separate
-product decision. API billing does not consume the user's Pro/Max/Team subscription
-allowance. The latter can use `apiKeyHelper`, but does not satisfy the requested
-subscription-account concept. [A1, A6, A8]
+The selected direction remains subscription accounts on the account server.
+API-key/gateway billing would be a separate product decision: it does not consume
+the user's Pro/Max/Team subscription allowance. That alternative can use
+`apiKeyHelper`, but does not satisfy the requested subscription-account concept.
+[A1, A8]
 
 ## Evidence and boundaries
 
@@ -265,10 +268,34 @@ acceptance checks, not assumptions derived from the synthetic tests.
 
 ## 4. Shared account server versus a separate service
 
-| Choice                                                                  | Advantages                                                                                                                                                                   | Costs and risks                                                                                                                                                                                                            |
-| ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Extend codexctl with providers — recommended, conditional on permission | Reuses SSO enrollment, machine approval/revocation, immutable company-user identity, vault, refresh ownership, monitoring, and private deployment; one service for both CLIs | Existing code assumes OpenAI auth and identity in many places; needs versioned schema/protocol migration and provider isolation. Shared outage and security blast radius.                                                  |
-| Separate claudectl account server                                       | Independent release cycle, policy boundary, and outage domain; no compatibility change for existing codexctl users                                                           | Duplicates enrollment, authorization, recovery, secrets, alerts, deployment, and machine lifecycle; risks two implementations drifting on refresh safety. Does not solve Anthropic's policy or client-renewal constraints. |
+### People who use only Claude
+
+Reusing the server implementation must not require the codexctl client, a Codex
+installation, or an OpenAI account. A company user installs `claudectl`, connects
+to the account server, and sees the Claude accounts they can use. Enrollment and
+the browser approval page should use a neutral account-server name.
+
+Separate the client product from the server package. The server needs explicit
+provider enablement and a Claude-only deployment that does not install or start
+the Codex refresh-owner runtime. Configuration and readiness checks must not
+require OpenAI credentials or tools when that provider is disabled. The shared
+SSO, vault, and machine-management components remain necessary for either provider.
+These are proposed packaging requirements; the current codexctl server does not
+already satisfy them.
+
+For Sawmills, reuse the existing deployment and enable both providers. For a
+Claude-only operator, document one standalone account-server installation with
+only the Claude adapter enabled. A neutral server package can initially live in
+the codexctl repository; a repository split is not required for this design.
+If providing the Claude-only package requires substantial separation work, include
+that cost in the implementation plan rather than make Claude users install Codex.
+
+### Implementation choice
+
+| Choice                                       | Advantages                                                                                                                                                                   | Costs and risks                                                                                                                                                                                                                              |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Extend codexctl with providers — recommended | Reuses SSO enrollment, machine approval/revocation, immutable company-user identity, vault, refresh ownership, monitoring, and private deployment; one service for both CLIs | Existing code assumes OpenAI auth and identity in many places; needs versioned schema/protocol migration and provider isolation. Shared outage and security blast radius.                                                                    |
+| Separate claudectl account server            | Independent release cycle, policy boundary, and outage domain; no compatibility change for existing codexctl users                                                           | Duplicates enrollment, authorization, recovery, secrets, alerts, deployment, and machine lifecycle; risks two implementations drifting on refresh safety. Does not solve the client-renewal constraint or remove the accepted provider risk. |
 
 The codexctl implementation is not already provider-neutral: `TokenResponse`
 contains `chatgpt_account_id`, its refresh owner talks to Codex App Server RPC,
@@ -293,7 +320,7 @@ flowchart LR
 Proposed adapter responsibilities: validate imported identity, perform login
 renewal, obtain a usable access token with expiry, reconcile/persist refresh,
 classify failures, and read provider usage. Prefer a direct Claude OAuth grant
-adapter using the existing claudectl request semantics, if Anthropic permits it;
+adapter using the existing claudectl request semantics;
 do not invent a Claude equivalent of Codex App Server RPC. Its token/profile/usage
 contracts need their own version-pinned acceptance. [C2, X4]
 
@@ -386,7 +413,7 @@ local -> inventoried -> locally fenced -> server verified -> client retired
    import or OAuth preserves the saved server account and offers an activation
    retry; it must not send the refresh token back to the machine. If a subsequent
    login-renewal flow is needed, bind it to the same company user and Claude
-   identity, use Anthropic's permitted sign-in flow, and exchange/store the grant
+   identity, use Anthropic's sign-in flow, and exchange/store the grant
    on the server. Do not present company SSO as Claude authorization. [A6, C1]
 
 Other enrolled machines discover the same provider catalog. A fresh Linux machine
@@ -415,8 +442,8 @@ does not establish those macOS behaviors.
 
 ## Acceptance required before implementation can claim completion
 
-This research did not run live account experiments. After the policy decision,
-use only an explicitly admitted dedicated account for any live acceptance:
+This research did not run live account experiments. Use only an explicitly
+admitted dedicated account for any live acceptance:
 
 - Pro/Max/Team entitlement and intended billing through each chosen credential
   path; reject API/gateway/settings overrides rather than charge unexpectedly.
@@ -473,11 +500,12 @@ use only an explicitly admitted dedicated account for any live acceptance:
 
 ## Decisions for Amir
 
-1. **Permission:** seek explicit Anthropic confirmation for this private
-   own-user subscription vault before implementation/deployment; if unavailable,
-   retain native subscription login or choose API/gateway billing separately.
-2. **Server:** extend the codexctl account server with versioned provider support;
-   preserve existing OpenAI clients and add no separate claudectl service initially.
+1. **Provider restriction — decided:** proceed without seeking prior Anthropic
+   approval. Amir accepts the recorded provider risk; approval is not a prerequisite.
+2. **Server:** reuse the codexctl account-server implementation with versioned
+   provider support, a neutral standalone server package, and a Claude-only
+   deployment. Preserve existing OpenAI clients; require no Codex installation
+   or OpenAI account from Claude-only users or operators.
 3. **Ownership:** one company user per server account and one server refresh owner;
    no cross-person seat pooling and no client refresh-token copies after migration.
 4. **Client experience:** accept launch-time OAuth delivery with restart/resume at
