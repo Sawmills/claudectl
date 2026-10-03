@@ -1,142 +1,113 @@
-# Claude Code credential reload experiment
+# macOS Claude Code credential reload experiment
 
-2026-10-03. Question: can a running Claude Code session receive a replacement
-subscription access token without restarting or holding a refresh token?
+2026-10-03. Follow-up to the [Linux experiment](2026-10-03-claudectl-credential-reload-experiment.md).
+Question: can the Mac client continue after an access-only credential file changes,
+without restarting or receiving a refresh token?
 
 ## Result
 
-**Yes, in the tested Linux client with a synthetic API.** Claude Code 2.1.280
-reloaded an access-only `.credentials.json` file, sent the replacement bearer,
-and continued in the same process. This worked in streaming command mode and in
-the interactive terminal. Recovery also worked when the replacement file appeared
-only after a simulated HTTP 401.
+**Yes, with the tested isolation.** On an Apple silicon Mac mini running macOS
+27.0, Claude Code 2.1.288 reloaded the replacement access token and continued in
+the same process. The interactive terminal also recovered from a simulated 401
+and displayed the successful second reply. No real account or Anthropic endpoint
+was used.
 
-This supports choosing an access-only file, updated by a local account-server
-client, for the [account-server design](2026-10-02-claudectl-central-design.md).
-The account server would retain refresh ownership. A fixed OAuth environment
-value or a one-time inherited pipe did not recover in this test.
+All nine expected outcomes passed. This supports the access-only file approach in
+the [account-server design](2026-10-02-claudectl-central-design.md). It does not
+establish live subscription entitlement or Keychain precedence when the Keychain
+is accessible: the test deliberately blocked Keychain access to protect existing
+credentials. A production launcher still needs a verified isolated credential
+namespace and must refuse conflicting credential sources.
 
-This is a client-behavior result, not a live Anthropic interoperability result.
-No real login, token exchange, or provider request occurred. macOS, genuine plan
-entitlement, real rotation timing, and account identity still need acceptance.
+## Environment and protection
 
-The [macOS follow-up](2026-10-03-claudectl-macos-credential-reload-experiment.md) now records nine passing cases on macOS 27.0 with Claude Code 2.1.288 and Keychain access blocked. The Linux results below retain their original scope.
+- macOS 27.0, arm64; installed unmodified Claude Code 2.1.288.
+- Binary SHA-256: `bbe93063f7a0879a1021b2891e5c9354e5b3b98433e32efe6750f7710afed750`.
+- The Mac was reached through a temporary Tailscale connection and an SSH key
+  restricted to the test dev box. This was transport for the test harness, not a
+  Claude authentication mechanism.
+- Each Claude process ran under `/usr/bin/sandbox-exec` with a fresh private
+  `CLAUDE_CONFIG_DIR`. The sandbox denied external networking, real Claude/profile
+  credential paths, Keychain file access, and the specified securityd Mach services.
+  File writes were limited to the scratch directory and device files. Before
+  running Claude, the harness verified that a protected synthetic file read and
+  an outbound non-loopback connection failed with `PermissionError`.
+- A local HTTPS CONNECT proxy terminated TLS with a temporary test certificate.
+  Claude still addressed `https://api.anthropic.com`; the proxy never forwarded
+  requests. `NODE_EXTRA_CA_CERTS` trusted the certificate only for the test child.
+  No system certificate or DNS setting was changed.
+- `HOME` remained unchanged. No Keychain password was accepted, supplied, saved,
+  or logged. No login flow was run. All access values were deliberately invalid
+  synthetic A/B values, and no refresh token was supplied.
+- Tools, MCP servers, and hooks were disabled. The test used synthetic Messages
+  SSE responses and profile GETs returned 404. The displayed Max label came from
+  fixture metadata; it does not prove actual account identity or entitlement.
+- Credential writes used mode 0600 plus atomic rename inside mode 0700 directories.
+  The final mock serialized publication of B because the interactive client can
+  make concurrent requests. An initial mock-file race was corrected before the
+  complete nine-case rerun; the final run had no fixture stderr.
 
-## Test boundary
+## Observed outcomes
 
-- Unmodified installed Linux binary: Claude Code `2.1.280`.
-- Binary SHA-256: `92f2b4fd05d0bdcf7b9a0d4e0ecef4a1e4b368b290cd8fd07cff9a50013f45a2`.
-- A new network namespace contained only loopback. A new mount namespace hid
-  existing `~/.claude`, `~/.claudectl`, `~/.config/anthropic`, and `~/.claude.json`
-  where present, without reading their contents. `HOME` remained unchanged.
-- A temporary hosts file mapped the normal API hostname and known OAuth hosts to
-  loopback. A temporary certificate, trusted only by the test child, allowed the
-  mock to serve HTTPS at `https://api.anthropic.com`. Thus the normal first-party
-  hostname was retained without permitting external network access.
-- Every case used a fresh private `CLAUDE_CONFIG_DIR` and working directory, an
-  allowlisted environment, no tools/MCP servers/hooks, and disabled updates and
-  nonessential traffic. All temporary state was removed after the run.
-- Credentials were two deliberately invalid strings, referred to below as A and
-  B. Neither was a real token. No refresh token was supplied in any file or
-  environment input. Results record generation labels, not authorization headers.
-- The access-only file contained `claudeAiOauth.accessToken`, `expiresAt`,
-  `scopes: ["user:inference", "user:profile"]`, and synthetic
-  `subscriptionType: "max"`. The Max label is supplied fixture data, not evidence
-  of a verified subscription. Writes used a 0600 temporary file and atomic rename
-  inside a 0700 directory.
-- The mock returned a small valid Messages SSE response. It recorded bearer
-  generation, OAuth beta presence, API-key-header presence, request status, and
-  other endpoint paths. Profile reads returned 404. Identity lookup was therefore
-  deliberately outside the success claim.
+A and B below identify synthetic generations, not token contents. The streaming
+tests used one long-lived process with two prompts, or three for the outage case.
+Their successful results had `is_error: false`, `result: "OK"`, and an unchanged
+session ID. The terminal test used one pseudo-terminal process and checked the
+rendered reply after the second prompt.
 
-## Procedure and observations
+| Case                                                                | Messages request sequence         | Result                                                     |
+| ------------------------------------------------------------------- | --------------------------------- | ---------------------------------------------------------- |
+| File replaced before the second prompt                              | A/200 → B/200                     | Continued in the same process/session.                     |
+| File replaced when returning the first 401                          | A/200 → A/401 → B/200             | Automatic request retry used B.                            |
+| A's `expiresAt` elapsed before publishing B                         | A/200 → B/200                     | Continued with the replacement.                            |
+| Successor unavailable after expiry; B published before third prompt | A/200 → A/401 → A/401 → B/200     | Second prompt failed; third recovered in the same session. |
+| File missing before second prompt                                   | A/200; no second Messages request | `Not logged in`; process stayed alive.                     |
+| File malformed before second prompt                                 | A/200; no second Messages request | `Not logged in`; process stayed alive.                     |
+| Fixed OAuth environment value                                       | A/200 → A/401 → A/401             | Retained A; second prompt failed.                          |
+| One-time OAuth descriptor                                           | A/200 → A/401 → A/401             | Retained A; second prompt failed.                          |
+| Interactive terminal, file replaced on 401                          | A/200 ×2 → A/401 ×2 → B/200 ×2    | Retry notice, then `OK`; no restart.                       |
 
-Each streaming case kept one `claude -p --input-format stream-json
---output-format stream-json` process alive. The first prompt succeeded with A.
-For the second prompt the mock accepted B and rejected A with HTTP 401. The
-controller either replaced the credential beforehand or atomically published B
-immediately before returning that first 401. No restart occurred between prompts.
+All observed Messages requests carried the OAuth beta header and no API-key
+header. The mock recorded profile GETs but no OAuth token-exchange requests.
+The controller confirmed each child remained alive through its case. The test
+does not assume one HTTP request per terminal prompt.
 
-The inherited-pipe case closed its writer after sending A; it tests the existing
-one-time descriptor approach, not an invented reusable pipe protocol. The plain
-environment case tests the fixed launch input; a separate settings case tests
-rewriting the on-disk `env` setting. Host-file cases used the PID/start-time/expiry
-shape observed in this binary, including its managed-host flag and, for OAuth,
-`CLAUDE_CODE_HOST_AUTH_ENV_VAR=CLAUDE_CODE_OAUTH_TOKEN`.
+## What remains unproved
 
-`A/200` below means a request using synthetic generation A received HTTP 200.
-Successful streaming prompts returned `is_error: false`, `result: "OK"`, and the
-same session ID. Error outcomes were checked using `is_error`; this binary still
-reported `subtype: "success"` for some authentication errors.
-
-| Case                                                                 | Observed request sequence         | Outcome                                                                              |
-| -------------------------------------------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------ |
-| File replaced before second prompt                                   | A/200 → B/200                     | Same process and session continued.                                                  |
-| File replaced while returning second prompt's first 401              | A/200 → A/401 → B/200             | Retry used B; second prompt succeeded.                                               |
-| File A's `expiresAt` elapsed before publishing B                     | A/200 → B/200                     | Same session continued with the successor.                                           |
-| File A expired, successor unavailable; publish B before third prompt | A/200 → A/401 → A/401 → B/200     | Second prompt reported authentication failure; third succeeded in the same session.  |
-| Credential file removed before second prompt                         | A/200; no second Messages request | `Not logged in`; process remained alive.                                             |
-| Credential file malformed before second prompt                       | A/200; no second Messages request | `Not logged in`; process remained alive.                                             |
-| Fixed `CLAUDE_CODE_OAUTH_TOKEN`                                      | A/200 → A/401 → A/401             | Retained A; second prompt failed.                                                    |
-| One-time OAuth descriptor                                            | A/200 → A/401 → A/401             | Retained A; second prompt failed.                                                    |
-| Host credential file supplying OAuth, replaced on 401                | A/200 → A/401 → A/401             | Retained A; second prompt failed.                                                    |
-| Host credential file supplying generic bearer, replaced on 401       | A/200 → A/401 → B/200             | Reload worked, but requests lacked the OAuth beta header.                            |
-| `apiKeyHelper` output replaced on 401                                | A/200 → A/401 → B/200             | Reload worked, but requests used an API-key header and lacked the OAuth beta header. |
-| `settings.json` OAuth `env` value replaced before second prompt      | A/200 → B/200                     | This build reloaded the setting; not a reason to prefer secrets in general settings. |
-| Interactive terminal, credential file replaced on 401                | A/200 ×2 → A/401 ×2 → B/200 ×2    | Same terminal process continued and displayed `OK` for the second prompt.            |
-
-All 13 outcomes matched these expectations. Every child was still running when
-the controller completed its case. Each streaming case kept one session ID
-across its prompts. The terminal case used a single pseudo-terminal process and
-displayed an API-retry notice followed by the successful reply. It made multiple
-model requests; do not infer one HTTP request per interactive prompt.
-
-The file, environment, descriptor, and OAuth-settings requests included
-`anthropic-beta: oauth-2025-04-20` and no API-key header. The file tests observed
-only a profile GET outside the Messages requests, with no OAuth-token endpoint
-requests. This is stronger evidence of the intended client auth path than the
-earlier `auth status` checks, while still proving nothing about real entitlements.
-
-## Design consequences
-
-1. Prefer a dedicated private access-only credential file for continuous sessions.
-   Do not also inject an OAuth environment value or descriptor that would override it.
-2. The local writer acquires access tokens from the account server and atomically
-   replaces the file before expiry. It never receives a refresh token.
-3. A server outage can still cause a failed prompt. Preserve the session and allow
-   a later retry after credentials arrive; do not promise zero visible auth errors
-   or automatically replay work with side effects.
-4. Retain the version/hash compatibility boundary. The test does not turn the
-   internal credential-file schema into an official external-writer API.
-5. Next acceptance work is real Anthropic behavior and macOS file/Keychain
-   selection, followed by multiple machines and repeated rotation. This experiment
-   did not use real accounts, implement a server, or change product code.
+- Real Anthropic acceptance, plan scopes, identity, refresh rotation, and access
+  token validity across a real server refresh.
+- Keychain selection in an ordinary unsandboxed launch, including an existing
+  conflicting item. This test proves the file path works when Keychain access is
+  blocked; it does not prove that a file outranks an accessible Keychain entry.
+- Multiple machines acquiring credentials from an implemented account server,
+  repeated rotation over long sessions, and recovery during tools with side effects.
+- Other Claude Code versions. Linux 2.1.280 and macOS 2.1.288 are separate observed
+  builds, not a claim about all releases.
 
 ## Reproduce
 
-The following is a throwaway experiment harness, not a product component. It needs
-Linux user/network/mount namespaces, Python 3, OpenSSL, `mount`, and the Claude
-binary. Save the Python block below to a temporary `probe.py`, then run:
+Save the block below as a temporary `mac-probe.py` on a Mac with Python 3, OpenSSL,
+`sandbox-exec`, and Claude Code. Set the binary path explicitly for your machine.
+The recorded run used Homebrew Python/OpenSSL and the installed versioned binary.
+Update the OpenSSL path if Homebrew is installed elsewhere.
 
 ```bash
 CLAUDECTL_PROBE_BINARY=/absolute/path/to/claude \
-CLAUDECTL_PROBE_PARENT_NET="$(readlink /proc/self/ns/net)" \
-CLAUDECTL_PROBE_PARENT_MNT="$(readlink /proc/self/ns/mnt)" \
-unshare -Urnm python3 /tmp/probe.py > /tmp/claudectl-reload-results.jsonl
+/opt/homebrew/bin/python3 /tmp/mac-probe.py > /tmp/claudectl-mac-results.jsonl
 ```
 
-The namespace arguments are required: the harness refuses to run without them,
-or with any non-loopback network interface. It prints one JSON summary per case.
-For a narrower run, append case names such as `file_401 file_tui`. The complete
-matrix above was run using the final harness, with the real stores hidden.
+The script checks the sandbox before starting any Claude process. The parent
+serves synthetic data on loopback and does not forward traffic. Temporary config,
+certificates, and child processes are cleaned up after each run. To run only the
+401 and interactive cases, append `file_401 file_tui`.
 
 <details>
-<summary>Complete synthetic experiment harness</summary>
+<summary>Complete macOS experiment harness</summary>
 
 ```python
 """Throwaway synthetic-only Claude credential-reload experiment; not product code.
 
-Run under unshare -Urnm so the process has no external network and its own mounts.
+macOS variant: every Claude child runs under a network/credential-store sandbox.
 No real credential value is read or logged. Report only synthetic generation labels.
 """
 import fcntl
@@ -158,7 +129,7 @@ import tempfile
 import threading
 import time
 
-BINARY = os.environ.get('CLAUDECTL_PROBE_BINARY', '/home/amir/.local/bin/claude')
+BINARY = os.environ.get('CLAUDECTL_PROBE_BINARY', '/Users/amirjakoby/.local/share/claude/versions/2.1.288')
 A = 'synthetic-invalid-generation-a'
 B = 'synthetic-invalid-generation-b'
 
@@ -187,6 +158,7 @@ def run_case(root, case, server):
     host = run / 'host.json'
     helper_token = run / 'helper-input'
     env = {
+        'HTTPS_PROXY': PROXY_URL, 'HTTP_PROXY': PROXY_URL,
         'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': os.environ['HOME'],
         'CLAUDE_CONFIG_DIR': str(config), 'DISABLE_AUTOUPDATER': '1',
         'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1', 'DISABLE_TELEMETRY': '1',
@@ -240,7 +212,7 @@ def run_case(root, case, server):
              'rotate_on_401': case in ['file_401', 'host_oauth', 'host_bearer', 'helper'],
              'rotate': lambda: write_generation(B), 'rotated': False}
     server.state = state
-    command = [BINARY, '-p', '--input-format', 'stream-json', '--output-format',
+    command = ['/usr/bin/sandbox-exec', '-f', str(root / 'sandbox.sb'), BINARY, '-p', '--input-format', 'stream-json', '--output-format',
                'stream-json', '--verbose', '--model', 'claude-sonnet-4-6',
                '--tools', '', '--strict-mcp-config', '--setting-sources', 'user',
                '--settings', json.dumps(settings), '--no-session-persistence']
@@ -323,6 +295,98 @@ def run_case(root, case, server):
     print(json.dumps(summary), flush=True)
 
 
+class Proxy(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_CONNECT(self):
+        if self.path not in ['api.anthropic.com:443', 'console.anthropic.com:443',
+                             'platform.claude.com:443', 'claude.ai:443']:
+            self.send_error(403, 'Synthetic proxy refuses this destination')
+            return
+        self.send_response(200, 'Connection established')
+        self.end_headers()
+        try:
+            connection = self.server.tls_context.wrap_socket(self.connection, server_side=True)
+            Handler(connection, self.client_address, self.server)
+        except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+            pass
+        self.close_connection = True
+
+
+def main():
+    global PROXY_URL
+    if sys.platform != 'darwin':
+        raise SystemExit('This variant requires macOS sandbox-exec')
+    supported = {'file_proactive', 'file_401', 'file_expired', 'file_outage',
+                 'file_missing', 'file_malformed', 'env', 'fd', 'helper',
+                 'settings_env', 'file_tui'}
+    cases = sys.argv[1:] or ['file_proactive', 'file_401', 'file_expired', 'file_outage',
+                             'file_missing', 'file_malformed', 'env', 'fd', 'file_tui']
+    if not set(cases) <= supported:
+        raise SystemExit('Unsupported macOS test case')
+    with tempfile.TemporaryDirectory(prefix='claudectl-mac-isolated-') as scratch:
+        root = Path(scratch).resolve()
+        (root / 'sandbox-denied').write_text('synthetic sandbox check')
+        home = Path(os.environ['HOME'])
+        forbidden = [home / '.claude', home / '.claudectl', home / '.config/anthropic',
+                     home / 'Library/Keychains', root / 'sandbox-denied']
+        profile = '''(version 1)
+(allow default)
+(deny network*)
+(allow network-inbound (local ip "localhost:*"))
+(allow network-outbound (remote ip "localhost:*"))
+(deny mach-lookup (global-name "com.apple.securityd")
+                  (global-name "com.apple.securityd.xpc")
+                  (global-name "com.apple.SecurityServer"))
+(deny file-write*)
+'''
+        profile += '(allow file-write* (subpath ' + json.dumps(str(root)) + ') (subpath "/dev"))\n'
+        for location in forbidden:
+            profile += '(deny file-read* file-write* (subpath ' + json.dumps(str(location)) + '))\n'
+        profile += '(deny file-read* file-write* (literal ' + json.dumps(str(home / '.claude.json')) + '))\n'
+        (root / 'sandbox.sb').write_text(profile)
+        validation = '''import socket,sys
+try:
+ open(sys.argv[1]).read()
+ raise SystemExit('FAIL: protected fixture readable')
+except PermissionError: pass
+s=socket.socket(); s.settimeout(2)
+try:
+ s.connect(('1.1.1.1',443))
+ raise SystemExit('FAIL: external network allowed')
+except PermissionError: pass
+print('PASS: fixture reads and external connections denied')
+'''
+        checked = subprocess.run(['/usr/bin/sandbox-exec', '-f', str(root / 'sandbox.sb'),
+                                  sys.executable, '-c', validation, str(root / 'sandbox-denied')],
+                                 text=True, capture_output=True, timeout=10)
+        if checked.returncode:
+            raise SystemExit('Sandbox validation failed: ' + checked.stderr + checked.stdout)
+        print(checked.stdout.strip(), flush=True)
+        subprocess.run(['/opt/homebrew/bin/openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+                        '-keyout', str(root / 'key.pem'), '-out', str(root / 'cert.pem'),
+                        '-days', '1', '-subj', '/CN=api.anthropic.com',
+                        '-addext', 'subjectAltName=DNS:api.anthropic.com,DNS:console.anthropic.com,DNS:platform.claude.com,DNS:claude.ai'],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Proxy)
+        server.rotation_lock = threading.Lock()
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(root / 'cert.pem', root / 'key.pem')
+        server.tls_context = ctx
+        PROXY_URL = 'http://127.0.0.1:' + str(server.server_port)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        print(json.dumps({'binary_sha256': hashlib.sha256(Path(BINARY).read_bytes()).hexdigest(),
+                          'network': 'sandboxed Claude children; local synthetic HTTPS CONNECT proxy',
+                          'keychain': 'securityd access and Keychain files denied'}), flush=True)
+        for case in cases:
+            if case == 'file_tui':
+                run_tui_case(root, server)
+            else:
+                run_case(root, case, server)
+        server.shutdown()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -354,9 +418,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                   'status': status, 'oauth_beta': 'oauth-2025-04-20' in self.headers.get('anthropic-beta', ''),
                                   'api_key_header': bool(key)})
         if status == 401:
-            if state['rotate_on_401'] and not state['rotated']:
-                state['rotate']()
-                state['rotated'] = True
+            with self.server.rotation_lock:
+                if state['rotate_on_401'] and not state['rotated']:
+                    state['rotate']()
+                    state['rotated'] = True
             self.reply_json(401, {'type': 'error', 'error': {'type': 'authentication_error',
                                                            'message': 'Synthetic old credential expired'}})
             return
@@ -393,12 +458,12 @@ def run_tui_case(root, server):
                     'scopes': ['user:inference', 'user:profile'], 'subscriptionType': 'max'}})
     rotate(A)
     atomic_json(config / '.claude.json', {'hasCompletedOnboarding': True,
-                'lastOnboardingVersion': '2.1.280', 'theme': 'dark',
+                'lastOnboardingVersion': '2.1.288', 'theme': 'dark',
                 'projects': {str(run): {'hasTrustDialogAccepted': True}}})
     state = {'case': 'file_tui', 'turn': 1, 'requests': [], 'other_requests': [],
              'rotate_on_401': True, 'rotated': False, 'rotate': lambda: rotate(B)}
     server.state = state
-    env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': os.environ['HOME'],
+    env = {'HTTPS_PROXY': PROXY_URL, 'HTTP_PROXY': PROXY_URL, 'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': os.environ['HOME'],
            'CLAUDE_CONFIG_DIR': str(config), 'DISABLE_AUTOUPDATER': '1',
            'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1', 'DISABLE_TELEMETRY': '1',
            'DISABLE_ERROR_REPORTING': '1', 'DISABLE_GROWTHBOOK': '1',
@@ -407,8 +472,8 @@ def run_tui_case(root, server):
            'CLAUDE_CODE_MAX_OUTPUT_TOKENS': '128', 'API_TIMEOUT_MS': '8000',
            'TERM': 'xterm-256color', 'COLORTERM': 'truecolor'}
     master, slave = pty.openpty()
-    fcntl.ioctl(slave, 0x5414, struct.pack('HHHH', 40, 120, 0, 0))
-    command = [BINARY, '--model', 'claude-sonnet-4-6', '--tools', '',
+    fcntl.ioctl(slave, 0x80087467, struct.pack('HHHH', 40, 120, 0, 0))
+    command = ['/usr/bin/sandbox-exec', '-f', str(root / 'sandbox.sb'), BINARY, '--model', 'claude-sonnet-4-6', '--tools', '',
                '--strict-mcp-config', '--setting-sources', 'user', '--settings',
                json.dumps({'alwaysThinkingEnabled': False, 'disableAllHooks': True})]
     child = subprocess.Popen(command, env=env, cwd=run, stdin=slave, stdout=slave,
@@ -462,55 +527,6 @@ def run_tui_case(root, server):
     summary.update(pid=child.pid, same_process_alive_after_turns=alive, results=results,
                    terminal_excerpt=text_screen()[-2500:].replace(A, '<A>').replace(B, '<B>'))
     print(json.dumps(summary), flush=True)
-
-
-def main():
-    for kind in ['net', 'mnt']:
-        parent_namespace = os.environ.get('CLAUDECTL_PROBE_PARENT_' + kind.upper())
-        if not parent_namespace or os.readlink('/proc/self/ns/' + kind) == parent_namespace:
-            raise SystemExit('Run with unshare -Urnm: separate network and mount namespaces required')
-    if {name for _, name in socket.if_nameindex()} != {'lo'}:
-        raise SystemExit('Refusing a network namespace with any non-loopback interface')
-    with tempfile.TemporaryDirectory(prefix='claudectl-renewal-isolated-') as scratch:
-        root = Path(scratch)
-        # Hide real credential stores in this private mount namespace, without reading them.
-        for number, relative in enumerate(['.claude', '.claudectl', '.config/anthropic']):
-            original = Path(os.environ['HOME']) / relative
-            if original.is_dir():
-                empty = root / ('empty-store-' + str(number))
-                empty.mkdir(mode=0o700)
-                subprocess.run(['mount', '--bind', str(empty), str(original)], check=True)
-        original_json = Path(os.environ['HOME']) / '.claude.json'
-        if original_json.is_file():
-            empty_json = root / 'empty-user.json'
-            empty_json.write_text('{}')
-            subprocess.run(['mount', '--bind', str(empty_json), str(original_json)], check=True)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        fcntl.ioctl(sock, 0x8914, struct.pack('16sh', b'lo', 0x1 | 0x40))
-        sock.close()
-        (root / 'hosts').write_text('127.0.0.1 localhost api.anthropic.com console.anthropic.com platform.claude.com claude.ai\n')
-        subprocess.run(['mount', '--bind', str(root / 'hosts'), '/etc/hosts'], check=True)
-        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
-                        '-keyout', str(root / 'key.pem'), '-out', str(root / 'cert.pem'),
-                        '-days', '1', '-subj', '/CN=api.anthropic.com',
-                        '-addext', 'subjectAltName=DNS:api.anthropic.com,DNS:console.anthropic.com,DNS:platform.claude.com,DNS:claude.ai'],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        server = http.server.ThreadingHTTPServer(('127.0.0.1', 443), Handler)
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(root / 'cert.pem', root / 'key.pem')
-        server.socket = ctx.wrap_socket(server.socket, server_side=True)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        print(json.dumps({'binary_sha256': hashlib.sha256(Path(BINARY).read_bytes()).hexdigest(),
-                          'network': 'isolated namespace; only loopback; synthetic TLS endpoint'}), flush=True)
-        for case in sys.argv[1:] or ['file_proactive', 'file_401', 'env', 'fd', 'host_oauth',
-                                   'host_bearer', 'helper', 'settings_env', 'file_expired',
-                                   'file_outage', 'file_missing', 'file_malformed', 'file_tui']:
-            if case == 'file_tui':
-                run_tui_case(root, server)
-            else:
-                run_case(root, case, server)
-        server.shutdown()
-
 
 if __name__ == '__main__':
     main()
