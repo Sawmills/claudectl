@@ -68,9 +68,8 @@ jobs:
       - name: Build
         run: cargo build --release
       - name: Test
-        # Keep runner-owned pipes out of the descriptor-isolation fixtures.
-        run: |
-          python3 - <<'PY'
-          import subprocess
-          subprocess.run(["cargo", "test", "--all-targets"], check=True, close_fds=True)
-          PY
+        # Cargo may create jobserver pipes after starting; isolate each test binary.
+        env:
+          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER: python3 .github/clean-test-runner.py
+          CARGO_TARGET_X86_64_APPLE_DARWIN_RUNNER: python3 .github/clean-test-runner.py
+        run: cargo test --all-targets
