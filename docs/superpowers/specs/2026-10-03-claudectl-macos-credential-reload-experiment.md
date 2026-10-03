@@ -17,7 +17,10 @@ the [account-server design](2026-10-02-claudectl-central-design.md). It does not
 establish live subscription entitlement or Keychain precedence when the Keychain
 is accessible: the test deliberately blocked Keychain access to protect existing
 credentials. A production launcher still needs a verified isolated credential
-namespace and must refuse conflicting credential sources.
+namespace and must refuse conflicting credential sources. The later
+[synthetic Keychain follow-up](2026-10-03-claudectl-macos-keychain-experiment.md)
+found that a matching Keychain response overrides the file, including when it
+appears after launch; a storage override can select the ordinary service.
 
 ## Environment and protection
 

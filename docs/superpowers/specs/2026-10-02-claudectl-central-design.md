@@ -5,7 +5,9 @@ this document. Scope: subscription accounts used by the same person across their
 machines, with refresh credentials held only by a private company-SSO account
 server.
 
-Updated 2026-10-03 with isolated Linux and macOS credential-reload experiments. [O2, O3]
+Updated 2026-10-03 with Linux/Mac reload and synthetic Keychain-selection experiments.
+[O2–O4] See the [implementation plan](../plans/2026-10-03-claudectl-central-implementation.md)
+for the proposed sequence and acceptance gates.
 
 ## Recommendation and feasibility
 
@@ -20,8 +22,10 @@ Amir has decided to proceed without making Anthropic approval a prerequisite.
 The provider restriction below remains a recorded risk. Linux and macOS experiments
 now show that a running Claude Code process can receive replacement access tokens
 through an access-only credential file, including in its interactive terminal.
-Real Anthropic acceptance and macOS behavior with an accessible Keychain remain
-to be verified; the Mac test blocked Keychain access. [O2, O3]
+A synthetic Mac follow-up found that a matching Keychain response overrides the
+file, including when it appears after launch; a storage override can select the
+ordinary login despite a private config. Production launch isolation and real
+Anthropic acceptance remain required. Real Keychain access stayed blocked. [O2–O4]
 
 1. **Provider restriction — accepted risk.** Anthropic's current
    documentation says developers “may not collect, store, or intermediate Claude.ai
@@ -37,9 +41,10 @@ to be verified; the Mac test blocked Keychain access. [O2, O3]
    with a new token on expiry. However, the 2026-10-03 experiment demonstrated
    credential-file reload and recovery from a simulated 401 in Linux Claude Code
    2.1.280 and isolated macOS Claude Code 2.1.288. Prefer that access-only file path
-   for continuous sessions, subject to live and accessible-Keychain checks. This is
-   observed compatibility, not a documented external credential-writer contract.
-   [A1–A3, O2, O3]
+   for continuous sessions, subject to live acceptance and lifetime Keychain
+   isolation. This is observed compatibility, not a documented external
+   credential-writer contract.
+   [A1–A3, O2–O4]
 
 The selected direction remains subscription accounts on the account server.
 API-key/gateway billing would be a separate product decision: it does not consume
@@ -113,8 +118,8 @@ Access-only `.credentials.json` replacement worked before the next request, afte
 its recorded expiry, and after a simulated 401. Interactive terminal recovery also
 worked without a process restart. An unavailable replacement caused a request
 error, but a later replacement let the same session continue. Missing/malformed
-files failed closed. Plain environment and one-time descriptor delivery retained
-the old token. Settings-file `env` reload worked in this build, despite the general
+files failed closed under the test isolation. Plain environment and one-time
+descriptor delivery retained the old token. Settings-file `env` reload worked in this build, despite the general
 documented fixed-token guidance; prefer the dedicated credential file over settings
 that distribute values to subprocesses. The host-credentials interface worked for
 generic bearer auth but failed to replace the OAuth token in this experiment. [O2]
@@ -127,16 +132,26 @@ was sandboxed to loopback and a private writable config; real credential paths
 and Keychain access were denied. This establishes the Mac file-based path under
 that isolation, not precedence over an accessible Keychain item. [O3]
 
+The [Keychain command-boundary follow-up](2026-10-03-claudectl-macos-keychain-experiment.md)
+ran ten synthetic cases through the same Mac binary. A matching Keychain response
+won over the file before and after replacement, including on 401 retry. A response
+that appeared after launch also took over. Private configs requested suffixed
+service names and did not fall back to the ordinary item on missing/malformed
+files, unless `CLAUDE_SECURESTORAGE_CONFIG_DIR` was explicitly set to empty; then
+the ordinary service supplied the credential. All Keychain responses were fixtures,
+with the real command and stores denied. This establishes source-selection
+behavior, not native ACL/unlock semantics. [O4]
+
 ## 1. How Claude Code receives credentials
 
-| Mechanism                                                      | Subscription OAuth: Pro/Max/Team                                                                      | API/gateway credentials                            | Renewal and conclusion                                                                                                                                                                                     |
-| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apiKeyHelper` setting                                         | No documented subscription-helper contract; do not equate a bearer header with subscription mode      | Documented; stdout is the credential string        | Default cache is five minutes; `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` changes the interval. Reinvoked on 401/403. Appropriate for the API/gateway alternative, not the selected subscription path.            |
-| `CLAUDE_CODE_OAUTH_TOKEN`                                      | Documented Claude.ai access-token input; ordinary subscription login supports Pro/Max/Team/Enterprise | Not an API-key input                               | Fixed launch input; synthetic 401 retries retained the old token. Keep for explicitly bounded sessions. [O2]                                                                                               |
-| Access-only `.credentials.json` managed by claudectl           | Recognized as Claude.ai by the isolated check; normal subscription storage already uses this shape    | A `claudeAiOauth` object is not an API key         | Linux 2.1.280 and isolated macOS 2.1.288 reloaded replacements and recovered from simulated 401s, including in the terminal. Live and accessible-Keychain checks remain. No client refresh token. [O2, O3] |
-| Settings `env` / per-launch `--settings` / process environment | Can supply the OAuth environment input                                                                | Can supply API-key or gateway inputs               | Settings-file env reload worked in Linux 2.1.280; plain process environment did not. Prefer the dedicated credential file over settings secrets inherited by subprocesses. [O2]                            |
-| `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`                      | Recognized in this binary and used by existing claudectl `exec`                                       | Separate API-key descriptor exists in current code | One-time input; synthetic 401 retries retained the old token. Existing bounded exec use can remain; do not use it for file-based renewal. [O2]                                                             |
-| `CLAUDE_CODE_HOST_CREDS_FILE`                                  | Public format, eligibility, and reload semantics not found                                            | Not established here                               | Generic bearer reload worked; OAuth reload failed in the isolated test. The normal credential file has stronger evidence for this proposal. [O2]                                                           |
+| Mechanism                                                      | Subscription OAuth: Pro/Max/Team                                                                      | API/gateway credentials                            | Renewal and conclusion                                                                                                                                                                                                                                  |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apiKeyHelper` setting                                         | No documented subscription-helper contract; do not equate a bearer header with subscription mode      | Documented; stdout is the credential string        | Default cache is five minutes; `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` changes the interval. Reinvoked on 401/403. Appropriate for the API/gateway alternative, not the selected subscription path.                                                         |
+| `CLAUDE_CODE_OAUTH_TOKEN`                                      | Documented Claude.ai access-token input; ordinary subscription login supports Pro/Max/Team/Enterprise | Not an API-key input                               | Fixed launch input; synthetic 401 retries retained the old token. Keep for explicitly bounded sessions. [O2]                                                                                                                                            |
+| Access-only `.credentials.json` managed by claudectl           | Recognized as Claude.ai by the isolated check; normal subscription storage already uses this shape    | A `claudeAiOauth` object is not an API key         | Linux 2.1.280 and isolated macOS 2.1.288 reloaded replacements and recovered from simulated 401s, including in the terminal. Matching Keychain responses override the file; lifetime isolation and live checks remain. No client refresh token. [O2–O4] |
+| Settings `env` / per-launch `--settings` / process environment | Can supply the OAuth environment input                                                                | Can supply API-key or gateway inputs               | Settings-file env reload worked in Linux 2.1.280; plain process environment did not. Prefer the dedicated credential file over settings secrets inherited by subprocesses. [O2]                                                                         |
+| `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`                      | Recognized in this binary and used by existing claudectl `exec`                                       | Separate API-key descriptor exists in current code | One-time input; synthetic 401 retries retained the old token. Existing bounded exec use can remain; do not use it for file-based renewal. [O2]                                                                                                          |
+| `CLAUDE_CODE_HOST_CREDS_FILE`                                  | Public format, eligibility, and reload semantics not found                                            | Not established here                               | Generic bearer reload worked; OAuth reload failed in the isolated test. The normal credential file has stronger evidence for this proposal. [O2]                                                                                                        |
 
 Sources: authentication and precedence [A1], settings reference [A2], environment
 reference [A3], storage documentation [A5], observation [O1], current exec [C3], reload experiment [O2].
@@ -173,8 +188,22 @@ not remove project, local, or managed settings. [A1, A4, C3]
 Proposed launcher behavior: select the server account explicitly, reject inherited
 credential/routing overrides or conflicting settings without printing their values,
 and honor managed policy by refusing an incompatible launch. Do not weaken policy.
-Use an isolated Claude config with no subscription refresh credentials. Supply the
-selected access token only to the Claude child, never as an argument, shell command
+Use an isolated Claude config with no subscription refresh credentials. Treat
+`CLAUDE_SECURESTORAGE_CONFIG_DIR`, including an empty value, as a credential-source
+override in both environment and settings; the existing `CLAUDE_CODE_*` and
+`ANTHROPIC_*` filters do not cover it. [O4]
+
+On macOS, require a credential boundary that prevents conflicting Keychain
+selection for the entire session. A fresh config avoids the ordinary service in
+the tested build, but a matching entry can override the file even after launch.
+A startup absence check alone is insufficient. Refuse conflicts; never overwrite
+or delete an unrelated Keychain item. The research sandbox proves file renewal
+with Keychain blocked, but its restrictions and inherited effects on tool children
+need a production compatibility check. Do not ship the synthetic command fixture
+as an isolation mechanism. This is the first implementation milestone. [O3, O4]
+
+Supply the selected access token only to the Claude child, never as an argument,
+shell command
 substitution, terminal output, receipt field, or persistent settings value. For
 continuous sessions, provision a private `CLAUDE_CONFIG_DIR/.credentials.json`
 containing only the access token, expiry, scopes, and matching metadata. A local
@@ -204,8 +233,9 @@ file is updated, but an outage can still surface an authentication error. Preser
 the session so the company user can retry the failed prompt without restarting;
 never automatically replay completed tool actions. Persist conversation state
 separately from disposable credential state. Linux and isolated macOS synthetic
-tests support this design; live identity, accessible-Keychain behavior, and
-cross-launch resume still need acceptance. [O2, O3]
+tests support file renewal; live identity, production Keychain isolation, and
+cross-launch resume still need acceptance. The synthetic follow-up demonstrates
+why the macOS isolation requirement is necessary. [O2–O4]
 
 ## 2. Rotation, competing machines, and token lifetime
 
@@ -485,8 +515,10 @@ For Linux, use private directories and files, process locks, the existing privat
 config/access-only-file approach, and headless SSO approval. For macOS, prove that the
 new launch path never falls back to an old Keychain grant and that retirement
 handles the correct Keychain item and identity. The Mac experiment demonstrates
-file reload when Keychain access is blocked, but does not establish selection
-against an accessible conflicting item. [O3]
+file reload when Keychain access is blocked. The synthetic command-boundary
+follow-up shows that matching Keychain responses win over the file and can take
+over after launch. Verify a production boundary before enabling continuous
+macOS server-account sessions. [O3, O4]
 
 ## Acceptance required before implementation can claim completion
 
@@ -498,7 +530,7 @@ admitted dedicated account for any live acceptance:
 - Two machines acquiring concurrently and crossing real access expiry, proving
   one refresh owner, durable rotation, revocation behavior, and safe restart/resume.
 - Extend the demonstrated Linux and isolated Mac file-reload/401 behavior to live
-  Anthropic credentials, correct identity, and accessible macOS Keychain selection.
+  Anthropic credentials, correct identity, and lifetime macOS Keychain isolation.
   Verify repeated rotation, long-running tool work, and absence of client refresh
   credentials. The synthetic headless and terminal results are recorded in [O2, O3].
 - Usage scopes, nullable/model limits, 429 cooldowns across machines, native
@@ -534,6 +566,10 @@ admitted dedicated account for any live acceptance:
 - **[O3]** [2026-10-03 macOS credential-reload experiment](2026-10-03-claudectl-macos-credential-reload-experiment.md):
   nine synthetic cases through the unmodified Mac binary, including the terminal;
   Keychain and real credential access blocked, with the executed harness included.
+- **[O4]** [2026-10-03 macOS Keychain-selection experiment](2026-10-03-claudectl-macos-keychain-experiment.md):
+  ten synthetic command-boundary cases demonstrate matching-item precedence, late
+  selection, namespace isolation, and the secure-storage override; actual Keychain
+  reads stayed blocked. Includes the executed companion harness.
 
 **Repository primary sources** (relative claudectl links refer to this PR's base):
 
@@ -565,8 +601,10 @@ admitted dedicated account for any live acceptance:
    no cross-person seat pooling and no client refresh-token copies after migration.
 4. **Client experience — tested direction:** prefer continuous sessions using an
    access-only credential file updated from the account server. Linux and isolated
-   Mac headless/terminal tests passed; finish live and accessible-Keychain acceptance
-   before claiming production support. Keep restart/resume as recovery, not normal renewal.
+   Mac headless/terminal reload tests passed. The Keychain follow-up found matching
+   credentials can override the file, including after launch. Finish lifetime
+   isolation and live acceptance before claiming production support. Keep
+   restart/resume as recovery, not normal renewal.
 5. **Usage:** add server-cached per-account usage and an optional status-line
    integration; treat native Pro/Max fields as supplemental and Team fields as unproved.
 6. **Migration:** require an exclusive, resumable cutover across all old machines,
