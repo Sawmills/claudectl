@@ -11,8 +11,10 @@ use claudectl::shell;
 pub fn run(alias: &str) -> Result<()> {
     let alias = profile::validate_alias(alias)?;
     let paths = config::default_paths()?;
+    claudectl::central::ensure_local(&paths.claudectl_dir(), alias)?;
     let store = AuthStore::real(paths.clone());
     let flow = SystemLoginFlow {
+        alias,
         paths: &paths,
         store: &store,
     };
@@ -74,6 +76,7 @@ trait LoginFlow {
 }
 
 struct SystemLoginFlow<'a> {
+    alias: &'a str,
     paths: &'a config::Paths,
     store: &'a AuthStore,
 }
@@ -98,7 +101,9 @@ impl LoginFlow for SystemLoginFlow<'_> {
     }
 
     fn lock_auth_state(&self) -> Result<Option<std::fs::File>> {
-        self.store.lock_auth_state().map(Some)
+        let lock = self.store.lock_auth_state()?;
+        claudectl::central::ensure_local(&self.paths.claudectl_dir(), self.alias)?;
+        Ok(Some(lock))
     }
 
     fn exchange_code(&self, code: &str, state: &str, verifier: &str) -> Result<api::OauthCreds> {
@@ -115,7 +120,12 @@ impl LoginFlow for SystemLoginFlow<'_> {
         creds: &CredentialsFile,
         account: Option<serde_json::Value>,
     ) -> Result<()> {
-        profile::save_profile_to(self.paths, alias, creds, account)?;
+        if let Err(error) = profile::save_profile_to(self.paths, alias, creds, account.clone()) {
+            let retained = claudectl::central::retain_login(self.paths, creds, &account).context(
+                "login acquired a grant but neither the profile nor recovery copy could be written",
+            )?;
+            return Err(error).with_context(|| format!("acquired login retained privately at {}; no activation or refresh was attempted", retained.display()));
+        }
         Ok(())
     }
 

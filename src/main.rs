@@ -17,6 +17,11 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Use Claude accounts held by a company account server
+    Server {
+        #[command(subcommand)]
+        command: claudectl::central::Command,
+    },
     /// Show account status and what to do next
     Status {
         /// Check only this saved profile
@@ -110,6 +115,7 @@ fn main() {
     }
 
     let result = match cli.command {
+        Commands::Server { command } => claudectl::central::dispatch(command),
         Commands::Status {
             ref alias,
             cached,
