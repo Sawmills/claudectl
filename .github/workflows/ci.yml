@@ -68,4 +68,9 @@ jobs:
       - name: Build
         run: cargo build --release
       - name: Test
-        run: cargo test --all-targets
+        # Keep runner-owned pipes out of the descriptor-isolation fixtures.
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          subprocess.run(["cargo", "test", "--all-targets"], check=True, close_fds=True)
+          PY
