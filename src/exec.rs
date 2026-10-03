@@ -28,6 +28,7 @@ pub const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 /// Credential sources the child must not inherit that `is_scrubbed_env`'s
 /// name rules do not cover.
 const SCRUBBED_ENV: &[&str] = &[
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_SCOPES",
     "CLAUDE_CODE_HOST_CREDS_FILE",
     "CCR_OAUTH_TOKEN_FILE",
@@ -732,10 +733,10 @@ pub fn run_with_writer(
 /// Signal handling is process-wide, so one process runs one `exec` at a time.
 static RUN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-struct RunSlot;
+pub(crate) struct RunSlot;
 
 impl RunSlot {
-    fn take() -> Result<Self, ExecError> {
+    pub(crate) fn take() -> Result<Self, ExecError> {
         use std::sync::atomic::Ordering;
         RUN_ACTIVE
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -975,7 +976,7 @@ fn run_in_dir(
     Ok(code)
 }
 
-enum Descendants {
+pub(crate) enum Descendants {
     None,
     Terminated,
     Killed,
@@ -999,7 +1000,7 @@ impl Descendants {
 
 /// Bounded TERM-to-KILL teardown of the child's process group. The caller
 /// keeps the leader unreaped for the whole call.
-fn teardown_group(leader: u32) -> Descendants {
+pub(crate) fn teardown_group(leader: u32) -> Descendants {
     let members = match descendants_in_group(leader) {
         Ok(members) => members,
         Err(_) => {
@@ -1174,7 +1175,7 @@ fn descendants_in_group(_leader: u32) -> std::io::Result<Vec<i32>> {
 }
 
 #[cfg(unix)]
-fn wait_exit_no_reap(pid: u32) -> std::io::Result<()> {
+pub(crate) fn wait_exit_no_reap(pid: u32) -> std::io::Result<()> {
     loop {
         // SAFETY: waitid writes only into `info`; WNOWAIT leaves the child
         // reapable by Child::wait.
@@ -1198,7 +1199,7 @@ fn wait_exit_no_reap(pid: u32) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn wait_exit_no_reap(_pid: u32) -> std::io::Result<()> {
+pub(crate) fn wait_exit_no_reap(_pid: u32) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1228,13 +1229,13 @@ fn terminate(_leader: u32, _signal: i32) -> bool {
 }
 
 #[cfg(unix)]
-fn set_process_group(command: &mut Command) {
+pub(crate) fn set_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
 }
 
 #[cfg(not(unix))]
-fn set_process_group(_command: &mut Command) {}
+pub(crate) fn set_process_group(_command: &mut Command) {}
 
 fn snapshot_executable(program: &Path, config_dir: &Path) -> Result<PathBuf, ExecError> {
     let dir = config_dir.join("bin");
@@ -1633,7 +1634,7 @@ pub fn sha256_file(path: &Path) -> Result<String, ExecError> {
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
-fn exit_code_of(status: &std::process::ExitStatus) -> i32 {
+pub(crate) fn exit_code_of(status: &std::process::ExitStatus) -> i32 {
     status
         .code()
         .unwrap_or_else(|| 128 + signal_of(status).unwrap_or(1))

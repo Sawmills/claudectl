@@ -1,9 +1,10 @@
 # Account-server implementation plan
 
-2026-10-03. Proposed work sequence; this PR contains documentation and synthetic
-experiments only. No product implementation, deployment, real login, or migration
-has been performed. The [design](../specs/2026-10-02-claudectl-central-design.md)
-defines ownership, protocol, migration, and accepted provider risk.
+2026-10-03. Work sequence approved by the subsequent “do it all” instruction.
+Implementation is under review separately from the research PR. See
+[the preview runbook](../../account-server.md) for implemented commands, executed
+checks, and remaining pilot gates. Real-account pilot handling is authorized, but
+no grant has been migrated while ownership remains unresolved.
 
 ## Outcome and current evidence
 
