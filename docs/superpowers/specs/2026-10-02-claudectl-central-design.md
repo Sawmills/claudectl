@@ -5,6 +5,8 @@ this document. Scope: subscription accounts used by the same person across their
 machines, with refresh credentials held only by a private company-SSO account
 server.
 
+Updated 2026-10-03 with an isolated credential-reload experiment. [O2]
+
 ## Recommendation and feasibility
 
 Reuse the codexctl account-server implementation with an explicit provider dimension
@@ -15,9 +17,10 @@ account assigned to exactly one company user. Claude Code continues to run tools
 locally and send inference directly to Anthropic.
 
 Amir has decided to proceed without making Anthropic approval a prerequisite.
-The provider restriction below remains a recorded risk. The unresolved technical
-question is whether Claude Code can receive replacement access tokens without
-restarting.
+The provider restriction below remains a recorded risk. The Linux experiment now
+shows that a running Claude Code process can receive replacement access tokens
+through an access-only credential file, including in its interactive terminal.
+Real Anthropic acceptance and macOS behavior remain to be verified. [O2]
 
 1. **Provider restriction — accepted risk.** Anthropic's current
    documentation says developers “may not collect, store, or intermediate Claude.ai
@@ -30,8 +33,11 @@ restarting.
    was found.** `apiKeyHelper` is documented for API/gateway credentials;
    `CLAUDE_CODE_OAUTH_TOKEN` supplies subscription OAuth but stays fixed for the
    session. The documented baseline is token acquisition at launch, then restart
-   with a new token on expiry. Updating a credential file during a running session
-   is a candidate requiring compatibility evidence, not a promised solution. [A1–A3]
+   with a new token on expiry. However, the 2026-10-03 experiment demonstrated
+   credential-file reload and recovery from a simulated 401 in Linux Claude Code
+   2.1.280. Prefer that access-only file path for the continuous-session design,
+   subject to the remaining live and macOS checks. This is observed compatibility,
+   not a documented external credential-writer contract. [A1–A3, O2]
 
 The selected direction remains subscription accounts on the account server.
 API-key/gateway billing would be a separate product decision: it does not consume
@@ -92,19 +98,38 @@ or in-process reload**. No macOS observation or live token-lifetime experiment w
 performed. Inspecting strings in this vendor binary also found
 `CLAUDE_CODE_HOST_CREDS_FILE`; that alone establishes no usable contract. [O1]
 
+### Credential-reload experiment: 2026-10-03
+
+The [experiment report and reproducible harness](2026-10-03-claudectl-credential-reload-experiment.md)
+extend the earlier source-selection checks. An unmodified Claude Code process
+made requests to a synthetic HTTPS endpoint inside an isolated network namespace.
+The normal API hostname resolved only to loopback; no external network was
+available. Real credential stores were hidden in the private mount namespace.
+Only invalid synthetic access values were supplied, with no refresh token. [O2]
+
+Access-only `.credentials.json` replacement worked before the next request, after
+its recorded expiry, and after a simulated 401. Interactive terminal recovery also
+worked without a process restart. An unavailable replacement caused a request
+error, but a later replacement let the same session continue. Missing/malformed
+files failed closed. Plain environment and one-time descriptor delivery retained
+the old token. Settings-file `env` reload worked in this build, despite the general
+documented fixed-token guidance; prefer the dedicated credential file over settings
+that distribute values to subprocesses. The host-credentials interface worked for
+generic bearer auth but failed to replace the OAuth token in this experiment. [O2]
+
 ## 1. How Claude Code receives credentials
 
-| Mechanism                                                      | Subscription OAuth: Pro/Max/Team                                                                      | API/gateway credentials                            | Renewal and conclusion                                                                                                                                                                          |
-| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apiKeyHelper` setting                                         | No documented subscription-helper contract; do not equate a bearer header with subscription mode      | Documented; stdout is the credential string        | Default cache is five minutes; `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` changes the interval. Reinvoked on 401/403. Appropriate for the API/gateway alternative, not the selected subscription path. |
-| `CLAUDE_CODE_OAUTH_TOKEN`                                      | Documented Claude.ai access-token input; ordinary subscription login supports Pro/Max/Team/Enterprise | Not an API-key input                               | Fixed for the session unless the user runs `/login`; replace and restart after expiry. Preferred documented transport for the bounded-session baseline.                                         |
-| Access-only `.credentials.json` managed by claudectl           | Recognized as Claude.ai by the isolated check; normal subscription storage already uses this shape    | A `claudeAiOauth` object is not an API key         | A file writer could replace access token and expiry, but reload/caching/401 behavior remains unproved. Never include a client refresh token. Candidate only.                                    |
-| Settings `env` / per-launch `--settings` / process environment | Can supply the OAuth environment input                                                                | Can supply API-key or gateway inputs               | Configuration delivery, not a new refresh protocol. Prefer a child environment over persisting secrets in settings.                                                                             |
-| `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`                      | Recognized in this binary and used by existing claudectl `exec`                                       | Separate API-key descriptor exists in current code | Better exposure characteristics than environment text, but undocumented in the reviewed public reference. Treat as version-pinned, one-time delivery until stronger evidence exists.            |
-| `CLAUDE_CODE_HOST_CREDS_FILE`                                  | Public format, eligibility, and reload semantics not found                                            | Not established here                               | Binary marker is insufficient. Do not build the initial design on it.                                                                                                                           |
+| Mechanism                                                      | Subscription OAuth: Pro/Max/Team                                                                      | API/gateway credentials                            | Renewal and conclusion                                                                                                                                                                                             |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `apiKeyHelper` setting                                         | No documented subscription-helper contract; do not equate a bearer header with subscription mode      | Documented; stdout is the credential string        | Default cache is five minutes; `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` changes the interval. Reinvoked on 401/403. Appropriate for the API/gateway alternative, not the selected subscription path.                    |
+| `CLAUDE_CODE_OAUTH_TOKEN`                                      | Documented Claude.ai access-token input; ordinary subscription login supports Pro/Max/Team/Enterprise | Not an API-key input                               | Fixed launch input; synthetic 401 retries retained the old token. Keep for explicitly bounded sessions. [O2]                                                                                                       |
+| Access-only `.credentials.json` managed by claudectl           | Recognized as Claude.ai by the isolated check; normal subscription storage already uses this shape    | A `claudeAiOauth` object is not an API key         | Linux 2.1.280 reloaded a replacement before the next request and after a simulated 401, including in the terminal. Preferred continuous-session candidate; live/macOS checks remain. No client refresh token. [O2] |
+| Settings `env` / per-launch `--settings` / process environment | Can supply the OAuth environment input                                                                | Can supply API-key or gateway inputs               | Settings-file env reload worked in Linux 2.1.280; plain process environment did not. Prefer the dedicated credential file over settings secrets inherited by subprocesses. [O2]                                    |
+| `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`                      | Recognized in this binary and used by existing claudectl `exec`                                       | Separate API-key descriptor exists in current code | One-time input; synthetic 401 retries retained the old token. Existing bounded exec use can remain; do not use it for file-based renewal. [O2]                                                                     |
+| `CLAUDE_CODE_HOST_CREDS_FILE`                                  | Public format, eligibility, and reload semantics not found                                            | Not established here                               | Generic bearer reload worked; OAuth reload failed in the isolated test. The normal credential file has stronger evidence for this proposal. [O2]                                                                   |
 
 Sources: authentication and precedence [A1], settings reference [A2], environment
-reference [A3], storage documentation [A5], observation [O1], current exec [C3].
+reference [A3], storage documentation [A5], observation [O1], current exec [C3], reload experiment [O2].
 
 `apiKeyHelper` is executed through `/bin/sh`; documented helper output is sent in
 both `X-Api-Key` and `Authorization: Bearer` headers. The helper TTL concerns Claude
@@ -140,10 +165,15 @@ credential/routing overrides or conflicting settings without printing their valu
 and honor managed policy by refusing an incompatible launch. Do not weaken policy.
 Use an isolated Claude config with no subscription refresh credentials. Supply the
 selected access token only to the Claude child, never as an argument, shell command
-substitution, terminal output, receipt field, or persistent settings value. Prefer
-the inherited descriptor after version-specific acceptance; retain the documented
-environment transport as the compatibility baseline. Neither transport protects a
-bearer token from a compromised machine or same-user process inspection.
+substitution, terminal output, receipt field, or persistent settings value. For
+continuous sessions, provision a private `CLAUDE_CONFIG_DIR/.credentials.json`
+containing only the access token, expiry, scopes, and matching metadata. A local
+process obtains replacement access tokens from the account server and atomically
+replaces that file with mode 0600 inside a mode 0700 directory. It never holds or
+exchanges a refresh token. Do not also set an OAuth environment or descriptor input:
+it would take precedence over the file. Keep descriptor/environment transport only
+for explicitly bounded sessions. Neither path protects a bearer token from a
+compromised machine or same-user process inspection. [O2]
 Refuse bare/simple mode for a subscription launch: it ignores OAuth environment
 variables and stored OAuth credentials. [A1, A3]
 
@@ -156,11 +186,15 @@ conflicting migration identity. Session metadata must agree with this identity;
 never reuse another account's `oauthAccount` blob. [C1, C2]
 
 A long-running session must not silently switch accounts or replay tool actions.
-Warn before the acquired token expires; on expiry/rejection, stop new work and
-offer a new launch or explicit resume with a newly acquired token for the same
-server account. Persist conversation state separately from disposable credential
-state. Cross-launch resume and account identity need acceptance testing. The
-first version does not promise seamless sessions beyond access-token expiry.
+The local credential writer should acquire and publish the next server-issued
+access token before expiry, using the server's expiry and revision metadata. If
+renewal is unavailable, preserve a still-usable access token and report the outage;
+never fall back to a local refresh grant. A rejected request can recover after the
+file is updated, but an outage can still surface an authentication error. Preserve
+the session so the company user can retry the failed prompt without restarting;
+never automatically replay completed tool actions. Persist conversation state
+separately from disposable credential state. Linux synthetic tests support this
+design; live identity, macOS, and cross-launch resume still need acceptance. [O2]
 
 ## 2. Rotation, competing machines, and token lifetime
 
@@ -202,8 +236,10 @@ Use a non-secret opaque revision for the full credential state. Two machines
 rejecting the same revision cause at most one refresh; a request naming an old
 revision receives the newer valid access token. A fresh 401 permits one controlled
 retry; a 403 or usage 429 is not proof that refresh is needed. Refresh proactively
-within a configured margin for new launches, while acknowledging that this does
-not replace the token already held by a running environment-authenticated child.
+within a configured margin for new launches and existing file-based sessions.
+The local writer must publish the acquired successor; a server-side refresh alone
+does not update a machine's credential file. Environment-authenticated children
+remain bounded by their launch token.
 
 Use one broker process and durable ownership fences. Do not run two replicas
 against copied vaults. On timeout or crash after Anthropic may have rotated a
@@ -435,7 +471,7 @@ Returning a migrated account to local ownership would require a separate,
 exclusive reverse-migration design.
 
 For Linux, use private directories and files, process locks, the existing private
-config/descriptor approach, and headless SSO approval. For macOS, prove that the
+config/access-only-file approach, and headless SSO approval. For macOS, prove that the
 new launch path never falls back to an old Keychain grant and that retirement
 handles the correct Keychain item and identity. The current Linux observation
 does not establish those macOS behaviors.
@@ -449,9 +485,10 @@ admitted dedicated account for any live acceptance:
   path; reject API/gateway/settings overrides rather than charge unexpectedly.
 - Two machines acquiring concurrently and crossing real access expiry, proving
   one refresh owner, durable rotation, revocation behavior, and safe restart/resume.
-- If seamless renewal is required: access-only file replacement in the same
-  running process, cache invalidation, 401 recovery, no refresh attempts by the
-  child, and both Linux and macOS behavior. An auth-status check is insufficient.
+- Extend the demonstrated Linux file-reload/401 behavior to live Anthropic
+  credentials, correct account identity, and macOS Keychain/file selection.
+  Verify repeated rotation, long-running tool work, and absence of client refresh
+  credentials. The synthetic headless and terminal results are recorded in [O2].
 - Usage scopes, nullable/model limits, 429 cooldowns across machines, native
   Pro/Max status-line fields, Team fallback, and stale/offline display.
 - Migration faults at every fence/upload/receipt/retirement boundary, duplicate
@@ -479,6 +516,9 @@ admitted dedicated account for any live acceptance:
 - **[A9]** [Custom status line: rate-limit usage](https://code.claude.com/docs/en/statusline#rate-limit-usage).
 - **[O1]** Isolated Claude Code 2.1.280 observations, binary hash and method in this
   document's evidence section. These are local observations, not published API guarantees.
+- **[O2]** [2026-10-03 credential-reload experiment](2026-10-03-claudectl-credential-reload-experiment.md):
+  synthetic requests through the unmodified Linux binary, including the interactive
+  terminal, with a reproducible isolated harness and explicit verification limits.
 
 **Repository primary sources** (relative claudectl links refer to this PR's base):
 
@@ -508,9 +548,10 @@ admitted dedicated account for any live acceptance:
    or OpenAI account from Claude-only users or operators.
 3. **Ownership:** one company user per server account and one server refresh owner;
    no cross-person seat pooling and no client refresh-token copies after migration.
-4. **Client experience:** accept launch-time OAuth delivery with restart/resume at
-   expiry for the first version, or require a separate proof of seamless renewal
-   before approving that version. Do not assume `apiKeyHelper` provides it.
+4. **Client experience — tested direction:** prefer continuous sessions using an
+   access-only credential file updated from the account server. Linux synthetic
+   headless and terminal tests passed; finish live and macOS acceptance before
+   claiming production support. Keep restart/resume as recovery, not normal renewal.
 5. **Usage:** add server-cached per-account usage and an optional status-line
    integration; treat native Pro/Max fields as supplemental and Team fields as unproved.
 6. **Migration:** require an exclusive, resumable cutover across all old machines,
