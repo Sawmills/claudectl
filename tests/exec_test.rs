@@ -165,6 +165,26 @@ exit {code}
     script
 }
 
+/// Pipes the child reported in `extra_fds`, less the ones this test process
+/// itself inherited without close-on-exec (a CI runner can pass one on).
+/// Every child of this process inherits those, so they are not a leak from
+/// claudectl; the token pipe is close-on-exec here.
+fn leaked_fds(out: &Path) -> Vec<String> {
+    std::fs::read_to_string(out.join("extra_fds"))
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            let Ok(fd) = line.parse::<i32>() else {
+                return true;
+            };
+            // SAFETY: F_GETFD only reads this process's descriptor flags.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            flags == -1 || flags & libc::FD_CLOEXEC != 0
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 fn request(alias: &str, program: &Path) -> ExecRequest {
     ExecRequest {
         alias: alias.into(),
@@ -438,8 +458,8 @@ fn runs_the_child_on_the_saved_profile_and_leaves_global_state_alone() {
     assert!(out.join("config_exists").exists());
     assert_eq!(std::fs::read_to_string(out.join("fd_name")).unwrap(), "3");
     assert_eq!(
-        std::fs::read_to_string(out.join("extra_fds")).unwrap(),
-        "",
+        leaked_fds(&out),
+        Vec::<String>::new(),
         "the child must inherit no descriptor besides the token fd\n{}",
         std::fs::read_to_string(out.join("fd_detail")).unwrap_or_default()
     );
@@ -948,10 +968,9 @@ fn concurrent_runs_in_two_processes_stay_isolated() {
             token == format!("a-{alias}").into_bytes(),
             "{alias} received another alias's token"
         );
-        let extra = std::fs::read_to_string(out.join("extra_fds")).unwrap();
         assert_eq!(
-            extra,
-            "",
+            leaked_fds(&out),
+            Vec::<String>::new(),
             "{alias} inherited another descriptor\n{}",
             std::fs::read_to_string(out.join("fd_detail")).unwrap_or_default()
         );
