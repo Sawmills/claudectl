@@ -29,6 +29,25 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 urlencoding = "2"
 tempfile = "3"
+aes-gcm = { version = "0.10", optional = true }
+axum = { version = "0.8", optional = true }
+openidconnect = { version = "4", optional = true, default-features = false, features = [
+  "reqwest",
+  "rustls-tls",
+] }
+
+[features]
+# The account server binary. The client build never pulls server dependencies.
+server = ["dep:aes-gcm", "dep:axum", "dep:openidconnect", "tokio/net", "tokio/sync", "tokio/signal"]
+
+[[bin]]
+name = "claudectl"
+path = "src/main.rs"
+
+[[bin]]
+name = "claudectl-server"
+path = "src/bin/claudectl-server.rs"
+required-features = ["server"]
 
 [dev-dependencies]
 assert_cmd = "2"
