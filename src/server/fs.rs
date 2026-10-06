@@ -12,7 +12,9 @@ pub fn validate_alias(alias: &str) -> Result<&str> {
         || alias.len() > 64
         || !alias.is_ascii()
         || alias.starts_with('.')
-        || alias.chars().any(|c| c.is_control() || c == '/' || c == '\\')
+        || alias
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\')
     {
         bail!("alias must be 1 to 64 ASCII characters without path separators");
     }
@@ -27,7 +29,8 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
     if std::fs::symlink_metadata(path).is_ok_and(|m| !m.is_dir() || m.file_type().is_symlink()) {
         bail!("server directory must be a real directory");
     }
-    std::fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

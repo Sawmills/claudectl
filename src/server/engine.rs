@@ -1,5 +1,5 @@
 //! Claude's single refresh owner. Machines receive access-only snapshots.
-use super::{fs as store, vault};
+use super::{audit, fs as store, vault};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -373,10 +373,42 @@ impl Engine {
         if let Some(receipt) = self.receipt(user, migration).await? {
             return Ok(receipt);
         }
-        let receipt = self.admit(user, alias, migration, grant, None).await?;
-        let current = self.acquire_for(user, machine, &receipt.account_id, None).await?;
-        self.acquire_for(user, machine, &receipt.account_id, Some(&current.revision))
-            .await?;
+        let admitted = self.admit(user, alias, migration, grant, None).await;
+        let receipt = match admitted {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.audit(&audit::Event {
+                    operation: "migrate",
+                    machine,
+                    account: &account_id(user, alias),
+                    result: "refused",
+                    rotated: None,
+                })?;
+                return Err(error);
+            }
+        };
+        let current = self
+            .acquire_for(user, machine, &receipt.account_id, None)
+            .await;
+        let refreshed = match current {
+            Ok(current) => {
+                self.acquire_for(user, machine, &receipt.account_id, Some(&current.revision))
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        self.audit(&audit::Event {
+            operation: "migrate",
+            machine,
+            account: &receipt.account_id,
+            result: if refreshed.is_ok() {
+                "ok"
+            } else {
+                "admitted_refresh_failed"
+            },
+            rotated: None,
+        })?;
+        refreshed?;
         Ok(receipt)
     }
     async fn selected(&self, user: &str, id: &str) -> Result<Arc<Mutex<Record>>> {
@@ -427,13 +459,82 @@ impl Engine {
         }
         Ok(())
     }
+    /// Exchange the refresh token once. Returns whether the provider rotated it.
+    async fn refresh(&self, record: &mut Record) -> Result<bool> {
+        record.phase = Phase::Refreshing;
+        self.persist(record)?;
+        let response=self.http.post(&self.endpoints.token).json(&json!({"grant_type":"refresh_token","refresh_token":record.grant.refresh_token,"client_id":CLIENT_ID})).send().await.map_err(|_|anyhow::anyhow!("refresh outcome uncertain; login renewal required"))?;
+        if !response.status().is_success() {
+            bail!("refresh rejected; login renewal required");
+        }
+        #[derive(Deserialize)]
+        struct Response {
+            access_token: String,
+            refresh_token: Option<String>,
+            expires_in: i64,
+            scope: Option<String>,
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| anyhow::anyhow!("refresh response incomplete; login renewal required"))?;
+        // Preserve the acquired response even when its metadata cannot be parsed.
+        let retained = self
+            .state
+            .join("accounts")
+            .join(&record.id)
+            .join("refresh-response.enc");
+        vault::seal(
+            &retained,
+            &self.key,
+            &json!({"received_at":now(),"body":bytes.to_vec()}),
+        )?;
+        let next: Response = serde_json::from_slice(&bytes).map_err(|_| {
+            anyhow::anyhow!("refresh response invalid; retained for reconciliation")
+        })?;
+        let expiry = next
+            .expires_in
+            .checked_mul(1000)
+            .and_then(|ms| now().checked_add(ms))
+            .filter(|_| next.expires_in > 0)
+            .context("refresh expiry invalid")?;
+        let rotated = next
+            .refresh_token
+            .as_ref()
+            .is_some_and(|t| *t != record.grant.refresh_token);
+        let grant = Grant {
+            access_token: next.access_token,
+            refresh_token: next
+                .refresh_token
+                .unwrap_or_else(|| record.grant.refresh_token.clone()),
+            expires_at: expiry,
+            scopes: next
+                .scope
+                .map(|s| s.split_whitespace().map(str::to_owned).collect())
+                .unwrap_or_else(|| record.grant.scopes.clone()),
+        };
+        grant.validate()?;
+        record.grant = grant;
+        record.revision = revision();
+        record.generation = record
+            .generation
+            .checked_add(1)
+            .context("generation overflow")?;
+        record.phase = Phase::Unverified;
+        self.persist(record)?;
+        self.verify_successor(record).await?;
+        Ok(rotated)
+    }
+    fn audit(&self, event: &audit::Event) -> Result<()> {
+        audit::record(&self.state, &self.key, event)
+    }
     pub async fn acquire(&self, user: &str, id: &str, previous: Option<&str>) -> Result<Access> {
         self.acquire_for(user, "server", id, previous).await
     }
     pub async fn acquire_for(
         &self,
         user: &str,
-        _machine: &str,
+        machine: &str,
         id: &str,
         previous: Option<&str>,
     ) -> Result<Access> {
@@ -448,63 +549,15 @@ impl Engine {
         let refresh =
             record.grant.expires_at <= now() + MARGIN || previous == Some(record.revision.as_str());
         if refresh {
-            record.phase = Phase::Refreshing;
-            self.persist(&record)?;
-            let response=self.http.post(&self.endpoints.token).json(&json!({"grant_type":"refresh_token","refresh_token":record.grant.refresh_token,"client_id":CLIENT_ID})).send().await.map_err(|_|anyhow::anyhow!("refresh outcome uncertain; login renewal required"))?;
-            if !response.status().is_success() {
-                bail!("refresh rejected; login renewal required");
-            }
-            #[derive(Deserialize)]
-            struct Response {
-                access_token: String,
-                refresh_token: Option<String>,
-                expires_in: i64,
-                scope: Option<String>,
-            }
-            let bytes = response.bytes().await.map_err(|_| {
-                anyhow::anyhow!("refresh response incomplete; login renewal required")
+            let outcome = self.refresh(&mut record).await;
+            self.audit(&audit::Event {
+                operation: "refresh",
+                machine,
+                account: &record.id,
+                result: if outcome.is_ok() { "ok" } else { "failed" },
+                rotated: outcome.as_ref().ok().copied(),
             })?;
-            // Preserve the acquired response even when its metadata cannot be parsed.
-            let retained = self
-                .state
-                .join("accounts")
-                .join(&record.id)
-                .join("refresh-response.enc");
-            vault::seal(
-                &retained,
-                &self.key,
-                &json!({"received_at":now(),"body":bytes.to_vec()}),
-            )?;
-            let next: Response = serde_json::from_slice(&bytes).map_err(|_| {
-                anyhow::anyhow!("refresh response invalid; retained for reconciliation")
-            })?;
-            let expiry = next
-                .expires_in
-                .checked_mul(1000)
-                .and_then(|ms| now().checked_add(ms))
-                .filter(|_| next.expires_in > 0)
-                .context("refresh expiry invalid")?;
-            let grant = Grant {
-                access_token: next.access_token,
-                refresh_token: next
-                    .refresh_token
-                    .unwrap_or_else(|| record.grant.refresh_token.clone()),
-                expires_at: expiry,
-                scopes: next
-                    .scope
-                    .map(|s| s.split_whitespace().map(str::to_owned).collect())
-                    .unwrap_or_else(|| record.grant.scopes.clone()),
-            };
-            grant.validate()?;
-            record.grant = grant;
-            record.revision = revision();
-            record.generation = record
-                .generation
-                .checked_add(1)
-                .context("generation overflow")?;
-            record.phase = Phase::Unverified;
-            self.persist(&record)?;
-            self.verify_successor(&mut record).await?;
+            outcome?;
         }
         Ok(Access {
             provider: PROVIDER,

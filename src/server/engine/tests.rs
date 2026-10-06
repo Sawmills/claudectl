@@ -466,7 +466,12 @@ fn grant_until(access: &str, expires_at: i64) -> Grant {
 /// A synthetic Anthropic API: a fixed identity and a counted refresh that returns `expires_in`.
 async fn synthetic_provider(
     expires_in: i64,
-) -> (tempfile::TempDir, Engine, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+) -> (
+    tempfile::TempDir,
+    Engine,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
     let count = Arc::new(AtomicUsize::new(0));
     let refreshes = count.clone();
     let app = Router::new()
@@ -508,20 +513,38 @@ async fn synthetic_provider(
 async fn the_server_refreshes_inside_five_minutes_of_expiry_and_not_before() {
     let (_root, engine, refreshes, task) = synthetic_provider(3600).await;
     let early = engine
-        .admit("person", "early", "m-early", grant_until("early", now() + 360_000), None)
+        .admit(
+            "person",
+            "early",
+            "m-early",
+            grant_until("early", now() + 360_000),
+            None,
+        )
         .await
         .unwrap();
-    let access = engine.acquire("person", &early.account_id, None).await.unwrap();
+    let access = engine
+        .acquire("person", &early.account_id, None)
+        .await
+        .unwrap();
     assert_eq!(access.access_token, "early");
     assert_eq!(refreshes.load(Ordering::SeqCst), 0);
     task.abort();
 
     let (_root, engine, refreshes, task) = synthetic_provider(3600).await;
     let due = engine
-        .admit("person", "due", "m-due", grant_until("due", now() + 240_000), None)
+        .admit(
+            "person",
+            "due",
+            "m-due",
+            grant_until("due", now() + 240_000),
+            None,
+        )
         .await
         .unwrap();
-    let access = engine.acquire("person", &due.account_id, None).await.unwrap();
+    let access = engine
+        .acquire("person", &due.account_id, None)
+        .await
+        .unwrap();
     assert_eq!(access.access_token, "successor-0");
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
     task.abort();
@@ -531,13 +554,26 @@ async fn the_server_refreshes_inside_five_minutes_of_expiry_and_not_before() {
 async fn a_refresh_reads_expires_in_as_seconds() {
     let (_root, engine, _refreshes, task) = synthetic_provider(3600).await;
     let receipt = engine
-        .admit("person", "work", "m", grant_until("first", now() + 240_000), None)
+        .admit(
+            "person",
+            "work",
+            "m",
+            grant_until("first", now() + 240_000),
+            None,
+        )
         .await
         .unwrap();
     let before = now();
-    let access = engine.acquire("person", &receipt.account_id, None).await.unwrap();
+    let access = engine
+        .acquire("person", &receipt.account_id, None)
+        .await
+        .unwrap();
     // One hour: 3,600 seconds is 3,600,000 milliseconds.
-    assert!(access.expires_at >= before + 3_590_000, "{}", access.expires_at - before);
+    assert!(
+        access.expires_at >= before + 3_590_000,
+        "{}",
+        access.expires_at - before
+    );
     assert!(access.expires_at <= now() + 3_600_000);
     task.abort();
 }
@@ -546,19 +582,74 @@ async fn a_refresh_reads_expires_in_as_seconds() {
 async fn a_migration_refreshes_once_so_copies_of_the_old_grant_go_stale() {
     let (_root, engine, refreshes, task) = synthetic_provider(3600).await;
     let receipt = engine
-        .migrate("person", "machine", "work", "m-1", grant_until("migrated", now() + 3_600_000))
+        .migrate(
+            "person",
+            "machine",
+            "work",
+            "m-1",
+            grant_until("migrated", now() + 3_600_000),
+        )
         .await
         .unwrap();
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
-    let access = engine.acquire("person", &receipt.account_id, None).await.unwrap();
+    let access = engine
+        .acquire("person", &receipt.account_id, None)
+        .await
+        .unwrap();
     assert_eq!(access.access_token, "successor-0");
     assert_eq!(access.generation, 2);
 
     let retry = engine
-        .migrate("person", "machine", "work", "m-1", grant_until("migrated", now() + 3_600_000))
+        .migrate(
+            "person",
+            "machine",
+            "work",
+            "m-1",
+            grant_until("migrated", now() + 3_600_000),
+        )
         .await
         .unwrap();
     assert_eq!(retry.account_id, receipt.account_id);
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn the_audit_log_records_migration_and_refresh_without_any_token() {
+    let (root, engine, _refreshes, task) = synthetic_provider(3600).await;
+    let receipt = engine
+        .migrate(
+            "person",
+            "mac-1",
+            "work",
+            "m-1",
+            grant_until("migrated", now() + 3_600_000),
+        )
+        .await
+        .unwrap();
+    let events =
+        crate::server::audit::read(&root.path().join("store"), &root.path().join("key")).unwrap();
+    let operations: Vec<_> = events
+        .iter()
+        .map(|e| {
+            (
+                e["operation"].as_str().unwrap(),
+                e["result"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(operations, [("refresh", "ok"), ("migrate", "ok")]);
+    assert_eq!(events[0]["machine"], "mac-1");
+    assert_eq!(events[0]["account"], receipt.account_id);
+    assert_eq!(events[0]["rotated"], true);
+    let mut sealed = Vec::new();
+    for entry in std::fs::read_dir(root.path().join("store").join("audit")).unwrap() {
+        sealed.extend(std::fs::read(entry.unwrap().path()).unwrap());
+    }
+    let plain = serde_json::to_string(&events).unwrap();
+    for secret in ["migrated", "successor-0", "successor-refresh-0"] {
+        assert!(!plain.contains(secret), "audit event contains {secret}");
+        assert!(!String::from_utf8_lossy(&sealed).contains(secret));
+    }
     task.abort();
 }
