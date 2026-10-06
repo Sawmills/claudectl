@@ -147,6 +147,10 @@ n=4; while [ $n -le 63 ]; do
   if [ -p "/dev/fd/$n" ]; then echo "$n" >> "$out/extra_fds"; fi
   n=$((n+1))
 done
+# Describe a leak for the failure message: this process and its parent.
+if [ -s "$out/extra_fds" ]; then
+  {{ lsof -p $$; ps -o pid,command -p $PPID; lsof -p $PPID; }} > "$out/fd_detail" 2>&1
+fi
 sleep "${{FAKE_SLEEP:-0}}"
 exit {code}
 "#,
@@ -436,7 +440,8 @@ fn runs_the_child_on_the_saved_profile_and_leaves_global_state_alone() {
     assert_eq!(
         std::fs::read_to_string(out.join("extra_fds")).unwrap(),
         "",
-        "the child must inherit no descriptor besides the token fd"
+        "the child must inherit no descriptor besides the token fd\n{}",
+        std::fs::read_to_string(out.join("fd_detail")).unwrap_or_default()
     );
     let config_dir =
         std::path::PathBuf::from(std::fs::read_to_string(out.join("config_dir")).unwrap());
@@ -944,7 +949,12 @@ fn concurrent_runs_in_two_processes_stay_isolated() {
             "{alias} received another alias's token"
         );
         let extra = std::fs::read_to_string(out.join("extra_fds")).unwrap();
-        assert_eq!(extra, "", "{alias} inherited another descriptor");
+        assert_eq!(
+            extra,
+            "",
+            "{alias} inherited another descriptor\n{}",
+            std::fs::read_to_string(out.join("fd_detail")).unwrap_or_default()
+        );
         dirs.push(std::fs::read_to_string(out.join("config_dir")).unwrap());
     }
     assert_ne!(dirs[0], dirs[1], "runs share a config dir");
