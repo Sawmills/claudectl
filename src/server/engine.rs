@@ -360,6 +360,25 @@ impl Engine {
             migration_id: migration.into(),
         })
     }
+    /// Admit a grant moved from a machine, then refresh once. A single-use refresh token makes
+    /// every copy left on another holder stale. A retry with the same ID returns the receipt.
+    pub async fn migrate(
+        &self,
+        user: &str,
+        machine: &str,
+        alias: &str,
+        migration: &str,
+        grant: Grant,
+    ) -> Result<Receipt> {
+        if let Some(receipt) = self.receipt(user, migration).await? {
+            return Ok(receipt);
+        }
+        let receipt = self.admit(user, alias, migration, grant, None).await?;
+        let current = self.acquire_for(user, machine, &receipt.account_id, None).await?;
+        self.acquire_for(user, machine, &receipt.account_id, Some(&current.revision))
+            .await?;
+        Ok(receipt)
+    }
     async fn selected(&self, user: &str, id: &str) -> Result<Arc<Mutex<Record>>> {
         let record = self
             .records
@@ -409,6 +428,15 @@ impl Engine {
         Ok(())
     }
     pub async fn acquire(&self, user: &str, id: &str, previous: Option<&str>) -> Result<Access> {
+        self.acquire_for(user, "server", id, previous).await
+    }
+    pub async fn acquire_for(
+        &self,
+        user: &str,
+        _machine: &str,
+        id: &str,
+        previous: Option<&str>,
+    ) -> Result<Access> {
         let selected = self.selected(user, id).await?;
         let mut record = selected.lock().await;
         if record.phase == Phase::Unverified {

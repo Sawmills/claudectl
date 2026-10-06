@@ -541,3 +541,24 @@ async fn a_refresh_reads_expires_in_as_seconds() {
     assert!(access.expires_at <= now() + 3_600_000);
     task.abort();
 }
+
+#[tokio::test]
+async fn a_migration_refreshes_once_so_copies_of_the_old_grant_go_stale() {
+    let (_root, engine, refreshes, task) = synthetic_provider(3600).await;
+    let receipt = engine
+        .migrate("person", "machine", "work", "m-1", grant_until("migrated", now() + 3_600_000))
+        .await
+        .unwrap();
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    let access = engine.acquire("person", &receipt.account_id, None).await.unwrap();
+    assert_eq!(access.access_token, "successor-0");
+    assert_eq!(access.generation, 2);
+
+    let retry = engine
+        .migrate("person", "machine", "work", "m-1", grant_until("migrated", now() + 3_600_000))
+        .await
+        .unwrap();
+    assert_eq!(retry.account_id, receipt.account_id);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    task.abort();
+}
