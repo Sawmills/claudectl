@@ -12,7 +12,9 @@ use claudectl::exec::*;
 
 const HOUR_MS: i64 = 3_600_000;
 
-/// Signal handlers are process-wide; tests that start children run one at a time.
+/// Signal handlers are process-wide, and on macOS a pipe is not close-on-exec
+/// until just after it is created, so a fork in another test thread can leak
+/// it. Tests that start processes run one at a time.
 static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn run_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -633,6 +635,7 @@ fn run_helper_in(
 
 #[test]
 fn child_env_drops_credentials_provider_selectors_and_endpoint_overrides() {
+    let _guard = run_guard();
     let (home, paths, _store) = setup();
     save(
         &paths,
@@ -851,6 +854,7 @@ fn user_settings_in_home_are_skipped_below_home_but_checked_at_home() {
 
 #[test]
 fn exec_refuses_to_start_in_a_project_whose_settings_set_a_credential() {
+    let _guard = run_guard();
     let (home, paths, _store) = setup();
     save(
         &paths,
@@ -874,6 +878,7 @@ fn exec_refuses_to_start_in_a_project_whose_settings_set_a_credential() {
 
 #[test]
 fn inherited_ignored_sighup_stays_ignored_for_child_and_after_run() {
+    let _guard = run_guard();
     let (home, paths, _store) = setup();
     save(
         &paths,
@@ -899,6 +904,7 @@ fn inherited_ignored_sighup_stays_ignored_for_child_and_after_run() {
 
 #[test]
 fn concurrent_runs_in_two_processes_stay_isolated() {
+    let _guard = run_guard();
     let (home, paths, _store) = setup();
     for alias in ["one", "two"] {
         save(
