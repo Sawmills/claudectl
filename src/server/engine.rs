@@ -99,6 +99,9 @@ struct Record {
     generation: u64,
     phase: Phase,
     admissions: Vec<String>,
+    /// Set when a delete wins the lock; a waiting request must not persist the record again.
+    #[serde(skip)]
+    removed: bool,
 }
 #[derive(Clone, Serialize)]
 pub struct Account {
@@ -121,12 +124,28 @@ impl Default for Endpoints {
     }
 }
 type Accounts = BTreeMap<String, Arc<Mutex<Record>>>;
+/// The account was deleted. A machine must not retry with it.
+#[derive(Debug)]
+pub struct Gone;
+impl std::fmt::Display for Gone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("server account was deleted")
+    }
+}
+impl std::error::Error for Gone {}
+/// A deleted account ID and its company user. It holds no grant.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct Tombstone {
+    id: String,
+    user: String,
+}
 pub struct Engine {
     state: PathBuf,
     key: PathBuf,
     http: reqwest::Client,
     endpoints: Endpoints,
     records: RwLock<Accounts>,
+    deleted: Mutex<Vec<Tombstone>>,
     admissions: Mutex<()>,
     usage_state: Mutex<usage::UsageState>,
     _owner: vault::Lock,
@@ -139,6 +158,19 @@ impl Engine {
         let owner = vault::lock(state, "owner.lock")?;
         store::ensure_private_dir(&state.join("accounts"))?;
         store::ensure_private_dir(&state.join("pending"))?;
+        let deleted: Vec<Tombstone> = if state.join("deleted.json").try_exists()? {
+            serde_json::from_slice(&vault::private_read(&state.join("deleted.json"))?)?
+        } else {
+            Vec::new()
+        };
+        // Finish a delete that stopped after its tombstone was written.
+        for tombstone in &deleted {
+            let dir = state.join("accounts").join(&tombstone.id);
+            if dir.try_exists()? {
+                std::fs::remove_dir_all(&dir)?;
+                store::sync_directory(&state.join("accounts"))?;
+            }
+        }
         let mut records = BTreeMap::new();
         let mut identities = Vec::new();
         for entry in std::fs::read_dir(state.join("accounts"))? {
@@ -169,6 +201,7 @@ impl Engine {
                 .no_proxy()
                 .build()?,
             records: RwLock::new(records),
+            deleted: Mutex::new(deleted),
             admissions: Mutex::new(()),
             usage_state: Mutex::new(if state.join("usage.json").exists() {
                 serde_json::from_slice(&vault::private_read(&state.join("usage.json"))?)?
@@ -342,8 +375,10 @@ impl Engine {
             generation,
             phase: Phase::Ready,
             admissions,
+            removed: false,
         };
         self.persist(&record)?;
+        self.forget_tombstone(&id).await?;
         if let Some(ref mut old) = old {
             **old = record;
         } else {
@@ -412,13 +447,19 @@ impl Engine {
         Ok(receipt)
     }
     async fn selected(&self, user: &str, id: &str) -> Result<Arc<Mutex<Record>>> {
-        let record = self
-            .records
-            .read()
-            .await
-            .get(id)
-            .cloned()
-            .context("server account not found")?;
+        let record = self.records.read().await.get(id).cloned();
+        let Some(record) = record else {
+            let gone = self
+                .deleted
+                .lock()
+                .await
+                .iter()
+                .any(|t| t.id == id && t.user == user);
+            if gone {
+                return Err(Gone.into());
+            }
+            bail!("server account not found");
+        };
         if record.lock().await.user != user {
             bail!("server account not found");
         }
@@ -525,6 +566,48 @@ impl Engine {
         self.verify_successor(record).await?;
         Ok(rotated)
     }
+    async fn save_tombstones(&self, deleted: &[Tombstone]) -> Result<()> {
+        store::atomic_write(
+            &self.state.join("deleted.json"),
+            &serde_json::to_vec(deleted)?,
+        )
+    }
+    async fn forget_tombstone(&self, id: &str) -> Result<()> {
+        let mut deleted = self.deleted.lock().await;
+        if deleted.iter().any(|t| t.id == id) {
+            deleted.retain(|t| t.id != id);
+            self.save_tombstones(&deleted).await?;
+        }
+        Ok(())
+    }
+    /// Delete an account and its sealed grant. Access tokens already given out stay valid
+    /// until they expire; the server stops renewing them now.
+    pub async fn remove(&self, user: &str, machine: &str, id: &str) -> Result<()> {
+        let selected = self.selected(user, id).await?;
+        let mut record = selected.lock().await;
+        if record.removed {
+            return Err(Gone.into());
+        }
+        record.removed = true;
+        {
+            let mut deleted = self.deleted.lock().await;
+            deleted.push(Tombstone {
+                id: id.into(),
+                user: user.into(),
+            });
+            self.save_tombstones(&deleted).await?;
+        }
+        std::fs::remove_dir_all(self.state.join("accounts").join(id))?;
+        store::sync_directory(&self.state.join("accounts"))?;
+        self.records.write().await.remove(id);
+        self.audit(&audit::Event {
+            operation: "revoke",
+            machine,
+            account: id,
+            result: "ok",
+            rotated: None,
+        })
+    }
     fn audit(&self, event: &audit::Event) -> Result<()> {
         audit::record(&self.state, &self.key, event)
     }
@@ -540,6 +623,9 @@ impl Engine {
     ) -> Result<Access> {
         let selected = self.selected(user, id).await?;
         let mut record = selected.lock().await;
+        if record.removed {
+            return Err(Gone.into());
+        }
         if record.phase == Phase::Unverified {
             self.verify_successor(&mut record).await?;
         }

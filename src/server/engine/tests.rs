@@ -653,3 +653,53 @@ async fn the_audit_log_records_migration_and_refresh_without_any_token() {
     }
     task.abort();
 }
+
+#[tokio::test]
+async fn a_deleted_account_keeps_no_grant_and_answers_gone_after_restart() {
+    let (root, engine, _refreshes, task) = synthetic_provider(3600).await;
+    let receipt = engine
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .remove("other-person", "mac-1", &receipt.account_id)
+            .await
+            .is_err()
+    );
+    engine
+        .remove("person", "mac-1", &receipt.account_id)
+        .await
+        .unwrap();
+    let error = engine
+        .acquire("person", &receipt.account_id, None)
+        .await
+        .err()
+        .unwrap();
+    assert!(error.downcast_ref::<Gone>().is_some());
+    assert!(engine.accounts("person").await.is_empty());
+    let store = root.path().join("store");
+    assert!(!store.join("accounts").join(&receipt.account_id).exists());
+    drop(engine);
+    let engine = Engine::open_at(&store, &root.path().join("key"), Endpoints::default()).unwrap();
+    let error = engine
+        .acquire("person", &receipt.account_id, None)
+        .await
+        .err()
+        .unwrap();
+    assert!(error.downcast_ref::<Gone>().is_some());
+    let events = crate::server::audit::read(&store, &root.path().join("key")).unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(
+        (last["operation"].as_str(), last["result"].as_str()),
+        (Some("revoke"), Some("ok"))
+    );
+    assert_eq!(last["machine"], "mac-1");
+    task.abort();
+}
