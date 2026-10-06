@@ -32,6 +32,8 @@ pub struct Config {
     /// Company email addresses that may use this server. Nobody else gets access.
     pub allowed_users: Vec<String>,
     pub sso: Option<Sso>,
+    /// SHA-256 of the Prometheus scrape token. Without it, `/metrics` needs a machine token.
+    pub metrics_token_hash: Option<String>,
     pub endpoints: Endpoints,
 }
 
@@ -40,6 +42,7 @@ pub struct Server {
     engine: Arc<Engine>,
     pub(super) sso: Option<enrollment::Sso>,
     allowed: Vec<String>,
+    metrics_token_hash: Option<String>,
     failures: StdMutex<BTreeMap<&'static str, u64>>,
     work: Arc<Semaphore>,
 }
@@ -160,6 +163,7 @@ impl Server {
                 .iter()
                 .map(|u| u.to_ascii_lowercase())
                 .collect(),
+            metrics_token_hash: config.metrics_token_hash,
             failures: StdMutex::new(BTreeMap::new()),
             work: Arc::new(Semaphore::new(64)),
         }))
@@ -509,7 +513,18 @@ async fn ready(State(server): Shared) -> StatusCode {
     }
 }
 async fn metrics(State(server): Shared, headers: HeaderMap) -> Result<Response, HttpError> {
-    server.authorize(&headers)?;
+    if let Some(expected) = &server.metrics_token_hash {
+        let actual = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|v| vault::digest(v.as_bytes()));
+        if actual.as_ref() != Some(expected) {
+            return Err(server.error(StatusCode::UNAUTHORIZED, "metrics_unauthorized"));
+        }
+    } else {
+        server.authorize(&headers)?;
+    }
     let output: String = server
         .failures
         .lock()
@@ -542,4 +557,46 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/v2/anthropic/login/complete", post(login_complete))
         .route("/v2/anthropic/migrations", post(migrate).get(receipt));
     enrollment::routes(routes).with_state(server)
+}
+
+/// Serve until SIGTERM or Ctrl-C. A network listener needs an HTTPS public origin and company SSO.
+pub async fn serve(config: Config, listen: std::net::SocketAddr) -> Result<()> {
+    let public_url = config.sso.as_ref().map(|s| s.public_url.clone());
+    if !listen.ip().is_loopback() {
+        let Some(public_url) = public_url else {
+            bail!("a network listener requires company SSO configuration");
+        };
+        if reqwest::Url::parse(&public_url)?.scheme() != "https" {
+            bail!("a network listener requires an HTTPS public origin");
+        }
+    }
+    let server = Server::open(config).await?;
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    eprintln!(
+        "{}",
+        json!({"operation":"serve","stage":"listening","address":listener.local_addr()?.to_string()})
+    );
+    axum::serve(listener, router(server))
+        .with_graceful_shutdown(async {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("SIGTERM handler");
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        })
+        .await?;
+    Ok(())
+}
+
+pub fn set_user(state: &Path, email: &str, enabled: bool) -> Result<()> {
+    let _lock = vault::registry_lock(state, "registry.lock")?;
+    let mut users = vault::users(state)?;
+    let user = users
+        .iter_mut()
+        .find(|u| u.email.eq_ignore_ascii_case(email))
+        .context("user not found")?;
+    user.enabled = enabled;
+    vault::save_users(state, &users)
 }

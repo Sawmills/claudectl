@@ -68,6 +68,7 @@ impl Fixture {
             key,
             allowed_users: vec![AMIR.into()],
             sso: None,
+            metrics_token_hash: None,
             endpoints,
         })
         .await
