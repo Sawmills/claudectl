@@ -179,13 +179,19 @@ The child gets the saved access token through an inherited pipe
 `CLAUDE_CONFIG_DIR` that is removed when the run ends. The child runs
 in its own process group: `SIGTERM`, `SIGINT` and `SIGHUP` sent to claudectl
 reach the whole group once, and descendants left after the child exits get
-`SIGTERM`, then `SIGKILL`.
+`SIGTERM`, then `SIGKILL`. `SIGCONT` follows each `SIGTERM` and `SIGHUP`, so a
+stopped process acts on them.
 
-`exec` is for non-interactive runs such as `claude -p`. A child that reads the
-terminal is stopped by the terminal driver, because it runs in a background
-process group. `exec` runs a private copy of the executable, so use it for a
-single-file program such as the Claude Code native binary; a program that loads
-files next to its own path does not find them. The Keychain entry,
+`exec` also runs an interactive child such as the Claude Code TUI. When
+claudectl owns the terminal foreground, the child's group takes it, as a shell
+job does: the terminal sends Ctrl-C and window size changes to the child
+directly. Ctrl-Z stops the child and claudectl together, and `fg` resumes both.
+claudectl takes the foreground back when the child exits. If the terminal hangs
+up (for example, the pane closes), the child gets `SIGHUP` from the terminal,
+and the private directory is still removed after it exits. `exec` runs a
+private copy of the executable, so use it for a single-file program such as the
+Claude Code native binary; a program that loads files next to its own path does
+not find them. The Keychain entry,
 `~/.claude/.credentials.json`, `~/.claude.json` and the active marker are not
 written.
 
