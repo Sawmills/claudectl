@@ -453,3 +453,91 @@ async fn login_retries_retained_response_without_reusing_authorization_code() {
     assert_eq!(exchanges.load(Ordering::SeqCst), 1);
     task.abort();
 }
+
+fn grant_until(access: &str, expires_at: i64) -> Grant {
+    Grant {
+        access_token: access.into(),
+        refresh_token: format!("{access}-refresh"),
+        expires_at,
+        scopes: vec!["user:inference".into(), "user:profile".into()],
+    }
+}
+
+/// A synthetic Anthropic API: a fixed identity and a counted refresh that returns `expires_in`.
+async fn synthetic_provider(
+    expires_in: i64,
+) -> (tempfile::TempDir, Engine, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let refreshes = count.clone();
+    let app = Router::new()
+        .route(
+            "/api/oauth/profile",
+            get(|| async { Json(json!({"account":{"uuid":"a"},"organization":{"uuid":"o"}})) }),
+        )
+        .route(
+            "/token",
+            post(move || {
+                let refreshes = refreshes.clone();
+                async move {
+                    let n = refreshes.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"access_token":format!("successor-{n}"),"refresh_token":format!("successor-refresh-{n}"),"expires_in":expires_in,"scope":"user:inference user:profile"}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let key = root.path().join("key");
+    vault::create_secret(&key, &[21; 32]).unwrap();
+    let engine = Engine::open_at(
+        &root.path().join("store"),
+        &key,
+        Endpoints {
+            api: origin.clone(),
+            token: format!("{origin}/token"),
+        },
+    )
+    .unwrap();
+    (root, engine, count, task)
+}
+
+#[tokio::test]
+async fn the_server_refreshes_inside_five_minutes_of_expiry_and_not_before() {
+    let (_root, engine, refreshes, task) = synthetic_provider(3600).await;
+    let early = engine
+        .admit("person", "early", "m-early", grant_until("early", now() + 360_000), None)
+        .await
+        .unwrap();
+    let access = engine.acquire("person", &early.account_id, None).await.unwrap();
+    assert_eq!(access.access_token, "early");
+    assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+    task.abort();
+
+    let (_root, engine, refreshes, task) = synthetic_provider(3600).await;
+    let due = engine
+        .admit("person", "due", "m-due", grant_until("due", now() + 240_000), None)
+        .await
+        .unwrap();
+    let access = engine.acquire("person", &due.account_id, None).await.unwrap();
+    assert_eq!(access.access_token, "successor-0");
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_refresh_reads_expires_in_as_seconds() {
+    let (_root, engine, _refreshes, task) = synthetic_provider(3600).await;
+    let receipt = engine
+        .admit("person", "work", "m", grant_until("first", now() + 240_000), None)
+        .await
+        .unwrap();
+    let before = now();
+    let access = engine.acquire("person", &receipt.account_id, None).await.unwrap();
+    // One hour: 3,600 seconds is 3,600,000 milliseconds.
+    assert!(access.expires_at >= before + 3_590_000, "{}", access.expires_at - before);
+    assert!(access.expires_at <= now() + 3_600_000);
+    task.abort();
+}

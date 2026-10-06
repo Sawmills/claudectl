@@ -24,7 +24,7 @@ impl Engine {
         result.stale = result.data.is_none()
             || result.error.is_some()
             || now() >= result.next_retry_at
-            || result.observed_at.is_some_and(|t| t > now() + MARGIN);
+            || result.observed_at.is_some_and(|t| t > now() + USABLE);
         if cached || now() < result.next_retry_at || now() < state.cooldown_until {
             result.next_retry_at = result.next_retry_at.max(state.cooldown_until);
             return Ok(result);

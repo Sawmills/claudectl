@@ -19,7 +19,10 @@ pub use login::Login;
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const BETA: &str = "oauth-2025-04-20";
 const PROVIDER: &str = "anthropic";
-const MARGIN: i64 = 60_000;
+/// Refresh when less than this remains, so machines always hold a token with room to work.
+const MARGIN: i64 = 300_000;
+/// A grant must stay valid this long for admission and identity verification.
+const USABLE: i64 = 60_000;
 fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -291,7 +294,7 @@ impl Engine {
             grant
         };
         grant.validate()?;
-        if grant.expires_at <= now() + MARGIN {
+        if grant.expires_at <= now() + USABLE {
             bail!("admission requires a usable access token; grant retained for login renewal");
         }
         let identity = self.identify(&grant.access_token).await?;
