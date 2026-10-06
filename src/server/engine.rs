@@ -111,9 +111,10 @@ pub struct Account {
     pub identity: Identity,
     pub available: bool,
 }
-struct Endpoints {
-    api: String,
-    token: String,
+/// Anthropic API origins. Tests point them at a synthetic provider.
+pub struct Endpoints {
+    pub api: String,
+    pub token: String,
 }
 impl Default for Endpoints {
     fn default() -> Self {
@@ -154,7 +155,7 @@ impl Engine {
     pub fn open(state: &Path, key: &Path) -> Result<Self> {
         Self::open_at(state, key, Endpoints::default())
     }
-    fn open_at(state: &Path, key: &Path, endpoints: Endpoints) -> Result<Self> {
+    pub fn open_at(state: &Path, key: &Path, endpoints: Endpoints) -> Result<Self> {
         let owner = vault::lock(state, "owner.lock")?;
         store::ensure_private_dir(&state.join("accounts"))?;
         store::ensure_private_dir(&state.join("pending"))?;
@@ -418,6 +419,7 @@ impl Engine {
                     account: &account_id(user, alias),
                     result: "refused",
                     rotated: None,
+                    target: None,
                 })?;
                 return Err(error);
             }
@@ -442,6 +444,7 @@ impl Engine {
                 "admitted_refresh_failed"
             },
             rotated: None,
+            target: None,
         })?;
         refreshed?;
         Ok(receipt)
@@ -606,9 +609,10 @@ impl Engine {
             account: id,
             result: "ok",
             rotated: None,
+            target: None,
         })
     }
-    fn audit(&self, event: &audit::Event) -> Result<()> {
+    pub fn audit(&self, event: &audit::Event) -> Result<()> {
         audit::record(&self.state, &self.key, event)
     }
     pub async fn acquire(&self, user: &str, id: &str, previous: Option<&str>) -> Result<Access> {
@@ -642,6 +646,7 @@ impl Engine {
                 account: &record.id,
                 result: if outcome.is_ok() { "ok" } else { "failed" },
                 rotated: outcome.as_ref().ok().copied(),
+                target: None,
             })?;
             outcome?;
         }

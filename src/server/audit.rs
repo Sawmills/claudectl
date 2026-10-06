@@ -16,6 +16,9 @@ pub struct Event<'a> {
     pub result: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rotated: Option<bool>,
+    /// The revoked machine, for a machine revoke.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<&'a str>,
 }
 
 /// An audit write failure fails the operation it records.
