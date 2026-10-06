@@ -43,7 +43,8 @@ pub struct Server {
     pub(super) sso: Option<enrollment::Sso>,
     allowed: Vec<String>,
     metrics_token_hash: Option<String>,
-    failures: StdMutex<BTreeMap<&'static str, u64>>,
+    /// Per reason: failure count and the Unix time of the last one.
+    failures: StdMutex<BTreeMap<&'static str, (u64, i64)>>,
     work: Arc<Semaphore>,
 }
 
@@ -169,12 +170,12 @@ impl Server {
         }))
     }
     pub(super) fn error(&self, status: StatusCode, reason: &'static str) -> HttpError {
-        *self
-            .failures
-            .lock()
-            .expect("metrics lock")
-            .entry(reason)
-            .or_default() += 1;
+        {
+            let mut failures = self.failures.lock().expect("metrics lock");
+            let failure = failures.entry(reason).or_default();
+            failure.0 += 1;
+            failure.1 = chrono::Utc::now().timestamp();
+        }
         eprintln!(
             "{}",
             json!({"operation":"request","stage":"http","reason":reason,"status":status.as_u16()})
@@ -530,8 +531,10 @@ async fn metrics(State(server): Shared, headers: HeaderMap) -> Result<Response, 
         .lock()
         .expect("metrics lock")
         .iter()
-        .map(|(reason, count)| {
-            format!("claudectl_server_failed_requests_total{{reason=\"{reason}\"}} {count}\n")
+        .map(|(reason, (count, last))| {
+            format!(
+                "claudectl_server_failed_requests_total{{reason=\"{reason}\"}} {count}\nclaudectl_server_last_failure_timestamp_seconds{{reason=\"{reason}\"}} {last}\n"
+            )
         })
         .collect();
     Ok((

@@ -282,3 +282,41 @@ async fn a_machine_revoked_during_a_refresh_gets_no_token() {
     assert_eq!(status, 401, "{body}");
     assert!(!body.contains("successor"));
 }
+
+#[tokio::test]
+async fn metrics_count_failures_by_reason_with_the_last_failure_time() {
+    let f = Fixture::new(None).await;
+    let (_mac_id, mac) = app::register(&f.state, AMIR, "mac").unwrap();
+    assert_eq!(
+        f.call(reqwest::Method::GET, "/v1/me", Some("guess"), None)
+            .await
+            .0,
+        401
+    );
+    let text = f
+        .http
+        .get(format!("{}/metrics", f.origin))
+        .bearer_auth(&mac)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        text.contains("claudectl_server_failed_requests_total{reason=\"unauthorized\"} 1\n"),
+        "{text}"
+    );
+    let now = chrono::Utc::now().timestamp();
+    let last: i64 = text
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix(
+                "claudectl_server_last_failure_timestamp_seconds{reason=\"unauthorized\"} ",
+            )
+        })
+        .expect("last failure gauge")
+        .parse()
+        .unwrap();
+    assert!((now - 5..=now).contains(&last));
+}

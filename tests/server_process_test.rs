@@ -105,3 +105,27 @@ fn a_network_listener_requires_https_and_company_sso() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("company SSO"));
 }
+
+#[test]
+fn setup_if_absent_keeps_existing_state_for_a_restarted_pod() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let key = root.path().join("key");
+    let setup = |extra: &[&str]| {
+        server()
+            .args(["setup", "--state"])
+            .arg(&state)
+            .arg("--key-file")
+            .arg(&key)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    assert!(setup(&[]).status.success());
+    let (machine, _) = claudectl::server::app::register(&state, "amir@sawmills.ai", "mac").unwrap();
+    assert!(!setup(&[]).status.success());
+    assert!(setup(&["--if-absent"]).status.success());
+    let machines = claudectl::server::vault::machines(&state).unwrap();
+    assert_eq!(machines.len(), 1);
+    assert_eq!(machines[0].id, machine);
+}

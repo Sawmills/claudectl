@@ -23,6 +23,9 @@ enum Commands {
         state: PathBuf,
         #[arg(long)]
         key_file: PathBuf,
+        /// Succeed without changes when the state already exists (pod restarts)
+        #[arg(long)]
+        if_absent: bool,
     },
     /// Check a local server's readiness without credentials
     HealthCheck {
@@ -87,7 +90,15 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Commands::Setup { state, key_file } => app::setup(&state, &key_file)?,
+        Commands::Setup {
+            state,
+            key_file,
+            if_absent,
+        } => {
+            if !(if_absent && state.join("users.json").try_exists()?) {
+                app::setup(&state, &key_file)?;
+            }
+        }
         Commands::HealthCheck { address } => {
             ensure!(address.ip().is_loopback(), "health checks require loopback");
             let response = reqwest::Client::builder()

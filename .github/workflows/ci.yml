@@ -29,11 +29,20 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets
 
+      - name: Clippy (account server)
+        run: cargo clippy --all-targets --all-features
+
       - name: Test
         run: cargo test --all-targets
 
+      - name: Test (account server)
+        run: cargo test --all-targets --features server
+
       - name: Build
         run: cargo build --release
+
+      - name: Build (account server)
+        run: cargo build --release --features server --bin claudectl-server
 
   trunk:
     name: Trunk Check
