@@ -56,11 +56,11 @@ Staging only, in the same pattern as `codexctl-central`:
 |---|---|---|
 | 1 | ECR | Repository `claudectl-server` in account 767398060436, us-east-1, immutable tags, the `codexctl-central` lifecycle rule. |
 | 2 | Image publish role | IAM role for GitHub OIDC, trust `repo:Sawmills/claudectl:ref:refs/heads/main`, ECR push to `claudectl-server` only. Repository variable `SERVER_IMAGE_PUBLISH_ROLE` in Sawmills/claudectl. |
-| 3 | Secrets | SSM SecureString `/app/claudectl/vault-key` (32 random bytes, base64) and `/app/claudectl/oidc-client-secret`. ClusterSecretStore `claudectl-secrets` with a role that reads `/app/claudectl/*` only. |
-| 4 | Company SSO | Google OAuth client with redirect `https://claudectl.ue1.staging.plat.sm-svc.com/auth/callback`, restricted to the company domain. |
+| 3 | Secrets | SSM SecureString `/app/claudectl/vault-key` (32 random bytes, base64), `/app/claudectl/oidc-client-secret` and `/app/claudectl/metrics-token`. The shared ClusterSecretStore `aws-parameter-store` (the one codexctl uses) must be able to read `/app/claudectl/*`. |
+| 4 | Company SSO | A Clerk OAuth application on `https://clerk.sawmills.ai` (as for codexctl) with redirect `https://claudectl.ue1.staging.plat.sm-svc.com/auth/callback`. Its client ID replaces the placeholder in `deploy/k8s/overlays/staging/sso.yaml`. |
 | 5 | Argo CD | Application `claudectl` in project `sawmills`, source `Sawmills/claudectl` path `deploy/k8s/overlays/staging`, namespace `claudectl` (CreateNamespace). The project must allow that repository, and Argo CD needs read access to it. |
 | 6 | Network | Host `claudectl.ue1.staging.plat.sm-svc.com` on the internal ALB, covered by the existing certificate, DNS and Twingate resource for `*.ue1.staging.plat.sm-svc.com`. Egress on 443 to `console.anthropic.com`, `api.anthropic.com` and Google OIDC. |
-| 7 | Storage | One gp3 PVC (1 GiB) for the file store. |
+| 7 | Storage | One `encrypted-gp3-1b` PVC (1 GiB) for the file store, retained on delete. |
 | 8 | Alerts | The PrometheusRule from the overlay routes warnings to #warning-alerts and pages through PagerDuty, as for codexctl. |
 
 The PR adds the Dockerfile, the image workflow and the k8s manifests. Nothing applies until Amir grants items 1 to 6.
