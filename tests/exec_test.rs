@@ -2185,6 +2185,11 @@ struct PtyJob {
     done: bool,
 }
 
+/// A shell whose `set -m` sees a job stop. macOS /bin/sh (bash 3.2) does not
+/// see one; dash does, and it is /bin/sh on Ubuntu.
+#[cfg(unix)]
+const STOP_SHELL: &str = "/bin/dash";
+
 #[cfg(unix)]
 const JOB_SHELL: &str = r#"set -m
 "$@"
@@ -2225,12 +2230,13 @@ impl PtyJob {
             .open(&name)
             .unwrap();
         let name = name.trim_start_matches("/dev/").to_owned();
-        // macOS /bin/sh (bash 3.2) with `set -m` does not see a job stop;
-        // dash does, and it is /bin/sh on Ubuntu.
-        let job_shell = ["/bin/dash", "/bin/sh"]
-            .into_iter()
-            .find(|path| Path::new(path).exists())
-            .unwrap();
+        // Only the Ctrl-Z test needs the shell to see a job stop, and it
+        // runs only with STOP_SHELL; the other tests accept any /bin/sh.
+        let job_shell = if Path::new(STOP_SHELL).exists() {
+            STOP_SHELL
+        } else {
+            "/bin/sh"
+        };
         let mut shell = std::process::Command::new(job_shell);
         shell
             .args(["-c", JOB_SHELL, "sh"])
@@ -2419,6 +2425,12 @@ while :; do sleep 1; done"#,
 #[cfg(unix)]
 #[test]
 fn ctrl_z_suspends_the_job_and_fg_resumes_the_child() {
+    if !Path::new(STOP_SHELL).exists() {
+        eprintln!(
+            "skipped: {STOP_SHELL} is missing, and no other shell is known to see a job stop"
+        );
+        return;
+    }
     let _guard = run_guard();
     let (home, out) = tty_child_setup(
         r#"echo ready > "$out/ready"
