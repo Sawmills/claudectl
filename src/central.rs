@@ -582,6 +582,8 @@ pub enum Command {
     Devices,
     /// Stop a machine from acquiring further access tokens
     Revoke { machine_id: String },
+    /// Delete a server account and its refresh grant; tokens already issued expire on their own
+    Remove { alias: String },
     /// Remove this machine's local connection; does not revoke it on the server
     Disconnect,
 }
@@ -656,6 +658,24 @@ pub fn dispatch(command: Command) -> Result<()> {
                             .map_err(|_| anyhow::anyhow!("account server unavailable"))?,
                     )?;
                     println!("Machine revoked.");
+                    Ok(())
+                }
+                Command::Remove { alias } => {
+                    let account = client.account(&alias)?;
+                    checked(
+                        client
+                            .http
+                            .delete(format!(
+                                "{}/v2/anthropic/accounts/{}",
+                                client.connection.server, account.account_id
+                            ))
+                            .bearer_auth(&client.token)
+                            .send()
+                            .map_err(|_| anyhow::anyhow!("account server unavailable"))?,
+                    )?;
+                    println!(
+                        "Server account removed. Access tokens already issued stay valid until they expire."
+                    );
                     Ok(())
                 }
                 _ => unreachable!(),
