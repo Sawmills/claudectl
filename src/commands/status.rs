@@ -17,6 +17,7 @@ use comfy_table::{
 pub struct FetchedUsage {
     pub snapshot: Snapshot,
     pub alias: String,
+    pub account_uuid: Option<String>,
     pub label: Option<String>,
     /// `subscriptionType` from the saved credentials, such as "max" or "team".
     pub plan: Option<String>,
@@ -193,6 +194,7 @@ pub fn status_json(fetched: &[FetchedUsage], now: i64) -> serde_json::Value {
 /// Explicit switching stays local: show only this account's cached data.
 pub fn run_focused(store: &AuthStore, paths: &config::Paths, alias: &str) -> Result<()> {
     let fetched = fetch_usages_from(store, paths, Some(alias), FetchMode::Cached)?;
+    record_statusline_for(paths, &fetched, alias);
     print_focused(&fetched, alias);
     Ok(())
 }
@@ -226,20 +228,31 @@ fn fetch_usages(alias: Option<&str>, mode: FetchMode) -> Result<Vec<FetchedUsage
 /// Keep the statusline sample in step with the active account's latest
 /// usage. A failure only affects the statusline, so it is a warning.
 fn record_statusline(paths: &config::Paths, fetched: &[FetchedUsage], all_profiles: bool) {
-    let now = chrono::Utc::now().timestamp();
     let active = fetched.iter().find(|f| f.is_active);
     // A check of one other profile says nothing about the active one.
     if active.is_none() && !all_profiles {
         return;
     }
-    let sample = active.map(|f| {
-        let usage = f
+    record_statusline_entry(paths, active);
+}
+
+/// After a switch to `alias`, record its usage as the active account's.
+pub fn record_statusline_for(paths: &config::Paths, fetched: &[FetchedUsage], alias: &str) {
+    record_statusline_entry(paths, fetched.iter().find(|f| f.alias == alias));
+}
+
+fn record_statusline_entry(paths: &config::Paths, entry: Option<&FetchedUsage>) {
+    let now = chrono::Utc::now().timestamp();
+    let active = entry.map(|f| claudectl::statusline::Active {
+        alias: &f.alias,
+        account_uuid: f.account_uuid.as_deref(),
+        label: f.label.as_deref(),
+        usage: f
             .usage
             .as_ref()
-            .filter(|_| f.error.is_none() && f.snapshot.is_fresh_at(now));
-        (f.alias.as_str(), f.label.as_deref(), usage)
+            .filter(|_| f.error.is_none() && f.snapshot.is_fresh_at(now)),
     });
-    if let Err(error) = claudectl::statusline::record(paths, sample, now) {
+    if let Err(error) = claudectl::statusline::record(paths, active, now) {
         eprintln!("warning: statusline sample not updated: {error:#}");
     }
 }
@@ -298,6 +311,7 @@ fn fetch_usages_with_refresh(
             let mut result = FetchedUsage {
                 alias: profile.meta.alias.clone(),
                 label: profile.meta.label.clone(),
+                account_uuid: profile.meta.account_uuid().map(str::to_string),
                 is_active,
                 ..FetchedUsage::default()
             };

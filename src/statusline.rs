@@ -28,6 +28,9 @@ pub struct Sample {
     pub version: u32,
     pub sampled_at: i64,
     pub alias: String,
+    /// The account behind the alias when sampled; an alias saved again for
+    /// another login must not show this account's usage.
+    pub account_uuid: String,
     pub label: Option<String>,
     pub five_hour: Option<Window>,
     pub seven_day: Option<Window>,
@@ -53,21 +56,28 @@ fn sample_path(paths: &Paths) -> std::path::PathBuf {
     paths.claudectl_dir().join("statusline.json")
 }
 
+/// The active account as `status` saw it.
+pub struct Active<'a> {
+    pub alias: &'a str,
+    pub account_uuid: Option<&'a str>,
+    pub label: Option<&'a str>,
+    /// Fresh usage only; None when the check failed or is old.
+    pub usage: Option<&'a UsageResponse>,
+}
+
 /// Record the active account's usage, or remove the sample when there is no
-/// fresh usage for it, so the statusline never shows another account's data.
-pub fn record(
-    paths: &Paths,
-    active: Option<(&str, Option<&str>, Option<&UsageResponse>)>,
-    now: i64,
-) -> Result<()> {
+/// fresh usage or no known account for it, so the statusline never shows
+/// another account's data.
+pub fn record(paths: &Paths, active: Option<Active<'_>>, now: i64) -> Result<()> {
     let path = sample_path(paths);
-    let sample = active.and_then(|(alias, label, usage)| {
-        let usage = usage?;
+    let sample = active.and_then(|active| {
+        let usage = active.usage?;
         Some(Sample {
             version: VERSION,
             sampled_at: now,
-            alias: alias.to_string(),
-            label: label.map(str::to_string),
+            alias: active.alias.to_string(),
+            account_uuid: active.account_uuid?.to_string(),
+            label: active.label.map(str::to_string),
             five_hour: Window::from_usage(usage.five_hour.as_ref()),
             seven_day: Window::from_usage(usage.seven_day.as_ref()),
         })
@@ -91,6 +101,11 @@ pub fn render(paths: &Paths, now: i64) -> Option<String> {
     let sample = read_sample(&sample_path(paths))?;
     let active = std::fs::read_to_string(paths.active_file()).ok()?;
     if sample.version != VERSION || sample.alias != active.trim() {
+        return None;
+    }
+    let alias = crate::profile::validate_alias(&sample.alias).ok()?;
+    let profile = crate::profile::get_profile_from(paths, alias).ok()?;
+    if profile.meta.account_uuid() != Some(sample.account_uuid.as_str()) {
         return None;
     }
     let age = now.checked_sub(sample.sampled_at)?;
@@ -179,7 +194,33 @@ mod tests {
         let paths = Paths::from_home(tmp.path().to_path_buf());
         paths.ensure_dirs().unwrap();
         std::fs::write(paths.active_file(), active).unwrap();
+        save_profile(&paths, active, "u1");
         (tmp, paths)
+    }
+
+    fn save_profile(paths: &Paths, alias: &str, uuid: &str) {
+        let creds: crate::api::CredentialsFile =
+            serde_json::from_str(r#"{"claudeAiOauth":{"accessToken":"t"}}"#).unwrap();
+        crate::profile::save_profile_to(
+            paths,
+            alias,
+            &creds,
+            Some(serde_json::json!({ "accountUuid": uuid })),
+        )
+        .unwrap();
+    }
+
+    fn active<'a>(
+        alias: &'a str,
+        label: Option<&'a str>,
+        usage: Option<&'a UsageResponse>,
+    ) -> Option<Active<'a>> {
+        Some(Active {
+            alias,
+            account_uuid: Some("u1"),
+            label,
+            usage,
+        })
     }
 
     fn usage(five: f64, week: f64) -> UsageResponse {
@@ -201,7 +242,7 @@ mod tests {
         let u = usage(10.0, 38.0);
         record(
             &paths,
-            Some(("amir5@sawmills.ai", Some("team"), Some(&u))),
+            active("amir5@sawmills.ai", Some("team"), Some(&u)),
             NOW,
         )
         .unwrap();
@@ -215,12 +256,12 @@ mod tests {
     fn falls_back_to_the_alias_local_part_and_strips_unsafe_text() {
         let (_tmp, paths) = setup("amir5@sawmills.ai");
         let u = usage(0.0, 0.0);
-        record(&paths, Some(("amir5@sawmills.ai", None, Some(&u))), NOW).unwrap();
+        record(&paths, active("amir5@sawmills.ai", None, Some(&u)), NOW).unwrap();
         assert!(render(&paths, NOW).unwrap().starts_with("amir5 100% wk"));
         let label = "\u{1b}]0;evil\u{7}a-very-long-label-that-goes-on";
         record(
             &paths,
-            Some(("amir5@sawmills.ai", Some(label), Some(&u))),
+            active("amir5@sawmills.ai", Some(label), Some(&u)),
             NOW,
         )
         .unwrap();
@@ -233,7 +274,7 @@ mod tests {
     fn is_silent_when_old_for_another_account_or_reset() {
         let (_tmp, paths) = setup("work");
         let u = usage(10.0, 38.0);
-        record(&paths, Some(("work", None, Some(&u))), NOW).unwrap();
+        record(&paths, active("work", None, Some(&u)), NOW).unwrap();
         assert!(render(&paths, NOW + MAX_AGE_SECONDS).is_some());
         assert_eq!(
             render(&paths, NOW + MAX_AGE_SECONDS + 1),
@@ -255,8 +296,36 @@ mod tests {
             }),
             ..UsageResponse::default()
         };
-        record(&paths, Some(("work", None, Some(&past))), NOW).unwrap();
+        record(&paths, active("work", None, Some(&past)), NOW).unwrap();
         assert_eq!(render(&paths, NOW), None, "weekly reset passed");
+    }
+
+    #[test]
+    fn is_silent_when_the_alias_now_holds_another_account() {
+        let (_tmp, paths) = setup("work");
+        let u = usage(10.0, 38.0);
+        record(&paths, active("work", None, Some(&u)), NOW).unwrap();
+        assert!(render(&paths, NOW).is_some());
+        save_profile(&paths, "work", "u2");
+        assert_eq!(
+            render(&paths, NOW),
+            None,
+            "alias saved again for another login"
+        );
+    }
+
+    #[test]
+    fn records_nothing_without_a_known_account() {
+        let (_tmp, paths) = setup("work");
+        let u = usage(10.0, 38.0);
+        let unknown = Active {
+            alias: "work",
+            account_uuid: None,
+            label: None,
+            usage: Some(&u),
+        };
+        record(&paths, Some(unknown), NOW).unwrap();
+        assert!(!sample_path(&paths).exists());
     }
 
     #[test]
@@ -264,7 +333,7 @@ mod tests {
         let (_tmp, paths) = setup("work");
         let mut u = usage(10.0, 38.0);
         u.five_hour = None;
-        record(&paths, Some(("work", None, Some(&u))), NOW).unwrap();
+        record(&paths, active("work", None, Some(&u)), NOW).unwrap();
         assert_eq!(render(&paths, NOW).as_deref(), Some("work 62% wk · 6d22h"));
     }
 
@@ -272,10 +341,10 @@ mod tests {
     fn missing_usage_or_no_active_account_removes_the_sample() {
         let (_tmp, paths) = setup("work");
         let u = usage(10.0, 38.0);
-        record(&paths, Some(("work", None, Some(&u))), NOW).unwrap();
-        record(&paths, Some(("work", None, None)), NOW).unwrap();
+        record(&paths, active("work", None, Some(&u)), NOW).unwrap();
+        record(&paths, active("work", None, None), NOW).unwrap();
         assert!(!sample_path(&paths).exists());
-        record(&paths, Some(("work", None, Some(&u))), NOW).unwrap();
+        record(&paths, active("work", None, Some(&u)), NOW).unwrap();
         record(&paths, None, NOW).unwrap();
         assert!(!sample_path(&paths).exists());
         record(&paths, None, NOW).unwrap();

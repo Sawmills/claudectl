@@ -28,6 +28,7 @@ pub fn run(alias: Option<&str>) -> Result<()> {
             };
             let best = best.to_string();
             let email = profile::switch_to(&store, &paths, &best)?;
+            status::record_statusline_for(&paths, &fetched, &best);
             println!("auto-selected most available: {best} ({email})");
             println!();
             status::print_focused(&fetched, &best);
