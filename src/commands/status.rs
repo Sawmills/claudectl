@@ -111,7 +111,8 @@ pub fn billing_class(usage: Option<&UsageResponse>, plan: Option<&str>) -> &'sta
     {
         Some(true) => "usage_based",
         Some(false)
-            if plan.is_some() && (usage.five_hour.is_some() || usage.seven_day.is_some()) =>
+            if plan.is_some_and(|plan| !plan.trim().is_empty())
+                && (usage.five_hour.is_some() || usage.seven_day.is_some()) =>
         {
             "rate_limited"
         }
@@ -293,7 +294,13 @@ fn fetch_usages_with_refresh(
                 }
             };
             result.token_expiry_secs = creds.claude_ai_oauth.expiry_secs();
-            result.plan = creds.claude_ai_oauth.subscription_type.clone();
+            result.plan = creds
+                .claude_ai_oauth
+                .subscription_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|plan| !plan.is_empty())
+                .map(str::to_string);
             if creds.claude_ai_oauth.access_token.trim().is_empty() {
                 result.error = Some("missing access token; log in again".into());
                 fetched.push(result);
