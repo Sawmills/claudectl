@@ -4,12 +4,13 @@ metadata:
   namespace: claudectl
   name: claudectl-sso
 data:
-  # client_id: the Clerk OAuth application for this server (deploy item 4 in
-  # docs/superpowers/plans/2026-10-06-saw-12454-claude-server.md). Replace before registration.
+  # Google Workspace OIDC (A14). client_id comes from the Google OAuth client created in
+  # A15; replace the placeholder before registration.
   sso.json: |
     {
-      "issuer": "https://clerk.sawmills.ai",
-      "client_id": "REPLACE_WITH_CLAUDECTL_CLERK_CLIENT_ID",
+      "issuer": "https://accounts.google.com",
+      "client_id": "REPLACE_WITH_GOOGLE_CLIENT_ID",
       "client_secret_file": "/keys/oidc-client-secret",
-      "allowed_domains": ["sawmills.ai"]
+      "allowed_domains": ["sawmills.ai"],
+      "allowed_hosted_domains": ["sawmills.ai"]
     }

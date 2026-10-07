@@ -1,0 +1,54 @@
+# The schema owner. Argo CD runs it before each sync; serve never migrates.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  namespace: claudectl
+  name: claudectl-migrate
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    checkov.io/skip1: CKV_K8S_43=Release must replace template workload images with the published digest before Argo registration.
+    checkov.io/skip2: CKV_K8S_35=Database credentials come from the ExternalSecret by design.
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: claudectl
+        app.kubernetes.io/component: migration
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          imagePullPolicy: Always
+          image: claudectl-server:staging
+          args: [migrate]
+          env:
+            # The migrator role owns the schema; the runtime role has DML only.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: claudectl-migrator-postgres, key: DATABASE_URL }
+            - name: CLAUDECTL_SERVER_DB_CA_FILE
+              value: /etc/claudectl/rds-ca/global-bundle.pem
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 64Mi }
+          volumeMounts:
+            - { name: rds-ca, mountPath: /etc/claudectl/rds-ca, readOnly: true }
+      volumes:
+        - name: rds-ca
+          configMap:
+            name: claudectl-rds-ca

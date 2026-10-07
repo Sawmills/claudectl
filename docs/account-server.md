@@ -124,33 +124,48 @@ verification or identity-pinned login renewal.
 
 ```sh
 cargo build --release --features server --bin claudectl-server
-claudectl-server setup --state /data/state --key-file /keys/vault-key --if-absent
-claudectl-server serve --state /data/state --key-file /keys/vault-key \
-  --listen 0.0.0.0:8787 --public-url https://claudectl.example.com \
+# PostgreSQL, several replicas (staging):
+DATABASE_URL='postgres://migrator@db/claudectl?sslmode=require' claudectl-server migrate
+DATABASE_URL='postgres://claudectl@db/claudectl?sslmode=require' claudectl-server serve \
+  --key-file /keys/vault-key --listen 0.0.0.0:8787 --public-url https://claudectl.example.com \
   --sso-config /configuration/sso.json --metrics-token-file /keys/metrics-token \
   --allow-user person@example.com
-claudectl-server users --state /data/state
-claudectl-server revoke --state /data/state --key-file /keys/vault-key --machine MACHINE_ID
-claudectl-server audit --state /data/state --key-file /keys/vault-key
+# One machine, file store:
+claudectl-server setup --state /data/state --key-file /keys/vault-key --if-absent
+claudectl-server serve --state /data/state --key-file /keys/vault-key --public-url http://127.0.0.1:8787/ --allow-user person@example.com
+# Operator commands take --database-url (or DATABASE_URL) or --state, plus --key-file:
+claudectl-server users --key-file /keys/vault-key
+claudectl-server revoke --key-file /keys/vault-key --machine MACHINE_ID
+claudectl-server audit --key-file /keys/vault-key
 ```
 
-- **Storage.** Files under `--state`, sealed with AES-256-GCM under the vault key.
-  One process owns a state directory, so run one replica. A lost vault key loses
-  every grant.
-- **Access.** A request needs an enrolled machine token, an enabled company user,
-  and an email on the allow list. A network listener needs an HTTPS origin and
-  company SSO (`issuer`, `client_id`, `client_secret_file`, `allowed_domains`).
-- **Refresh.** The server is the only refresh owner. It refreshes when a machine
-  reports the current revision as rejected, or when less than five minutes remain.
-  It never replays a lost refresh response; that account then needs `renew`.
+- **Storage.** PostgreSQL for several replicas, or one sealed file for one process. Every
+  payload is sealed with AES-256-GCM under the vault key before it reaches the store; the
+  key never does. A lost vault key loses every grant.
+- **Schema.** Only `migrate` changes the schema; the staging Argo CD app runs it as a PreSync
+  Job with the migrator role. `serve` refuses a schema older than it needs, or one that needs
+  a newer server.
+- **One refresh owner.** Each account has a database lease (120 s, epoch-fenced). Only its
+  holder refreshes, and every write a refresh makes checks the lease. Another replica waits
+  up to 35 s for the new token and then answers 503 `refresh_in_progress`; machines retry.
+  A provider response is kept before it is parsed, so a stop never forces a replay.
+- **Access.** A request needs an enrolled machine token, an enabled company user, and an
+  email on the allow list. A network listener needs an HTTPS origin and company SSO. With
+  the Google issuer, the signed `hd` claim must match `allowed_hosted_domains` (default:
+  `allowed_domains`), and `email_verified` must be true. Users key on issuer and subject.
+  Enrollment state lives in the store and is consumed once, so any replica can serve it.
+- **Refresh.** The server refreshes when a machine reports the current revision as rejected,
+  or when less than five minutes remain. A usage read never refreshes.
 - **Revoke.** `server revoke` stops a machine, also during a refresh in progress.
-  `server remove` deletes the account and its sealed grant; later token requests
-  get HTTP 410. Neither recalls an access token already delivered, so the exposure
-  after a revoke is at most one access-token lifetime.
-- **Audit.** Every migrate, issue, refresh, and revoke writes one line to stderr and
-  one sealed line to `STATE/audit/DATE.log`: operation, machine, account digest,
-  result, and for a refresh whether the provider rotated the refresh token. No line
-  holds a token.
+  `server remove` deletes the account, its grant, and every pending login or admission for
+  its alias in one step; later token requests get HTTP 410, and work that started before the
+  delete cannot recreate it. Neither recalls an access token already delivered, so the
+  exposure after a revoke is at most one access-token lifetime.
+- **Shutdown.** On SIGTERM readiness fails, new connections stop, and in-flight refreshes
+  and verifications finish and persist before the process exits (grace period 120 s).
+- **Audit.** Every migrate, issue, refresh, and revoke writes one line to stderr and one
+  sealed row to the store: operation, machine, account digest, result, and for a refresh
+  whether the provider rotated the refresh token. No line holds a token.
 - **Metrics.** `/metrics` (scrape token or machine token) exports
   `claudectl_server_failed_requests_total{reason}` and
   `claudectl_server_last_failure_timestamp_seconds{reason}`. The staging overlay in

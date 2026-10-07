@@ -7,6 +7,7 @@ spec:
   podSelector:
     matchLabels:
       app.kubernetes.io/name: claudectl
+      app.kubernetes.io/component: server
   policyTypes: [Ingress, Egress]
   ingress:
     - from:
@@ -29,5 +30,38 @@ spec:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
     - ports:
-        # Anthropic (console.anthropic.com, api.anthropic.com) and the company issuer use HTTPS.
+        # Anthropic (console.anthropic.com, api.anthropic.com) and Google OIDC use HTTPS.
         - { protocol: TCP, port: 443 }
+    - to:
+        # The staging quota-manager RDS instance is inside the VPC.
+        - ipBlock: { cidr: 10.1.0.0/16 }
+      ports:
+        - { protocol: TCP, port: 5432 }
+---
+# The migration Job reaches only DNS and the database.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  namespace: claudectl
+  name: claudectl-migration
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: claudectl
+      app.kubernetes.io/component: migration
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - ipBlock: { cidr: 10.1.0.0/16 }
+      ports:
+        - { protocol: TCP, port: 5432 }
