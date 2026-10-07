@@ -134,12 +134,8 @@ const MAX_CLAUDE_JSON_BYTES: u64 = 16 * 1024 * 1024;
 /// The live login's account from `~/.claude.json`, a local file: no network
 /// and no Keychain.
 fn live_account_uuid(paths: &Paths) -> Option<String> {
-    let path = paths.claude_json();
-    let metadata = std::fs::metadata(&path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_CLAUDE_JSON_BYTES {
-        return None;
-    }
-    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+    let bytes = read_capped(&paths.claude_json(), MAX_CLAUDE_JSON_BYTES)?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     json.get("oauthAccount")?
         .get("accountUuid")?
         .as_str()
@@ -147,17 +143,27 @@ fn live_account_uuid(paths: &Paths) -> Option<String> {
 }
 
 fn read_sample(path: &Path) -> Option<Sample> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+    // claudectl writes the sample itself, so a link there is not trusted.
+    if !std::fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    serde_json::from_slice(&read_capped(path, MAX_FILE_BYTES)?).ok()
+}
+
+/// A regular file's bytes, read through one handle and only when it holds at
+/// most `cap` bytes, so a file that grows or is replaced after the check is
+/// still bounded. The path check first keeps a FIFO from blocking the open.
+fn read_capped(path: &Path, cap: u64) -> Option<Vec<u8>> {
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
         return None;
     }
     let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(MAX_FILE_BYTES)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    serde_json::from_slice(&bytes).ok()
+    file.take(cap + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= cap).then_some(bytes)
 }
 
 /// The label, or the alias's local part; only `[A-Za-z0-9 ._-]`, so no
@@ -414,6 +420,17 @@ mod tests {
         std::fs::remove_file(sample_path(&paths)).unwrap();
         std::fs::create_dir(sample_path(&paths)).unwrap();
         assert_eq!(render(&paths, NOW), None);
+    }
+
+    #[test]
+    fn capped_reads_reject_more_than_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f");
+        std::fs::write(&path, b"1234").unwrap();
+        assert_eq!(read_capped(&path, 4).as_deref(), Some(&b"1234"[..]));
+        std::fs::write(&path, b"12345").unwrap();
+        assert_eq!(read_capped(&path, 4), None);
+        assert_eq!(read_capped(tmp.path(), 4), None, "a directory");
     }
 
     #[test]
