@@ -203,7 +203,15 @@ fn run_once(
     let result = exec::run(paths, store, prepared, &request);
     stop.store(true, Ordering::SeqCst);
     let _ = watcher.join();
-    let code = result?;
+    let code = match result {
+        Ok(code) => code,
+        // exec rechecks ownership under the auth lock right before the spawn;
+        // these errors come only from those pre-spawn checks.
+        Err(error @ (exec::ExecError::Refused(_) | exec::ExecError::Identity(_))) => {
+            return Ok(Outcome::Refused(error.to_string()));
+        }
+        Err(error) => return Err(error.into()),
+    };
     let hit = limited.lock().unwrap_or_else(|e| e.into_inner()).take();
     Ok(match hit {
         Some(hit) => Outcome::Limited(hit),
@@ -226,6 +234,7 @@ fn watch(
     let mut handled: Vec<String> = Vec::new();
     let mut retry_at: Option<Instant> = None;
     let mut final_scan_done = false;
+    let mut scanner = lane::TranscriptScanner::new(config_dir, cwd, launched);
     loop {
         let exited = stop.load(Ordering::SeqCst);
         if exited {
@@ -238,7 +247,7 @@ fn watch(
             final_scan_done = true;
         }
         std::thread::sleep(WATCH_INTERVAL);
-        let Some(hit) = lane::find_rate_limit_in(config_dir, cwd, launched) else {
+        let Some(hit) = scanner.poll() else {
             continue;
         };
         if handled.contains(&hit.uuid) || retry_at.is_some_and(|at| Instant::now() < at) {

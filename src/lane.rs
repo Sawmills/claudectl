@@ -8,7 +8,7 @@
 //!   rebuilds `.claude.json` at every launch keeping only the lane's start-up
 //!   decisions, so no account state moves to the next account.
 
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -183,52 +183,107 @@ impl Lane {
     }
 }
 
-/// `Lane::find_rate_limit` for a config directory, usable from a watcher
-/// thread that does not own the lane.
+/// `Lane::find_rate_limit` for a config directory: one full scan.
 pub fn find_rate_limit_in(
     config_dir: &Path,
     cwd: &Path,
     since: chrono::DateTime<chrono::Utc>,
 ) -> Option<RateLimitHit> {
-    let cwd = cwd.to_str()?;
-    let projects = config_dir.join(KEPT);
-    let mut newest: Option<RateLimitHit> = None;
-    for project in std::fs::read_dir(projects).ok()?.flatten() {
-        let Ok(files) = std::fs::read_dir(project.path()) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().is_none_or(|ext| ext != "jsonl") {
-                continue;
-            }
-            let modified = file.metadata().and_then(|m| m.modified()).ok();
-            if modified.is_some_and(|m| chrono::DateTime::<chrono::Utc>::from(m) < since) {
-                continue;
-            }
-            for hit in rate_limits_in(&path, cwd, since) {
-                if newest.as_ref().is_none_or(|n| hit.timestamp > n.timestamp) {
-                    newest = Some(hit);
-                }
-            }
+    TranscriptScanner::new(config_dir, cwd, since).poll()
+}
+
+/// Reads the lane transcripts for rate-limit errors and remembers where it
+/// stopped in each file, so a watcher polling a long session reads each
+/// byte once.
+pub struct TranscriptScanner {
+    projects: PathBuf,
+    cwd: String,
+    since: chrono::DateTime<chrono::Utc>,
+    offsets: std::collections::HashMap<PathBuf, u64>,
+    newest: Option<RateLimitHit>,
+}
+
+impl TranscriptScanner {
+    pub fn new(config_dir: &Path, cwd: &Path, since: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            projects: config_dir.join(KEPT),
+            cwd: cwd.to_string_lossy().into_owned(),
+            since,
+            offsets: std::collections::HashMap::new(),
+            newest: None,
         }
     }
-    newest
+
+    /// Read the new complete lines of every transcript changed since `since`
+    /// and return the newest hit seen so far.
+    pub fn poll(&mut self) -> Option<RateLimitHit> {
+        let Ok(projects) = std::fs::read_dir(&self.projects) else {
+            return self.newest.clone();
+        };
+        for project in projects.flatten() {
+            let Ok(files) = std::fs::read_dir(project.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let path = file.path();
+                if path.extension().is_none_or(|ext| ext != "jsonl") {
+                    continue;
+                }
+                let Ok(metadata) = file.metadata() else {
+                    continue;
+                };
+                let modified = metadata.modified().ok();
+                if modified.is_some_and(|m| chrono::DateTime::<chrono::Utc>::from(m) < self.since) {
+                    continue;
+                }
+                self.read_new_lines(&path, metadata.len());
+            }
+        }
+        self.newest.clone()
+    }
+
+    fn read_new_lines(&mut self, path: &Path, len: u64) {
+        use std::io::{Read, Seek};
+        let offset = self.offsets.get(path).copied().unwrap_or(0);
+        // A shorter file was replaced or truncated: start again.
+        let offset = if len < offset { 0 } else { offset };
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return;
+        };
+        if file.seek(std::io::SeekFrom::Start(offset)).is_err() {
+            return;
+        }
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).is_err() {
+            return;
+        }
+        // A line still being written is read on a later poll.
+        let Some(end) = bytes.iter().rposition(|&b| b == b'\n').map(|i| i + 1) else {
+            self.offsets.insert(path.to_path_buf(), offset);
+            return;
+        };
+        for hit in rate_limits_in(&bytes[..end], &self.cwd, self.since) {
+            if self
+                .newest
+                .as_ref()
+                .is_none_or(|n| hit.timestamp > n.timestamp)
+            {
+                self.newest = Some(hit);
+            }
+        }
+        self.offsets.insert(path.to_path_buf(), offset + end as u64);
+    }
 }
 
 fn rate_limits_in(
-    path: &Path,
+    bytes: &[u8],
     cwd: &str,
     since: chrono::DateTime<chrono::Utc>,
 ) -> Vec<RateLimitHit> {
-    let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
-    std::io::BufReader::new(file)
+    String::from_utf8_lossy(bytes)
         .lines()
-        .map_while(Result::ok)
         .filter(|line| line.contains("\"rate_limit\""))
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|record| {
             record["type"] == "assistant"
                 && record["error"] == "rate_limit"
@@ -355,7 +410,8 @@ mod tests {
             ),
             record(serde_json::json!({"uuid": "hit", "sessionId": "s2", "timestamp": at(-5)})),
         ];
-        std::fs::write(dir.join("s.jsonl"), lines.join("\n")).unwrap();
+        // Claude ends every record with a newline.
+        std::fs::write(dir.join("s.jsonl"), lines.join("\n") + "\n").unwrap();
         let since = now - chrono::Duration::minutes(60);
         let hit = lane.find_rate_limit(Path::new("/work"), since).unwrap();
         assert_eq!((hit.uuid.as_str(), hit.session_id.as_str()), ("hit", "s2"));
@@ -363,6 +419,31 @@ mod tests {
             lane.find_rate_limit(Path::new("/work"), now),
             None,
             "nothing after now"
+        );
+    }
+
+    #[test]
+    fn the_scanner_reads_new_complete_lines_only() {
+        let (_tmp, paths) = paths();
+        let lane = Lane::open(&paths, "lane").unwrap();
+        let dir = lane.config_dir().join("projects/-work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.jsonl");
+        let since = chrono::Utc::now() - chrono::Duration::minutes(60);
+        let mut scanner = TranscriptScanner::new(&lane.config_dir(), Path::new("/work"), since);
+        let at = |m: i64| (chrono::Utc::now() - chrono::Duration::minutes(m)).to_rfc3339();
+        let first = record(serde_json::json!({"uuid": "a", "timestamp": at(10)}));
+        // Half a line: not read yet.
+        std::fs::write(&file, &first[..first.len() / 2]).unwrap();
+        assert_eq!(scanner.poll(), None);
+        std::fs::write(&file, format!("{first}\n")).unwrap();
+        assert_eq!(scanner.poll().unwrap().uuid, "a");
+        let second = record(serde_json::json!({"uuid": "b", "timestamp": at(5)}));
+        std::fs::write(&file, format!("{first}\n{second}\n")).unwrap();
+        assert_eq!(scanner.poll().unwrap().uuid, "b");
+        assert_eq!(
+            scanner.offsets[&file],
+            std::fs::metadata(&file).unwrap().len()
         );
     }
 
