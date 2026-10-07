@@ -2765,13 +2765,18 @@ fn trust_comes_from_the_closest_trusted_ancestor_under_its_own_key() {
     std::fs::create_dir_all(&worktree).unwrap();
     let root_key = std::fs::canonicalize(&root).unwrap();
     let repo_key = root_key.join("repo");
+    let worktree_key = std::fs::canonicalize(&worktree).unwrap();
+    // Claude writes `false` entries on its own for every directory it opens,
+    // and Claude Code 2.1.292 trusts a directory under any trusted ancestor
+    // even when a nearer entry is `false` (checked live, SAW-12468 PR 1).
     std::fs::write(
         paths.claude_json(),
         serde_json::json!({
             "hasCompletedOnboarding": true,
             "projects": {
                 root_key.to_str().unwrap(): {"hasTrustDialogAccepted": true},
-                repo_key.to_str().unwrap(): {"hasTrustDialogAccepted": false}
+                repo_key.to_str().unwrap(): {"hasTrustDialogAccepted": false},
+                worktree_key.to_str().unwrap(): {"hasTrustDialogAccepted": false}
             }
         })
         .to_string(),
@@ -2784,16 +2789,20 @@ fn trust_comes_from_the_closest_trusted_ancestor_under_its_own_key() {
     assert!(status.success());
     let seeded: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("claude_json")).unwrap()).unwrap();
-    // The closest ancestor with a recorded decision is repo (not trusted),
-    // so nothing is trusted: a closer "no" wins over a farther "yes".
-    assert_eq!(seeded, serde_json::json!({"hasCompletedOnboarding": true}));
+    assert_eq!(
+        seeded,
+        serde_json::json!({
+            "hasCompletedOnboarding": true,
+            "projects": {root_key.to_str().unwrap(): {"hasTrustDialogAccepted": true}}
+        })
+    );
 
-    // Without the closer "no", the trusted root is copied under its own key.
+    // With no trusted ancestor, nothing is trusted.
     std::fs::write(
         paths.claude_json(),
         serde_json::json!({
             "hasCompletedOnboarding": true,
-            "projects": {root_key.to_str().unwrap(): {"hasTrustDialogAccepted": true}}
+            "projects": {repo_key.to_str().unwrap(): {"hasTrustDialogAccepted": false}}
         })
         .to_string(),
     )
@@ -2803,11 +2812,5 @@ fn trust_comes_from_the_closest_trusted_ancestor_under_its_own_key() {
     assert!(status.success());
     let seeded: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("claude_json")).unwrap()).unwrap();
-    assert_eq!(
-        seeded,
-        serde_json::json!({
-            "hasCompletedOnboarding": true,
-            "projects": {root_key.to_str().unwrap(): {"hasTrustDialogAccepted": true}}
-        })
-    );
+    assert_eq!(seeded, serde_json::json!({"hasCompletedOnboarding": true}));
 }

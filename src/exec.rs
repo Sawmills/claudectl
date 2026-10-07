@@ -1856,14 +1856,17 @@ fn seed_claude_json(paths: &Paths, config_dir: &Path) -> Result<(), ExecError> {
     let mut seeded_projects = serde_json::Map::new();
     let cwd = std::env::current_dir().ok();
     if let Some(cwd) = cwd.as_deref() {
-        // Claude inherits folder trust from a parent: take the decision of
-        // the closest directory that recorded one, under that directory's
-        // own key, and copy it only when it is a "yes".
-        let decided = cwd.ancestors().filter_map(Path::to_str).find_map(|dir| {
-            let accepted = project(dir)?.get("hasTrustDialogAccepted")?.as_bool()?;
-            Some((dir, accepted))
+        // Claude trusts a directory under any trusted ancestor, and it writes
+        // `false` entries on its own for every directory it opens (Claude
+        // Code 2.1.292, checked live). Copy the closest `true`, under that
+        // directory's own key: the same trust the user's Claude grants.
+        let trusted = cwd.ancestors().filter_map(Path::to_str).find(|dir| {
+            project(dir)
+                .and_then(|entry| entry.get("hasTrustDialogAccepted"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
         });
-        if let Some((dir, true)) = decided {
+        if let Some(dir) = trusted {
             seeded_projects.insert(
                 dir.to_string(),
                 serde_json::json!({ "hasTrustDialogAccepted": true }),

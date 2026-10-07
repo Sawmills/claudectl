@@ -72,7 +72,7 @@ Claude Code 2.1.x reads an OAuth access token from an inherited file descriptor 
 Each run gets a new private directory, so the child neither reads nor writes the global `~/.claude.json` identity or the global Keychain login. Nothing is linked into it, and only one file is copied in: a `.claude.json` built from an allowlist, so that the child starts at its prompt (SAW-12468).
 
 - Top-level keys: `hasCompletedOnboarding` and `lastOnboardingVersion`.
-- Folder trust: the closest directory, from the current directory up, that recorded `hasTrustDialogAccepted`. Its decision is copied under its own key, only when true; a closer "no" wins over a farther "yes". Claude inherits trust from a parent directory.
+- Folder trust: the closest directory, from the current directory up, with `hasTrustDialogAccepted: true`, copied under its own key. Claude Code 2.1.292 trusts a directory under any trusted ancestor, also when a nearer entry is `false`, and it writes `false` entries on its own for directories it opens (checked live). The seed grants the same trust the user's Claude grants, no more.
 - For the current directory only: `hasClaudeMdExternalIncludesApproved` and `hasClaudeMdExternalIncludesWarningShown`, copied only when true.
 - Claude rewrites `~/.claude.json` while it runs, so a parse error gets one retry, then a warning on stderr and no seed. A malformed file is refused earlier, by the live identity check.
 - Never copied: `oauthAccount` and any other identity, tokens, approved API keys, allowed tools, MCP servers, other projects, and settings files.
