@@ -21,7 +21,7 @@ Rule 57 challenge on codexctl plan 9ac0ea1: K3, K4, K7 and K8 and the three open
   - `audit.rs`: the audit log (K8).
   - `app.rs`: routes, `/health`, `/ready`, `/metrics`, TLS requirement.
 - The HTTP contract is the one claudectl#15 already calls: `/v1/enrollment/*`, `/v1/me`, `/v1/devices`, `/v1/devices/revoke`, `/v2/anthropic/{accounts,token,usage,login/*,migrations}`. One new route is `DELETE /v2/anthropic/accounts/{id}`.
-- Storage mode: file store first, one replica (StatefulSet with one PVC and a process lock). HA and PostgreSQL are a follow-up ticket.
+- Storage mode: superseded by A14. The file store stays for local tests and one-machine use; staging runs PostgreSQL with several replicas.
 
 ## Token, refresh, rotation, revoke
 
@@ -48,22 +48,9 @@ The pilot is one inactive Claude account, never the active one.
 4. Run `claudectl server migrate --exclusive-owner` on one machine. The claudectl fence then blocks a restore of that grant or identity there.
 5. On every other holder, delete the copy by digest match and record a fence there too.
 
-## Deploy access needed (Amir's item; the lane does not request it)
+## Deploy access (superseded by the A14 section below)
 
-Staging only, in the same pattern as `codexctl-central`:
-
-| # | Item | Exact need |
-|---|---|---|
-| 1 | ECR | Repository `claudectl-server` in account 767398060436, us-east-1, immutable tags, the `codexctl-central` lifecycle rule. |
-| 2 | Image publish role | IAM role for GitHub OIDC, trust `repo:Sawmills/claudectl:ref:refs/heads/main`, ECR push to `claudectl-server` only. Repository variable `SERVER_IMAGE_PUBLISH_ROLE` in Sawmills/claudectl. |
-| 3 | Secrets | SSM SecureString `/app/claudectl/vault-key` (32 random bytes, base64), `/app/claudectl/oidc-client-secret` and `/app/claudectl/metrics-token`. The shared ClusterSecretStore `aws-parameter-store` (the one codexctl uses) must be able to read `/app/claudectl/*`. |
-| 4 | Company SSO | A Clerk OAuth application on `https://clerk.sawmills.ai` (as for codexctl) with redirect `https://claudectl.ue1.staging.plat.sm-svc.com/auth/callback`. Its client ID replaces the placeholder in `deploy/k8s/overlays/staging/sso.yaml`. |
-| 5 | Argo CD | Application `claudectl` in project `sawmills`, source `Sawmills/claudectl` path `deploy/k8s/overlays/staging`, namespace `claudectl` (CreateNamespace). The project must allow that repository, and Argo CD needs read access to it. |
-| 6 | Network | Host `claudectl.ue1.staging.plat.sm-svc.com` on the internal ALB, covered by the existing certificate, DNS and Twingate resource for `*.ue1.staging.plat.sm-svc.com`. Egress on 443 to `console.anthropic.com`, `api.anthropic.com` and Google OIDC. |
-| 7 | Storage | One `encrypted-gp3-1b` PVC (1 GiB) for the file store, retained on delete. |
-| 8 | Alerts | The PrometheusRule from the overlay routes warnings to #warning-alerts and pages through PagerDuty, as for codexctl. |
-
-The PR adds the Dockerfile, the image workflow and the k8s manifests. Nothing applies until Amir grants items 1 to 6.
+The single-PVC deploy table is replaced. See "A14 revision: infra PRs".
 
 ## Tests (test first, synthetic tokens only)
 
@@ -80,3 +67,75 @@ The PR adds the Dockerfile, the image workflow and the k8s manifests. Nothing ap
 
 - One PR in Sawmills/claudectl, stacked on claudectl#15 (`feat/account-server`), so the client and the server review together but stay separate commits.
 - Stop at `needs re-review <pr> <sha> CI green`. No merge, deploy, tag, k8s write or credential migration without HQ.
+
+## A14 revision: PostgreSQL, several replicas, Google Workspace SSO
+
+Amir A14 to A16 (2026-10-06 17:46 to 17:49 PDT). Done so far, on the file store, at a678a29: the engine, HTTP routes, allow list, audit, delete fences, `server qualify`, and 116 tests. This section is the delta. It needs its own rule 57 challenge.
+
+### Store
+
+- A `Store` trait behind the engine and the registries, with two backends: `File` (today's code: tests and one-machine use) and `Postgres` (staging). One test suite runs against both; CI starts a PostgreSQL service container. The Mac runs the file suite only (no container builds on the Mac).
+- Crates as in codexctl: `tokio-postgres`, `tokio-postgres-rustls`, `rustls`, `webpki-roots`, plus the RDS CA bundle as a ConfigMap. `sslmode=require`. One reconnecting client per pod, 2 s statement timeout.
+- Schema (version 1), all payloads sealed with the vault key before insert; the key never enters the database:
+
+| Table | Holds |
+|---|---|
+| `accounts` | `account_id` PK, `user_id`, `alias`, identity UUIDs, sealed record (grant, phase, revision, generation, admissions, `rotation_pending`), `revision` BIGINT |
+| `refresh_leases` | `account_id` PK, `holder_id`, `epoch`, `expires_at` |
+| `tombstones` | `account_id` PK, `user_id`, `alias`, `deleted_at`, `cleaned` |
+| `pending_admissions` | digest PK, `user_id`, `alias`, sealed grant, `started_at` |
+| `login_flows` | `id` PK, `user_id`, `alias`, sealed flow, `exchanging`, sealed retained response |
+| `enrollment_flows` | device-code, SSO login, and approval state (today in process memory) |
+| `users`, `machines` | registries with a `revision` for compare-and-swap |
+| `usage_cache` | `account_id` PK, sealed usage, `next_retry_at`, poll lease |
+| `audit_events` | sealed audit lines |
+| `schema_migrations` | version |
+
+### One refresh owner across replicas
+
+- Per-account lease, as in codexctl `storage.rs:1659`. `INSERT ... ON CONFLICT DO UPDATE SET epoch = epoch + 1 WHERE expires_at <= now() OR holder_id = EXCLUDED.holder_id`. Holder = pod name + boot nonce. TTL 120 s, renewed every 30 s while held; the Anthropic exchange times out at 30 s.
+- Every write that a refresh makes (Refreshing, the retained response, Unverified, Ready) is fenced: `UPDATE accounts ... WHERE revision = $expected AND EXISTS (lease row with this holder and epoch and expires_at > now() FOR UPDATE)`. A lost lease fails the write, and the request returns no token.
+- A replica that finds the lease held does not refresh. It waits up to 35 s for the revision to change and returns the successor, or answers 503 `refresh_in_progress`.
+- Startup takes no lease and runs no refresh; work starts per request after the lease. `/ready` checks the database and the schema version.
+- Admission, delete, and login completion serialize per account with `pg_advisory_xact_lock(account_id)` in one transaction, instead of today's process mutex. The delete ordering rule (`deleted_at` against `started_at`) and the permanent tombstone stay.
+- Enrollment state moves to `enrollment_flows`, so start, poll, callback, and approve can reach different replicas.
+- Usage polling keeps one poller per account through a short lease on the `usage_cache` row.
+
+### Schema owner and rollout
+
+- `claudectl-server migrate` applies the schema. An Argo CD PreSync hook Job runs it with its own NetworkPolicy (DNS and 5432 only). `serve` never migrates and refuses a schema version it does not know.
+- A Deployment with 2 replicas, zone and host anti-affinity, PDB `minAvailable: 1`, no PVC. The file-store StatefulSet is never deployed, so no file-to-database cutover is needed.
+
+### Google Workspace OIDC (replaces Clerk)
+
+- Issuer `https://accounts.google.com`, `allowed_domains` and `allowed_hosted_domains` = `sawmills.ai`. Port the codexctl checks: the `hd` hint on the request (`enrollment.rs:426`), `email_verified == true` (:532), and a case-insensitive `hd` claim match (:543). The `--allow-user` list (Amir only) stays on top.
+- Client secret in AWS Secrets Manager `/app/claudectl/oidc-client-secret`, read by `ClusterSecretStore/aws-secrets-manager`, as for codexctl.
+
+### Infra PRs (this lane writes them; A14 item 3)
+
+| # | Repo | Change (copy of the codexctl B34 pattern) |
+|---|---|---|
+| 1 | Sawmills/infra | `stacks/catalog/ecr.yaml`: repository `claudectl-server` |
+| 2 | Sawmills/infra | `stacks/catalog/github-oidc-role/claudectl.yaml` (`gha-claudectl`, `repo:Sawmills/claudectl:ref:refs/heads/main`, ECR push to `claudectl-server` only) and its import in `core/artifacts/global-region/baseline.yaml` |
+| 3 | Sawmills/infra | `components/terraform/rds/claudectl` and `stacks/catalog/rds/claudectl.yaml` on the STAGING quota-manager instance: database `claudectl`, a login role (no superuser, createdb, createrole, inherit; connection limit 30), `REVOKE CONNECT, TEMPORARY ON DATABASE claudectl FROM PUBLIC`, SSM `/rds/quota-manager/claudectl/*` |
+| 4 | Sawmills/infra | `manifests/claudectl/external-secret.yaml` (`claudectl-postgres`) as `eks/claudectl-db-secret` |
+| 5 | Sawmills/argocd-deploy | `plat/ue1-staging/argocd/claudectl-application.yaml` (path `deploy/k8s/overlays/staging`) |
+| 6 | Sawmills/claudectl | overlay: Deployment, PDB, PreSync migration Job and its NetworkPolicy, RDS CA ConfigMap, ExternalSecrets, ingress `claudectl.ue1.staging.plat.sm-svc.com`, egress 443 and 5432, alerts |
+
+The shared ExternalSecrets IAM grant already covers `app/*` and `rds/*`, so no store change is needed (`eks.yaml:75-79`).
+
+### Steps that need Amir or HQ
+
+- **Google OAuth client (A15).** The lane creates it with computer use in Dia, as an internal app with redirect `https://claudectl.ue1.staging.plat.sm-svc.com/auth/callback`. Amir is needed if Google asks for MFA, an admin role, or a consent-screen change. This session has the computer-use skill but no computer-use tool loaded yet; if none loads, the lane stops and tells HQ.
+- **RDS apply (A16).** CI apply excludes the `rds/*` components; they apply through the in-cluster (private VPC) Atmos path. The lane runs it only if that path works from this session; otherwise Amir runs `atmos terraform apply rds/claudectl -s <staging stack>`. If only the prod quota-manager instance fits, the lane stops. The agent found the codexctl database on the staging instance, so staging fits.
+- **Hand-set secrets.** `/app/claudectl/vault-key` and `/app/claudectl/metrics-token` (SSM), generated from stdin and never printed. Lane with HQ approval; Amir if the lane's AWS role cannot write them.
+- **k8s writes and the Argo registration.** The `eks/claudectl-db-secret` apply and the argocd-deploy merge (automated sync = deploy) wait for HQ.
+
+### Tests added for HA
+
+- The engine and HTTP suites run on both backends.
+- Two engines (two holders) on one database: concurrent token requests on both refresh once; a follower returns the successor; a lease lost during a refresh fences the write and returns no token; a holder killed while Refreshing is never replayed by the other.
+- Enrollment start on one replica, poll and approve on the other.
+- A delete on one replica during a renewal on the other is refused by the ordering rule.
+- `serve` refuses an unknown schema version; `migrate` is idempotent.
+- Google `hd` and `email_verified` checks.
