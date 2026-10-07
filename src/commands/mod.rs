@@ -1,3 +1,4 @@
+pub mod claude;
 pub mod completions;
 pub mod exec;
 pub mod label;

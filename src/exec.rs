@@ -179,11 +179,16 @@ pub fn check_settings(cwd: &Path, home: &Path, managed: &Path) -> Result<(), Exe
 
 /// `check_settings` for this process's working directory, which the child
 /// inherits.
+/// The settings check for this process, reported as `ExecError::Settings`:
+/// the refusal concerns the directory and settings, not the account.
 fn check_current_settings(paths: &Paths) -> Result<(), ExecError> {
     let cwd = std::env::current_dir().map_err(|e| {
-        ExecError::Refused(format!("cannot read the working directory ({})", e.kind()))
+        ExecError::Settings(format!("cannot read the working directory ({})", e.kind()))
     })?;
-    check_settings(&cwd, &paths.home, &managed_settings_dir())
+    check_settings(&cwd, &paths.home, &managed_settings_dir()).map_err(|error| match error {
+        ExecError::Refused(message) => ExecError::Settings(message),
+        other => other,
+    })
 }
 
 pub struct ExecRequest {
@@ -194,6 +199,10 @@ pub struct ExecRequest {
     pub receipt: Option<PathBuf>,
     pub program: OsString,
     pub args: Vec<OsString>,
+    /// A directory to use as `CLAUDE_CONFIG_DIR` and keep after the run, so
+    /// session transcripts survive (the `claude` launcher's lane). None gives
+    /// a fresh private directory that is removed when the run ends.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Account lookup for the identity check. Production uses the OAuth profile
@@ -217,6 +226,9 @@ impl IdentitySource for LiveIdentity {
 
 #[derive(Debug)]
 pub enum ExecError {
+    /// The settings or the working directory make any account unsafe to run
+    /// here (same exit code as Refused).
+    Settings(String),
     /// Policy refusal: active alias, shared grant, short lifetime, bad profile.
     Refused(String),
     /// Identity missing or mismatched.
@@ -236,7 +248,7 @@ impl ExecError {
         match self {
             ExecError::Identity(_) => 3,
             ExecError::Pin(_) => 4,
-            ExecError::Refused(_) => 5,
+            ExecError::Refused(_) | ExecError::Settings(_) => 5,
             ExecError::Receipt(_) => 6,
             ExecError::Spawn(_) => 7,
             ExecError::Cleanup(_) => 8,
@@ -244,10 +256,12 @@ impl ExecError {
     }
 }
 
+impl std::error::Error for ExecError {}
+
 impl std::fmt::Display for ExecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExecError::Refused(m) => write!(f, "refused: {m}"),
+            ExecError::Refused(m) | ExecError::Settings(m) => write!(f, "refused: {m}"),
             ExecError::Identity(m) => write!(f, "identity check failed: {m}"),
             ExecError::Pin(m) => write!(f, "executable pin failed: {m}"),
             ExecError::Receipt(m) => write!(f, "receipt write failed: {m}"),
@@ -769,7 +783,11 @@ fn run_with_receipt(
     // Handle cancellation for the whole life of the private directory, so a
     // signal cannot skip its removal.
     signals::install();
-    let config_dir = match fresh_config_dir(paths, &prepared.alias) {
+    let config_dir = match &req.state_dir {
+        Some(dir) => kept_config_dir(dir),
+        None => fresh_config_dir(paths, &prepared.alias).map(ConfigDir::Temp),
+    };
+    let config_dir = match config_dir {
         Ok(dir) => dir,
         Err(error) => {
             signals::reset();
@@ -1800,6 +1818,49 @@ impl Receipt {
 
 /// A new private directory per run, removed when the run ends.
 #[doc(hidden)]
+/// The child's `CLAUDE_CONFIG_DIR`: a private temporary directory, or a kept
+/// state directory that outlives the run.
+enum ConfigDir {
+    Temp(tempfile::TempDir),
+    Kept(PathBuf),
+}
+
+impl ConfigDir {
+    fn path(&self) -> &Path {
+        match self {
+            ConfigDir::Temp(dir) => dir.path(),
+            ConfigDir::Kept(dir) => dir,
+        }
+    }
+
+    /// Remove a temporary directory; a kept one stays.
+    fn close(self) -> std::io::Result<()> {
+        match self {
+            ConfigDir::Temp(dir) => dir.close(),
+            ConfigDir::Kept(_) => Ok(()),
+        }
+    }
+}
+
+/// A kept state directory, cleared of the executable snapshot; the seeded
+/// `.claude.json` is rebuilt by `seed_claude_json`.
+fn kept_config_dir(dir: &Path) -> Result<ConfigDir, ExecError> {
+    let metadata = std::fs::symlink_metadata(dir)
+        .map_err(|e| ExecError::Spawn(format!("cannot use {}: {e}", dir.display())))?;
+    if !metadata.is_dir() {
+        return Err(ExecError::Spawn(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
+    }
+    let bin = dir.join("bin");
+    if bin.exists() {
+        std::fs::remove_dir_all(&bin)
+            .map_err(|e| ExecError::Spawn(format!("cannot clear {}: {e}", bin.display())))?;
+    }
+    Ok(ConfigDir::Kept(dir.to_path_buf()))
+}
+
 pub fn fresh_config_dir(paths: &Paths, alias: &str) -> Result<tempfile::TempDir, ExecError> {
     let root = paths.claudectl_dir().join("run").join(alias);
     std::fs::create_dir_all(&root)
@@ -1843,45 +1904,61 @@ const IMPORT_KEYS: &[&str] = &[
 /// are never copied. Without a readable `~/.claude.json` nothing is seeded,
 /// and Claude shows its first-run screens as before.
 fn seed_claude_json(paths: &Paths, config_dir: &Path) -> Result<(), ExecError> {
-    let Some(user) = read_claude_json(paths) else {
-        return Ok(());
-    };
-    let mut seed = serde_json::Map::new();
-    for key in ONBOARDING_KEYS {
-        if let Some(value) = user.get(*key) {
-            seed.insert((*key).to_string(), value.clone());
-        }
+    // A kept lane directory still holds the last run's file. Carry only the
+    // start-up decisions made in the lane; everything else in it, account
+    // state included, is dropped before the new seed is written.
+    let old = config_dir.join(".claude.json");
+    let carried = carried_decisions(&old);
+    if old.exists() {
+        std::fs::remove_file(&old)
+            .map_err(|e| ExecError::Spawn(format!("cannot clear {}: {e}", old.display())))?;
     }
-    let projects = user.get("projects");
-    let project = |dir: &str| projects.and_then(|p| p.get(dir));
+    let mut seed = serde_json::Map::new();
     let mut seeded_projects = serde_json::Map::new();
-    let cwd = std::env::current_dir().ok();
-    if let Some(cwd) = cwd.as_deref() {
-        // Claude trusts a directory under any trusted ancestor, and it writes
-        // `false` entries on its own for every directory it opens (Claude
-        // Code 2.1.292, checked live). Copy the closest `true`, under that
-        // directory's own key: the same trust the user's Claude grants.
-        let trusted = cwd.ancestors().filter_map(Path::to_str).find(|dir| {
-            project(dir)
-                .and_then(|entry| entry.get("hasTrustDialogAccepted"))
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-        });
-        if let Some(dir) = trusted {
-            seeded_projects.insert(
-                dir.to_string(),
-                serde_json::json!({ "hasTrustDialogAccepted": true }),
-            );
+    if let Some(user) = read_claude_json(paths) {
+        for key in ONBOARDING_KEYS {
+            if let Some(value) = user.get(*key) {
+                seed.insert((*key).to_string(), value.clone());
+            }
         }
-        if let Some((dir, entry)) = cwd.to_str().and_then(|dir| Some((dir, project(dir)?))) {
-            for key in IMPORT_KEYS {
-                if entry.get(*key).and_then(|v| v.as_bool()) == Some(true) {
-                    let slot = seeded_projects
-                        .entry(dir.to_string())
-                        .or_insert_with(|| serde_json::json!({}));
-                    slot[*key] = serde_json::Value::Bool(true);
+        let projects = user.get("projects");
+        let project = |dir: &str| projects.and_then(|p| p.get(dir));
+        let cwd = std::env::current_dir().ok();
+        if let Some(cwd) = cwd.as_deref() {
+            // Claude trusts a directory under any trusted ancestor, and it
+            // writes `false` entries on its own for every directory it opens
+            // (Claude Code 2.1.292, checked live). Copy the closest `true`,
+            // under that directory's own key: the trust the user's Claude grants.
+            let trusted = cwd.ancestors().filter_map(Path::to_str).find(|dir| {
+                project(dir)
+                    .and_then(|entry| entry.get("hasTrustDialogAccepted"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            });
+            if let Some(dir) = trusted {
+                seeded_projects.insert(
+                    dir.to_string(),
+                    serde_json::json!({ "hasTrustDialogAccepted": true }),
+                );
+            }
+            if let Some((dir, entry)) = cwd.to_str().and_then(|dir| Some((dir, project(dir)?))) {
+                for key in IMPORT_KEYS {
+                    if entry.get(*key).and_then(|v| v.as_bool()) == Some(true) {
+                        let slot = seeded_projects
+                            .entry(dir.to_string())
+                            .or_insert_with(|| serde_json::json!({}));
+                        slot[*key] = serde_json::Value::Bool(true);
+                    }
                 }
             }
+        }
+    }
+    for (dir, decisions) in carried {
+        let slot = seeded_projects
+            .entry(dir)
+            .or_insert_with(|| serde_json::json!({}));
+        for (key, value) in decisions {
+            slot[key] = value;
         }
     }
     if !seeded_projects.is_empty() {
@@ -1906,6 +1983,37 @@ fn seed_claude_json(paths: &Paths, config_dir: &Path) -> Result<(), ExecError> {
         .map_err(|e| ExecError::Spawn(format!("cannot create {}: {e}", path.display())))?;
     file.write_all(serde_json::Value::Object(seed).to_string().as_bytes())
         .map_err(|e| ExecError::Spawn(format!("cannot write {}: {e}", path.display())))
+}
+
+/// Per-project start-up decisions a lane may carry from one run to the next:
+/// folder trust and the external-import approvals.
+fn is_decision_key(key: &str) -> bool {
+    key == "hasTrustDialogAccepted" || IMPORT_KEYS.contains(&key)
+}
+
+/// The decision keys set to true in a previous seed file, by project.
+fn carried_decisions(path: &Path) -> Vec<(String, serde_json::Map<String, serde_json::Value>)> {
+    let Some(serde_json::Value::Object(old)) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+    else {
+        return Vec::new();
+    };
+    let Some(serde_json::Value::Object(projects)) = old.get("projects") else {
+        return Vec::new();
+    };
+    projects
+        .iter()
+        .filter_map(|(dir, entry)| {
+            let decisions: serde_json::Map<String, serde_json::Value> = entry
+                .as_object()?
+                .iter()
+                .filter(|(key, value)| is_decision_key(key) && value.as_bool() == Some(true))
+                .map(|(key, _)| (key.clone(), serde_json::Value::Bool(true)))
+                .collect();
+            (!decisions.is_empty()).then(|| (dir.clone(), decisions))
+        })
+        .collect()
 }
 
 /// `~/.claude.json` as an object, or None when it is missing. Claude rewrites
