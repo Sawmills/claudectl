@@ -18,6 +18,15 @@ pub(super) struct UsageState {
     failures: u32,
     accounts: BTreeMap<String, Usage>,
 }
+impl UsageState {
+    /// Drop a deleted account's cached usage, so a new account under the alias starts empty.
+    pub(super) fn forget(&mut self, state: &Path, id: &str) -> Result<()> {
+        if self.accounts.remove(id).is_some() {
+            store::atomic_write(&state.join("usage.json"), &serde_json::to_vec(&*self)?)?;
+        }
+        Ok(())
+    }
+}
 impl Engine {
     /// A cached read never acquires credentials or contacts the provider.
     pub async fn usage(&self, user: &str, id: &str, cached: bool) -> Result<Usage> {

@@ -529,9 +529,13 @@ impl Engine {
         if self.identify(&record.grant.access_token).await? != record.identity {
             bail!("refreshed identity mismatch; successor retained");
         }
+        // A migration counts as rotated only once its successor is verified.
+        let pending = record.rotation_pending;
         record.phase = Phase::Ready;
+        record.rotation_pending = false;
         if let Err(error) = self.persist(record) {
             record.phase = Phase::Unverified;
+            record.rotation_pending = pending;
             return Err(error);
         }
         let dir = self.state.join("accounts").join(&record.id);
@@ -598,7 +602,6 @@ impl Engine {
         };
         grant.validate()?;
         record.grant = grant;
-        record.rotation_pending = false;
         record.revision = revision();
         record.generation = record
             .generation
@@ -633,18 +636,23 @@ impl Engine {
         if record.removed {
             return Err(Gone.into());
         }
-        record.removed = true;
         {
             let mut deleted = self.deleted.lock().await;
-            deleted.push(Tombstone {
+            let mut next = deleted.clone();
+            next.push(Tombstone {
                 id: id.into(),
                 user: user.into(),
             });
-            self.save_tombstones(&deleted).await?;
+            // Until the tombstone is durable, the account stays usable and the delete retryable.
+            self.save_tombstones(&next).await?;
+            *deleted = next;
         }
+        record.removed = true;
+        self.records.write().await.remove(id);
+        self.usage_state.lock().await.forget(&self.state, id)?;
+        // A restart finishes this removal from the tombstone if it stops here.
         std::fs::remove_dir_all(self.state.join("accounts").join(id))?;
         store::sync_directory(&self.state.join("accounts"))?;
-        self.records.write().await.remove(id);
         self.audit(&audit::Event {
             operation: "revoke",
             machine,

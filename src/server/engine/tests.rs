@@ -849,3 +849,144 @@ async fn a_usage_read_reports_a_failed_refresh_once() {
     assert_eq!(cached.failure, None);
     task.abort();
 }
+
+#[tokio::test]
+async fn a_delete_whose_tombstone_cannot_be_saved_leaves_the_account_usable_and_retryable() {
+    let (root, engine, _refreshes, task) = synthetic_provider(3600).await;
+    let receipt = engine
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let blocker = root.path().join("store").join("deleted.json");
+    std::fs::create_dir(&blocker).unwrap();
+    assert!(
+        engine
+            .remove("person", "mac", &receipt.account_id)
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .acquire("person", &receipt.account_id, None)
+            .await
+            .is_ok()
+    );
+    std::fs::remove_dir(&blocker).unwrap();
+    engine
+        .remove("person", "mac", &receipt.account_id)
+        .await
+        .unwrap();
+    let error = engine
+        .acquire("person", &receipt.account_id, None)
+        .await
+        .err()
+        .unwrap();
+    assert!(error.downcast_ref::<Gone>().is_some());
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_delete_drops_the_cached_usage_of_that_account() {
+    let (_root, engine, _refreshes, task) = synthetic_provider(3600).await;
+    let first = engine
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    // The synthetic provider has no usage route; any fresh read stores a result.
+    engine
+        .usage("person", &first.account_id, false)
+        .await
+        .unwrap();
+    engine
+        .remove("person", "mac", &first.account_id)
+        .await
+        .unwrap();
+    let second = engine
+        .admit(
+            "person",
+            "work",
+            "m-2",
+            grant_until("second", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.account_id, first.account_id);
+    let cached = engine
+        .usage("person", &second.account_id, true)
+        .await
+        .unwrap();
+    assert!(cached.error.is_none() && cached.observed_at.is_none() && cached.next_retry_at == 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_migration_completes_only_after_its_successor_is_verified() {
+    let profiles = Arc::new(AtomicUsize::new(0));
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let (calls, exchanges) = (profiles.clone(), refreshes.clone());
+    let app = Router::new()
+        .route("/api/oauth/profile", get(move || {
+            let calls = calls.clone();
+            async move {
+                use axum::response::IntoResponse;
+                // Admission check passes; the first successor check fails.
+                if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                } else {
+                    Json(json!({"account":{"uuid":"a"},"organization":{"uuid":"o"}})).into_response()
+                }
+            }
+        }))
+        .route("/token", post(move || {
+            let exchanges = exchanges.clone();
+            async move {
+                exchanges.fetch_add(1, Ordering::SeqCst);
+                Json(json!({"access_token":"successor","refresh_token":"successor-refresh","expires_in":3600,"scope":"user:inference user:profile"}))
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let key = root.path().join("key");
+    vault::create_secret(&key, &[23; 32]).unwrap();
+    let engine = Engine::open_at(
+        &root.path().join("store"),
+        &key,
+        Endpoints {
+            api: origin.clone(),
+            token: format!("{origin}/token"),
+        },
+    )
+    .unwrap();
+    let grant = || grant_until("migrated", now() + 3_600_000);
+    assert!(
+        engine
+            .migrate("person", "mac", "work", "m-1", grant())
+            .await
+            .is_err()
+    );
+    assert!(engine.receipt("person", "m-1").await.unwrap().is_none());
+    engine
+        .migrate("person", "mac", "work", "m-1", grant())
+        .await
+        .unwrap();
+    assert!(engine.receipt("person", "m-1").await.unwrap().is_some());
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    task.abort();
+}

@@ -3,6 +3,8 @@ FROM rust:1.89-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88
 WORKDIR /source
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# The client library embeds the build qualification harness.
+COPY experiments/settings-renewal/*.py ./experiments/settings-renewal/
 RUN cargo build --release --locked --features server --bin claudectl-server
 RUN set -eu; \
     mkdir -p /runtime/etc/ssl /runtime/tmp; \
