@@ -18,6 +18,8 @@ use claudectl::usage_cache::FetchMode;
 use crate::commands::status::{self, FetchedUsage};
 use crate::commands::use_profile;
 
+/// Token lifetime exec requires at launch.
+const MIN_VALID: Duration = Duration::from_secs(30 * 60);
 /// Recoveries allowed in one hour before the launcher stops.
 const MAX_RECOVERIES_PER_HOUR: usize = 3;
 /// How often the watcher reads the lane transcripts.
@@ -97,7 +99,6 @@ fn run_inner(launch: LaunchArgs) -> Result<i32> {
                 hit.session_id
             );
         }
-        lane.log("recovery", &alias, Some(&hit.session_id))?;
         tried.push(alias.clone());
         let Some(next) = choose(&status::fetch_all_usages()?, &tried) else {
             bail!(
@@ -107,6 +108,8 @@ fn run_inner(launch: LaunchArgs) -> Result<i32> {
                 launch.lane
             );
         };
+        // Counted only when a next run starts.
+        lane.log("recovery", &alias, Some(&hit.session_id))?;
         eprintln!(
             "claudectl claude: {alias} reached its limit; resuming session {} on {next}",
             hit.session_id
@@ -137,7 +140,7 @@ fn run_once(
         alias: alias.to_string(),
         expect_account: None,
         expect_sha256: None,
-        min_valid: Duration::from_secs(30 * 60),
+        min_valid: MIN_VALID,
         // Receipts go to the lane, not over the Claude screen.
         receipt: Some(lane.config_dir().with_file_name("receipts.jsonl")),
         program: program.clone(),
@@ -238,9 +241,14 @@ fn limit_check(alias: &str) -> Limit {
 /// every limit, not the live login, and not tried in this launch, ranked as
 /// `use` ranks: lowest max(5h, 7d), a missing window counting as unavailable.
 fn choose(fetched: &[FetchedUsage], tried: &[String]) -> Option<String> {
+    let usable_until = chrono::Utc::now().timestamp() + MIN_VALID.as_secs() as i64;
     let candidates: Vec<use_profile::Candidate> = fetched
         .iter()
         .filter(|f| !f.is_active && !tried.contains(&f.alias))
+        // exec refuses a profile without a known account or with a token that
+        // expires within MIN_VALID; do not rank one.
+        .filter(|f| f.account_uuid.is_some())
+        .filter(|f| f.token_expiry_secs.is_some_and(|at| at >= usable_until))
         .filter(|f| {
             f.usage.as_ref().is_some_and(|usage| {
                 status::billing_class(Some(usage), f.plan.as_deref()) == "rate_limited"
@@ -319,6 +327,8 @@ mod tests {
             alias: alias.into(),
             plan: plan.map(str::to_string),
             usage: Some(serde_json::from_str(usage).unwrap()),
+            account_uuid: Some(format!("uuid-{alias}")),
+            token_expiry_secs: Some(now + 3_600),
             snapshot: Snapshot {
                 fresh: true,
                 fetched_at: Some(now),
@@ -409,6 +419,19 @@ mod tests {
         assert_eq!(choose(&accounts, &[]).as_deref(), Some("calm"));
         assert_eq!(choose(&accounts, &["calm".into()]).as_deref(), Some("hot"));
         assert_eq!(choose(&accounts[2..], &[]), None, "missing 5h window");
+    }
+
+    #[test]
+    fn profiles_exec_would_refuse_are_never_chosen() {
+        let room =
+            format!(r#"{{"five_hour":{{"utilization":1}},"seven_day":{{"utilization":1}},{OFF}}}"#);
+        let mut no_uuid = fetched("no-uuid", &room, Some("max"));
+        no_uuid.account_uuid = None;
+        let mut expiring = fetched("expiring", &room, Some("max"));
+        expiring.token_expiry_secs = Some(chrono::Utc::now().timestamp() + 60);
+        let mut no_expiry = fetched("no-expiry", &room, Some("max"));
+        no_expiry.token_expiry_secs = None;
+        assert_eq!(choose(&[no_uuid, expiring, no_expiry], &[]), None);
     }
 
     #[test]

@@ -114,6 +114,7 @@ impl Lane {
         }
         #[cfg(target_os = "macos")]
         {
+            const NOT_FOUND: i32 = 44;
             let service = keychain_service(&self.config_dir());
             let status = std::process::Command::new("security")
                 .args(["find-generic-password", "-s", &service])
@@ -121,10 +122,16 @@ impl Lane {
                 .stderr(std::process::Stdio::null())
                 .status()
                 .context("failed to run security")?;
-            if status.success() {
-                bail!(
+            // 44 is security's "item not found". Any other result, including a
+            // locked Keychain or denied access, cannot prove there is none.
+            match status.code() {
+                Some(NOT_FOUND) => {}
+                Some(0) => bail!(
                     "the Keychain holds a '{service}' item for this lane; delete it before launching"
-                );
+                ),
+                _ => bail!(
+                    "cannot check the Keychain for a '{service}' item ({status}); unlock it and retry"
+                ),
             }
         }
         Ok(())
