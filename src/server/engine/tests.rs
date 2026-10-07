@@ -1603,3 +1603,69 @@ async fn a_pending_grant_is_never_stored_for_a_cancelled_login() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn the_runtime_role_needs_no_delete_privilege() {
+    let Some(url) = testing::fresh_database().await.unwrap() else {
+        return;
+    };
+    let role = format!("rt_{}", &vault::secret()[..12]);
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    client
+        .batch_execute(&format!(
+            "CREATE ROLE {role} LOGIN;
+             GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO {role};
+             GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {role};"
+        ))
+        .await
+        .unwrap();
+    let runtime_url = url.replacen("postgres://postgres@", &format!("postgres://{role}@"), 1);
+    let f = Fixture::new(provider(Arc::default(), 3600, None)).await;
+    let store = Store::Postgres(PostgresStore::connect(&runtime_url).await.unwrap());
+    let engine = Engine::with_store(Arc::new(store), &f.key, f.endpoints()).unwrap();
+    let grant = || grant_until("first", now() + 3_600_000);
+    let receipt = engine
+        .migrate("person", "mac", "work", "m-1", grant())
+        .await
+        .unwrap();
+    engine
+        .usage("person", &receipt.account_id, false)
+        .await
+        .unwrap();
+    engine
+        .remove("person", "mac", &receipt.account_id)
+        .await
+        .unwrap();
+    let error = engine
+        .acquire("person", &receipt.account_id, None)
+        .await
+        .err()
+        .unwrap();
+    assert!(error.downcast_ref::<Gone>().is_some());
+    let again = engine
+        .admit(
+            "person",
+            "work",
+            "m-2",
+            grant_until("second", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let access = engine
+        .acquire("person", &again.account_id, None)
+        .await
+        .unwrap();
+    assert_eq!(access.access_token, "second");
+    let cached = engine
+        .usage("person", &again.account_id, true)
+        .await
+        .unwrap();
+    assert!(
+        cached.observed_at.is_none(),
+        "a deleted account's usage came back"
+    );
+}

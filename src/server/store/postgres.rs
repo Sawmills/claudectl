@@ -24,9 +24,14 @@ CREATE TABLE IF NOT EXISTS accounts (
     organization_uuid TEXT NOT NULL,
     revision BIGINT NOT NULL,
     sealed BYTEA NOT NULL,
-    UNIQUE (account_uuid, organization_uuid)
+    -- A delete keeps the row as a marker and erases the sealed grant; the runtime role
+    -- has no DELETE privilege.
+    deleted BOOLEAN NOT NULL DEFAULT false
 );
-CREATE UNIQUE INDEX IF NOT EXISTS accounts_user_alias ON accounts (user_id, lower(alias));
+CREATE UNIQUE INDEX IF NOT EXISTS accounts_user_alias ON accounts (user_id, lower(alias))
+    WHERE NOT deleted;
+CREATE UNIQUE INDEX IF NOT EXISTS accounts_identity ON accounts (account_uuid, organization_uuid)
+    WHERE NOT deleted;
 CREATE TABLE IF NOT EXISTS refresh_leases (
     account_id TEXT PRIMARY KEY,
     holder_id TEXT NOT NULL,
@@ -248,7 +253,7 @@ impl PostgresStore {
         let client = self.pool.get().await?;
         Ok(client
             .query_opt(
-                "SELECT * FROM accounts WHERE account_id = $1 AND user_id = $2",
+                "SELECT * FROM accounts WHERE account_id = $1 AND user_id = $2 AND NOT deleted",
                 &[&id, &user],
             )
             .await?
@@ -259,7 +264,7 @@ impl PostgresStore {
         let client = self.pool.get().await?;
         Ok(client
             .query(
-                "SELECT * FROM accounts WHERE user_id = $1 ORDER BY alias",
+                "SELECT * FROM accounts WHERE user_id = $1 AND NOT deleted ORDER BY alias",
                 &[&user],
             )
             .await?
@@ -288,7 +293,7 @@ impl PostgresStore {
                     FOR UPDATE
                  )
                  UPDATE accounts SET revision = $3, sealed = $4
-                 WHERE account_id = $1 AND user_id = $2 AND revision = $8
+                 WHERE account_id = $1 AND user_id = $2 AND revision = $8 AND NOT deleted
                    AND EXISTS (SELECT 1 FROM lease)",
                 &[
                     &a.id,
@@ -339,14 +344,15 @@ impl PostgresStore {
         }
         let current: Option<i64> = tx
             .query_opt(
-                "SELECT revision FROM accounts WHERE account_id = $1 AND user_id = $2 FOR UPDATE",
+                "SELECT revision FROM accounts
+                 WHERE account_id = $1 AND user_id = $2 AND NOT deleted FOR UPDATE",
                 &[&a.id, &a.user],
             )
             .await?
             .map(|r| r.get(0));
         let conflict = tx
             .query_opt(
-                "SELECT 1 FROM accounts WHERE account_id <> $1 AND (
+                "SELECT 1 FROM accounts WHERE account_id <> $1 AND NOT deleted AND (
                     (account_uuid = $2 AND organization_uuid = $3)
                     OR (user_id = $4 AND lower(alias) = lower($5)))",
                 &[
@@ -367,7 +373,7 @@ impl PostgresStore {
                 "INSERT INTO accounts (account_id, user_id, alias, account_uuid, organization_uuid, revision, sealed)
                  VALUES ($1, $2, $3, $4, $5, $6, $7)
                  ON CONFLICT (account_id) DO UPDATE SET alias = $3, account_uuid = $4,
-                    organization_uuid = $5, revision = $6, sealed = $7
+                    organization_uuid = $5, revision = $6, sealed = $7, deleted = false
                  WHERE accounts.user_id = $2",
                 &[&a.id, &a.user, &a.alias, &a.account_uuid, &a.organization_uuid, &a.revision, &a.sealed],
             )
@@ -421,7 +427,7 @@ impl PostgresStore {
         let tx = client.transaction().await?;
         let Some(alias): Option<String> = tx
             .query_opt(
-                "SELECT alias FROM accounts WHERE account_id = $1 AND user_id = $2",
+                "SELECT alias FROM accounts WHERE account_id = $1 AND user_id = $2 AND NOT deleted",
                 &[&id, &user],
             )
             .await?
@@ -434,9 +440,11 @@ impl PostgresStore {
             &[&alias_lock(user, &alias)],
         )
         .await?;
+        // Keep the row as a marker; erase the grant. No DELETE: the runtime role has none.
         if tx
             .execute(
-                "DELETE FROM accounts WHERE account_id = $1 AND user_id = $2",
+                "UPDATE accounts SET deleted = true, sealed = ''::BYTEA, revision = revision + 1
+                 WHERE account_id = $1 AND user_id = $2 AND NOT deleted",
                 &[&id, &user],
             )
             .await?
@@ -444,10 +452,18 @@ impl PostgresStore {
         {
             return Ok(false);
         }
-        tx.execute("DELETE FROM refresh_leases WHERE account_id = $1", &[&id])
-            .await?;
-        tx.execute("DELETE FROM usage_cache WHERE account_id = $1", &[&id])
-            .await?;
+        // A new epoch fences every write of a refresh that was in flight.
+        tx.execute(
+            "UPDATE refresh_leases SET holder_id = 'deleted', epoch = epoch + 1, expires_at = now()
+             WHERE account_id = $1",
+            &[&id],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE usage_cache SET sealed = ''::BYTEA WHERE account_id = $1",
+            &[&id],
+        )
+        .await?;
         tx.execute(
             "INSERT INTO deletions (user_id, account_id, alias) VALUES ($1, $2, $3)",
             &[&user, &id, &alias],
@@ -478,7 +494,7 @@ impl PostgresStore {
         Ok(client
             .query_opt(
                 "SELECT 1 FROM deletions d WHERE d.user_id = $1 AND d.account_id = $2
-                 AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.account_id = $2)",
+                 AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.account_id = $2 AND NOT a.deleted)",
                 &[&user, &id],
             )
             .await?
@@ -639,14 +655,17 @@ impl PostgresStore {
                 &[&id],
             )
             .await?
-            .map(|r| r.get(0)))
+            .map(|r| r.get::<_, Vec<u8>>(0))
+            // A delete erases the cached usage in place.
+            .filter(|sealed| !sealed.is_empty()))
     }
     pub async fn put_usage(&self, id: &str, sealed: &[u8]) -> Result<()> {
         let client = self.pool.get().await?;
         client
             .execute(
                 "INSERT INTO usage_cache (account_id, sealed)
-                 SELECT $1, $2 WHERE starts_with($1, '__') OR EXISTS (SELECT 1 FROM accounts WHERE account_id = $1)
+                 SELECT $1, $2 WHERE starts_with($1, '__')
+                    OR EXISTS (SELECT 1 FROM accounts WHERE account_id = $1 AND NOT deleted)
                  ON CONFLICT (account_id) DO UPDATE SET sealed = EXCLUDED.sealed",
                 &[&id, &sealed],
             )
