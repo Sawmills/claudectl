@@ -21,6 +21,29 @@ pub struct Login {
     pub expires_at: i64,
 }
 impl Engine {
+    /// Drop every login flow and retained login grant for one alias. A delete calls this so a
+    /// replayed login completion cannot restore the account.
+    pub(super) fn cancel_logins(&self, user: &str, alias: &str) -> Result<()> {
+        let directory = self.state.join("logins");
+        if !directory.try_exists()? {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(&directory)? {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".enc").filter(|n| !n.ends_with("-grant")) else {
+                continue;
+            };
+            let flow: Flow = vault::unseal(&path, &self.key)?;
+            if flow.user == user && flow.alias.eq_ignore_ascii_case(alias) {
+                store::remove_if_present(&directory.join(format!("{id}-grant.enc")))?;
+                store::remove_if_present(&path)?;
+            }
+        }
+        store::sync_directory(&directory)
+    }
     pub async fn start_login(
         &self,
         user: &str,

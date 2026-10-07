@@ -1113,24 +1113,45 @@ async fn a_new_account_survives_restart_after_a_failed_tombstone_cleanup() {
     let (root, engine, _refreshes, task) = synthetic_provider(3600).await;
     let store = root.path().join("store");
     let first = engine
-        .admit("person", "work", "m-1", grant_until("first", now() + 3_600_000), None)
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
         .await
         .unwrap();
-    engine.remove("person", "mac", &first.account_id).await.unwrap();
+    engine
+        .remove("person", "mac", &first.account_id)
+        .await
+        .unwrap();
     let tombstones = store.join("deleted.json");
     let saved = store.join("deleted.saved");
     std::fs::rename(&tombstones, &saved).unwrap();
     std::fs::create_dir(&tombstones).unwrap();
     assert!(
         engine
-            .admit("person", "work", "m-2", grant_until("second", now() + 3_600_000), None)
+            .admit(
+                "person",
+                "work",
+                "m-2",
+                grant_until("second", now() + 3_600_000),
+                None
+            )
             .await
             .is_err()
     );
     std::fs::remove_dir(&tombstones).unwrap();
     std::fs::rename(&saved, &tombstones).unwrap();
     let second = engine
-        .admit("person", "work", "m-2", grant_until("second", now() + 3_600_000), None)
+        .admit(
+            "person",
+            "work",
+            "m-2",
+            grant_until("second", now() + 3_600_000),
+            None,
+        )
         .await
         .unwrap();
     drop(engine);
@@ -1138,5 +1159,127 @@ async fn a_new_account_survives_restart_after_a_failed_tombstone_cleanup() {
     assert_eq!(engine.accounts("person").await.len(), 1);
     assert!(engine.receipt("person", "m-2").await.unwrap().is_some());
     assert_eq!(second.account_id, first.account_id);
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_retained_login_cannot_restore_a_deleted_account() {
+    use axum::response::IntoResponse;
+    let profiles = Arc::new(AtomicUsize::new(0));
+    let ids = profiles.clone();
+    let app = Router::new()
+        .route("/token", post(|| async {
+            Json(json!({"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600,"scope":"user:inference user:profile"}))
+        }))
+        .route("/api/oauth/profile", get(move || {
+            let ids = ids.clone();
+            async move {
+                if ids.fetch_add(1, Ordering::SeqCst) == 0 {
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                } else {
+                    Json(json!({"account":{"uuid":"a"},"organization":{"uuid":"o"}})).into_response()
+                }
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let key = root.path().join("key");
+    vault::create_secret(&key, &[25; 32]).unwrap();
+    let store = root.path().join("store");
+    let engine = Engine::open_at(
+        &store,
+        &key,
+        Endpoints {
+            api: origin.clone(),
+            token: format!("{origin}/token"),
+        },
+    )
+    .unwrap();
+    let challenge = engine
+        .start_login("person", "machine", "work", false)
+        .await
+        .unwrap();
+    let url = reqwest::Url::parse(&challenge.authorize_url).unwrap();
+    let state = url
+        .query_pairs()
+        .find(|(n, _)| n == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    let code = format!("fake-code#{state}");
+    // The first verification fails, so the exchanged grant is retained.
+    assert!(
+        engine
+            .finish_login("person", "machine", &challenge.id, &code)
+            .await
+            .is_err()
+    );
+    let logins = store.join("logins");
+    let copy = root.path().join("logins-copy");
+    std::fs::create_dir(&copy).unwrap();
+    for entry in std::fs::read_dir(&logins).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), copy.join(entry.file_name())).unwrap();
+    }
+    let receipt = engine
+        .finish_login("person", "machine", &challenge.id, &code)
+        .await
+        .unwrap();
+    // A stop before cleanup leaves the retained files behind.
+    for entry in std::fs::read_dir(&copy).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), logins.join(entry.file_name())).unwrap();
+    }
+    engine
+        .remove("person", "mac", &receipt.account_id)
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .finish_login("person", "machine", &challenge.id, &code)
+            .await
+            .is_err()
+    );
+    assert!(engine.accounts("person").await.is_empty());
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_new_account_never_reuses_a_residual_deleted_directory() {
+    let (root, engine, _refreshes, task) = synthetic_provider(3600).await;
+    let store = root.path().join("store");
+    let first = engine
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    engine
+        .remove("person", "mac", &first.account_id)
+        .await
+        .unwrap();
+    // A delete that stopped before its directory removal.
+    let residual = store.join("accounts").join(&first.account_id);
+    crate::server::fs::ensure_private_dir(&residual).unwrap();
+    crate::server::fs::atomic_write(&residual.join("refresh-response.enc"), b"old").unwrap();
+    engine
+        .admit(
+            "person",
+            "work",
+            "m-2",
+            grant_until("second", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!residual.join("refresh-response.enc").exists());
     task.abort();
 }

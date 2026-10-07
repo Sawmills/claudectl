@@ -636,6 +636,12 @@ impl Engine {
     async fn forget_tombstone(&self, id: &str) -> Result<()> {
         let mut deleted = self.deleted.lock().await;
         if deleted.iter().any(|t| t.id == id) {
+            // Finish a residual delete before its marker goes.
+            let residual = self.state.join("accounts").join(id);
+            if residual.try_exists()? {
+                std::fs::remove_dir_all(&residual)?;
+                store::sync_directory(&self.state.join("accounts"))?;
+            }
             let next: Vec<_> = deleted.iter().filter(|t| t.id != id).cloned().collect();
             // Keep the tombstone in memory until its removal is durable.
             self.save_tombstones(&next).await?;
@@ -666,6 +672,8 @@ impl Engine {
         }
         record.removed = true;
         self.records.write().await.remove(id);
+        // The admission lock is held, so no login completion runs concurrently.
+        self.cancel_logins(user, &record.alias)?;
         // A usage read takes the cache lock before an account lock; never hold both here.
         drop(record);
         self.usage_state.lock().await.forget(&self.state, id)?;
