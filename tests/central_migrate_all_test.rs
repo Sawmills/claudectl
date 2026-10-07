@@ -683,3 +683,34 @@ fn a_malformed_receipt_reply_halts_the_run() {
     assert!(Env::row(&text, "b2").contains("not-attempted"), "{text}");
     assert!(!env.fenced("b2"));
 }
+
+#[test]
+fn a_refreshed_grant_that_cannot_be_saved_is_kept_in_a_private_recovery_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, -1_000);
+    let dir = env.paths.profiles_dir().join("a1");
+    let file = dir.join("credentials.json");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let (ok, text) = env.all();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!ok, "{text}");
+    assert!(Env::row(&text, "a1").contains("refused"), "{text}");
+    assert_eq!(env.fake.lock().unwrap().refreshes, 1);
+    let kept = env
+        .paths
+        .claudectl_dir()
+        .join("server/refresh-recovery/a1.json");
+    let saved: CredentialsFile = serde_json::from_slice(&std::fs::read(&kept).unwrap()).unwrap();
+    assert_eq!(
+        saved.claude_ai_oauth.refresh_token.as_deref(),
+        Some("rotated-refresh")
+    );
+    assert_eq!(
+        std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!env.fenced("a1"));
+}

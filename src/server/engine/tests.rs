@@ -2071,3 +2071,31 @@ async fn a_receipt_state_is_pending_while_an_admission_is_in_flight() {
     assert!(receipt.is_none());
     assert_eq!(state, "pending");
 }
+
+/// The admission and its pending row are separate reads; a commit between them leaves a
+/// committed pending row, which must not read as "none".
+#[tokio::test]
+async fn a_committed_pending_row_without_a_visible_admission_is_not_none() {
+    let (_f, engine, _refreshes) = synthetic(3600).await;
+    let row = store::PendingRow {
+        user: "person".into(),
+        alias: "work".into(),
+        state: store::PendingState::Live,
+        sealed: vec![1],
+    };
+    engine.store().put_pending("m-9", &row, None).await.unwrap();
+    // Model the reader that saw no admission, then a committed row.
+    assert_eq!(
+        engine.receipt_state("person", "m-9").await.unwrap().1,
+        "pending"
+    );
+    assert_eq!(
+        state_without_admission(Some(store::PendingState::Committed)),
+        "pending"
+    );
+    assert_eq!(
+        state_without_admission(Some(store::PendingState::Cancelled)),
+        "none"
+    );
+    assert_eq!(state_without_admission(None), "none");
+}

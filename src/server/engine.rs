@@ -257,6 +257,17 @@ pub struct Engine {
     local: StdMutex<BTreeMap<String, Arc<Mutex<()>>>>,
     usage_poll: Mutex<()>,
 }
+/// The receipt state when no committed admission was visible, from the pending row read
+/// after it.
+pub(crate) fn state_without_admission(pending: Option<store::PendingState>) -> &'static str {
+    match pending {
+        // Live: an admission may still commit. Committed: it committed after the admission
+        // read; the client's rerun finds the receipt.
+        Some(store::PendingState::Live | store::PendingState::Committed) => "pending",
+        // Cancelled by a delete, or never kept: nothing can be admitted.
+        Some(store::PendingState::Cancelled) | None => "none",
+    }
+}
 impl Engine {
     /// A file-store engine at `state`; it takes the state directory's process lock.
     pub fn open_at(state: &Path, key: &Path, endpoints: Endpoints) -> Result<Self> {
@@ -671,10 +682,12 @@ impl Engine {
     ) -> Result<(Option<Receipt>, &'static str)> {
         match self.admitted(user, admission).await? {
             // A kept grant not yet committed may still be admitted: never "none".
-            None => match self.store.pending(user, admission).await? {
-                Some(row) if row.state == store::PendingState::Live => Ok((None, "pending")),
-                _ => Ok((None, "none")),
-            },
+            None => Ok((
+                None,
+                state_without_admission(
+                    self.store.pending(user, admission).await?.map(|r| r.state),
+                ),
+            )),
             Some((receipt, Rotation::Rotated | Rotation::NotMigrated, _)) => {
                 Ok((Some(receipt), "complete"))
             }

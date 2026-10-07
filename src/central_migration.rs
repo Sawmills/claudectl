@@ -594,14 +594,28 @@ fn refresh_inactive(paths: &Paths, alias: &str) -> Result<()> {
     }
     current.claude_ai_oauth = rotated;
     let active = profile::get_active_from(paths)?;
-    profile::persist_rotated_grant(
+    if let Err(error) = profile::persist_rotated_grant(
         paths,
         active.as_deref(),
         &current_profile,
         &current,
         &crate::usage_cache::UsageCache::key(&grant),
-    )
-    .context("refreshed but could not save the profile")
+    ) {
+        // The provider already rotated the grant: the successor must survive somewhere.
+        let kept = root(paths)
+            .join("refresh-recovery")
+            .join(format!("{alias}.json"));
+        atomic(&kept, &current).with_context(|| {
+            format!(
+                "refreshed {alias} but could neither save the profile nor keep the grant ({error})"
+            )
+        })?;
+        bail!(
+            "refreshed {alias} but could not save the profile ({error}); the new grant is kept privately at {}",
+            kept.display()
+        );
+    }
+    Ok(())
 }
 fn fenced_alias(paths: &Paths, alias: &str) -> bool {
     directory(&paths.claudectl_dir(), alias)
