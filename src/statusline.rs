@@ -102,7 +102,9 @@ pub fn render(paths: &Paths, now: i64) -> Option<String> {
     }
     let alias = crate::profile::validate_alias(&sample.alias).ok()?;
     let profile = crate::profile::get_profile_from(paths, alias).ok()?;
-    if profile.meta.account_uuid() != Some(sample.account_uuid.as_str()) {
+    if profile.meta.account_uuid() != Some(sample.account_uuid.as_str())
+        || live_account_uuid(paths).as_deref() != Some(sample.account_uuid.as_str())
+    {
         return None;
     }
     let age = now.checked_sub(sample.sampled_at)?;
@@ -124,6 +126,24 @@ pub fn render(paths: &Paths, now: i64) -> Option<String> {
         line.push_str(&format!(" · {}% 5h", remaining(five.used_percent)));
     }
     Some(line)
+}
+
+/// Largest `~/.claude.json` the prompt path reads.
+const MAX_CLAUDE_JSON_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The live login's account from `~/.claude.json`, a local file: no network
+/// and no Keychain.
+fn live_account_uuid(paths: &Paths) -> Option<String> {
+    let path = paths.claude_json();
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_CLAUDE_JSON_BYTES {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+    json.get("oauthAccount")?
+        .get("accountUuid")?
+        .as_str()
+        .map(str::to_string)
 }
 
 fn read_sample(path: &Path) -> Option<Sample> {
@@ -193,7 +213,16 @@ mod tests {
         paths.ensure_dirs().unwrap();
         std::fs::write(paths.active_file(), active).unwrap();
         save_profile(&paths, active, "u1");
+        set_live_login(&paths, "u1");
         (tmp, paths)
+    }
+
+    fn set_live_login(paths: &Paths, uuid: &str) {
+        std::fs::write(
+            paths.claude_json(),
+            serde_json::json!({ "oauthAccount": { "accountUuid": uuid } }).to_string(),
+        )
+        .unwrap();
     }
 
     fn save_profile(paths: &Paths, alias: &str, uuid: &str) {
@@ -317,6 +346,18 @@ mod tests {
             None,
             "alias saved again for another login"
         );
+    }
+
+    #[test]
+    fn is_silent_when_the_live_login_changes_after_the_sample() {
+        let (_tmp, paths) = setup("work");
+        let u = usage(10.0, 38.0);
+        record(&paths, active(&paths, "work", None, Some(&u)), NOW).unwrap();
+        assert!(render(&paths, NOW).is_some());
+        set_live_login(&paths, "u2");
+        assert_eq!(render(&paths, NOW), None, "live login is another account");
+        std::fs::remove_file(paths.claude_json()).unwrap();
+        assert_eq!(render(&paths, NOW), None, "no live login");
     }
 
     #[test]
