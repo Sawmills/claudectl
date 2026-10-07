@@ -137,6 +137,15 @@ impl std::fmt::Display for Gone {
     }
 }
 impl std::error::Error for Gone {}
+/// No account with this ID belongs to the company user.
+#[derive(Debug)]
+pub struct NotFound;
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("server account not found")
+    }
+}
+impl std::error::Error for NotFound {}
 /// A deleted account ID and its company user. It holds no grant.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct Tombstone {
@@ -194,6 +203,15 @@ impl Engine {
             identities.push(record.identity.clone());
             records.insert(record.id.clone(), Arc::new(Mutex::new(record)));
         }
+        let mut usage_state: usage::UsageState = if state.join("usage.json").exists() {
+            serde_json::from_slice(&vault::private_read(&state.join("usage.json"))?)?
+        } else {
+            Default::default()
+        };
+        // A delete that stopped after its tombstone may have left cached usage behind.
+        for tombstone in &deleted {
+            usage_state.forget(state, &tombstone.id)?;
+        }
         Ok(Self {
             state: state.into(),
             key: key.into(),
@@ -207,11 +225,7 @@ impl Engine {
             records: RwLock::new(records),
             deleted: Mutex::new(deleted),
             admissions: Mutex::new(()),
-            usage_state: Mutex::new(if state.join("usage.json").exists() {
-                serde_json::from_slice(&vault::private_read(&state.join("usage.json"))?)?
-            } else {
-                Default::default()
-            }),
+            usage_state: Mutex::new(usage_state),
             _owner: owner,
         })
     }
@@ -506,10 +520,10 @@ impl Engine {
             if gone {
                 return Err(Gone.into());
             }
-            bail!("server account not found");
+            return Err(NotFound.into());
         };
         if record.lock().await.user != user {
-            bail!("server account not found");
+            return Err(NotFound.into());
         }
         Ok(record)
     }
@@ -649,6 +663,8 @@ impl Engine {
         }
         record.removed = true;
         self.records.write().await.remove(id);
+        // A usage read takes the cache lock before an account lock; never hold both here.
+        drop(record);
         self.usage_state.lock().await.forget(&self.state, id)?;
         // A restart finishes this removal from the tombstone if it stops here.
         std::fs::remove_dir_all(self.state.join("accounts").join(id))?;

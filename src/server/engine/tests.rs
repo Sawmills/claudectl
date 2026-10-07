@@ -990,3 +990,120 @@ async fn a_migration_completes_only_after_its_successor_is_verified() {
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
     task.abort();
 }
+
+#[tokio::test]
+async fn a_delete_and_a_usage_read_waiting_on_the_same_account_do_not_deadlock() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let gate = release.clone();
+    let app = Router::new()
+        .route(
+            "/api/oauth/profile",
+            get(|| async { Json(json!({"account":{"uuid":"a"},"organization":{"uuid":"o"}})) }),
+        )
+        .route(
+            "/token",
+            post(move || {
+                let gate = gate.clone();
+                async move {
+                    gate.notified().await;
+                    Json(json!({"access_token":"successor","refresh_token":"successor-refresh","expires_in":3600,"scope":"user:inference user:profile"}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let key = root.path().join("key");
+    vault::create_secret(&key, &[24; 32]).unwrap();
+    let engine = Arc::new(
+        Engine::open_at(
+            &root.path().join("store"),
+            &key,
+            Endpoints {
+                api: origin.clone(),
+                token: format!("{origin}/token"),
+            },
+        )
+        .unwrap(),
+    );
+    let receipt = engine
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let id = receipt.account_id.clone();
+    let current = engine.acquire("person", &id, None).await.unwrap();
+    // 1. A forced refresh holds the account lock.
+    let refresh = {
+        let (engine, id) = (engine.clone(), id.clone());
+        tokio::spawn(async move { engine.acquire("person", &id, Some(&current.revision)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // 2. A delete queues for the account lock first, 3. then a usage read holding the cache.
+    let remove = {
+        let (engine, id) = (engine.clone(), id.clone());
+        tokio::spawn(async move { engine.remove("person", "mac", &id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let usage = {
+        let (engine, id) = (engine.clone(), id.clone());
+        tokio::spawn(async move { engine.usage("person", &id, false).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    release.notify_one();
+    let all = async {
+        let _ = refresh.await.unwrap();
+        remove.await.unwrap().unwrap();
+        let _ = usage.await.unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(10), all)
+        .await
+        .expect("delete and usage read deadlocked");
+    task.abort();
+}
+
+#[tokio::test]
+async fn startup_drops_cached_usage_of_an_account_deleted_before_a_stop() {
+    let (root, engine, _refreshes, task) = synthetic_provider(3600).await;
+    let store = root.path().join("store");
+    let first = engine
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    engine
+        .usage("person", &first.account_id, false)
+        .await
+        .unwrap();
+    let cached = std::fs::read(store.join("usage.json")).unwrap();
+    engine
+        .remove("person", "mac", &first.account_id)
+        .await
+        .unwrap();
+    drop(engine);
+    // A stop after the tombstone, before the cache cleanup.
+    crate::server::fs::atomic_write(&store.join("usage.json"), &cached).unwrap();
+    let engine = Engine::open_at(&store, &root.path().join("key"), Endpoints::default()).unwrap();
+    let cached = engine.usage("person", &first.account_id, true).await;
+    assert!(cached.is_err(), "a deleted account has no usage");
+    let usage: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.join("usage.json")).unwrap()).unwrap();
+    assert!(
+        usage["accounts"].get(&first.account_id).is_none(),
+        "{usage}"
+    );
+    task.abort();
+}

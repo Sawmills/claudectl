@@ -320,3 +320,47 @@ async fn metrics_count_failures_by_reason_with_the_last_failure_time() {
         .unwrap();
     assert!((now - 5..=now).contains(&last));
 }
+
+#[tokio::test]
+async fn a_delete_that_cannot_persist_answers_503_and_an_unknown_account_404() {
+    let f = Fixture::new(None).await;
+    let (_mac_id, mac) = app::register(&f.state, AMIR, "mac").unwrap();
+    let id = f.migrate(&mac).await;
+    let blocker = f.state.join("deleted.json");
+    std::fs::create_dir(&blocker).unwrap();
+    let (status, body) = f
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/v2/anthropic/accounts/{id}"),
+            Some(&mac),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (503, Some("persistence_failed"))
+    );
+    let (status, _) = f
+        .call(
+            reqwest::Method::POST,
+            "/v2/anthropic/token",
+            Some(&mac),
+            Some(json!({"account_id":id})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    std::fs::remove_dir(&blocker).unwrap();
+    let missing = "0".repeat(64);
+    let (status, body) = f
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/v2/anthropic/accounts/{missing}"),
+            Some(&mac),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (404, Some("account_not_found"))
+    );
+}

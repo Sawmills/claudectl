@@ -1,7 +1,7 @@
 //! HTTP contract, machine authorization, and the company-user allow list.
 use super::{
     audit,
-    engine::{self, Endpoints, Engine, Gone},
+    engine::{self, Endpoints, Engine, Gone, NotFound},
     enrollment, fs, vault,
 };
 use anyhow::{Context, Result, bail};
@@ -339,8 +339,10 @@ async fn delete_account(
         .map_err(|e| {
             if e.downcast_ref::<Gone>().is_some() {
                 server.error(StatusCode::GONE, "account_deleted")
-            } else {
+            } else if e.downcast_ref::<NotFound>().is_some() {
                 server.error(StatusCode::NOT_FOUND, "account_not_found")
+            } else {
+                server.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
             }
         })?;
     Ok(StatusCode::NO_CONTENT)
