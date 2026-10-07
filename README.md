@@ -179,8 +179,8 @@ The child gets the saved access token through an inherited pipe
 `CLAUDE_CONFIG_DIR` that is removed when the run ends. So that the child
 starts at its prompt, that directory gets a `.claude.json` with only your
 onboarding state (`hasCompletedOnboarding`, `lastOnboardingVersion`) and the
-start-up approvals you gave the current directory (folder trust, external
-CLAUDE.md imports). Accounts, tokens, allowed tools and MCP servers are never
+start-up approvals that cover the current directory (folder trust, also when
+it comes from a parent directory, and external CLAUDE.md imports). Accounts, tokens, allowed tools and MCP servers are never
 copied. The child runs
 in its own process group: `SIGTERM`, `SIGINT` and `SIGHUP` sent to claudectl
 reach the whole group once, and descendants left after the child exits get

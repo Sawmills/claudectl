@@ -2749,3 +2749,65 @@ fn without_a_claude_json_the_child_starts_without_a_seed() {
     assert!(status.success());
     assert!(!out.join("claude_json").exists());
 }
+
+#[test]
+fn trust_comes_from_the_closest_trusted_ancestor_under_its_own_key() {
+    let _guard = run_guard();
+    let (home, paths, _store) = setup();
+    save(
+        &paths,
+        "one",
+        "uuid-one",
+        &creds("a-one", "r-one", 2 * HOUR_MS),
+    );
+    let root = home.path().join("code");
+    let worktree = root.join("repo").join(".worktrees").join("lane");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let root_key = std::fs::canonicalize(&root).unwrap();
+    let repo_key = root_key.join("repo");
+    std::fs::write(
+        paths.claude_json(),
+        serde_json::json!({
+            "hasCompletedOnboarding": true,
+            "projects": {
+                root_key.to_str().unwrap(): {"hasTrustDialogAccepted": true},
+                repo_key.to_str().unwrap(): {"hasTrustDialogAccepted": false}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = home.path().join("out-ancestor");
+    std::fs::create_dir(&out).unwrap();
+    fake_child(&out, &out, 0);
+    let status = run_helper_in(home.path(), "one", &out, &[], false, Some(&worktree));
+    assert!(status.success());
+    let seeded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("claude_json")).unwrap()).unwrap();
+    // The closest ancestor with a recorded decision is repo (not trusted),
+    // so nothing is trusted: a closer "no" wins over a farther "yes".
+    assert_eq!(seeded, serde_json::json!({"hasCompletedOnboarding": true}));
+
+    // Without the closer "no", the trusted root is copied under its own key.
+    std::fs::write(
+        paths.claude_json(),
+        serde_json::json!({
+            "hasCompletedOnboarding": true,
+            "projects": {root_key.to_str().unwrap(): {"hasTrustDialogAccepted": true}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::remove_file(out.join("claude_json")).unwrap();
+    let status = run_helper_in(home.path(), "one", &out, &[], false, Some(&worktree));
+    assert!(status.success());
+    let seeded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("claude_json")).unwrap()).unwrap();
+    assert_eq!(
+        seeded,
+        serde_json::json!({
+            "hasCompletedOnboarding": true,
+            "projects": {root_key.to_str().unwrap(): {"hasTrustDialogAccepted": true}}
+        })
+    );
+}
