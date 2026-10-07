@@ -4,9 +4,9 @@
 //! - `lock`: held while a launcher runs the lane, so two cannot share it.
 //! - `accounts.jsonl`: which account ran when, for `rate`.
 //! - `config/`: the child's `CLAUDE_CONFIG_DIR`. Only `projects/` (session
-//!   transcripts) is kept between runs; everything else, and the seeded
-//!   `.claude.json`, is rebuilt at every launch, so no account state moves to
-//!   the next account.
+//!   transcripts) is kept between runs; everything else is removed, and exec
+//!   rebuilds `.claude.json` at every launch keeping only the lane's start-up
+//!   decisions, so no account state moves to the next account.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -16,8 +16,11 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Paths;
 
-/// The kept part of the config directory.
+/// Session transcripts, kept between runs.
 const KEPT: &str = "projects";
+/// The last seed. exec carries only its start-up decisions into the next seed
+/// and rebuilds the rest, so it is left for exec to replace.
+const SEED: &str = ".claude.json";
 
 pub struct Lane {
     root: PathBuf,
@@ -75,15 +78,16 @@ impl Lane {
         self.root.join("config")
     }
 
-    /// Remove everything in the config directory except `projects/`, so a
-    /// launch on any account starts from no account state.
+    /// Remove everything in the config directory except `projects/` and the
+    /// last `.claude.json`, which exec rebuilds keeping only the start-up
+    /// decisions, so a launch on any account starts from no account state.
     pub fn clear_account_state(&self) -> Result<()> {
         let config = self.config_dir();
         for entry in std::fs::read_dir(&config)
             .with_context(|| format!("failed to read {}", config.display()))?
         {
             let entry = entry?;
-            if entry.file_name() == KEPT {
+            if entry.file_name() == KEPT || entry.file_name() == SEED {
                 continue;
             }
             let path = entry.path();
@@ -284,7 +288,9 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(left, ["projects"]);
+        let mut left = left;
+        left.sort();
+        assert_eq!(left, [".claude.json", "projects"]);
         assert!(config.join("projects/p/s.jsonl").exists());
     }
 

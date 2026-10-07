@@ -276,7 +276,7 @@ claudectl claude --lane review --account amir+2@example.com
 `CLAUDE_CONFIG_DIR` set to the lane's directory, `~/.claudectl/lanes/<lane>/config`.
 Only `projects/` (session transcripts) and the start-up decisions you made in
 the lane (folder trust, external CLAUDE.md imports) carry from one run to the
-next. Everything else, the `.claude.json` account state included, is rebuilt
+next; a usage read that fails is retried after 30 seconds. Everything else, the `.claude.json` account state included, is rebuilt
 at every launch, so nothing moves from one account to another. One launcher at
 a time holds a lane.
 

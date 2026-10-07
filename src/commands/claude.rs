@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use claudectl::auth_store::AuthStore;
@@ -22,6 +22,8 @@ use crate::commands::use_profile;
 const MAX_RECOVERIES_PER_HOUR: usize = 3;
 /// How often the watcher reads the lane transcripts.
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
+/// Wait before another usage read when one failed or came back old.
+const CONFIRM_RETRY: Duration = Duration::from_secs(30);
 
 pub struct LaunchArgs {
     pub lane: String,
@@ -179,37 +181,56 @@ fn watch(
     stop: &AtomicBool,
     limited: &Mutex<Option<RateLimitHit>>,
 ) {
-    let mut checked: Vec<String> = Vec::new();
+    // Hits whose usage read showed room; a failed read is retried later.
+    let mut handled: Vec<String> = Vec::new();
+    let mut retry_at: Option<Instant> = None;
     while !stop.load(Ordering::SeqCst) {
         std::thread::sleep(WATCH_INTERVAL);
         let Some(hit) = lane::find_rate_limit_in(config_dir, cwd, launched) else {
             continue;
         };
-        if checked.contains(&hit.uuid) {
+        if handled.contains(&hit.uuid) || retry_at.is_some_and(|at| Instant::now() < at) {
             continue;
         }
-        checked.push(hit.uuid.clone());
-        if !limit_confirmed(alias) {
-            continue;
+        match limit_check(alias) {
+            Limit::Reached => {
+                *limited.lock().unwrap_or_else(|e| e.into_inner()) = Some(hit);
+                // Signal the child's group directly, through exec's forwarder:
+                // a SIGTERM to this process would be lost if it was inherited
+                // as ignored.
+                exec::signals::forward(libc::SIGTERM);
+                return;
+            }
+            Limit::Room => handled.push(hit.uuid),
+            Limit::Unknown => retry_at = Some(Instant::now() + CONFIRM_RETRY),
         }
-        *limited.lock().unwrap_or_else(|e| e.into_inner()) = Some(hit);
-        // Signal the child's group directly, through exec's forwarder: a
-        // SIGTERM to this process would be lost if it was inherited as ignored.
-        exec::signals::forward(libc::SIGTERM);
-        return;
     }
+}
+
+enum Limit {
+    /// Fresh usage shows a window at 100%.
+    Reached,
+    /// Fresh usage shows room: the error was a short API throttle.
+    Room,
+    /// The read failed or came back old; try again later.
+    Unknown,
 }
 
 /// One usage read for the account: a transcript error alone can be a short
 /// API throttle, not a used-up window.
-fn limit_confirmed(alias: &str) -> bool {
+fn limit_check(alias: &str) -> Limit {
     match status::fetch_alias(alias, FetchMode::Refresh) {
-        Ok(Some(fetched)) => {
-            let fresh = fetched.error.is_none()
-                && fetched.snapshot.is_fresh_at(chrono::Utc::now().timestamp());
-            fresh && fetched.usage.as_ref().is_some_and(status::exhausted)
+        Ok(Some(fetched))
+            if fetched.error.is_none()
+                && fetched.snapshot.is_fresh_at(chrono::Utc::now().timestamp()) =>
+        {
+            match fetched.usage.as_ref() {
+                Some(usage) if status::exhausted(usage) => Limit::Reached,
+                Some(_) => Limit::Room,
+                None => Limit::Unknown,
+            }
         }
-        _ => false,
+        _ => Limit::Unknown,
     }
 }
 
