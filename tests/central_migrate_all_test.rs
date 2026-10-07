@@ -47,6 +47,11 @@ struct Fake {
     imports: HashMap<String, usize>,
     imported_refresh: HashMap<String, String>,
     me_down: bool,
+    /// The claudectl auth lock, probed while a refresh is in flight.
+    lock_path: Option<PathBuf>,
+    lock_held_during_refresh: Option<bool>,
+    /// A profile file rewritten while the refresh is in flight.
+    rewrite: Option<(PathBuf, String)>,
 }
 type Shared = Arc<Mutex<Fake>>;
 
@@ -111,7 +116,21 @@ async fn import(State(fake): State<Shared>, Json(body): Json<Value>) -> Response
         }
     }
 }
-async fn token() -> Json<Value> {
+async fn token(State(fake): State<Shared>) -> Json<Value> {
+    let mut fake = fake.lock().unwrap();
+    if let Some(path) = fake.lock_path.clone() {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        fake.lock_held_during_refresh = Some(file.try_lock().is_err());
+    }
+    if let Some((path, contents)) = fake.rewrite.take() {
+        std::fs::write(path, contents).unwrap();
+    }
     Json(
         json!({"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}),
     )
@@ -513,4 +532,58 @@ fn an_expired_inactive_profile_is_refreshed_before_its_fence() {
         "rotated-refresh",
         "the rotated grant was migrated"
     );
+}
+
+#[test]
+fn abort_of_a_live_migration_restores_the_live_login() {
+    let env = Env::new();
+    env.live("me", "u-me-0000", "live");
+    env.script("me", Script::Down);
+    let (_, text) = env.run(&["--all", "--exclusive-owner"], "");
+    assert!(env.fenced("me"), "{text}");
+    // The live login is lost meanwhile (for example a logout); the fence holds the only copy.
+    std::fs::remove_file(env.paths.claude_credentials_file()).unwrap();
+    let (ok, text) = env.run(&["--abort", "me"], "");
+    assert!(ok, "{text}");
+    let restored: CredentialsFile =
+        serde_json::from_slice(&std::fs::read(env.paths.claude_credentials_file()).unwrap())
+            .unwrap();
+    assert_eq!(
+        restored.claude_ai_oauth.refresh_token.as_deref(),
+        Some("live-refresh")
+    );
+    assert!(
+        env.has_credentials("me"),
+        "the profile copy is restored too"
+    );
+    assert!(!env.fenced("me"));
+}
+
+#[test]
+fn a_profile_refresh_holds_no_lock_during_the_network_call() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, -1_000);
+    env.fake.lock().unwrap().lock_path = Some(env.paths.claudectl_dir().join("auth-state.lock"));
+    let (ok, text) = env.all();
+    assert!(ok, "{text}");
+    assert_eq!(
+        env.fake.lock().unwrap().lock_held_during_refresh,
+        Some(false),
+        "auth-state.lock was held during the provider call"
+    );
+}
+
+#[test]
+fn a_profile_changed_during_its_refresh_is_not_overwritten() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, -1_000);
+    let file = env.paths.profiles_dir().join("a1").join("credentials.json");
+    let other = serde_json::to_string(&creds("relogin", 3_600_000)).unwrap();
+    env.fake.lock().unwrap().rewrite = Some((file.clone(), other));
+    let (ok, text) = env.all();
+    assert!(!ok, "{text}");
+    assert!(Env::row(&text, "a1").contains("refused"), "{text}");
+    let kept: CredentialsFile = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(kept.claude_ai_oauth.access_token, "relogin-access");
+    assert!(!env.fenced("a1"));
 }

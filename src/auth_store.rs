@@ -155,6 +155,31 @@ impl AuthStore {
         }
     }
 
+    /// The Keychain grant on macOS: `Ok(None)` only when the item does not exist. A locked
+    /// Keychain, a failed read or an unparsable item is an error, never "no Keychain".
+    /// Without a Keychain (Linux) this is `Ok(None)`; the credentials file is read separately.
+    pub fn read_live_grant(&self) -> Result<Option<CredentialsFile>> {
+        if !self.keychain {
+            return Ok(None);
+        }
+        let output = Command::new("security")
+            .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
+            .stdin(Stdio::null())
+            .output()
+            .context("failed to run security(1)")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if keychain_item_not_found(&stderr) {
+                return Ok(None);
+            }
+            bail!("could not read the Keychain login: {}", stderr.trim());
+        }
+        let raw = String::from_utf8(output.stdout).context("Keychain item is not UTF-8")?;
+        Ok(Some(
+            serde_json::from_str(raw.trim()).context("invalid Keychain credentials")?,
+        ))
+    }
+
     /// Delete the live login: the Keychain credentials item (macOS) and
     /// ~/.claude/.credentials.json. Callers compare grant digests first; this never reads or
     /// prints a token. A missing item or file is already deleted.

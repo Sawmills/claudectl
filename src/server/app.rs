@@ -470,6 +470,8 @@ async fn migrate_account(
                 server.error(StatusCode::CONFLICT, "refresh_token_not_rotated")
             } else if e.downcast_ref::<Superseded>().is_some() {
                 server.error(StatusCode::CONFLICT, "migration_superseded")
+            } else if e.downcast_ref::<Gone>().is_some() {
+                server.error(StatusCode::GONE, "account_deleted")
             } else {
                 server.error(StatusCode::CONFLICT, "admission_refused_reconcile_receipt")
             }

@@ -81,14 +81,21 @@ impl Profile {
         )?;
         let json = serde_json::to_string(creds)?;
         let path = self.credentials_path();
-        std::fs::write(&path, json)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
+        // Atomic: a failed write keeps the old file whole.
+        let write = || -> Result<()> {
+            let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
+            std::io::Write::write_all(&mut tmp, json.as_bytes())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tmp.as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            tmp.as_file().sync_all()?;
+            tmp.persist(&path)?;
+            Ok(())
+        };
+        write().with_context(|| format!("failed to write {}", path.display()))
     }
 }
 
@@ -376,10 +383,8 @@ pub fn persist_rotated_grant(
     rotated: &CredentialsFile,
     original_grant_key: &str,
 ) -> Result<()> {
-    let mut failures = Vec::new();
-    if origin.write_credentials(rotated).is_err() {
-        failures.push(origin.meta.alias.clone());
-    }
+    // Stage every sibling update first, so a listing error writes nothing.
+    let mut staged = Vec::new();
     // Rotation changes the grant for every saved copy, including unexpired
     // aliases and aliases excluded by a focused status request.
     for sibling in list_profiles_from(paths)? {
@@ -405,6 +410,15 @@ pub fn persist_rotated_grant(
         creds.claude_ai_oauth.access_token = rotated.claude_ai_oauth.access_token.clone();
         creds.claude_ai_oauth.refresh_token = rotated.claude_ai_oauth.refresh_token.clone();
         creds.claude_ai_oauth.expires_at = rotated.claude_ai_oauth.expires_at;
+        staged.push((sibling, creds));
+    }
+    // The origin first: if it cannot hold the rotated grant, no sibling changes either.
+    origin
+        .write_credentials(rotated)
+        .with_context(|| format!("could not save the rotated grant to {}", origin.meta.alias))?;
+    // Each sibling write is atomic: a failed one keeps its old file whole.
+    let mut failures = Vec::new();
+    for (sibling, creds) in staged {
         if sibling.write_credentials(&creds).is_err() {
             failures.push(sibling.meta.alias.clone());
         }
@@ -797,5 +811,32 @@ mod tests {
             "t1"
         );
         assert_eq!(get_active_from(&paths).unwrap(), Some("a@x".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rotated_grant_that_cannot_be_saved_to_its_origin_touches_no_sibling() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, paths, _store) = setup();
+        let origin = save_profile_to(&paths, "a@x", &creds("t-a"), None).unwrap();
+        save_profile_to(&paths, "b@x", &creds("t-b"), None).unwrap();
+        let key = crate::usage_cache::UsageCache::key("rt");
+        let mut rotated = creds("rotated");
+        rotated.claude_ai_oauth.refresh_token = Some("rt-2".into());
+        let file = origin.credentials_path();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::set_permissions(&origin.dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = persist_rotated_grant(&paths, None, &origin, &rotated, &key);
+        std::fs::set_permissions(&origin.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(result.is_err());
+        let sibling = get_profile_from(&paths, "b@x")
+            .unwrap()
+            .read_credentials()
+            .unwrap();
+        assert_eq!(
+            sibling.claude_ai_oauth.access_token, "t-b",
+            "a sibling was rotated"
+        );
     }
 }

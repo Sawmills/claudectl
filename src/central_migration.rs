@@ -364,6 +364,31 @@ fn migrate_one(paths: &Paths, client: &Client, alias: &str, source: Source) -> R
     cleanup(paths, &store, &journal, &dir, &profile_file)?;
     Ok(Done::Already)
 }
+/// ~/.claude/.credentials.json: `Ok(None)` when absent, an error when unreadable.
+fn live_file(paths: &Paths) -> Result<Option<CredentialsFile>> {
+    let file = paths.claude_credentials_file();
+    if !file.try_exists()? {
+        return Ok(None);
+    }
+    Ok(Some(
+        serde_json::from_slice(&std::fs::read(&file)?).context("invalid live credentials file")?,
+    ))
+}
+/// Check every present live holder against the migrated grant. Ok(true) when at least one
+/// holder is present (and all match).
+fn verify_live_holders(
+    keychain: Result<Option<CredentialsFile>>,
+    file: Result<Option<CredentialsFile>>,
+    migrated: &[String],
+) -> Result<bool> {
+    let (keychain, file) = (keychain?, file?);
+    for creds in keychain.iter().chain(file.iter()) {
+        if !same_digests(&digests(creds), migrated) {
+            bail!("live login changed; nothing deleted. Reconcile the current login, then rerun");
+        }
+    }
+    Ok(keychain.is_some() || file.is_some())
+}
 /// After a receipt (the server verified a rotation): retire every local copy. Idempotent.
 fn cleanup(
     paths: &Paths,
@@ -376,26 +401,15 @@ fn cleanup(
         bail!("credentials reappeared in migrated profile; reconcile the competing owner");
     }
     if journal.live {
-        // Compare-and-delete: only the exact grant that was migrated is removed.
-        // No authoritative copy left: nothing to compare or delete there.
-        let keychain = store.read_refresh_owner().unwrap_or_default();
-        let file = paths.claude_credentials_file();
-        let file_creds: Option<CredentialsFile> = if file.try_exists()? {
-            Some(
-                serde_json::from_slice(&std::fs::read(&file)?)
-                    .map_err(|_| anyhow::anyhow!("live login changed; nothing deleted"))?,
-            )
-        } else {
-            None
-        };
-        for creds in keychain.iter().chain(file_creds.iter()) {
-            if !same_digests(&digests(creds), &journal.grant_digests) {
-                bail!(
-                    "live login changed; nothing deleted. Reconcile the current login, then rerun"
-                );
-            }
-        }
-        if keychain.is_some() || file_creds.is_some() {
+        // Compare-and-delete: every present holder must be the exact migrated grant. A
+        // holder that cannot be read stops the cleanup; nothing is deleted.
+        if verify_live_holders(
+            store
+                .read_live_grant()
+                .context("Keychain login unreadable; nothing deleted"),
+            live_file(paths).context("live credentials file unreadable; nothing deleted"),
+            &journal.grant_digests,
+        )? {
             store.delete_live_login()?;
         }
         if profile::get_active_from(paths)?
@@ -461,54 +475,86 @@ fn claude_processes() -> Result<Vec<(u32, String)>> {
         .collect())
 }
 /// The host's Claude build must be qualified (K3) before any account leaves this machine.
+/// The build must be qualified on this machine; a built-in hash alone is not enough here.
+fn require_qualified(paths: &Paths, digest: &str) -> Result<()> {
+    if super::qualify::is_qualified(paths, digest)? {
+        return Ok(());
+    }
+    bail!("Claude build {digest} is not qualified on this machine; run claudectl server qualify")
+}
 fn qualified_claude(paths: &Paths) -> Result<()> {
-    super::session::check_supported(paths, &super::session::program(Path::new("claude"))?)
+    let binary = super::session::program(Path::new("claude"))?;
+    let digest = crate::exec::sha256_file(&binary).map_err(|e| anyhow::anyhow!("{e}"))?;
+    require_qualified(paths, &digest)
 }
 /// Refresh an expired inactive profile before any lock is taken, through the same path as
 /// `claudectl status`. The live login is never refreshed here: Claude Code owns it.
 fn refresh_inactive(paths: &Paths, alias: &str) -> Result<()> {
     let store = AuthStore::real(paths.clone());
-    let _lock = store.lock_auth_state()?;
-    let active = profile::get_active_from(paths)?;
-    if active
-        .as_deref()
-        .is_some_and(|a| crate::exec::same_profile(paths, a, alias))
-    {
-        return Ok(());
-    }
-    let profile = profile::get_profile_from(paths, alias)?;
-    let mut creds = profile.read_credentials()?;
-    if creds
+    // Under the lock: decide ownership and take a snapshot. The provider call runs without it.
+    let owned = |store: &AuthStore| -> Result<Option<(profile::Profile, CredentialsFile)>> {
+        let active = profile::get_active_from(paths)?;
+        if active
+            .as_deref()
+            .is_some_and(|a| crate::exec::same_profile(paths, a, alias))
+        {
+            return Ok(None);
+        }
+        let profile = profile::get_profile_from(paths, alias)?;
+        let creds = profile.read_credentials()?;
+        if store
+            .read_refresh_owner()?
+            .as_ref()
+            .is_some_and(|live| shared(&creds, live))
+        {
+            bail!("profile shares the live refresh grant; not refreshed");
+        }
+        Ok(Some((profile, creds)))
+    };
+    let (_, before) = {
+        let _lock = store.lock_auth_state()?;
+        match owned(&store)? {
+            Some(found) => found,
+            None => return Ok(()),
+        }
+    };
+    if before
         .claude_ai_oauth
         .expires_at
         .is_some_and(|e| e > now() + 60_000)
     {
         return Ok(());
     }
-    if store
-        .read_refresh_owner()?
-        .as_ref()
-        .is_some_and(|live| shared(&creds, live))
-    {
-        bail!("profile shares the live refresh grant; not refreshed");
-    }
-    let key = crate::usage_cache::UsageCache::key(
-        creds
-            .claude_ai_oauth
-            .refresh_token
-            .as_deref()
-            .context("no refresh grant saved")?,
-    );
+    let grant = before
+        .claude_ai_oauth
+        .refresh_token
+        .clone()
+        .context("no refresh grant saved")?;
     let rotated =
         tokio::runtime::Runtime::new()?.block_on(crate::api::refresh_credentials_async(
             &reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()?,
-            &creds.claude_ai_oauth,
+            &before.claude_ai_oauth,
         ))?;
-    creds.claude_ai_oauth = rotated;
-    profile::persist_rotated_grant(paths, active.as_deref(), &profile, &creds, &key)
-        .context("refreshed but could not save the profile")
+    // Again under the lock: save only over the exact grant that was refreshed.
+    let _lock = store.lock_auth_state()?;
+    let Some((current_profile, mut current)) = owned(&store)? else {
+        bail!("{alias} became the live login during its refresh; not saved");
+    };
+    if current.claude_ai_oauth.refresh_token.as_deref() != Some(grant.as_str()) {
+        bail!("{alias} changed during its refresh (another login or refresh); not saved");
+    }
+    current.claude_ai_oauth = rotated;
+    let active = profile::get_active_from(paths)?;
+    profile::persist_rotated_grant(
+        paths,
+        active.as_deref(),
+        &current_profile,
+        &current,
+        &crate::usage_cache::UsageCache::key(&grant),
+    )
+    .context("refreshed but could not save the profile")
 }
 fn fenced_alias(paths: &Paths, alias: &str) -> bool {
     directory(&paths.claudectl_dir(), alias)
@@ -712,6 +758,15 @@ pub fn abort(paths: &Paths, client: &Client, alias: &str) -> Result<()> {
     let profile_file = paths.profiles_dir().join(alias).join("credentials.json");
     let retained = dir.join("grant.json");
     let aside = dir.join("profile-credentials.json");
+    if restore && journal.live && retained.try_exists()? {
+        // The live login first: put the fenced grant back unless a newer login replaced it.
+        let present = store.read_live_grant()?.is_some() || live_file(paths)?.is_some();
+        if !present {
+            let creds: CredentialsFile = serde_json::from_slice(&private_read(&retained)?)
+                .map_err(|_| anyhow::anyhow!("invalid retained migration grant"))?;
+            store.write_credentials_after_live_commit(&creds, || {})?;
+        }
+    }
     let copy = if journal.live { &aside } else { &retained };
     if restore && copy.try_exists()? {
         if profile_file.try_exists()? {
@@ -817,5 +872,25 @@ mod tests {
         let paths = Paths::from_home(home.path().into());
         let kept = crate::central::retain_login(&paths, "other", &creds("new"), &None).unwrap();
         assert!(kept.exists());
+    }
+
+    #[test]
+    fn a_keychain_read_error_is_never_treated_as_no_keychain() {
+        let migrated = digests(&creds("live"));
+        let error = || Err(anyhow::anyhow!("Keychain locked"));
+        // A matching file must not license a delete while the Keychain is unreadable.
+        assert!(verify_live_holders(error(), Ok(Some(creds("live"))), &migrated).is_err());
+        assert!(verify_live_holders(Ok(Some(creds("live"))), error(), &migrated).is_err());
+        assert!(verify_live_holders(Ok(None), Ok(Some(creds("other"))), &migrated).is_err());
+        assert!(verify_live_holders(Ok(Some(creds("live"))), Ok(None), &migrated).unwrap());
+        assert!(!verify_live_holders(Ok(None), Ok(None), &migrated).unwrap());
+    }
+
+    #[test]
+    fn a_built_in_claude_hash_still_needs_qualification_for_migration() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().into());
+        let builtin = "92f2b4fd05d0bdcf7b9a0d4e0ecef4a1e4b368b290cd8fd07cff9a50013f45a2";
+        assert!(require_qualified(&paths, builtin).is_err());
     }
 }

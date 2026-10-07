@@ -505,3 +505,35 @@ async fn the_receipt_route_reports_the_admission_state() {
     assert_eq!(body["state"], "complete");
     assert_eq!(body["receipt"]["migration_id"], "m-1");
 }
+
+#[tokio::test]
+async fn a_migration_retried_after_its_account_was_deleted_answers_410() {
+    let f = Fixture::new(None).await;
+    let (_mac_id, mac) = f.register(AMIR, "mac").await;
+    let id = f.migrate(&mac).await;
+    let (status, _) = f
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/v2/anthropic/accounts/{id}"),
+            Some(&mac),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+    // A lost reply makes the client retry the same migration ID.
+    let expires_at = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    let (status, body) = f
+        .call(
+            reqwest::Method::POST,
+            "/v2/anthropic/migrations",
+            Some(&mac),
+            Some(json!({"alias":"work","migration_id":"m-1","exclusive_owner":true,
+                "grant":{"access_token":"migrated","refresh_token":"migrated-refresh","expires_at":expires_at,"scopes":["user:inference","user:profile"]}})),
+        )
+        .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (410, Some("account_deleted")),
+        "{body}"
+    );
+}
