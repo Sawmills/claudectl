@@ -252,18 +252,23 @@ impl Fixture {
     }
     /// Complete the callback with this ID token: (status, body).
     async fn callback(&self, token: Token<'_>) -> (u16, String) {
+        let response = self.callback_response(token, None).await;
+        (response.status().as_u16(), response.text().await.unwrap())
+    }
+    /// Complete the callback, optionally as a browser that accepts HTML.
+    async fn callback_response(&self, token: Token<'_>, accept: Option<&str>) -> reqwest::Response {
         let query = self.sign_in().await;
         // The hint asks Google for the company account chooser; it is not a decision.
         assert_eq!(query.get("hd").map(String::as_str), Some("sawmills.ai"));
         self.issuer.prepare(&query["nonce"], &token);
-        let response = self
+        let mut request = self
             .http
             .get(format!("{}/auth/callback", self.origin))
-            .query(&[("state", query["state"].as_str()), ("code", "c")])
-            .send()
-            .await
-            .unwrap();
-        (response.status().as_u16(), response.text().await.unwrap())
+            .query(&[("state", query["state"].as_str()), ("code", "c")]);
+        if let Some(accept) = accept {
+            request = request.header("accept", accept);
+        }
+        request.send().await.unwrap()
     }
     async fn users(&self) -> usize {
         self.server.store().users().await.unwrap().len()
@@ -320,6 +325,63 @@ async fn a_token_without_the_company_hd_claim_is_refused_despite_the_url_hint() 
     // A personal Gmail account: refused by the email domain already, and it has no hd.
     let (status, body) = f.callback(Token::new("someone@gmail.com", None)).await;
     assert_refused(status, &body, 403, "company_identity_required");
+    assert_eq!(f.users().await, 0);
+}
+
+#[tokio::test]
+async fn a_browser_gets_an_error_page_with_the_same_status() {
+    let f = Fixture::new().await;
+    let browser = "text/html,application/xhtml+xml,*/*;q=0.8";
+    let response = f
+        .callback_response(Token::new("amir@sawmills.ai", None), Some(browser))
+        .await;
+    assert_eq!(response.status().as_u16(), 403);
+    let headers = response.headers().clone();
+    assert!(
+        headers["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    assert!(headers.contains_key("content-security-policy"));
+    let body = response.text().await.unwrap();
+    assert!(body.contains("Use your company account"), "{body}");
+    assert!(
+        approval(&body).is_none(),
+        "a refused sign-in offered approval"
+    );
+    let expired = f
+        .http
+        .get(format!("{}/enroll?code=UNKNOWN", f.origin))
+        .header("accept", browser)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(expired.status().as_u16(), 410);
+    assert!(
+        expired
+            .text()
+            .await
+            .unwrap()
+            .contains("This link has expired")
+    );
+    // CLI and API clients keep the exact JSON body and status.
+    for accept in [
+        None,
+        Some("application/json"),
+        Some("application/json, text/html;q=0"),
+    ] {
+        let mut request = f.http.get(format!("{}/enroll?code=UNKNOWN", f.origin));
+        if let Some(accept) = accept {
+            request = request.header("accept", accept);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 410);
+        assert_eq!(
+            response.text().await.unwrap(),
+            r#"{"error":"enrollment_expired"}"#
+        );
+    }
     assert_eq!(f.users().await, 0);
 }
 
