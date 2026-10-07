@@ -259,7 +259,12 @@ it, so a later claudectl upgrade does not change what the launcher runs.
 claudectl list      # saved profiles, * marks active
 claudectl whoami    # active profile
 claudectl remove <alias>
+claudectl label <alias> "Team seat"   # display label; omit the text to clear
 ```
+
+A label is a display name only: `list` shows it in brackets, and `status` adds a
+Label column when any account has one. It is at most 40 characters and need
+not be unique. Saving the alias again keeps it.
 
 ### Shell completions
 

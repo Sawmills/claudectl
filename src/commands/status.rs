@@ -17,6 +17,7 @@ use comfy_table::{
 pub struct FetchedUsage {
     pub snapshot: Snapshot,
     pub alias: String,
+    pub label: Option<String>,
     pub usage: Option<UsageResponse>,
     pub token_expiry_secs: Option<i64>,
     pub is_active: bool,
@@ -26,6 +27,7 @@ pub struct FetchedUsage {
 struct AccountStatus {
     snapshot: Snapshot,
     alias: String,
+    label: Option<String>,
     h5_pct: Option<f64>,
     d7_pct: Option<f64>,
     h5_reset: String,
@@ -168,6 +170,7 @@ fn fetch_usages_with_refresh(
             let is_active = active.as_deref() == Some(profile.meta.alias.as_str());
             let mut result = FetchedUsage {
                 alias: profile.meta.alias.clone(),
+                label: profile.meta.label.clone(),
                 is_active,
                 ..FetchedUsage::default()
             };
@@ -352,6 +355,7 @@ fn to_account_status(f: &FetchedUsage) -> AccountStatus {
     match (&f.usage, &f.error) {
         (Some(usage), _) => AccountStatus {
             alias: f.alias.clone(),
+            label: f.label.clone(),
             snapshot: f.snapshot.clone(),
             h5_pct: usage.five_hour.as_ref().and_then(|w| w.utilization),
             d7_pct: usage.seven_day.as_ref().and_then(|w| w.utilization),
@@ -368,6 +372,7 @@ fn to_account_status(f: &FetchedUsage) -> AccountStatus {
         },
         (None, err) => AccountStatus {
             alias: f.alias.clone(),
+            label: f.label.clone(),
             snapshot: f.snapshot.clone(),
             h5_pct: None,
             d7_pct: None,
@@ -402,7 +407,11 @@ fn print_table(accounts: &[AccountStatus]) {
     if std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
         table.force_no_tty();
     }
+    let show_label = show_label_column(accounts);
     let mut header = vec!["Account", "5h", "5h Reset", "7d", "7d Reset"];
+    if show_label {
+        header.insert(1, "Label");
+    }
     if show_models {
         header.push("Opus 7d");
         header.push("Sonnet 7d");
@@ -415,7 +424,11 @@ fn print_table(accounts: &[AccountStatus]) {
     table.set_header(header);
 
     for account in accounts {
-        table.add_row(render_row(account, show_models, show_fable));
+        table.add_row(with_label(
+            render_row(account, show_models, show_fable),
+            account,
+            show_label,
+        ));
     }
     println!("{table}");
     println!("Percentages are used capacity. Fetch success does not prove model access.");
@@ -622,17 +635,33 @@ fn summary_table(accounts: &[AccountStatus], no_color: bool) -> Table {
     if no_color {
         table.force_no_tty();
     }
-    table.set_header(
-        ["Account", "Status", "Usage used", "Data", "Next step"].map(|label| {
-            Cell::new(label)
-                .fg(Color::Cyan)
-                .add_attribute(Attribute::Bold)
-        }),
-    );
+    let show_label = show_label_column(accounts);
+    let mut header = vec!["Account", "Status", "Usage used", "Data", "Next step"];
+    if show_label {
+        header.insert(1, "Label");
+    }
+    table.set_header(header.into_iter().map(|label| {
+        Cell::new(label)
+            .fg(Color::Cyan)
+            .add_attribute(Attribute::Bold)
+    }));
     for account in accounts {
-        table.add_row(summary_row(account));
+        table.add_row(with_label(summary_row(account), account, show_label));
     }
     table
+}
+
+/// The Label column appears only when some account has a label.
+fn show_label_column(accounts: &[AccountStatus]) -> bool {
+    accounts.iter().any(|a| a.label.is_some())
+}
+
+/// Insert the Label cell after the Account cell.
+fn with_label(mut row: Vec<Cell>, account: &AccountStatus, show_label: bool) -> Vec<Cell> {
+    if show_label {
+        row.insert(1, Cell::new(account.label.as_deref().unwrap_or("")));
+    }
+    row
 }
 
 fn print_summary(accounts: &[AccountStatus]) {
@@ -1346,6 +1375,7 @@ mod tests {
     fn account(h5: Option<f64>, d7: Option<f64>, is_error: bool) -> AccountStatus {
         AccountStatus {
             alias: "a@x".to_string(),
+            label: None,
             snapshot: Snapshot {
                 fresh: !is_error,
                 source: "live",
@@ -1364,6 +1394,20 @@ mod tests {
             is_error,
             error_msg: String::new(),
         }
+    }
+
+    #[test]
+    fn label_column_appears_only_when_an_account_has_a_label() {
+        let plain = fresh_account(Some(20.0), Some(30.0), false);
+        let table = summary_table(std::slice::from_ref(&plain), true).to_string();
+        assert!(!table.contains("Label"), "{table}");
+        let mut labelled = fresh_account(Some(20.0), Some(30.0), false);
+        labelled.label = Some("Team seat".into());
+        let table = summary_table(&[plain, labelled], true).to_string();
+        assert!(
+            table.contains("Label") && table.contains("Team seat"),
+            "{table}"
+        );
     }
 
     #[test]

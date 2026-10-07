@@ -89,6 +89,7 @@ fn help_shows_all_subcommands() {
         "list",
         "remove",
         "whoami",
+        "label",
         "completions",
     ] {
         assert!(stdout.contains(subcommand), "missing {subcommand}");
@@ -263,4 +264,39 @@ fn exec_requires_a_command_after_the_separator() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn label_shows_in_list_and_clears() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join(".claudectl/profiles/work");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("account.json"),
+        r#"{"alias":"work","saved_at":"2026-01-01T00:00:00Z","oauth_account":{"emailAddress":"w@x.io"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"t"}}"#,
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let output = Command::cargo_bin("claudectl")
+            .unwrap()
+            .args(args)
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert!(run(&["label", "work", "Team seat"]).contains("labelled 'work' as 'Team seat'"));
+    assert!(run(&["list"]).contains("work [Team seat] (w@x.io)"));
+    assert!(run(&["label", "work"]).contains("cleared the label of 'work'"));
+    assert!(run(&["list"]).contains("  work (w@x.io)"));
 }
