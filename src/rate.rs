@@ -177,27 +177,32 @@ struct Scan {
 /// `since` to `now`, the time open spans end at, so a record written during
 /// the scan is left out rather than counted outside a run. Claude Code
 /// writes one record per content block, so responses count once per API
-/// message id.
+/// message id. Subagent transcripts sit deeper
+/// (`<project>/<session>/subagents/*.jsonl`) and run on the same account, so
+/// the whole tree is read.
 fn turns(projects: &Path, since: DateTime<Utc>, now: DateTime<Utc>) -> Result<Scan> {
     let mut scan = Scan::default();
     let mut seen = HashSet::new();
-    let Some(dirs) = read_dir(projects)? else {
-        return Ok(scan);
-    };
-    for dir in dirs {
-        if !dir.file_type()?.is_dir() {
-            continue;
-        }
-        let Some(files) = read_dir(&dir.path())? else {
+    let mut pending = vec![projects.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Some(entries) = read_dir(&dir)? else {
             continue;
         };
-        for file in files {
-            let path = file.path();
-            if path.extension().is_none_or(|ext| ext != "jsonl") {
+        for entry in entries {
+            let path = entry.path();
+            // Not followed: a link could leave the lane or loop.
+            let kind = entry
+                .file_type()
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            if kind.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !kind.is_file() || path.extension().is_none_or(|ext| ext != "jsonl") {
                 continue;
             }
             // A file not written since `since` holds nothing newer.
-            let modified = file
+            let modified = entry
                 .metadata()
                 .and_then(|m| m.modified())
                 .with_context(|| format!("failed to read {}", path.display()))?;
@@ -259,13 +264,22 @@ fn turns_in(
             scan.skipped += 1;
             continue;
         };
+        let id = record["message"]["id"]
+            .as_str()
+            .or(record["uuid"].as_str())
+            .map(str::to_string);
+        if id.is_none() && record["isApiErrorMessage"] != true {
+            scan.skipped += 1;
+            continue;
+        }
         scan.turns
-            .extend(turn(&record, at.with_timezone(&Utc), since, now, seen));
+            .extend(turn(&record, id, at.with_timezone(&Utc), since, now, seen));
     }
 }
 
 fn turn(
     record: &serde_json::Value,
+    id: Option<String>,
     at: DateTime<Utc>,
     since: DateTime<Utc>,
     now: DateTime<Utc>,
@@ -280,11 +294,7 @@ fn turn(
             rate_limited: true,
         });
     }
-    let id = record["message"]["id"]
-        .as_str()
-        .or(record["uuid"].as_str())?
-        .to_string();
-    seen.insert(id).then_some(Turn {
+    seen.insert(id?).then_some(Turn {
         at,
         rate_limited: false,
     })
@@ -387,7 +397,9 @@ mod tests {
         ]
         .join("\n");
         let bad_time = serde_json::json!({"type": "assistant", "timestamp": "soon"}).to_string();
-        let text = [text, bad_time, "{\"type\":\"assistant\",".into()].join("\n")
+        let no_id = serde_json::json!({"type": "assistant", "timestamp": "2026-10-07T10:04:00Z"})
+            .to_string();
+        let text = [text, bad_time, no_id, "{\"type\":\"assistant\",".into()].join("\n")
             + "\n{\"type\":\"assistant\" partial";
         let mut seen = HashSet::new();
         let mut scan = Scan::default();
@@ -401,8 +413,9 @@ mod tests {
         .unwrap();
         let limited: Vec<_> = scan.turns.iter().map(|t| t.rate_limited).collect();
         assert_eq!(limited, [false, false, true]);
-        // The bad time and the broken complete line; not the partial last line.
-        assert_eq!(scan.skipped, 2);
+        // The bad time, the missing id and the broken complete line; not the
+        // partial last line.
+        assert_eq!(scan.skipped, 3);
     }
 
     #[test]
@@ -430,10 +443,17 @@ mod tests {
                 limited("2026-10-07T10:09:00Z"),
                 assistant("2026-10-07T10:10:30Z", "gap"),
                 assistant("2026-10-07T10:12:00Z", "m2"),
-                assistant("2026-10-07T10:13:00Z", "m3"),
             ]
             .join("\n")
                 + "\n",
+        )
+        .unwrap();
+        // Subagent transcripts sit below the session.
+        let subagents = projects.join("s/subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(
+            subagents.join("agent-1.jsonl"),
+            assistant("2026-10-07T10:13:00Z", "m3") + "\n",
         )
         .unwrap();
         let rates = collect(
