@@ -1895,3 +1895,124 @@ async fn a_pending_migration_never_returns_a_receipt_for_a_rotated_replacement()
     assert!(late.is_err(), "m-1 published a receipt for the replacement");
     assert!(late.err().unwrap().downcast_ref::<Gone>().is_some());
 }
+
+fn flow_row(alias: &str) -> store::FlowRow {
+    store::FlowRow {
+        user: "person".into(),
+        alias: alias.into(),
+        sealed: vec![1],
+        exchanging: false,
+        retained: None,
+        cancelled: false,
+        consumed: false,
+    }
+}
+
+/// start_login reads its renewal target, then a delete commits, then the flow is written:
+/// the write must see the delete under the alias lock and refuse.
+#[tokio::test]
+async fn a_login_flow_written_after_a_delete_of_its_target_is_refused() {
+    let (_f, engine, _refreshes) = synthetic(3600).await;
+    let receipt = engine
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let target = engine
+        .store()
+        .account("person", &receipt.account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    engine
+        .remove("person", "mac", &receipt.account_id)
+        .await
+        .unwrap();
+    let renewal = store::FlowTarget::Renew {
+        account: &target.id,
+        incarnation: &target.incarnation,
+    };
+    assert!(
+        !engine
+            .store()
+            .put_flow("late", &flow_row("work"), renewal)
+            .await
+            .unwrap()
+    );
+    assert!(
+        engine
+            .store()
+            .flow("person", "late")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // A recreated alias is a new incarnation: the old target still does not match.
+    engine
+        .admit(
+            "person",
+            "work",
+            "m-2",
+            grant_until("second", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !engine
+            .store()
+            .put_flow("late-2", &flow_row("work"), renewal)
+            .await
+            .unwrap()
+    );
+    // A new login for an alias that now exists is refused too.
+    assert!(
+        !engine
+            .store()
+            .put_flow("new", &flow_row("work"), store::FlowTarget::New)
+            .await
+            .unwrap()
+    );
+    assert!(
+        engine
+            .store()
+            .put_flow("fresh", &flow_row("home"), store::FlowTarget::New)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_usage_response_is_refused_and_never_stored() {
+    let app = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/api/oauth/usage",
+            get(|| async {
+                Json(json!({"five_hour":{"utilization":42,"pad":"x".repeat(MAX_RESPONSE)}}))
+            }),
+        );
+    let f = Fixture::new(app).await;
+    let engine = f.engine().await;
+    let receipt = engine
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let usage = engine
+        .usage("person", &receipt.account_id, false)
+        .await
+        .unwrap();
+    assert!(usage.data.is_none());
+    assert_eq!(usage.error.as_deref(), Some("invalid_usage"));
+}

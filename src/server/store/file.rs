@@ -356,9 +356,26 @@ impl FileStore {
     pub fn flow(&self, user: &str, id: &str) -> Result<Option<FlowRow>> {
         Ok(self.read(|t| t.flows.get(id).filter(|f| f.user == user).cloned()))
     }
-    pub fn put_flow(&self, id: &str, row: &FlowRow) -> Result<()> {
-        self.write(|t| {
-            t.flows.insert(id.into(), row.clone());
+    pub fn put_flow(&self, id: &str, row: &FlowRow, target: FlowTarget<'_>) -> Result<bool> {
+        self.transact(|t| {
+            let holds = match target {
+                FlowTarget::New => !t
+                    .accounts
+                    .values()
+                    .any(|a| a.user == row.user && a.alias.eq_ignore_ascii_case(&row.alias)),
+                FlowTarget::Renew {
+                    account,
+                    incarnation,
+                } => t.accounts.get(account).is_some_and(|a| {
+                    a.user == row.user
+                        && a.incarnation == incarnation
+                        && a.alias.eq_ignore_ascii_case(&row.alias)
+                }),
+            };
+            if holds {
+                t.flows.insert(id.into(), row.clone());
+            }
+            (holds, holds)
         })
     }
     pub fn start_exchange(&self, user: &str, id: &str) -> Result<bool> {

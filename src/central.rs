@@ -16,7 +16,7 @@ mod migration;
 mod qualify;
 #[path = "central_session.rs"]
 pub mod session;
-pub use migration::{ensure_local, ensure_local_grant, migrate};
+pub use migration::{ensure_local, ensure_local_grant, ensure_login_unfenced, migrate};
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -360,9 +360,11 @@ pub fn connect(paths: &Paths, server: &str, name: &str, no_browser: bool) -> Res
 /// A newly acquired login must survive a later local persistence/activation failure.
 pub fn retain_login(
     paths: &Paths,
+    alias: &str,
     creds: &crate::api::CredentialsFile,
     account: &Option<Value>,
 ) -> Result<PathBuf> {
+    ensure_login_unfenced(&paths.claudectl_dir(), alias, creds, account)?;
     let path = paths
         .claudectl_dir()
         .join("retained-logins")
