@@ -15,8 +15,8 @@ struct Tables {
     leases: BTreeMap<String, (String, i64, i64)>,
     /// Append-only: (user, account ID, alias, deleted_at).
     deletions: Vec<(String, String, String, i64)>,
-    /// "user\u{1f}admission ID" -> account ID
-    admissions: BTreeMap<String, String>,
+    /// "user\u{1f}admission ID" -> (account ID, revoked by a delete)
+    admissions: BTreeMap<String, (String, bool)>,
     /// "user\u{1f}admission ID" -> row
     pending: BTreeMap<String, PendingRow>,
     flows: BTreeMap<String, FlowRow>,
@@ -161,7 +161,8 @@ impl FileStore {
                 return (AdmitOutcome::Conflict, false);
             }
             t.accounts.insert(a.id.clone(), a.clone());
-            t.admissions.insert(pending_key.clone(), a.id.clone());
+            t.admissions
+                .insert(pending_key.clone(), (a.id.clone(), false));
             if let Some(p) = t.pending.get_mut(&pending_key) {
                 p.state = PendingState::Committed;
                 p.sealed.clear();
@@ -175,7 +176,7 @@ impl FileStore {
             (AdmitOutcome::Committed, true)
         })
     }
-    pub fn admission(&self, user: &str, admission_id: &str) -> Result<Option<String>> {
+    pub fn admission(&self, user: &str, admission_id: &str) -> Result<Option<(String, bool)>> {
         Ok(self.read(|t| t.admissions.get(&slot(user, admission_id)).cloned()))
     }
     pub fn delete(&self, user: &str, id: &str) -> Result<bool> {
@@ -193,6 +194,12 @@ impl FileStore {
             t.usage.remove(id);
             t.deletions
                 .push((user.into(), id.into(), alias.clone(), now()));
+            let prefix = slot(user, "");
+            for (key, (account, revoked)) in t.admissions.iter_mut() {
+                if key.starts_with(&prefix) && account == id {
+                    *revoked = true;
+                }
+            }
             for p in t.pending.values_mut() {
                 if p.user == user
                     && p.alias.eq_ignore_ascii_case(&alias)
@@ -271,10 +278,20 @@ impl FileStore {
     pub fn pending(&self, user: &str, admission_id: &str) -> Result<Option<PendingRow>> {
         Ok(self.read(|t| t.pending.get(&slot(user, admission_id)).cloned()))
     }
-    pub fn put_pending(&self, admission_id: &str, row: &PendingRow) -> Result<()> {
+    pub fn put_pending(
+        &self,
+        admission_id: &str,
+        row: &PendingRow,
+        login_id: Option<&str>,
+    ) -> Result<()> {
         let key = slot(&row.user, admission_id);
         self.transact(|t| {
-            if t.pending.contains_key(&key) {
+            let flow_live = login_id.is_none_or(|login| {
+                t.flows
+                    .get(login)
+                    .is_some_and(|f| f.user == row.user && !f.cancelled && !f.consumed)
+            });
+            if t.pending.contains_key(&key) || !flow_live {
                 return ((), false);
             }
             t.pending.insert(key, row.clone());

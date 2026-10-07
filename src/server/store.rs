@@ -170,8 +170,13 @@ impl Store {
     pub async fn admit(&self, admission: &Admission) -> Result<AdmitOutcome> {
         dispatch!(self, admit(admission))
     }
-    /// The account an admission ID produced, if it committed.
-    pub async fn admission(&self, user: &str, admission_id: &str) -> Result<Option<String>> {
+    /// The account an admission ID produced, if it committed, and whether a delete of that
+    /// account revoked it. A revoked admission never resolves to a recreated account.
+    pub async fn admission(
+        &self,
+        user: &str,
+        admission_id: &str,
+    ) -> Result<Option<(String, bool)>> {
         dispatch!(self, admission(user, admission_id))
     }
     /// Delete the user's account: erase its grant, log the deletion, and cancel every
@@ -197,9 +202,15 @@ impl Store {
     pub async fn pending(&self, user: &str, admission_id: &str) -> Result<Option<PendingRow>> {
         dispatch!(self, pending(user, admission_id))
     }
-    /// Keep an acquired grant before verification. Never replaces an existing row.
-    pub async fn put_pending(&self, admission_id: &str, row: &PendingRow) -> Result<()> {
-        dispatch!(self, put_pending(admission_id, row))
+    /// Keep an acquired grant before verification. Never replaces an existing row. For a
+    /// login, the row is written only while its flow is live, ordered against a delete.
+    pub async fn put_pending(
+        &self,
+        admission_id: &str,
+        row: &PendingRow,
+        login_id: Option<&str>,
+    ) -> Result<()> {
+        dispatch!(self, put_pending(admission_id, row, login_id))
     }
     pub async fn flow(&self, user: &str, id: &str) -> Result<Option<FlowRow>> {
         dispatch!(self, flow(user, id))

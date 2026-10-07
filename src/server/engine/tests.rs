@@ -1517,3 +1517,89 @@ async fn serve_refuses_a_schema_it_cannot_read() {
         .unwrap();
     assert!(store.check_schema().await.is_err());
 }
+
+#[tokio::test]
+async fn an_old_migration_receipt_never_resolves_to_a_recreated_account() {
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    // The migration's forced refresh fails, so m-1 never completes.
+    let app = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/token",
+            post(|| async { axum::http::StatusCode::BAD_GATEWAY }),
+        );
+    let f = Fixture::new(app).await;
+    let engine = f.engine().await;
+    let grant = || grant_until("migrated", now() + 3_600_000);
+    assert!(
+        engine
+            .migrate("person", "mac", "work", "m-1", grant())
+            .await
+            .is_err()
+    );
+    let id = account_id("person", "work");
+    engine.remove("person", "mac", &id).await.unwrap();
+    engine
+        .admit(
+            "person",
+            "work",
+            "login-2",
+            grant_until("second", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    // m-1 belonged to the deleted account; the recreated one must not complete it.
+    assert!(engine.receipt("person", "m-1").await.is_err());
+    assert!(
+        engine
+            .migrate("person", "mac", "work", "m-1", grant())
+            .await
+            .is_err()
+    );
+    assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_pending_grant_is_never_stored_for_a_cancelled_login() {
+    let (_f, engine, _refreshes) = synthetic(3600).await;
+    let receipt = engine
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let renewal = engine
+        .start_login("person", "machine", "work", true)
+        .await
+        .unwrap();
+    engine
+        .remove("person", "mac", &receipt.account_id)
+        .await
+        .unwrap();
+    // A completion that kept its response before the delete reaches admission afterwards.
+    let late = engine
+        .admit_with(
+            "person",
+            "work",
+            &renewal.id,
+            grant_until("late", now() + 3_600_000),
+            Some(&receipt.identity),
+            false,
+            Some(&renewal.id),
+        )
+        .await;
+    assert!(late.is_err());
+    assert!(
+        engine
+            .store()
+            .pending("person", &renewal.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

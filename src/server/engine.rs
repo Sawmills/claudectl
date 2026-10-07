@@ -413,13 +413,14 @@ impl Engine {
                 state: PendingState::Live,
                 sealed,
             };
-            self.store.put_pending(admission_id, &row).await?;
+            self.store.put_pending(admission_id, &row, login_id).await?;
         }
         let saved = self
             .store
             .pending(user, admission_id)
             .await?
-            .context("pending admission vanished")?;
+            // No row: a delete cancelled the login before the grant could be kept.
+            .ok_or_else(cancelled)?;
         if saved.state != PendingState::Live {
             return Err(cancelled());
         }
@@ -578,9 +579,12 @@ impl Engine {
     /// The receipt for an admission ID and its account's rotation state. An admission whose
     /// account was deleted is Gone: a retry cannot recreate it.
     async fn admitted(&self, user: &str, admission: &str) -> Result<Option<(Receipt, Rotation)>> {
-        let Some(id) = self.store.admission(user, admission).await? else {
+        let Some((id, revoked)) = self.store.admission(user, admission).await? else {
             return Ok(None);
         };
+        if revoked {
+            return Err(Gone.into());
+        }
         let loaded = self.selected(user, &id).await?;
         Ok(Some((
             Receipt {

@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS admissions (
     user_id TEXT NOT NULL,
     admission_id TEXT NOT NULL,
     account_id TEXT NOT NULL,
+    revoked BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (user_id, admission_id)
 );
@@ -401,15 +402,19 @@ impl PostgresStore {
         tx.commit().await?;
         Ok(AdmitOutcome::Committed)
     }
-    pub async fn admission(&self, user: &str, admission_id: &str) -> Result<Option<String>> {
+    pub async fn admission(
+        &self,
+        user: &str,
+        admission_id: &str,
+    ) -> Result<Option<(String, bool)>> {
         let client = self.pool.get().await?;
         Ok(client
             .query_opt(
-                "SELECT account_id FROM admissions WHERE user_id = $1 AND admission_id = $2",
+                "SELECT account_id, revoked FROM admissions WHERE user_id = $1 AND admission_id = $2",
                 &[&user, &admission_id],
             )
             .await?
-            .map(|r| r.get(0)))
+            .map(|r| (r.get(0), r.get(1))))
     }
     pub async fn delete(&self, user: &str, id: &str) -> Result<bool> {
         let mut client = self.pool.get().await?;
@@ -446,6 +451,11 @@ impl PostgresStore {
         tx.execute(
             "INSERT INTO deletions (user_id, account_id, alias) VALUES ($1, $2, $3)",
             &[&user, &id, &alias],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE admissions SET revoked = true WHERE user_id = $1 AND account_id = $2",
+            &[&user, &id],
         )
         .await?;
         tx.execute(
@@ -543,21 +553,38 @@ impl PostgresStore {
                 sealed: r.get(2),
             }))
     }
-    pub async fn put_pending(&self, admission_id: &str, row: &PendingRow) -> Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "INSERT INTO pending_admissions (user_id, admission_id, alias, state, sealed)
-                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-                &[
-                    &row.user,
-                    &admission_id,
-                    &row.alias,
-                    &state_name(row.state),
-                    &row.sealed,
-                ],
-            )
-            .await?;
+    pub async fn put_pending(
+        &self,
+        admission_id: &str,
+        row: &PendingRow,
+        login_id: Option<&str>,
+    ) -> Result<()> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        // Ordered against a delete of the alias, which cancels flows under the same lock.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&alias_lock(&row.user, &row.alias)],
+        )
+        .await?;
+        tx.execute(
+            "INSERT INTO pending_admissions (user_id, admission_id, alias, state, sealed)
+             SELECT $1, $2, $3, $4, $5
+             WHERE $6::TEXT IS NULL OR EXISTS (
+                SELECT 1 FROM login_flows
+                WHERE id = $6 AND user_id = $1 AND NOT cancelled AND NOT consumed)
+             ON CONFLICT DO NOTHING",
+            &[
+                &row.user,
+                &admission_id,
+                &row.alias,
+                &state_name(row.state),
+                &row.sealed,
+                &login_id,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
     pub async fn flow(&self, user: &str, id: &str) -> Result<Option<FlowRow>> {
