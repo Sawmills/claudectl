@@ -155,3 +155,30 @@ The shared ExternalSecrets IAM grant already covers `app/*` and `rds/*`, so no s
 - **H9.** Users key on (issuer, subject). The verifier checks audience, nonce, PKCE, `hd` and `email_verified`. Enrollment state, SSO state and device codes are consumed once with `UPDATE ... WHERE consumed_at IS NULL RETURNING`. Test: a replay on another replica fails.
 - **H10.** A follower waits up to 35 s, then answers 503 `refresh_in_progress`; the claudectl writer retries every 5 s.
 - **H11.** Tests: a stop after the retained response and before Ready (the next holder verifies the retained successor, no replay); a delete during Refreshing; a shutdown drain.
+
+## `claudectl server migrate --all` (Amir, 2026-10-07)
+
+Goal: one command moves every saved Claude account on this machine to the server, safely, and can be rerun. It reuses the per-account path (fence journal, server receipt, forced refresh and identity check on the server, retire the local grant); `--all` adds selection, preflight, order and a summary.
+
+**Selection.** Every profile in `~/.claudectl/profiles`. Already migrated (journal with receipt) = "already on server", skipped. A fenced profile without a receipt resumes (receipt lookup first, as today).
+
+**Preflight, read-only, before any fence; prints paths, aliases and digest prefixes, never values.** Per account:
+
+- Identity from `account.json`; two profiles with one identity, or one grant digest in two holders, refuse that account ("retire duplicate holders first").
+- Holders: the profile file, `~/.claudectl/run/<alias>/` and `lanes/*` receipts, the live Keychain entries (`Claude Code-credentials*`) and `~/.claude/.credentials.json` by digest and identity, the usage cache entry.
+- Running Claude processes (PIDs, start time) when the account is the host's live login.
+- Expired access token: refresh it locally first through the existing non-active `status` refresh path (rotation before the fence is harmless); the active account is never refreshed by claudectl.
+
+**Order and the active account.** Inactive accounts first, the live login last. The live login migrates only with `--exclusive-owner` (the user states every Claude session on this machine is stopped); without it, it is refused with the list of running Claude PIDs and the others still migrate. After its receipt and verified rotation, the live Keychain entry, `~/.claude/.credentials.json` and the active marker are cleared, so no local copy of a migrated grant remains; the summary says to start sessions with `claudectl server run` / `claudectl claude`.
+
+**Failure and retry.** Per-account isolation: a failed account stays fenced (journal kept) and the run continues; exit code 1 if any account failed or was refused. A rerun resumes fenced accounts from the receipt and skips migrated ones. A summary table: alias, identity prefix, result (`migrated` / `already` / `refused: <reason>` / `failed: fenced, rerun`), and the retry command.
+
+**After migration.** `claudectl claude` (lanes) and `exec` route a migrated alias to the server session (`central::session::run`, access-only tokens); account rotation on a usage limit also considers server accounts. Non-migrated profiles keep switching locally and offline.
+
+**Tests (synthetic, both stores where the server is involved).** All-success over three profiles; one account failing mid-run (others migrate, failed one fenced, rerun completes it); a lost server reply (receipt lookup, no second import); live-login refusal without `--exclusive-owner` (lists PIDs from an injected process list, others migrate); duplicate identity refused; expired token refreshed before fencing; lane runner picks a migrated alias via the server.
+
+**Open points for the HQ challenge.**
+
+1. Clearing the live login after migrating it leaves the Mac with no local Claude login. Recommendation: yes, that is the point of "all"; interactive use goes through `claudectl server run`.
+2. Local refresh of expired inactive profiles before fencing. Recommendation: yes.
+3. Lane routing to server accounts is in this change, not a follow-up. Recommendation: yes; otherwise lanes lose every migrated account.
