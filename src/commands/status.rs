@@ -98,23 +98,24 @@ pub const STATUS_JSON_VERSION: u32 = 1;
 
 /// How an account is paid for. Only `rate_limited` accounts are ever picked
 /// automatically: `usage_based` has extra usage on, so running past a plan
-/// window bills credits, and `unknown` cannot be proven safe.
+/// window bills credits, and `unknown` cannot be proven safe. Missing or null
+/// extra-usage data is not proof that extra usage is off.
 pub fn billing_class(usage: Option<&UsageResponse>, plan: Option<&str>) -> &'static str {
     let Some(usage) = usage else {
         return "unknown";
     };
-    if usage
+    match usage
         .extra_usage
         .as_ref()
         .and_then(|extra| extra.is_enabled)
-        .unwrap_or(false)
     {
-        return "usage_based";
-    }
-    if plan.is_some() && (usage.five_hour.is_some() || usage.seven_day.is_some()) {
-        "rate_limited"
-    } else {
-        "unknown"
+        Some(true) => "usage_based",
+        Some(false)
+            if plan.is_some() && (usage.five_hour.is_some() || usage.seven_day.is_some()) =>
+        {
+            "rate_limited"
+        }
+        _ => "unknown",
     }
 }
 
@@ -1516,7 +1517,17 @@ mod tests {
 
     #[test]
     fn billing_class_follows_extra_usage_and_plan() {
-        let rate = fetched_json("a", r#"{"five_hour":{"utilization":10}}"#, Some("max"));
+        let rate = fetched_json(
+            "a",
+            r#"{"five_hour":{"utilization":10},"extra_usage":{"is_enabled":false}}"#,
+            Some("max"),
+        );
+        let no_extra = fetched_json("d", r#"{"five_hour":{"utilization":10}}"#, Some("max"));
+        let null_extra = fetched_json(
+            "e",
+            r#"{"five_hour":{"utilization":10},"extra_usage":{"is_enabled":null}}"#,
+            Some("max"),
+        );
         let billed = fetched_json(
             "b",
             r#"{"five_hour":{"utilization":10},"extra_usage":{"is_enabled":true,"used_credits":3}}"#,
@@ -1527,6 +1538,16 @@ mod tests {
         assert_eq!(class(&rate), "rate_limited");
         assert_eq!(class(&billed), "usage_based");
         assert_eq!(class(&no_plan), "unknown");
+        assert_eq!(
+            class(&no_extra),
+            "unknown",
+            "missing extra_usage is not proof"
+        );
+        assert_eq!(
+            class(&null_extra),
+            "unknown",
+            "null is_enabled is not proof"
+        );
         assert_eq!(billing_class(None, Some("max")), "unknown");
     }
 

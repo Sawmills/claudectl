@@ -79,7 +79,8 @@ account has `alias`, `label`, `active`, `plan`, `billing_class`, `exhausted`,
 `extra_usage`, `token_expires_in_seconds`, `usage_age_seconds`, `usage_stale`
 and `error`. `billing_class` is `usage_based` when extra usage is on (running past
 a plan window bills credits), `rate_limited` for a subscription plan with usage
-windows, and `unknown` otherwise. `exhausted` is true when any window, including
+windows and extra usage reported off, and `unknown` otherwise (missing or null
+extra-usage data counts as unknown). `exhausted` is true when any window, including
 Opus, Sonnet and Fable, is at 100%. It combines with `--cached` and `--refresh`.
 
 The default table shows each account's status and next step:
