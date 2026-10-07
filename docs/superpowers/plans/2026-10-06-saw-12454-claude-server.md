@@ -139,3 +139,19 @@ The shared ExternalSecrets IAM grant already covers `app/*` and `rds/*`, so no s
 - A delete on one replica during a renewal on the other is refused by the ordering rule.
 - `serve` refuses an unknown schema version; `migrate` is idempotent.
 - Google `hd` and `email_verified` checks.
+
+### Challenge changes H1 to H11 (approved 2026-10-06 18:1x PDT; build follows, rule 66)
+
+- **K3 first.** `server qualify` (the renewal handoff gate) stays a precondition for any migration.
+- **Store shape.** The file backend becomes one sealed state file written atomically per change, so a multi-table change is one write. PostgreSQL does the same in one short transaction. No transaction spans an Anthropic call (H3).
+- **H1.** Before the token exchange, the lease must have at least 40 s left by the database clock (30 s exchange timeout + 10 s margin); otherwise renew first. The Refreshing write records an attempt ID. The retained-response write is fenced on holder, epoch, attempt ID and revision, not on `expires_at > now()`, so a response is kept when the lease lapsed mid-exchange but nobody took it over.
+- **H2.** SIGTERM: stop accepting requests, fail readiness, let in-flight refreshes and verifications finish and persist, then release leases. `terminationGracePeriodSeconds: 120`.
+- **H3.** A connection pool (`deadpool-postgres`), one connection per transaction. Each connection sets `statement_timeout`, `lock_timeout` and `idle_in_transaction_session_timeout`.
+- **H4.** Lease renewal is `UPDATE ... WHERE holder AND epoch AND expires_at > now()`, never a re-upsert. A failed renewal stops the work it covers.
+- **H5.** The forced refresh and verification after a migration run under the refresh lease. A usage read never refreshes; with no valid token it reports `login_required`.
+- **H6.** Admission commits under an advisory lock on hash(user, lower(alias)); `UNIQUE (user_id, lower(alias))` and `UNIQUE (account_uuid, organization_uuid)` back it. Test: two replicas admit the same grant.
+- **H7.** `schema_info(version, min_reader)`. `serve` refuses a database below its minimum version or one whose `min_reader` is above its own version. Migrations expand first and contract later.
+- **H8.** Infra: a migrator role that owns the schema and a runtime role with DML only; `NOSUPERUSER NOCREATEDB NOCREATEROLE`; `REVOKE CREATE ON SCHEMA public FROM PUBLIC`; role-level `statement_timeout` and `lock_timeout`.
+- **H9.** Users key on (issuer, subject). The verifier checks audience, nonce, PKCE, `hd` and `email_verified`. Enrollment state, SSO state and device codes are consumed once with `UPDATE ... WHERE consumed_at IS NULL RETURNING`. Test: a replay on another replica fails.
+- **H10.** A follower waits up to 35 s, then answers 503 `refresh_in_progress`; the claudectl writer retries every 5 s.
+- **H11.** Tests: a stop after the retained response and before Ready (the next holder verifies the retained successor, no replay); a delete during Refreshing; a shutdown drain.
