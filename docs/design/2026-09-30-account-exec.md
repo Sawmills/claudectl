@@ -69,7 +69,12 @@ Claude Code 2.1.x reads an OAuth access token from an inherited file descriptor 
 
 ## Config directory
 
-Each run gets a new empty directory, so the child neither reads nor writes the global `~/.claude.json` identity or the global Keychain login. No settings are copied or linked into it.
+Each run gets a new private directory, so the child neither reads nor writes the global `~/.claude.json` identity or the global Keychain login. Nothing is linked into it, and only one file is copied in: a `.claude.json` built from an allowlist, so that the child starts at its prompt (SAW-12468).
+
+- Top-level keys: `hasCompletedOnboarding` and `lastOnboardingVersion`.
+- For the current directory only, under `projects.<cwd>`: `hasTrustDialogAccepted`, `hasClaudeMdExternalIncludesApproved` and `hasClaudeMdExternalIncludesWarningShown`, copied only when true.
+- Never copied: `oauthAccount` and any other identity, tokens, approved API keys, allowed tools, MCP servers, other projects, and settings files.
+- Without a readable `~/.claude.json`, nothing is copied and Claude shows its first-run screens.
 
 ## Concurrency
 
