@@ -624,6 +624,13 @@ pub(super) fn migrate_all_with(
     processes: &dyn Fn() -> Result<Vec<(u32, String)>>,
     qualified: &dyn Fn(&Paths) -> Result<()>,
 ) -> Result<Vec<Row>> {
+    // The server forces a refresh after the exclusive-owner statement, so every account needs
+    // it: other machines, sessions and backups must be retired first.
+    if !exclusive_owner {
+        bail!(
+            "inventory and retire every other holder of these accounts (other machines, sessions, backups), then rerun with --exclusive-owner. Nothing was fenced"
+        );
+    }
     let running = processes()?;
     if !running.is_empty() {
         let list = running
@@ -676,15 +683,6 @@ pub(super) fn migrate_all_with(
                 identity,
                 result: "not-attempted".into(),
                 next: "rerun",
-            });
-            continue;
-        }
-        if source == Source::Live && !exclusive_owner {
-            rows.push(Row {
-                alias,
-                identity,
-                result: "refused:live login needs --exclusive-owner".into(),
-                next: "stop every session using it, then rerun with --exclusive-owner",
             });
             continue;
         }

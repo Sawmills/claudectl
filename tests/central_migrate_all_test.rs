@@ -291,7 +291,7 @@ impl Env {
         (output.status.success(), text)
     }
     fn all(&self) -> (bool, String) {
-        self.run(&["--all"], "")
+        self.run(&["--all", "--exclusive-owner"], "")
     }
     fn row(text: &str, alias: &str) -> String {
         text.lines()
@@ -451,14 +451,11 @@ fn the_live_login_migrates_last_and_is_deleted_only_while_it_is_the_migrated_gra
     let env = Env::new();
     env.profile("a1", "u-a1-0000", Script::Ok, 3_600_000);
     env.live("me", "u-me-0000", "live");
-    // Without --exclusive-owner the live login is refused; the others still migrate.
-    let (ok, text) = env.all();
+    // Without --exclusive-owner nothing migrates, the live login included.
+    let (ok, text) = env.run(&["--all"], "");
     assert!(!ok, "{text}");
-    assert!(
-        Env::row(&text, "me").contains("--exclusive-owner"),
-        "{text}"
-    );
-    assert!(Env::row(&text, "a1").contains("migrated"), "{text}");
+    assert!(text.contains("--exclusive-owner"), "{text}");
+    assert!(!env.fenced("a1") && !env.fenced("me"));
     assert!(env.paths.claude_credentials_file().exists());
 
     // The import commits but the reply is lost; then Claude rotates the live login.
@@ -586,4 +583,16 @@ fn a_profile_changed_during_its_refresh_is_not_overwritten() {
     let kept: CredentialsFile = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
     assert_eq!(kept.claude_ai_oauth.access_token, "relogin-access");
     assert!(!env.fenced("a1"));
+}
+
+#[test]
+fn migrate_all_without_the_exclusive_owner_statement_fences_nothing() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, 3_600_000);
+    let (ok, text) = env.run(&["--all"], "");
+    assert!(!ok, "{text}");
+    assert!(text.contains("--exclusive-owner"), "{text}");
+    assert!(!env.fenced("a1"));
+    assert!(env.has_credentials("a1"));
+    assert_eq!(env.imports(), 0);
 }

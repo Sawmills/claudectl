@@ -37,12 +37,12 @@ after token exchange, the server retains the acquired response. The failure show
 `complete-login ID --resume`, which retries verification without exchanging the
 code again. An uncertain exchange with no retained response requires a new login.
 
-`migrate --all` moves every saved account on this machine in one run. It first refuses
+`migrate --all --exclusive-owner` moves every saved account on this machine in one run;
+without `--exclusive-owner` it refuses and fences nothing. It first refuses
 the whole run while any Claude process runs (with or without `--exclusive-owner`),
 when the host's Claude build is not qualified, or when the server is unreachable;
 then nothing is fenced. Expired inactive profiles are refreshed locally before their
-fence. Inactive accounts migrate first. The host's live login migrates last, only with
-`--exclusive-owner`, from its Keychain grant; after the server verifies the rotation,
+fence. Inactive accounts migrate first. The host's live login migrates last, from its Keychain grant; after the server verifies the rotation,
 the live login is deleted only while it is still that exact grant (digest compare),
 and the active marker is cleared. A server outage or 5xx stops the run; other accounts
 continue past a per-account refusal. The summary shows one row per account (`migrated`,
