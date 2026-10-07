@@ -70,7 +70,7 @@ The single-PVC deploy table is replaced. See "A14 revision: infra PRs".
 
 ## A14 revision: PostgreSQL, several replicas, Google Workspace SSO
 
-Amir A14 to A16 (2026-10-06 17:46 to 17:49 PDT). Done so far, on the file store, at a678a29: the engine, HTTP routes, allow list, audit, delete fences, `server qualify`, and 116 tests. This section is the delta. It needs its own rule 57 challenge.
+Amir A14 to A16 (2026-10-06 17:46 to 17:49 PDT). Done so far, on the file store, at a678a29: the engine, HTTP routes, allow list, audit, delete fences, `server qualify`; the full suite with `--features server` lists 232 tests, all passing. This section is the delta. It needs its own rule 57 challenge.
 
 ### Store
 
