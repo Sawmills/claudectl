@@ -1222,8 +1222,8 @@ fn wait_exit_no_reap(pid: u32, interactive: bool) -> std::io::Result<()> {
     }
 }
 
-/// The child stopped. Take the foreground back, stop claudectl's own group
-/// as the terminal would, and when claudectl is continued, continue the
+/// The child stopped. Take the foreground back, stop claudectl as the
+/// terminal would, and when claudectl is continued, continue the
 /// child, in the foreground again if claudectl was resumed there (`fg`).
 #[cfg(unix)]
 fn suspend_with(leader: u32) {
@@ -1233,11 +1233,13 @@ fn suspend_with(leader: u32) {
     if foreground::owned_by(leader) {
         foreground::reclaim();
     }
-    // SAFETY: kill only sends a signal. A signal sent to claudectl's own
-    // group is delivered before kill returns, so claudectl stops here until
-    // it is continued. The kernel discards it for an orphaned group, and
-    // then the child continues at once.
-    unsafe { libc::kill(0, libc::SIGTSTP) };
+    // SAFETY: pthread_kill only sends a signal to this thread. A signal
+    // sent to this thread is handled before it runs on, so claudectl stops
+    // here until it is continued; a process-directed signal can go to
+    // another thread and leave this one running for a moment. The kernel
+    // discards it for an orphaned group, and then the child continues at
+    // once.
+    unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTSTP) };
     if foreground::owned() {
         let _ = foreground::give(leader);
     }

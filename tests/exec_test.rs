@@ -2601,5 +2601,13 @@ while [ ! -e "$out/go" ]; do sleep 0.1; done"#,
     // claudectl ran in the background when its child exited; the shell
     // keeps the terminal.
     assert_eq!(read_out(&out, "shell_tpgid"), read_out(&out, "shell_pgid"));
-    assert_eq!(read_out(&out, "foreground_after"), "not_owned");
+    assert_eq!(
+        read_out(&out, "foreground_after"),
+        "not_owned",
+        "job_status={:?} child pgid={:?} helper={:?}\n{}",
+        read_out(&out, "job_status"),
+        read_out(&out, "pgid"),
+        read_out(&out, "helper_pid"),
+        job.transcript()
+    );
 }
