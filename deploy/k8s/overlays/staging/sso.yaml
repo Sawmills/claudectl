@@ -5,7 +5,7 @@ metadata:
   name: claudectl-sso
 data:
   # Google Workspace OIDC (A14). client_id of the Google OAuth client from A26 (1Password
-  # Engineering item claudectl-staging-oauth); the secret is in Secrets Manager.
+  # Engineering item claudectl-staging-oauth); the secret is in SSM.
   sso.json: |
     {
       "issuer": "https://accounts.google.com",
