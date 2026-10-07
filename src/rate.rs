@@ -64,7 +64,9 @@ pub fn collect(
         let lane = entry.file_name().to_string_lossy().into_owned();
         let log = entry.path().join("accounts.jsonl");
         let spans = match std::fs::read_to_string(&log) {
-            Ok(text) => spans(&text, now),
+            Ok(text) => {
+                spans(&text, now).with_context(|| format!("bad record in {}", log.display()))?
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e).with_context(|| format!("failed to read {}", log.display())),
         };
@@ -90,13 +92,21 @@ pub fn collect(
     Ok(accounts.into_values().collect())
 }
 
-fn spans(log: &str, now: DateTime<Utc>) -> Vec<Span> {
+/// The account spans in a lane log. The log is the only record of which
+/// account ran, so a bad record fails rather than shift the attribution;
+/// only a last line still being written (no newline yet) is skipped.
+fn spans(log: &str, now: DateTime<Utc>) -> Result<Vec<Span>> {
     let mut spans = Vec::new();
     let mut open: Option<(String, DateTime<Utc>)> = None;
-    for record in log
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-    {
+    for (index, line) in log.split_inclusive('\n').enumerate() {
+        let Some(line) = line.strip_suffix('\n') else {
+            break;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: serde_json::Value =
+            serde_json::from_str(line).with_context(|| format!("line {}", index + 1))?;
         let (Some(event), Some(alias), Some(at)) = (
             record["event"].as_str(),
             record["alias"].as_str(),
@@ -104,7 +114,7 @@ fn spans(log: &str, now: DateTime<Utc>) -> Vec<Span> {
                 .as_str()
                 .and_then(|at| DateTime::parse_from_rfc3339(at).ok()),
         ) else {
-            continue;
+            anyhow::bail!("line {}: no event, alias, or time", index + 1);
         };
         let at = at.with_timezone(&Utc);
         match event {
@@ -138,7 +148,7 @@ fn spans(log: &str, now: DateTime<Utc>) -> Vec<Span> {
             to: now,
         });
     }
-    spans
+    Ok(spans)
 }
 
 #[derive(Debug, PartialEq)]
@@ -270,9 +280,11 @@ mod tests {
             event("start", "c", "2026-10-07T10:12:00Z"),
             event("start", "d", "2026-10-07T10:20:00Z"),
         ]
-        .join("\n");
+        .join("\n")
+            + "\n";
         let now = at("2026-10-07T11:00:00Z");
         let names: Vec<_> = spans(&log, now)
+            .unwrap()
             .into_iter()
             .map(|s| (s.alias, s.to))
             .collect();
@@ -285,6 +297,18 @@ mod tests {
                 ("d".into(), now),
             ]
         );
+    }
+
+    #[test]
+    fn a_bad_log_record_fails_but_a_partial_last_line_does_not() {
+        let now = at("2026-10-07T11:00:00Z");
+        let start = event("start", "a", "2026-10-07T10:00:00Z");
+        let partial = format!("{start}\n{{\"at\":\"2026-10");
+        assert_eq!(spans(&partial, now).unwrap().len(), 1);
+        let torn = format!("{start}\n{{\"at\":\"2026-10\n{start}\n");
+        assert!(spans(&torn, now).is_err());
+        let missing = format!("{start}\n{{\"event\":\"end\"}}\n");
+        assert!(spans(&missing, now).is_err());
     }
 
     #[test]
