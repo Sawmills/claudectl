@@ -176,7 +176,12 @@ claudectl launcher --profile amir+2@example.com --claude "$(command -v claude)" 
 `exec` runs one command on a saved profile and leaves the live login alone.
 The child gets the saved access token through an inherited pipe
 (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`) and a fresh private
-`CLAUDE_CONFIG_DIR` that is removed when the run ends. The child runs
+`CLAUDE_CONFIG_DIR` that is removed when the run ends. So that the child
+starts at its prompt, that directory gets a `.claude.json` with only your
+onboarding state (`hasCompletedOnboarding`, `lastOnboardingVersion`) and the
+start-up approvals you gave the current directory (folder trust, external
+CLAUDE.md imports). Accounts, tokens, allowed tools and MCP servers are never
+copied. The child runs
 in its own process group: `SIGTERM`, `SIGINT` and `SIGHUP` sent to claudectl
 reach the whole group once, and descendants left after the child exits get
 `SIGTERM`, then `SIGKILL`. `SIGCONT` follows each of these signals, so a

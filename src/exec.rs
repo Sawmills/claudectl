@@ -819,6 +819,7 @@ fn run_in_dir(
 ) -> Result<i32, ExecError> {
     // Execute a private copy, so the bytes that run are the bytes that were
     // hashed, even if the original path is replaced during the run.
+    seed_claude_json(paths, config_dir)?;
     let snapshot = snapshot_executable(&prepared.program, config_dir)?;
     let snapshot_sha256 = sha256_file(&snapshot)?;
     if snapshot_sha256 != prepared.program_sha256 {
@@ -1821,6 +1822,67 @@ pub fn fresh_config_dir(paths: &Paths, alias: &str) -> Result<tempfile::TempDir,
             .map_err(|e| ExecError::Spawn(format!("cannot restrict config dir: {e}")))?;
     }
     Ok(dir)
+}
+
+/// Keys of `~/.claude.json` that Claude Code checks before its theme and
+/// login screens.
+const ONBOARDING_KEYS: &[&str] = &["hasCompletedOnboarding", "lastOnboardingVersion"];
+
+/// Per-project decisions Claude Code asks for at start: folder trust and
+/// external CLAUDE.md imports. Only true values are copied.
+const PROJECT_KEYS: &[&str] = &[
+    "hasTrustDialogAccepted",
+    "hasClaudeMdExternalIncludesApproved",
+    "hasClaudeMdExternalIncludesWarningShown",
+];
+
+/// Start the child at its prompt: copy the user's onboarding state, and the
+/// start-up decisions for the current directory only, into the private
+/// config dir. Accounts, tokens, approved keys, allowed tools and MCP servers
+/// are never copied. Without a readable `~/.claude.json` nothing is seeded,
+/// and Claude shows its first-run screens as before.
+fn seed_claude_json(paths: &Paths, config_dir: &Path) -> Result<(), ExecError> {
+    let Ok(text) = std::fs::read_to_string(paths.claude_json()) else {
+        return Ok(());
+    };
+    let Ok(serde_json::Value::Object(user)) = serde_json::from_str(&text) else {
+        return Ok(());
+    };
+    let mut seed = serde_json::Map::new();
+    for key in ONBOARDING_KEYS {
+        if let Some(value) = user.get(*key) {
+            seed.insert((*key).to_string(), value.clone());
+        }
+    }
+    let cwd = std::env::current_dir().ok();
+    let cwd = cwd.as_deref().and_then(Path::to_str);
+    let project = cwd.and_then(|cwd| user.get("projects")?.get(cwd));
+    if let (Some(cwd), Some(project)) = (cwd, project) {
+        let decisions: serde_json::Map<String, serde_json::Value> = PROJECT_KEYS
+            .iter()
+            .filter(|key| project.get(**key).and_then(|v| v.as_bool()) == Some(true))
+            .map(|key| ((*key).to_string(), serde_json::Value::Bool(true)))
+            .collect();
+        if !decisions.is_empty() {
+            seed.insert("projects".into(), serde_json::json!({ cwd: decisions }));
+        }
+    }
+    if seed.is_empty() {
+        return Ok(());
+    }
+    let path = config_dir.join(".claude.json");
+    let mut options = std::fs::File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|e| ExecError::Spawn(format!("cannot create {}: {e}", path.display())))?;
+    file.write_all(serde_json::Value::Object(seed).to_string().as_bytes())
+        .map_err(|e| ExecError::Spawn(format!("cannot write {}: {e}", path.display())))
 }
 
 fn resolve_program(program: &OsString) -> Result<PathBuf, ExecError> {
