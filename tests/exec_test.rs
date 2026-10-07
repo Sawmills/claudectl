@@ -584,6 +584,18 @@ fn helper_run_one_alias() {
         self_identity(),
     )
     .unwrap();
+    if std::env::var_os("CLAUDECTL_TEST_GATE_LOCK").is_some() {
+        // Hold the auth lock until the test releases it, so `run` waits in
+        // its lock retry after its own checks.
+        let lock = store.lock_auth_state().unwrap();
+        let release = out.join("release_lock");
+        std::thread::spawn(move || {
+            while !release.exists() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            drop(lock);
+        });
+    }
     run(&paths, &store, prepared, &req).unwrap();
     #[cfg(unix)]
     {
@@ -2218,10 +2230,16 @@ exit "$s"
 #[cfg(unix)]
 impl PtyJob {
     fn start(home: &Path, alias: &str, out: &Path) -> Self {
-        Self::start_resuming(home, alias, out, "fg")
+        Self::start_resuming(home, alias, out, "fg", &[])
     }
 
-    fn start_resuming(home: &Path, alias: &str, out: &Path, resume: &str) -> Self {
+    fn start_resuming(
+        home: &Path,
+        alias: &str,
+        out: &Path,
+        resume: &str,
+        env: &[(&str, &str)],
+    ) -> Self {
         use std::io::Read;
         use std::os::fd::FromRawFd;
         use std::os::unix::fs::OpenOptionsExt;
@@ -2263,6 +2281,7 @@ impl PtyJob {
             .env("CLAUDECTL_TEST_OUT", out)
             .env("TSTP_STATUS", (128 + libc::SIGTSTP).to_string())
             .env("JOB_RESUME", resume)
+            .envs(env.iter().copied())
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave);
@@ -2582,7 +2601,7 @@ fn a_child_that_exits_in_the_background_leaves_the_terminal_to_the_shell() {
         r#"echo ready > "$out/ready"
 while [ ! -e "$out/go" ]; do sleep 0.1; done"#,
     );
-    let mut job = PtyJob::start_resuming(home.path(), "one", &out, "bg");
+    let mut job = PtyJob::start_resuming(home.path(), "one", &out, "bg", &[]);
     assert!(wait_for(&out.join("ready"), LIMIT), "{}", job.transcript());
     job.type_text(b"\x1a");
     assert!(
@@ -2610,4 +2629,49 @@ while [ ! -e "$out/go" ]; do sleep 0.1; done"#,
         read_out(&out, "helper_pid"),
         job.transcript()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_started_after_bg_leaves_the_terminal_to_the_shell() {
+    if !Path::new(STOP_SHELL).exists() {
+        eprintln!(
+            "skipped: {STOP_SHELL} is missing, and no other shell is known to see a job stop"
+        );
+        return;
+    }
+    let _guard = run_guard();
+    let (home, out) = tty_child_setup(r#"echo ready > "$out/ready""#);
+    let mut job = PtyJob::start_resuming(
+        home.path(),
+        "one",
+        &out,
+        "bg",
+        &[("CLAUDECTL_TEST_GATE_LOCK", "1")],
+    );
+    // claudectl owns the terminal and waits for the auth lock.
+    let receipt = out.join("receipt.jsonl");
+    let started = std::time::Instant::now();
+    while !read_out(&out, "receipt.jsonl").contains("\"prepared\"") && started.elapsed() < LIMIT {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(receipt.exists(), "{}", job.transcript());
+    std::thread::sleep(Duration::from_millis(200));
+    job.type_text(b"\x1a");
+    assert!(
+        wait_for(&out.join("in_background"), LIMIT),
+        "claudectl did not stop: {}",
+        job.transcript()
+    );
+    std::fs::write(out.join("release_lock"), "").unwrap();
+    let status = job.wait(LIMIT);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the background job did not finish: {:?}\n{}",
+        status,
+        job.transcript()
+    );
+    // The child started in the background: it must not take the terminal.
+    assert_ne!(read_out(&out, "tpgid"), read_out(&out, "pgid"));
+    assert_eq!(read_out(&out, "foreground_after"), "not_owned");
 }

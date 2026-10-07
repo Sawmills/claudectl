@@ -853,13 +853,13 @@ fn run_in_dir(
 
     // The child gets its own process group, so cancellation and teardown
     // reach its descendants and every signal reaches it exactly once. When
-    // claudectl owns the terminal foreground, the child's group takes it, as
-    // a shell job does: terminal keys (Ctrl-C, Ctrl-Z) and window size
-    // changes then go to the child directly, and claudectl gets the
-    // foreground back when the child exits.
+    // claudectl owns the terminal foreground at the spawn, the child's group
+    // takes it, as a shell job does: terminal keys (Ctrl-C, Ctrl-Z) and
+    // window size changes then go to the child directly, and claudectl gets
+    // the foreground back when the child exits.
     set_process_group(&mut command);
-    let interactive = foreground::owned();
-    if interactive {
+    let terminal = foreground::is_terminal();
+    if terminal {
         take_foreground(&mut command);
     }
 
@@ -892,7 +892,7 @@ fn run_in_dir(
             let spawned = command.spawn();
             if spawned.is_err() {
                 signals::unblock();
-                if interactive && foreground::owned_by_gone_group() {
+                if terminal && foreground::owned_by_gone_group() {
                     // The child took the foreground before its exec failed.
                     foreground::reclaim();
                 }
@@ -928,6 +928,9 @@ fn run_in_dir(
         }
     };
     let pid = child.id();
+    // Interactive only if the child really took the foreground: claudectl
+    // may have been stopped and resumed with `bg` before the spawn.
+    let interactive = terminal && i32::try_from(pid).is_ok_and(foreground::owned_by);
     // Held signals are released here and forwarded once, with their own
     // numbers, now that the child is registered.
     signals::watch(pid);
@@ -1329,16 +1332,24 @@ fn set_process_group(command: &mut Command) {
 #[cfg(not(unix))]
 fn set_process_group(_command: &mut Command) {}
 
-/// Make the child's new group the terminal foreground before it runs. Rust
-/// runs this after the child's setpgid, and spawn returns only after the
-/// exec, so the child owns the foreground from its first instruction.
+/// Make the child's new group the terminal foreground before it runs, if
+/// claudectl's group owns the foreground at that moment. Rust runs this
+/// after the child's setpgid, and spawn returns only after the exec, so the
+/// child owns the foreground from its first instruction.
 #[cfg(unix)]
 fn take_foreground(command: &mut Command) {
     use std::os::unix::process::CommandExt;
-    // SAFETY: runs in the forked child; foreground::give uses only
-    // async-signal-safe calls.
+    // SAFETY: getpgrp only reads process state.
+    let claudectl_group = unsafe { libc::getpgrp() };
+    // SAFETY: runs in the forked child; tcgetpgrp, getpid and
+    // foreground::give use only async-signal-safe calls.
     unsafe {
-        command.pre_exec(|| foreground::give(libc::getpid()));
+        command.pre_exec(move || {
+            if libc::tcgetpgrp(libc::STDIN_FILENO) == claudectl_group {
+                foreground::give(libc::getpid())?;
+            }
+            Ok(())
+        });
     }
 }
 
@@ -1349,6 +1360,12 @@ fn take_foreground(_command: &mut Command) {}
 /// interactive child as a shell hands it to a job.
 #[cfg(unix)]
 mod foreground {
+    /// Whether stdin is a terminal with a foreground group.
+    pub fn is_terminal() -> bool {
+        // SAFETY: tcgetpgrp only reads terminal state.
+        unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) != -1 }
+    }
+
     /// Whether claudectl's group owns the foreground. A stdin that is not a
     /// terminal (tcgetpgrp fails) is not interactive.
     pub fn owned() -> bool {
@@ -1417,6 +1434,9 @@ mod foreground {
 
 #[cfg(not(unix))]
 mod foreground {
+    pub fn is_terminal() -> bool {
+        false
+    }
     pub fn owned() -> bool {
         false
     }
