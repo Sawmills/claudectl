@@ -5,7 +5,7 @@ use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng, rand_core::RngCore},
 };
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
@@ -139,39 +139,6 @@ pub fn seal<T: Serialize>(path: &Path, key: &Path, value: &T) -> Result<()> {
 pub fn unseal<T: serde::de::DeserializeOwned>(path: &Path, key: &Path) -> Result<T> {
     let plaintext = decrypt(key, &private_read(path)?)?;
     serde_json::from_slice(&plaintext).map_err(|_| anyhow::anyhow!("invalid vault record"))
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct User {
-    pub id: String,
-    pub email: String,
-    pub enabled: bool,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Machine {
-    pub id: String,
-    pub user: String,
-    pub token_hash: String,
-    pub revoked: bool,
-}
-
-pub fn users(state: &Path) -> Result<Vec<User>> {
-    serde_json::from_slice(&private_read(&state.join("users.json"))?)
-        .context("invalid user registry")
-}
-
-pub fn save_users(state: &Path, users: &[User]) -> Result<()> {
-    fs::atomic_write(&state.join("users.json"), &serde_json::to_vec(users)?)
-}
-
-pub fn machines(state: &Path) -> Result<Vec<Machine>> {
-    serde_json::from_slice(&private_read(&state.join("machines.json"))?)
-        .context("invalid machine registry")
-}
-
-pub fn save_machines(state: &Path, machines: &[Machine]) -> Result<()> {
-    fs::atomic_write(&state.join("machines.json"), &serde_json::to_vec(machines)?)
 }
 
 #[cfg(test)]

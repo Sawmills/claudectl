@@ -1,7 +1,12 @@
 //! Account server for one company user's Claude subscription accounts.
-use anyhow::{Context, Result, ensure};
-use clap::{Parser, Subcommand};
-use claudectl::server::{app, engine::Endpoints, vault};
+use anyhow::{Result, bail, ensure};
+use clap::{Args, Parser, Subcommand};
+use claudectl::server::{
+    app::{self, StoreConfig},
+    engine::Endpoints,
+    store::FileStore,
+    vault,
+};
 use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Parser)]
@@ -15,17 +20,40 @@ struct Cli {
     command: Commands,
 }
 
+/// Server state: a PostgreSQL URL (env DATABASE_URL), or a file store directory.
+#[derive(Args)]
+struct Location {
+    #[arg(long, env = "DATABASE_URL", conflicts_with = "state")]
+    database_url: Option<String>,
+    #[arg(long)]
+    state: Option<PathBuf>,
+}
+impl Location {
+    fn store(&self) -> Result<StoreConfig> {
+        match (&self.database_url, &self.state) {
+            (Some(url), None) => Ok(StoreConfig::Postgres(url.clone())),
+            (None, Some(state)) => Ok(StoreConfig::File(state.clone())),
+            _ => bail!("give --database-url (or DATABASE_URL) or --state"),
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    /// Create empty registries and, when absent, a new vault key
+    /// Create a file store and, when absent, a new vault key
     Setup {
         #[arg(long)]
         state: PathBuf,
         #[arg(long)]
         key_file: PathBuf,
-        /// Succeed without changes when the state already exists (pod restarts)
+        /// Succeed without changes when the state already exists
         #[arg(long)]
         if_absent: bool,
+    },
+    /// Apply the database schema (the migration job; serve never migrates)
+    Migrate {
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
     },
     /// Check a local server's readiness without credentials
     HealthCheck {
@@ -34,9 +62,11 @@ enum Commands {
     },
     /// List company users, or enable or disable one by email
     Users {
+        #[command(flatten)]
+        location: Location,
         #[arg(long)]
-        state: PathBuf,
-        #[arg(long, requires = "state")]
+        key_file: PathBuf,
+        #[arg(long)]
         email: Option<String>,
         #[arg(long, conflicts_with = "disable", requires = "email")]
         enable: bool,
@@ -45,8 +75,8 @@ enum Commands {
     },
     /// Revoke a machine
     Revoke {
-        #[arg(long)]
-        state: PathBuf,
+        #[command(flatten)]
+        location: Location,
         #[arg(long)]
         key_file: PathBuf,
         #[arg(long)]
@@ -54,15 +84,15 @@ enum Commands {
     },
     /// Decrypt and print the audit log
     Audit {
-        #[arg(long)]
-        state: PathBuf,
+        #[command(flatten)]
+        location: Location,
         #[arg(long)]
         key_file: PathBuf,
     },
     /// Serve the HTTP API
     Serve {
-        #[arg(long)]
-        state: PathBuf,
+        #[command(flatten)]
+        location: Location,
         #[arg(long)]
         key_file: PathBuf,
         #[arg(long, default_value = "127.0.0.1:8787")]
@@ -97,10 +127,11 @@ async fn run(cli: Cli) -> Result<()> {
             key_file,
             if_absent,
         } => {
-            if !(if_absent && state.join("users.json").try_exists()?) {
+            if !(if_absent && FileStore::exists(&state)?) {
                 app::setup(&state, &key_file)?;
             }
         }
+        Commands::Migrate { database_url } => app::migrate(&database_url).await?,
         Commands::HealthCheck { address } => {
             ensure!(address.ip().is_loopback(), "health checks require loopback");
             let response = reqwest::Client::builder()
@@ -111,36 +142,41 @@ async fn run(cli: Cli) -> Result<()> {
                 .get(format!("http://{address}/ready"))
                 .send()
                 .await?;
-            ensure!(
-                response.status().is_success(),
-                "account server is not ready"
-            );
+            ensure!(response.status().is_success(), "account server is not ready");
         }
         Commands::Users {
-            state,
+            location,
+            key_file,
             email,
             enable,
             disable,
-        } => match email {
-            Some(email) if enable || disable => app::set_user(&state, &email, enable)?,
-            _ => {
-                for user in vault::users(&state)? {
-                    println!("{} {} {}", user.id, user.email, user.enabled);
+        } => {
+            let store = app::open_store(&location.store()?, &key_file).await?;
+            match email {
+                Some(email) if enable || disable => app::set_user(&store, &email, enable).await?,
+                _ => {
+                    for user in store.users().await? {
+                        println!("{} {} {}", user.id, user.email, user.enabled);
+                    }
                 }
             }
-        },
+        }
         Commands::Revoke {
-            state,
+            location,
             key_file,
             machine,
-        } => app::revoke(&state, &key_file, &machine)?,
-        Commands::Audit { state, key_file } => {
-            for event in claudectl::server::audit::read(&state, &key_file)? {
+        } => {
+            let store = app::open_store(&location.store()?, &key_file).await?;
+            app::revoke(&store, &key_file, &machine).await?;
+        }
+        Commands::Audit { location, key_file } => {
+            let store = app::open_store(&location.store()?, &key_file).await?;
+            for event in claudectl::server::audit::read(&store, &key_file).await? {
                 println!("{event}");
             }
         }
         Commands::Serve {
-            state,
+            location,
             key_file,
             listen,
             public_url,
@@ -153,7 +189,7 @@ async fn run(cli: Cli) -> Result<()> {
                 reqwest::Url::parse(&public_url)
                     .ok()
                     .filter(|_| listen.ip().is_loopback())
-                    .context("public URL must be an HTTPS origin")
+                    .ok_or_else(|| anyhow::anyhow!("public URL must be an HTTPS origin"))
             })?;
             let metrics_token_hash = metrics_token_file
                 .map(|path| -> Result<String> {
@@ -167,7 +203,7 @@ async fn run(cli: Cli) -> Result<()> {
                 public_url: public_url.clone(),
             });
             let config = app::Config {
-                state,
+                store: location.store()?,
                 key: key_file,
                 allowed_users,
                 sso,

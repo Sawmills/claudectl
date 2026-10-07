@@ -1,10 +1,12 @@
 //! HTTP contract, machine authorization, and the company-user allow list.
 use super::{
     audit,
-    engine::{self, Endpoints, Engine, Gone, NotFound},
-    enrollment, fs, vault,
+    engine::{self, Endpoints, Engine, Gone, NotFound, RefreshInProgress},
+    enrollment,
+    store::{self, Machine, Store},
+    vault,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use axum::{
     Json, Router,
     extract::{Path as UrlPath, Query, State},
@@ -17,7 +19,10 @@ use serde_json::json;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::sync::Semaphore;
 
@@ -26,8 +31,17 @@ pub struct Sso {
     pub public_url: String,
 }
 
+/// Where server state lives.
+#[derive(Clone)]
+pub enum StoreConfig {
+    /// One sealed file; one process. For tests and single-machine use.
+    File(PathBuf),
+    /// PostgreSQL; several replicas.
+    Postgres(String),
+}
+
 pub struct Config {
-    pub state: PathBuf,
+    pub store: StoreConfig,
     pub key: PathBuf,
     /// Company email addresses that may use this server. Nobody else gets access.
     pub allowed_users: Vec<String>,
@@ -38,7 +52,7 @@ pub struct Config {
 }
 
 pub struct Server {
-    pub(super) state: PathBuf,
+    key: PathBuf,
     engine: Arc<Engine>,
     pub(super) sso: Option<enrollment::Sso>,
     allowed: Vec<String>,
@@ -46,6 +60,8 @@ pub struct Server {
     /// Per reason: failure count and the Unix time of the last one.
     failures: StdMutex<BTreeMap<&'static str, (u64, i64)>>,
     work: Arc<Semaphore>,
+    /// Set on shutdown: readiness fails while in-flight work finishes.
+    draining: AtomicBool,
 }
 
 pub struct HttpError {
@@ -58,13 +74,20 @@ impl IntoResponse for HttpError {
     }
 }
 
-/// Create empty registries and, when absent, a new vault key.
+/// Open a store. A database must already have this binary's schema (run `migrate`).
+pub async fn open_store(config: &StoreConfig, key: &Path) -> Result<Arc<Store>> {
+    Ok(Arc::new(match config {
+        StoreConfig::File(state) => Store::File(store::FileStore::open(state, key)?),
+        StoreConfig::Postgres(url) => {
+            let store = store::PostgresStore::connect(url).await?;
+            store.check_schema().await?;
+            Store::Postgres(store)
+        }
+    }))
+}
+
+/// Create a new vault key when absent, and an empty file store.
 pub fn setup(state: &Path, key: &Path) -> Result<()> {
-    fs::ensure_private_dir(state)?;
-    let _lock = vault::lock(state, "owner.lock")?;
-    if state.join("users.json").try_exists()? {
-        bail!("server state already initialized");
-    }
     if key.try_exists()? {
         if vault::private_read(key)?.len() != 32 {
             bail!("vault key must contain exactly 32 bytes");
@@ -72,74 +95,49 @@ pub fn setup(state: &Path, key: &Path) -> Result<()> {
     } else {
         vault::create_secret(key, &vault::random_bytes())?;
     }
-    vault::save_machines(state, &[])?;
-    // The pod initializer treats this registry as the completion marker.
-    vault::save_users(state, &[])
+    store::FileStore::create(state, key)
+}
+
+/// Apply the database schema. The migration job runs this; `serve` never does.
+pub async fn migrate(url: &str) -> Result<()> {
+    store::PostgresStore::connect(url).await?.migrate().await
 }
 
 fn user_id(email: &str) -> String {
     vault::digest(format!("admin\0{}", email.to_ascii_lowercase()).as_bytes())
 }
 
-/// Record a company user from SSO. A disabled user stays disabled.
-pub(super) fn record_user(state: &Path, id: &str, email: &str) -> Result<bool> {
-    let _lock = vault::registry_lock(state, "registry.lock")?;
-    let mut users = vault::users(state)?;
-    if let Some(user) = users.iter_mut().find(|u| u.id == id) {
-        if !user.enabled {
-            return Ok(false);
-        }
-        user.email = email.into();
-    } else {
-        users.push(vault::User {
-            id: id.into(),
-            email: email.into(),
-            enabled: true,
-        });
-    }
-    vault::save_users(state, &users)?;
-    Ok(true)
-}
-
-pub(super) fn add_machine(state: &Path, user: &str, name: &str) -> Result<(String, String)> {
-    let _lock = vault::registry_lock(state, "registry.lock")?;
-    let mut machines = vault::machines(state)?;
+pub(super) async fn add_machine(store: &Store, user: &str, name: &str) -> Result<(String, String)> {
     let token = vault::secret();
     let id = format!("{name}-{}", &vault::secret()[..12]);
-    machines.push(vault::Machine {
-        id: id.clone(),
-        user: user.into(),
-        token_hash: vault::digest(token.as_bytes()),
-        revoked: false,
-    });
-    vault::save_machines(state, &machines)?;
+    store
+        .add_machine(&Machine {
+            id: id.clone(),
+            user: user.into(),
+            token_hash: vault::digest(token.as_bytes()),
+            revoked: false,
+        })
+        .await?;
     Ok((id, token))
 }
 
 /// Enroll a machine without SSO, for an operator on the server host. Returns the machine ID
 /// and its bearer token, which is shown once.
-pub fn register(state: &Path, email: &str, name: &str) -> Result<(String, String)> {
+pub async fn register(store: &Store, email: &str, name: &str) -> Result<(String, String)> {
     let id = user_id(email);
-    if !record_user(state, &id, &email.to_ascii_lowercase())? {
+    if !store.record_user(&id, &email.to_ascii_lowercase()).await? {
         bail!("user is disabled");
     }
-    add_machine(state, &id, name)
+    add_machine(store, &id, name).await
 }
 
 /// Revoke a machine from the server host, with an audit line.
-pub fn revoke(state: &Path, key: &Path, machine: &str) -> Result<()> {
-    {
-        let _lock = vault::registry_lock(state, "registry.lock")?;
-        let mut machines = vault::machines(state)?;
-        machines
-            .iter_mut()
-            .find(|m| m.id == machine)
-            .context("machine not found")?
-            .revoked = true;
-        vault::save_machines(state, &machines)?;
+pub async fn revoke(store: &Store, key: &Path, machine: &str) -> Result<()> {
+    if !store.revoke_machine(machine, None).await? {
+        bail!("machine not found");
     }
     audit::record(
-        state,
+        store,
         key,
         &audit::Event {
             operation: "revoke",
@@ -150,6 +148,14 @@ pub fn revoke(state: &Path, key: &Path, machine: &str) -> Result<()> {
             target: Some(machine),
         },
     )
+    .await
+}
+
+pub async fn set_user(store: &Store, email: &str, enabled: bool) -> Result<()> {
+    if !store.set_user_enabled(email, enabled).await? {
+        bail!("user not found");
+    }
+    Ok(())
 }
 
 impl Server {
@@ -162,16 +168,14 @@ impl Server {
         {
             bail!("at least one allowed company email is required");
         }
-        vault::users(&config.state)?;
-        vault::machines(&config.state)?;
-        // The engine holds the process lock: one server per state directory.
-        let engine = Engine::open_at(&config.state, &config.key, config.endpoints)?;
+        let store = open_store(&config.store, &config.key).await?;
+        let engine = Engine::with_store(store, &config.key, config.endpoints)?;
         let sso = match config.sso {
             Some(sso) => Some(enrollment::Sso::load(&sso.config, &sso.public_url).await?),
             None => None,
         };
         Ok(Arc::new(Self {
-            state: config.state,
+            key: config.key,
             engine: Arc::new(engine),
             sso,
             allowed: config
@@ -182,7 +186,17 @@ impl Server {
             metrics_token_hash: config.metrics_token_hash,
             failures: StdMutex::new(BTreeMap::new()),
             work: Arc::new(Semaphore::new(64)),
+            draining: AtomicBool::new(false),
         }))
+    }
+    pub fn store(&self) -> &Store {
+        self.engine.store()
+    }
+    pub(super) fn seal<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>> {
+        vault::encrypt(&self.key, &serde_json::to_vec(value)?)
+    }
+    pub(super) fn unseal<T: serde::de::DeserializeOwned>(&self, bytes: &[u8]) -> Result<T> {
+        Ok(serde_json::from_slice(&vault::decrypt(&self.key, bytes)?)?)
     }
     pub(super) fn error(&self, status: StatusCode, reason: &'static str) -> HttpError {
         self.record_failure(status, reason);
@@ -204,20 +218,24 @@ impl Server {
     pub(super) fn allowed(&self, email: &str) -> bool {
         self.allowed.iter().any(|a| a.eq_ignore_ascii_case(email))
     }
-    fn authorize(&self, headers: &HeaderMap) -> Result<vault::Machine, HttpError> {
+    async fn authorize(&self, headers: &HeaderMap) -> Result<Machine, HttpError> {
         let bearer = headers
             .get("authorization")
             .and_then(|h| h.to_str().ok())
             .and_then(|h| h.strip_prefix("Bearer "))
             .ok_or_else(|| self.error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
         let unavailable = |_| self.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable");
-        let hash = vault::digest(bearer.as_bytes());
-        let machine = vault::machines(&self.state)
+        let machine = self
+            .store()
+            .machine_by_token(&vault::digest(bearer.as_bytes()))
+            .await
             .map_err(unavailable)?
-            .into_iter()
-            .find(|m| m.token_hash == hash && !m.revoked)
+            .filter(|m| !m.revoked)
             .ok_or_else(|| self.error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
-        let user = vault::users(&self.state)
+        let user = self
+            .store()
+            .users()
+            .await
             .map_err(unavailable)?
             .into_iter()
             .find(|u| u.id == machine.user && u.enabled)
@@ -230,13 +248,18 @@ impl Server {
     fn engine_error(&self, error: &anyhow::Error, fallback: &'static str) -> HttpError {
         if error.downcast_ref::<Gone>().is_some() {
             self.error(StatusCode::GONE, "account_deleted")
+        } else if error.downcast_ref::<RefreshInProgress>().is_some() {
+            self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress")
+        } else if error.downcast_ref::<NotFound>().is_some() {
+            self.error(StatusCode::NOT_FOUND, "account_not_found")
         } else {
             self.error(StatusCode::SERVICE_UNAVAILABLE, fallback)
         }
     }
-    fn audit(&self, event: &audit::Event) -> Result<(), HttpError> {
+    async fn audit(&self, event: &audit::Event<'_>) -> Result<(), HttpError> {
         self.engine
             .audit(event)
+            .await
             .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable"))
     }
     /// Run engine work on its own task so a dropped request cannot cancel a refresh midway.
@@ -257,6 +280,10 @@ impl Server {
         .await
         .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))
     }
+    /// Wait until every running engine task has finished.
+    async fn drain(&self) {
+        let _all = self.work.acquire_many(64).await;
+    }
 }
 
 type Shared = State<Arc<Server>>;
@@ -271,12 +298,15 @@ fn body<T>(server: &Server, body: Body<T>) -> Result<T, HttpError> {
 }
 
 async fn me(State(server): Shared, headers: HeaderMap) -> Result<Response, HttpError> {
-    let machine = server.authorize(&headers)?;
+    let machine = server.authorize(&headers).await?;
     Ok(private(json!({"id": machine.user, "machine": machine.id})))
 }
 async fn machines(State(server): Shared, headers: HeaderMap) -> Result<Response, HttpError> {
-    let current = server.authorize(&headers)?;
-    let machines = vault::machines(&server.state)
+    let current = server.authorize(&headers).await?;
+    let machines = server
+        .store()
+        .machines()
+        .await
         .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
     Ok(private(
         machines
@@ -296,20 +326,15 @@ async fn revoke_machine(
     headers: HeaderMap,
     input: Body<RevokeMachine>,
 ) -> Result<StatusCode, HttpError> {
-    let current = server.authorize(&headers)?;
+    let current = server.authorize(&headers).await?;
     let input = body(&server, input)?;
+    if !server
+        .store()
+        .revoke_machine(&input.id, Some(&current.user))
+        .await
+        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
     {
-        let _lock = vault::registry_lock(&server.state, "registry.lock")
-            .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "registry_busy"))?;
-        let mut machines = vault::machines(&server.state)
-            .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
-        machines
-            .iter_mut()
-            .find(|m| m.id == input.id && m.user == current.user)
-            .ok_or_else(|| server.error(StatusCode::NOT_FOUND, "machine_not_found"))?
-            .revoked = true;
-        vault::save_machines(&server.state, &machines)
-            .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+        return Err(server.error(StatusCode::NOT_FOUND, "machine_not_found"));
     }
     server.audit(&audit::Event {
         operation: "revoke",
@@ -318,20 +343,26 @@ async fn revoke_machine(
         result: "ok",
         rotated: None,
         target: Some(&input.id),
-    })?;
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn accounts(State(server): Shared, headers: HeaderMap) -> Result<Response, HttpError> {
-    let machine = server.authorize(&headers)?;
-    Ok(private(server.engine.accounts(&machine.user).await))
+    let machine = server.authorize(&headers).await?;
+    let accounts = server
+        .engine
+        .accounts(&machine.user)
+        .await
+        .map_err(|e| server.engine_error(&e, "registry_unavailable"))?;
+    Ok(private(accounts))
 }
 async fn delete_account(
     State(server): Shared,
     headers: HeaderMap,
     UrlPath(id): UrlPath<String>,
 ) -> Result<StatusCode, HttpError> {
-    let machine = server.authorize(&headers)?;
+    let machine = server.authorize(&headers).await?;
     server
         .engine
         .remove(&machine.user, &machine.id, &id)
@@ -360,7 +391,7 @@ async fn token(
     headers: HeaderMap,
     input: Body<Token>,
 ) -> Result<Response, HttpError> {
-    let machine = server.authorize(&headers)?;
+    let machine = server.authorize(&headers).await?;
     let input = body(&server, input)?;
     let engine = server.engine.clone();
     let (user, machine_id) = (machine.user.clone(), machine.id.clone());
@@ -379,7 +410,7 @@ async fn token(
         .await?
         .map_err(|e| server.engine_error(&e, "account_unavailable_or_login_required"))?;
     // A machine revoked while the refresh ran gets nothing.
-    let authorized = server.authorize(&headers);
+    let authorized = server.authorize(&headers).await;
     server.audit(&audit::Event {
         operation: "issue",
         machine: &machine.id,
@@ -391,7 +422,8 @@ async fn token(
         },
         rotated: None,
         target: None,
-    })?;
+    })
+    .await?;
     authorized?;
     Ok(private(access))
 }
@@ -404,12 +436,12 @@ struct Migration {
     grant: engine::Grant,
     exclusive_owner: bool,
 }
-async fn migrate(
+async fn migrate_account(
     State(server): Shared,
     headers: HeaderMap,
     input: Body<Migration>,
 ) -> Result<Response, HttpError> {
-    let machine = server.authorize(&headers)?;
+    let machine = server.authorize(&headers).await?;
     let input = body(&server, input)?;
     if !input.exclusive_owner {
         return Err(server.error(StatusCode::CONFLICT, "exclusive_owner_required"));
@@ -430,7 +462,7 @@ async fn migrate(
         })
         .await?
         .map_err(|_| server.error(StatusCode::CONFLICT, "admission_refused_reconcile_receipt"))?;
-    server.authorize(&headers)?;
+    server.authorize(&headers).await?;
     Ok(private(receipt))
 }
 #[derive(Deserialize)]
@@ -442,7 +474,7 @@ async fn receipt(
     headers: HeaderMap,
     Query(input): Query<ReceiptQuery>,
 ) -> Result<Response, HttpError> {
-    let machine = server.authorize(&headers)?;
+    let machine = server.authorize(&headers).await?;
     let receipt = server
         .engine
         .receipt(&machine.user, &input.migration_id)
@@ -463,7 +495,7 @@ async fn usage(
     headers: HeaderMap,
     Query(input): Query<UsageQuery>,
 ) -> Result<Response, HttpError> {
-    let machine = server.authorize(&headers)?;
+    let machine = server.authorize(&headers).await?;
     let engine = server.engine.clone();
     let result = server
         .run(async move {
@@ -476,7 +508,7 @@ async fn usage(
     if let Some(reason) = result.failure {
         server.record_failure(StatusCode::SERVICE_UNAVAILABLE, reason);
     }
-    server.authorize(&headers)?;
+    server.authorize(&headers).await?;
     Ok(private(result))
 }
 
@@ -492,7 +524,7 @@ async fn login_start(
     headers: HeaderMap,
     input: Body<LoginStart>,
 ) -> Result<Response, HttpError> {
-    let machine = server.authorize(&headers)?;
+    let machine = server.authorize(&headers).await?;
     let input = body(&server, input)?;
     let login = server
         .engine
@@ -512,7 +544,7 @@ async fn login_complete(
     headers: HeaderMap,
     input: Body<LoginComplete>,
 ) -> Result<Response, HttpError> {
-    let machine = server.authorize(&headers)?;
+    let machine = server.authorize(&headers).await?;
     let input = body(&server, input)?;
     let engine = server.engine.clone();
     let result = server
@@ -523,7 +555,7 @@ async fn login_complete(
         })
         .await?
         .map_err(|_| server.error(StatusCode::CONFLICT, "login_incomplete_grant_retained"))?;
-    server.authorize(&headers)?;
+    server.authorize(&headers).await?;
     Ok(private(result))
 }
 
@@ -531,7 +563,7 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 async fn ready(State(server): Shared) -> StatusCode {
-    if vault::users(&server.state).is_ok() && vault::machines(&server.state).is_ok() {
+    if !server.draining.load(Ordering::Acquire) && server.store().ready().await.is_ok() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -548,7 +580,7 @@ async fn metrics(State(server): Shared, headers: HeaderMap) -> Result<Response, 
             return Err(server.error(StatusCode::UNAUTHORIZED, "metrics_unauthorized"));
         }
     } else {
-        server.authorize(&headers)?;
+        server.authorize(&headers).await?;
     }
     let output: String = server
         .failures
@@ -582,11 +614,12 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/v2/anthropic/usage", get(usage))
         .route("/v2/anthropic/login/start", post(login_start))
         .route("/v2/anthropic/login/complete", post(login_complete))
-        .route("/v2/anthropic/migrations", post(migrate).get(receipt));
+        .route("/v2/anthropic/migrations", post(migrate_account).get(receipt));
     enrollment::routes(routes).with_state(server)
 }
 
-/// Serve until SIGTERM or Ctrl-C. A network listener needs an HTTPS public origin and company SSO.
+/// Serve until SIGTERM or Ctrl-C. A network listener needs an HTTPS public origin and
+/// company SSO.
 pub async fn serve(config: Config, listen: std::net::SocketAddr) -> Result<()> {
     let public_url = config.sso.as_ref().map(|s| s.public_url.clone());
     if !listen.ip().is_loopback() {
@@ -603,27 +636,33 @@ pub async fn serve(config: Config, listen: std::net::SocketAddr) -> Result<()> {
         "{}",
         json!({"operation":"serve","stage":"listening","address":listener.local_addr()?.to_string()})
     );
-    axum::serve(listener, router(server))
-        .with_graceful_shutdown(async {
-            let mut term =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("SIGTERM handler");
-            tokio::select! {
-                _ = term.recv() => {}
-                _ = tokio::signal::ctrl_c() => {}
-            }
-        })
-        .await?;
-    Ok(())
+    serve_until(server, listener, async {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler");
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    })
+    .await
 }
 
-pub fn set_user(state: &Path, email: &str, enabled: bool) -> Result<()> {
-    let _lock = vault::registry_lock(state, "registry.lock")?;
-    let mut users = vault::users(state)?;
-    let user = users
-        .iter_mut()
-        .find(|u| u.email.eq_ignore_ascii_case(email))
-        .context("user not found")?;
-    user.enabled = enabled;
-    vault::save_users(state, &users)
+/// Serve until `stop` resolves, then drain: readiness fails, new connections stop, and
+/// in-flight requests and engine work finish and persist before this returns. Each refresh
+/// releases its lease when it finishes.
+pub async fn serve_until(
+    server: Arc<Server>,
+    listener: tokio::net::TcpListener,
+    stop: impl Future<Output = ()> + Send + 'static,
+) -> Result<()> {
+    let draining = server.clone();
+    axum::serve(listener, router(server.clone()))
+        .with_graceful_shutdown(async move {
+            stop.await;
+            draining.draining.store(true, Ordering::Release);
+            eprintln!("{}", json!({"operation":"serve","stage":"draining"}));
+        })
+        .await?;
+    server.drain().await;
+    Ok(())
 }

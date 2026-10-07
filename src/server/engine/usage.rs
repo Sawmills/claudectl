@@ -7,58 +7,56 @@ pub struct Usage {
     pub next_retry_at: i64,
     pub stale: bool,
     pub error: Option<String>,
-    /// Set only on the response to a fresh attempt that failed; never cached.
+    /// Set only on the response to a fresh attempt that failed; never stored.
     #[serde(skip)]
     pub failure: Option<&'static str>,
 }
+/// Provider throttling shared by every account and replica.
 #[derive(Default, Serialize, Deserialize)]
-pub(super) struct UsageState {
+struct Throttle {
     last_request: i64,
     cooldown_until: i64,
     failures: u32,
-    accounts: BTreeMap<String, Usage>,
 }
-impl UsageState {
-    /// Drop a deleted account's cached usage, so a new account under the alias starts empty.
-    pub(super) fn forget(&mut self, state: &Path, id: &str) -> Result<()> {
-        if self.accounts.remove(id).is_some() {
-            store::atomic_write(&state.join("usage.json"), &serde_json::to_vec(&*self)?)?;
-        }
-        Ok(())
-    }
-}
+const THROTTLE: &str = "__throttle";
+
 impl Engine {
-    /// A cached read never acquires credentials or contacts the provider.
+    async fn stored<T: serde::de::DeserializeOwned + Default>(&self, id: &str) -> Result<T> {
+        match self.store.usage(id).await? {
+            Some(sealed) => self.unseal(&sealed),
+            None => Ok(T::default()),
+        }
+    }
+    /// A cached read never contacts the provider. A fresh read uses the current access token
+    /// and never refreshes: without a usable token it reports `login_required`.
     pub async fn usage(&self, user: &str, id: &str, cached: bool) -> Result<Usage> {
-        self.selected(user, id).await?;
-        let mut state = self.usage_state.lock().await;
-        let mut result = state.accounts.get(id).cloned().unwrap_or_default();
+        let loaded = self.selected(user, id).await?;
+        let _poll = self.usage_poll.lock().await;
+        let mut throttle: Throttle = self.stored(THROTTLE).await?;
+        let mut result: Usage = self.stored(id).await?;
         result.stale = result.data.is_none()
             || result.error.is_some()
             || now() >= result.next_retry_at
             || result.observed_at.is_some_and(|t| t > now() + USABLE);
-        if cached || now() < result.next_retry_at || now() < state.cooldown_until {
-            result.next_retry_at = result.next_retry_at.max(state.cooldown_until);
+        if cached || now() < result.next_retry_at || now() < throttle.cooldown_until {
+            result.next_retry_at = result.next_retry_at.max(throttle.cooldown_until);
             return Ok(result);
         }
-        let access = match self.acquire(user, id, None).await {
-            Ok(access) => access,
-            Err(_) => {
-                result.error = Some("login_required".into());
-                result.stale = true;
-                result.failure = Some("usage_login_required");
-                return Ok(result);
-            }
-        };
-        let wait = (state.last_request + 1000 - now()).max(0) as u64;
+        if loaded.record.phase != Phase::Ready || loaded.record.grant.expires_at <= now() {
+            result.error = Some("login_required".into());
+            result.stale = true;
+            result.failure = Some("usage_login_required");
+            return Ok(result);
+        }
+        let wait = (throttle.last_request + 1000 - now()).max(0) as u64;
         if wait > 0 {
             tokio::time::sleep(Duration::from_millis(wait)).await;
         }
-        state.last_request = now();
+        throttle.last_request = now();
         let response = self
             .http
             .get(format!("{}/api/oauth/usage", self.endpoints.api))
-            .bearer_auth(&access.access_token)
+            .bearer_auth(&loaded.record.grant.access_token)
             .header("anthropic-beta", BETA)
             .send()
             .await;
@@ -67,17 +65,14 @@ impl Engine {
         match response {
             Ok(response) if response.status().is_success() => {
                 match response.json::<Value>().await {
-                    Ok(value) if value.is_object() => {
+                    Ok(Value::Object(value)) => {
                         let data: serde_json::Map<String, Value> = value
-                            .as_object()
-                            .unwrap()
-                            .iter()
+                            .into_iter()
                             .filter(|(k, _)| {
                                 k.as_str() == "five_hour"
                                     || k.starts_with("seven_day")
                                     || matches!(k.as_str(), "limits" | "extra_usage")
                             })
-                            .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
                         for window in ["five_hour", "seven_day"] {
                             if let Some(reset) = data
@@ -96,7 +91,7 @@ impl Engine {
                         result.observed_at = Some(now());
                         result.error = None;
                         result.stale = false;
-                        state.failures = 0;
+                        throttle.failures = 0;
                     }
                     _ => result.error = Some("invalid_usage".into()),
                 }
@@ -113,9 +108,10 @@ impl Engine {
                     .into(),
                 );
                 if status == 429 {
-                    state.failures = state.failures.saturating_add(1);
-                    let delay = (300_000_i64 * (1_i64 << state.failures.saturating_sub(1).min(4)))
-                        .min(3_600_000);
+                    throttle.failures = throttle.failures.saturating_add(1);
+                    let delay = (300_000_i64
+                        * (1_i64 << throttle.failures.saturating_sub(1).min(4)))
+                    .min(3_600_000);
                     let retry = response
                         .headers()
                         .get("retry-after")
@@ -131,26 +127,18 @@ impl Engine {
                                 })
                         })
                         .unwrap_or(0);
-                    state.cooldown_until = now().saturating_add(delay.max(retry));
-                    result.next_retry_at = state.cooldown_until;
+                    throttle.cooldown_until = now().saturating_add(delay.max(retry));
+                    result.next_retry_at = throttle.cooldown_until;
                 }
             }
             Err(_) => result.error = Some("usage_unavailable".into()),
         }
-        state.accounts.insert(
-            id.into(),
-            Usage {
-                failure: None,
-                ..result.clone()
-            },
-        );
+        self.store.put_usage(THROTTLE, &self.seal(&throttle)?).await?;
+        // A delete in the meantime removed the account; put_usage then stores nothing.
+        self.store.put_usage(id, &self.seal(&result)?).await?;
         if result.error.is_some() {
             result.failure = Some("usage_failed");
         }
-        store::atomic_write(
-            &self.state.join("usage.json"),
-            &serde_json::to_vec(&*state)?,
-        )?;
         Ok(result)
     }
 }

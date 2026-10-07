@@ -1,6 +1,8 @@
-//! Company OIDC sign-in around an application device-enrollment flow.
+//! Company OIDC sign-in around a machine device-code flow. Every step's state lives in the
+//! store and is consumed once, so start, poll, callback, and approve may reach any replica.
 use super::{
     app::{self, HttpError, Server},
+    store::EnrollmentRow,
     vault,
 };
 use anyhow::{Result, bail};
@@ -15,21 +17,59 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use openidconnect::{
     AccessTokenHash, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
     OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
-    core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
+    core::{CoreAuthenticationFlow, CoreProviderMetadata},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeMap,
-    path::Path,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
-
+use std::{path::Path, sync::Arc, time::Duration};
 use vault::secret;
+
+// Keep provider extension claims inside the library's signature, issuer, and nonce checks.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CompanyClaims {
+    #[serde(default)]
+    hd: Option<String>,
+}
+impl openidconnect::AdditionalClaims for CompanyClaims {}
+type CompanyTokenResponse = openidconnect::StandardTokenResponse<
+    openidconnect::IdTokenFields<
+        CompanyClaims,
+        openidconnect::EmptyExtraTokenFields,
+        openidconnect::core::CoreGenderClaim,
+        openidconnect::core::CoreJweContentEncryptionAlgorithm,
+        openidconnect::core::CoreJwsSigningAlgorithm,
+    >,
+    openidconnect::core::CoreTokenType,
+>;
+type CompanyClient = openidconnect::Client<
+    CompanyClaims,
+    openidconnect::core::CoreAuthDisplay,
+    openidconnect::core::CoreGenderClaim,
+    openidconnect::core::CoreJweContentEncryptionAlgorithm,
+    openidconnect::core::CoreJsonWebKey,
+    openidconnect::core::CoreAuthPrompt,
+    openidconnect::StandardErrorResponse<openidconnect::core::CoreErrorResponseType>,
+    CompanyTokenResponse,
+    openidconnect::core::CoreTokenIntrospectionResponse,
+    openidconnect::core::CoreRevocableToken,
+    openidconnect::core::CoreRevocationErrorResponse,
+    openidconnect::EndpointSet,
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointMaybeSet,
+    openidconnect::EndpointMaybeSet,
+>;
+const GOOGLE_ISSUER: &str = "https://accounts.google.com";
+const TTL_MS: i64 = 300_000;
+
 type Shared = State<Arc<Server>>;
-const TTL: Duration = Duration::from_secs(300);
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Configuration {
@@ -37,37 +77,43 @@ struct Configuration {
     client_id: String,
     client_secret_file: std::path::PathBuf,
     allowed_domains: Vec<String>,
+    /// Google Workspace `hd` values to require. Defaults to `allowed_domains` for Google.
+    #[serde(default)]
+    allowed_hosted_domains: Option<Vec<String>>,
 }
-struct Pending {
+impl Configuration {
+    fn hosted_domains(&self) -> Option<&[String]> {
+        self.allowed_hosted_domains
+            .as_deref()
+            .or_else(|| (self.issuer == GOOGLE_ISSUER).then_some(self.allowed_domains.as_slice()))
+    }
+}
+/// A machine waiting for approval; `grant` is set once a person approves it.
+#[derive(Serialize, Deserialize)]
+struct Device {
     name: String,
-    user_code: String,
-    created: Instant,
-    last_poll: Option<Instant>,
+    last_poll: Option<i64>,
     grant: Option<String>,
 }
-struct Login {
-    device_hash: String,
-    nonce: Nonce,
-    verifier: PkceCodeVerifier,
-    created: Instant,
+/// A browser sign-in in progress for one device.
+#[derive(Serialize, Deserialize)]
+struct SsoLogin {
+    device: String,
+    nonce: String,
+    verifier: String,
 }
+/// A signed-in person who may approve one device.
+#[derive(Serialize, Deserialize)]
 struct Approval {
-    device_hash: String,
+    device: String,
     user: String,
     email: String,
-    created: Instant,
 }
-#[derive(Default)]
-struct Flows {
-    devices: BTreeMap<String, Pending>,
-    logins: BTreeMap<String, Login>,
-    approvals: BTreeMap<String, Approval>,
-}
+
 pub struct Sso {
     config: Configuration,
     public_url: String,
     http: reqwest::Client,
-    flows: Mutex<Flows>,
     client_secret: String,
 }
 impl Sso {
@@ -89,7 +135,6 @@ impl Sso {
         {
             bail!("SSO issuer must use HTTPS");
         }
-        crate::central::origin(public_url)?;
         let client_secret = String::from_utf8(vault::private_read(&config.client_secret_file)?)?;
         if client_secret.trim().is_empty() {
             bail!("SSO client secret is empty");
@@ -103,7 +148,6 @@ impl Sso {
             config,
             public_url: public_url.trim_end_matches('/').into(),
             http,
-            flows: Mutex::new(Flows::default()),
             client_secret,
         };
         result.metadata().await?;
@@ -126,10 +170,13 @@ impl Sso {
         }
         Ok(metadata)
     }
-    fn cleanup(flows: &mut Flows) {
-        flows.devices.retain(|_, d| d.created.elapsed() < TTL);
-        flows.logins.retain(|_, d| d.created.elapsed() < TTL);
-        flows.approvals.retain(|_, d| d.created.elapsed() < TTL);
+    async fn client(&self) -> Result<CompanyClient> {
+        Ok(CompanyClient::from_provider_metadata(
+            self.metadata().await?,
+            ClientId::new(self.config.client_id.clone()),
+            Some(ClientSecret::new(self.client_secret.trim().into())),
+        )
+        .set_redirect_uri(RedirectUrl::new(format!("{}/auth/callback", self.public_url))?))
     }
 }
 fn sso(server: &Server) -> Result<&Sso, HttpError> {
@@ -165,6 +212,20 @@ fn escape(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
+impl Server {
+    fn seal_row<T: Serialize>(&self, value: &T, lookup: Option<String>) -> Result<EnrollmentRow, HttpError> {
+        Ok(EnrollmentRow {
+            lookup,
+            sealed: self.seal(value).map_err(|_| self.unavailable())?,
+            expires_at: now() + TTL_MS,
+            consumed: false,
+        })
+    }
+    fn unavailable(&self) -> HttpError {
+        self.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable")
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Start {
@@ -204,30 +265,25 @@ async fn start(State(server): Shared, Json(input): Json<Start>) -> Result<Respon
     {
         return Err(server.error(StatusCode::BAD_REQUEST, "provider_not_enabled"));
     }
-    let mut flows = sso.flows.lock().expect("enrollment lock");
-    Sso::cleanup(&mut flows);
-    if flows.devices.len() >= 1024 {
-        return Err(server.error(StatusCode::TOO_MANY_REQUESTS, "enrollment_capacity"));
-    }
     let device_code = secret();
     let user_code = secret()[..16].to_uppercase();
-    let verification_url = format!("{}/enroll?code={user_code}", sso.public_url);
-    flows.devices.insert(
-        vault::digest(device_code.as_bytes()),
-        Pending {
-            name: input.name,
-            user_code: user_code.clone(),
-            created: Instant::now(),
-            last_poll: None,
-            grant: None,
-        },
-    );
+    let device = Device {
+        name: input.name,
+        last_poll: None,
+        grant: None,
+    };
+    let row = server.seal_row(&device, Some(user_code.clone()))?;
+    server
+        .store()
+        .put_enrollment("device", &vault::digest(device_code.as_bytes()), &row)
+        .await
+        .map_err(|_| server.unavailable())?;
     Ok((
         [("cache-control", "no-store")],
         Json(Challenge {
+            verification_url: format!("{}/enroll?code={user_code}", sso.public_url),
             device_code,
             user_code,
-            verification_url,
             expires_in: 300,
             interval: 3,
         }),
@@ -235,25 +291,38 @@ async fn start(State(server): Shared, Json(input): Json<Start>) -> Result<Respon
         .into_response())
 }
 async fn poll(State(server): Shared, Json(input): Json<Poll>) -> Result<Response, HttpError> {
-    let sso = sso(&server)?;
-    let mut flows = sso.flows.lock().expect("enrollment lock");
-    Sso::cleanup(&mut flows);
-    let hash = vault::digest(input.device_code.as_bytes());
-    let device = flows
-        .devices
-        .get_mut(&hash)
+    sso(&server)?;
+    let key = vault::digest(input.device_code.as_bytes());
+    let store = server.store();
+    let row = store
+        .enrollment("device", &key, now())
+        .await
+        .map_err(|_| server.unavailable())?
+        .filter(|r| !r.consumed)
         .ok_or_else(|| server.error(StatusCode::GONE, "enrollment_expired"))?;
-    if device
-        .last_poll
-        .is_some_and(|t| t.elapsed() < Duration::from_secs(3))
-    {
+    let mut device: Device = server.unseal(&row.sealed).map_err(|_| server.unavailable())?;
+    if device.last_poll.is_some_and(|t| now() - t < 3_000) {
         return Err(server.error(StatusCode::TOO_MANY_REQUESTS, "slow_down"));
     }
-    device.last_poll = Some(Instant::now());
-    let Some(token) = device.grant.take() else {
+    if device.grant.is_none() {
+        device.last_poll = Some(now());
+        let sealed = server.seal(&device).map_err(|_| server.unavailable())?;
+        store
+            .update_enrollment("device", &key, &sealed)
+            .await
+            .map_err(|_| server.unavailable())?;
         return Ok((StatusCode::ACCEPTED, Json(json!({"status":"pending"}))).into_response());
-    };
-    flows.devices.remove(&hash);
+    }
+    // Hand the machine token out exactly once, whichever replica answers.
+    let row = store
+        .consume_enrollment("device", &key, now())
+        .await
+        .map_err(|_| server.unavailable())?
+        .ok_or_else(|| server.error(StatusCode::GONE, "enrollment_expired"))?;
+    let device: Device = server.unseal(&row.sealed).map_err(|_| server.unavailable())?;
+    let token = device
+        .grant
+        .ok_or_else(|| server.error(StatusCode::GONE, "enrollment_expired"))?;
     Ok((
         [("cache-control", "no-store")],
         Json(Grant {
@@ -268,53 +337,50 @@ struct Verify {
 }
 async fn verify(State(server): Shared, Query(input): Query<Verify>) -> Result<Response, HttpError> {
     let sso = sso(&server)?;
-    let device_hash = {
-        let mut flows = sso.flows.lock().expect("enrollment lock");
-        Sso::cleanup(&mut flows);
-        flows
-            .devices
-            .iter()
-            .find(|(_, d)| d.user_code == input.code && d.grant.is_none())
-            .map(|(k, _)| k.clone())
-            .ok_or_else(|| server.error(StatusCode::GONE, "enrollment_expired"))?
-    };
-    let metadata = sso
-        .metadata()
+    let (device, row) = server
+        .store()
+        .find_enrollment("device", &input.code, now())
+        .await
+        .map_err(|_| server.unavailable())?
+        .ok_or_else(|| server.error(StatusCode::GONE, "enrollment_expired"))?;
+    let pending: Device = server.unseal(&row.sealed).map_err(|_| server.unavailable())?;
+    if pending.grant.is_some() {
+        return Err(server.error(StatusCode::GONE, "enrollment_expired"));
+    }
+    let client = sso
+        .client()
         .await
         .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?;
-    let client = CoreClient::from_provider_metadata(
-        metadata,
-        ClientId::new(sso.config.client_id.clone()),
-        Some(ClientSecret::new(sso.client_secret.trim().into())),
-    )
-    .set_redirect_uri(
-        RedirectUrl::new(format!("{}/auth/callback", sso.public_url))
-            .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?,
-    );
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
-    let (url, state, nonce) = client
+    let mut authorization = client
         .authorize_url(
             CoreAuthenticationFlow::AuthorizationCode,
             CsrfToken::new_random,
             Nonce::new_random,
         )
         .add_scope(Scope::new("email".into()))
-        .set_pkce_challenge(challenge)
-        .url();
-    let mut flows = sso.flows.lock().expect("enrollment lock");
-    Sso::cleanup(&mut flows);
-    if flows.logins.len() >= 1024 {
-        return Err(server.error(StatusCode::TOO_MANY_REQUESTS, "enrollment_capacity"));
+        .set_pkce_challenge(challenge);
+    if let Some(domains) = sso.config.hosted_domains() {
+        // This affects Google's account chooser only. The signed claim is enforced below.
+        let hint = if domains.len() == 1 {
+            domains[0].as_str()
+        } else {
+            "*"
+        };
+        authorization = authorization.add_extra_param("hd", hint);
     }
-    flows.logins.insert(
-        vault::digest(state.secret().as_bytes()),
-        Login {
-            device_hash,
-            nonce,
-            verifier,
-            created: Instant::now(),
-        },
-    );
+    let (url, state, nonce) = authorization.url();
+    let login = SsoLogin {
+        device,
+        nonce: nonce.secret().clone(),
+        verifier: verifier.secret().clone(),
+    };
+    let row = server.seal_row(&login, None)?;
+    server
+        .store()
+        .put_enrollment("sso", &vault::digest(state.secret().as_bytes()), &row)
+        .await
+        .map_err(|_| server.unavailable())?;
     Ok((
         [
             ("cache-control", "no-store"),
@@ -334,62 +400,49 @@ async fn callback(
     Query(input): Query<Callback>,
 ) -> Result<Response, HttpError> {
     let sso = sso(&server)?;
-    let login = {
-        let mut flows = sso.flows.lock().expect("enrollment lock");
-        Sso::cleanup(&mut flows);
-        flows
-            .logins
-            .remove(&vault::digest(input.state.as_bytes()))
-            .ok_or_else(|| server.error(StatusCode::BAD_REQUEST, "invalid_sso_state"))?
-    };
-    let code = input
-        .code
-        .ok_or_else(|| server.error(StatusCode::UNAUTHORIZED, "sso_denied"))?;
-    let metadata = sso
-        .metadata()
+    let denied = || server.error(StatusCode::UNAUTHORIZED, "sso_denied");
+    // The SSO state works once, on any replica.
+    let row = server
+        .store()
+        .consume_enrollment("sso", &vault::digest(input.state.as_bytes()), now())
+        .await
+        .map_err(|_| server.unavailable())?
+        .ok_or_else(|| server.error(StatusCode::BAD_REQUEST, "invalid_sso_state"))?;
+    let login: SsoLogin = server.unseal(&row.sealed).map_err(|_| server.unavailable())?;
+    let code = input.code.ok_or_else(denied)?;
+    let client = sso
+        .client()
         .await
         .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?;
-    let client = CoreClient::from_provider_metadata(
-        metadata,
-        ClientId::new(sso.config.client_id.clone()),
-        Some(ClientSecret::new(sso.client_secret.trim().into())),
-    )
-    .set_redirect_uri(
-        RedirectUrl::new(format!("{}/auth/callback", sso.public_url))
-            .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?,
-    );
     let tokens = client
         .exchange_code(AuthorizationCode::new(code))
         .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?
-        .set_pkce_verifier(login.verifier)
+        .set_pkce_verifier(PkceCodeVerifier::new(login.verifier))
         .request_async(&sso.http)
         .await
-        .map_err(|_| server.error(StatusCode::UNAUTHORIZED, "sso_denied"))?;
+        .map_err(|_| denied())?;
+    // The verifier checks signature, issuer, audience, expiry, and nonce.
     let verifier = client.id_token_verifier();
-    let id = tokens
-        .extra_fields()
-        .id_token()
-        .ok_or_else(|| server.error(StatusCode::UNAUTHORIZED, "sso_denied"))?;
+    let id = tokens.extra_fields().id_token().ok_or_else(denied)?;
     let claims = id
-        .claims(&verifier, &login.nonce)
-        .map_err(|_| server.error(StatusCode::UNAUTHORIZED, "sso_denied"))?;
+        .claims(&verifier, &Nonce::new(login.nonce))
+        .map_err(|_| denied())?;
     if let Some(expected) = claims.access_token_hash() {
         let actual = AccessTokenHash::from_token(
             tokens.access_token(),
-            id.signing_alg()
-                .map_err(|_| server.error(StatusCode::UNAUTHORIZED, "sso_denied"))?,
-            id.signing_key(&verifier)
-                .map_err(|_| server.error(StatusCode::UNAUTHORIZED, "sso_denied"))?,
+            id.signing_alg().map_err(|_| denied())?,
+            id.signing_key(&verifier).map_err(|_| denied())?,
         )
-        .map_err(|_| server.error(StatusCode::UNAUTHORIZED, "sso_denied"))?;
+        .map_err(|_| denied())?;
         if actual != *expected {
-            return Err(server.error(StatusCode::UNAUTHORIZED, "sso_denied"));
+            return Err(denied());
         }
     }
+    let refused = || server.error(StatusCode::FORBIDDEN, "company_identity_required");
     let email = claims
         .email()
         .filter(|_| claims.email_verified() == Some(true))
-        .ok_or_else(|| server.error(StatusCode::FORBIDDEN, "company_identity_required"))?
+        .ok_or_else(refused)?
         .as_str();
     if !email.rsplit_once('@').is_some_and(|(_, domain)| {
         sso.config
@@ -397,48 +450,53 @@ async fn callback(
             .iter()
             .any(|d| d.eq_ignore_ascii_case(domain))
     }) {
-        return Err(server.error(StatusCode::FORBIDDEN, "company_identity_required"));
+        return Err(refused());
     }
-    let user =
-        vault::digest(format!("{}\0{}", sso.config.issuer, claims.subject().as_str()).as_bytes());
+    if let Some(domains) = sso.config.hosted_domains()
+        && !claims
+            .additional_claims()
+            .hd
+            .as_deref()
+            .is_some_and(|hd| domains.iter().any(|d| d.eq_ignore_ascii_case(hd)))
+    {
+        return Err(refused());
+    }
     if !server.allowed(email) {
         return Err(server.error(StatusCode::FORBIDDEN, "user_not_allowed"));
     }
-    if vault::users(&server.state)
-        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
-        .iter()
-        .any(|u| u.id == user && !u.enabled)
-    {
-        return Err(server.error(StatusCode::FORBIDDEN, "user_disabled"));
-    }
-    let mut flows = sso.flows.lock().expect("enrollment lock");
-    Sso::cleanup(&mut flows);
-    let device = flows
-        .devices
-        .get(&login.device_hash)
+    // Users key on (issuer, subject); an email change keeps the same user.
+    let user =
+        vault::digest(format!("{}\0{}", sso.config.issuer, claims.subject().as_str()).as_bytes());
+    let device = server
+        .store()
+        .enrollment("device", &login.device, now())
+        .await
+        .map_err(|_| server.unavailable())?
+        .filter(|r| !r.consumed)
         .ok_or_else(|| server.error(StatusCode::GONE, "enrollment_expired"))?;
-    let name = escape(&device.name);
-    let code = escape(&device.user_code);
+    let lookup = device.lookup.clone().unwrap_or_default();
+    let pending: Device = server.unseal(&device.sealed).map_err(|_| server.unavailable())?;
     let approval = secret();
     let html = format!(
         include_str!("enrollment/approval.html"),
         email = escape(email),
-        name = name,
-        code = code,
+        name = escape(&pending.name),
+        code = escape(&lookup),
         approval = approval,
     );
-    if flows.approvals.len() >= 1024 {
-        return Err(server.error(StatusCode::TOO_MANY_REQUESTS, "enrollment_capacity"));
-    }
-    flows.approvals.insert(
-        vault::digest(approval.as_bytes()),
-        Approval {
-            device_hash: login.device_hash,
+    let row = server.seal_row(
+        &Approval {
+            device: login.device,
             user,
             email: email.into(),
-            created: Instant::now(),
         },
-    );
+        None,
+    )?;
+    server
+        .store()
+        .put_enrollment("approval", &vault::digest(approval.as_bytes()), &row)
+        .await
+        .map_err(|_| server.unavailable())?;
     Ok(page(html))
 }
 #[derive(Deserialize)]
@@ -446,26 +504,45 @@ struct Approve {
     approval: String,
 }
 async fn approve(State(server): Shared, Form(input): Form<Approve>) -> Result<Response, HttpError> {
-    let sso = sso(&server)?;
-    let mut flows = sso.flows.lock().expect("enrollment lock");
-    Sso::cleanup(&mut flows);
-    let approval = flows
-        .approvals
-        .remove(&vault::digest(input.approval.as_bytes()))
+    sso(&server)?;
+    let store = server.store();
+    let row = store
+        .consume_enrollment("approval", &vault::digest(input.approval.as_bytes()), now())
+        .await
+        .map_err(|_| server.unavailable())?
         .ok_or_else(|| server.error(StatusCode::BAD_REQUEST, "invalid_approval"))?;
-    let device = flows
-        .devices
-        .get_mut(&approval.device_hash)
-        .filter(|d| d.grant.is_none())
+    let approval: Approval = server.unseal(&row.sealed).map_err(|_| server.unavailable())?;
+    let device_row = store
+        .enrollment("device", &approval.device, now())
+        .await
+        .map_err(|_| server.unavailable())?
+        .filter(|r| !r.consumed)
         .ok_or_else(|| server.error(StatusCode::GONE, "enrollment_expired"))?;
-    if !app::record_user(&server.state, &approval.user, &approval.email)
-        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
+    let mut device: Device = server
+        .unseal(&device_row.sealed)
+        .map_err(|_| server.unavailable())?;
+    if device.grant.is_some() {
+        return Err(server.error(StatusCode::GONE, "enrollment_expired"));
+    }
+    if !store
+        .record_user(&approval.user, &approval.email)
+        .await
+        .map_err(|_| server.unavailable())?
     {
         return Err(server.error(StatusCode::FORBIDDEN, "user_unavailable"));
     }
-    let (_, token) = app::add_machine(&server.state, &approval.user, &device.name)
+    let (_, token) = app::add_machine(store, &approval.user, &device.name)
+        .await
         .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     device.grant = Some(token);
+    let sealed = server.seal(&device).map_err(|_| server.unavailable())?;
+    if !store
+        .update_enrollment("device", &approval.device, &sealed)
+        .await
+        .map_err(|_| server.unavailable())?
+    {
+        return Err(server.error(StatusCode::GONE, "enrollment_expired"));
+    }
     Ok(page(include_str!("enrollment/connected.html").into()))
 }
 pub(super) fn routes(router: Router<Arc<Server>>) -> Router<Arc<Server>> {

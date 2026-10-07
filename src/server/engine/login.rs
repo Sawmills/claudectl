@@ -1,20 +1,17 @@
 use super::*;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
+use store::FlowRow;
 
 const REDIRECT: &str = "https://console.anthropic.com/oauth/code/callback";
 #[derive(Serialize, Deserialize)]
 struct Flow {
-    user: String,
     machine: String,
-    alias: String,
     verifier: String,
     state: String,
     expires_at: i64,
     expected: Option<Identity>,
-    exchanging: bool,
     /// A delete after this time refuses the flow's admission.
-    #[serde(default)]
     started_at: i64,
 }
 #[derive(Serialize)]
@@ -24,49 +21,6 @@ pub struct Login {
     pub expires_at: i64,
 }
 impl Engine {
-    /// Remove retained login responses whose flow no longer exists.
-    pub(super) fn sweep_orphan_logins(&self) -> Result<()> {
-        let directory = self.state.join("logins");
-        if !directory.try_exists()? {
-            return Ok(());
-        }
-        for entry in std::fs::read_dir(&directory)? {
-            let path = entry?.path();
-            let id = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_suffix("-grant.enc"));
-            if let Some(id) = id
-                && !directory.join(format!("{id}.enc")).try_exists()?
-            {
-                std::fs::remove_file(&path)?;
-            }
-        }
-        store::sync_directory(&directory)
-    }
-    /// Drop every login flow and retained login grant for one alias. A delete calls this so a
-    /// replayed login completion cannot restore the account.
-    pub(super) fn cancel_logins(&self, user: &str, alias: &str) -> Result<()> {
-        let directory = self.state.join("logins");
-        if !directory.try_exists()? {
-            return Ok(());
-        }
-        for entry in std::fs::read_dir(&directory)? {
-            let path = entry?.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let Some(id) = name.strip_suffix(".enc").filter(|n| !n.ends_with("-grant")) else {
-                continue;
-            };
-            let flow: Flow = vault::unseal(&path, &self.key)?;
-            if flow.user == user && flow.alias.eq_ignore_ascii_case(alias) {
-                store::remove_if_present(&directory.join(format!("{id}-grant.enc")))?;
-                store::remove_if_present(&path)?;
-            }
-        }
-        store::sync_directory(&directory)
-    }
     pub async fn start_login(
         &self,
         user: &str,
@@ -74,30 +28,32 @@ impl Engine {
         alias: &str,
         renew: bool,
     ) -> Result<Login> {
-        let alias = store::validate_alias(alias)?;
+        let alias = validate_alias(alias)?;
         let existing = self
             .accounts(user)
-            .await
+            .await?
             .into_iter()
             .find(|a| a.alias.eq_ignore_ascii_case(alias));
         if existing.is_some() != renew {
             bail!("use login renewal for an existing alias, or a new alias for login");
         }
         let flow = Flow {
-            user: user.into(),
             machine: machine.into(),
-            alias: alias.into(),
             verifier: URL_SAFE_NO_PAD.encode(vault::random_bytes()),
             state: revision(),
             expires_at: now() + 300_000,
             expected: existing.map(|a| a.identity),
-            exchanging: false,
             started_at: now(),
         };
         let id = revision();
-        let directory = self.state.join("logins");
-        store::ensure_private_dir(&directory)?;
-        vault::seal(&directory.join(format!("{id}.enc")), &self.key, &flow)?;
+        let row = FlowRow {
+            user: user.into(),
+            alias: alias.into(),
+            sealed: self.seal(&flow)?,
+            exchanging: false,
+            retained: None,
+        };
+        self.store.put_flow(&id, &row).await?;
         let mut url = reqwest::Url::parse("https://claude.ai/oauth/authorize")?;
         url.query_pairs_mut().extend_pairs([
             ("code", "true"),
@@ -118,6 +74,8 @@ impl Engine {
             expires_at: flow.expires_at,
         })
     }
+    /// Finish a login. A retry verifies a kept response; an uncertain exchange is never
+    /// replayed. A delete removes the flow, and a response that arrives later is dropped.
     pub async fn finish_login(
         &self,
         user: &str,
@@ -131,26 +89,21 @@ impl Engine {
         if let Some(receipt) = self.receipt(user, id).await? {
             return Ok(receipt);
         }
-        let path = self.state.join("logins").join(format!("{id}.enc"));
-        #[derive(Serialize, Deserialize)]
-        struct Retained {
-            received_at: i64,
-            body: Vec<u8>,
+        let row = self
+            .store
+            .flow(id)
+            .await?
+            .context("login not found, finished, or cancelled; start a new login")?;
+        let flow: Flow = self.unseal(&row.sealed)?;
+        if row.user != user || flow.machine != machine {
+            bail!("login does not belong to this user and machine");
         }
-        let retained = self.state.join("logins").join(format!("{id}-grant.enc"));
-        // A retry can verify a retained result, but can never replay an uncertain exchange.
-        let (flow, resume): (Flow, bool) = {
-            let _lock = self.admissions.lock().await;
-            let mut flow: Flow = vault::unseal(&path, &self.key)?;
-            if flow.user != user || flow.machine != machine {
-                bail!("login does not belong to this user and machine");
+        let retained: Retained = match &row.retained {
+            Some(sealed) => self.unseal(sealed)?,
+            None if row.exchanging => {
+                bail!("login exchange outcome uncertain; start a new login")
             }
-            let resume = flow.exchanging;
-            if resume {
-                if !retained.try_exists()? {
-                    bail!("login exchange outcome uncertain; start a new login");
-                }
-            } else {
+            None => {
                 if flow.expires_at < now() {
                     bail!("login expired");
                 }
@@ -161,23 +114,20 @@ impl Engine {
                 if code.is_empty() || state != flow.state {
                     bail!("login state mismatch");
                 }
-                flow.exchanging = true;
-                vault::seal(&path, &self.key, &flow)?;
-            }
-            (flow, resume)
-        };
-        let saved: Retained =
-            if resume {
-                vault::unseal(&retained, &self.key)?
-            } else {
-                let (code, _) = pasted
-                    .trim()
-                    .split_once('#')
-                    .context("invalid login response")?;
-                let response = self.http.post(&self.endpoints.token).json(&json!({
-                "grant_type":"authorization_code", "code":code, "state":flow.state,
-                "client_id":CLIENT_ID, "redirect_uri":REDIRECT, "code_verifier":flow.verifier
-            })).send().await.map_err(|_| anyhow::anyhow!("login exchange outcome uncertain"))?;
+                // Exactly one exchange per flow, across replicas.
+                if !self.store.start_exchange(id).await? {
+                    bail!("login exchange already started or the login was cancelled");
+                }
+                let response = self
+                    .http
+                    .post(&self.endpoints.token)
+                    .json(&json!({
+                        "grant_type":"authorization_code", "code":code, "state":flow.state,
+                        "client_id":CLIENT_ID, "redirect_uri":REDIRECT, "code_verifier":flow.verifier
+                    }))
+                    .send()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("login exchange outcome uncertain"))?;
                 if !response.status().is_success() {
                     bail!("Claude rejected the login exchange");
                 }
@@ -185,13 +135,16 @@ impl Engine {
                     .bytes()
                     .await
                     .map_err(|_| anyhow::anyhow!("login response incomplete"))?;
-                let saved = Retained {
+                let retained = Retained {
                     received_at: now(),
                     body: bytes.to_vec(),
                 };
-                vault::seal(&retained, &self.key, &saved)?;
-                saved
-            };
+                if !self.store.retain(id, &self.seal(&retained)?).await? {
+                    bail!("the login was cancelled by a delete; the response was not kept");
+                }
+                retained
+            }
+        };
         #[derive(Deserialize)]
         struct Response {
             access_token: String,
@@ -199,12 +152,12 @@ impl Engine {
             expires_in: i64,
             scope: String,
         }
-        let token: Response = serde_json::from_slice(&saved.body)
+        let token: Response = serde_json::from_slice(&retained.body)
             .map_err(|_| anyhow::anyhow!("login response invalid; acquired response retained"))?;
         let expiry = token
             .expires_in
             .checked_mul(1000)
-            .and_then(|t| saved.received_at.checked_add(t))
+            .and_then(|t| retained.received_at.checked_add(t))
             .filter(|_| token.expires_in > 0)
             .context("invalid login expiry; acquired response retained")?;
         let grant = Grant {
@@ -213,37 +166,19 @@ impl Engine {
             expires_at: expiry,
             scopes: token.scope.split_whitespace().map(str::to_owned).collect(),
         };
-        let admitted = self
-            .admit_with(
-                user,
-                &flow.alias,
-                id,
-                grant,
-                flow.expected.as_ref(),
-                Admission {
-                    rotation_pending: false,
-                    started_at: flow.started_at,
-                },
-            )
-            .await;
-        let receipt = match admitted {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                // A delete cancelled this flow while its exchange ran; keep no grant.
-                if !path.try_exists()? {
-                    store::remove_if_present(&retained)?;
-                }
-                return Err(error);
-            }
+        let options = Admission {
+            rotation_pending: false,
+            started_at: flow.started_at,
         };
-        for file in [path, retained] {
-            match std::fs::remove_file(file) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        store::sync_directory(&self.state.join("logins"))?;
-        Ok(receipt)
+        self.admit_with(
+            user,
+            &row.alias,
+            id,
+            grant,
+            flow.expected.as_ref(),
+            options,
+            Some(id),
+        )
+        .await
     }
 }

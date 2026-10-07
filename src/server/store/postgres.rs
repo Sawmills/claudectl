@@ -110,8 +110,11 @@ fn tls() -> Result<tokio_postgres_rustls::MakeRustlsConnect> {
     Ok(tokio_postgres_rustls::MakeRustlsConnect::new(config))
 }
 
-fn alias_key(user: &str, alias: &str) -> String {
-    format!("{user}\0{}", alias.to_ascii_lowercase())
+/// The advisory lock that serializes admission and delete for one user and alias.
+fn alias_lock(user: &str, alias: &str) -> i64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{user}\0{}", alias.to_ascii_lowercase()).as_bytes());
+    i64::from_be_bytes(digest[..8].try_into().expect("eight bytes"))
 }
 
 fn account(row: &Row) -> StoredAccount {
@@ -271,8 +274,8 @@ impl PostgresStore {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
         tx.execute(
-            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-            &[&alias_key(&a.user, &a.alias)],
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&alias_lock(&a.user, &a.alias)],
         )
         .await?;
         let deleted: Option<i64> = tx
@@ -365,8 +368,8 @@ impl PostgresStore {
             return Ok(false);
         };
         tx.execute(
-            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-            &[&alias_key(user, &alias)],
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&alias_lock(user, &alias)],
         )
         .await?;
         tx.execute("DELETE FROM accounts WHERE account_id = $1", &[&id])
@@ -394,17 +397,18 @@ impl PostgresStore {
         tx.commit().await?;
         Ok(true)
     }
-    pub async fn deleted(&self, id: &str, user: &str) -> Result<bool> {
+    pub async fn tombstone(&self, id: &str) -> Result<Option<(String, i64)>> {
         let client = self.pool.get().await?;
         Ok(client
             .query_opt(
-                "SELECT 1 FROM tombstones WHERE account_id = $1 AND user_id = $2",
-                &[&id, &user],
+                "SELECT user_id, deleted_at FROM tombstones WHERE account_id = $1",
+                &[&id],
             )
             .await?
-            .is_some())
+            .map(|r| (r.get(0), r.get(1))))
     }
     pub async fn acquire_lease(&self, id: &str, ttl_ms: i64) -> Result<Option<Lease>> {
+        let taken = std::time::Instant::now();
         let client = self.pool.get().await?;
         let row = client
             .query_opt(
@@ -421,9 +425,11 @@ impl PostgresStore {
             holder: self.holder.clone(),
             epoch: r.get(0),
             remaining_ms: r.get(1),
+            taken,
         }))
     }
     pub async fn renew_lease(&self, lease: &Lease, id: &str, ttl_ms: i64) -> Result<Option<Lease>> {
+        let taken = std::time::Instant::now();
         let client = self.pool.get().await?;
         let row = client
             .query_opt(
@@ -435,6 +441,7 @@ impl PostgresStore {
             .await?;
         Ok(row.map(|r| Lease {
             remaining_ms: r.get(0),
+            taken,
             ..lease.clone()
         }))
     }

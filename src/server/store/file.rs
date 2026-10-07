@@ -21,8 +21,8 @@ struct Tables {
     audit: Vec<Vec<u8>>,
     users: Vec<User>,
     machines: Vec<Machine>,
-    /// (kind, key) -> row
-    enrollment: BTreeMap<(String, String), EnrollmentRow>,
+    /// "kind\u{1f}key" -> row
+    enrollment: BTreeMap<String, EnrollmentRow>,
 }
 
 pub struct FileStore {
@@ -34,6 +34,9 @@ pub struct FileStore {
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+fn slot(kind: &str, key: &str) -> String {
+    format!("{kind}\u{1f}{key}")
 }
 
 impl FileStore {
@@ -180,8 +183,8 @@ impl FileStore {
             (true, true)
         })
     }
-    pub fn deleted(&self, id: &str, user: &str) -> Result<bool> {
-        Ok(self.read(|t| t.tombstones.get(id).is_some_and(|(u, _, _)| u == user)))
+    pub fn tombstone(&self, id: &str) -> Result<Option<(String, i64)>> {
+        Ok(self.read(|t| t.tombstones.get(id).map(|(u, _, at)| (u.clone(), *at))))
     }
     pub fn acquire_lease(&self, id: &str, ttl_ms: i64) -> Result<Option<Lease>> {
         let holder = self.holder().to_owned();
@@ -202,6 +205,7 @@ impl FileStore {
                     holder,
                     epoch,
                     remaining_ms: ttl_ms,
+                    taken: std::time::Instant::now(),
                 }),
                 true,
             )
@@ -221,6 +225,7 @@ impl FileStore {
             (
                 Some(Lease {
                     remaining_ms: ttl_ms,
+                    taken: std::time::Instant::now(),
                     ..lease.clone()
                 }),
                 true,
@@ -353,7 +358,7 @@ impl FileStore {
         let now = now();
         self.write(|t| {
             t.enrollment.retain(|_, r| r.expires_at > now);
-            t.enrollment.insert((kind.into(), key.into()), row.clone());
+            t.enrollment.insert(slot(kind, key), row.clone());
         })
     }
     pub fn find_enrollment(
@@ -365,25 +370,27 @@ impl FileStore {
         Ok(self.read(|t| {
             t.enrollment
                 .iter()
-                .find(|((k, _), r)| {
-                    k == kind
+                .find(|(slot, r)| {
+                    slot.split_once('\u{1f}').is_some_and(|(k, _)| k == kind)
                         && r.lookup.as_deref() == Some(lookup)
                         && !r.consumed
                         && r.expires_at > now
                 })
-                .map(|((_, key), r)| (key.clone(), r.clone()))
+                .and_then(|(slot, r)| {
+                    slot.split_once('\u{1f}').map(|(_, key)| (key.to_owned(), r.clone()))
+                })
         }))
     }
     pub fn enrollment(&self, kind: &str, key: &str, now: i64) -> Result<Option<EnrollmentRow>> {
         Ok(self.read(|t| {
             t.enrollment
-                .get(&(kind.into(), key.into()))
+                .get(&slot(kind, key))
                 .filter(|r| r.expires_at > now)
                 .cloned()
         }))
     }
     pub fn update_enrollment(&self, kind: &str, key: &str, sealed: &[u8]) -> Result<bool> {
-        self.transact(|t| match t.enrollment.get_mut(&(kind.into(), key.into())) {
+        self.transact(|t| match t.enrollment.get_mut(&slot(kind, key)) {
             Some(r) if !r.consumed => {
                 r.sealed = sealed.to_vec();
                 (true, true)
@@ -397,7 +404,7 @@ impl FileStore {
         key: &str,
         now: i64,
     ) -> Result<Option<EnrollmentRow>> {
-        self.transact(|t| match t.enrollment.get_mut(&(kind.into(), key.into())) {
+        self.transact(|t| match t.enrollment.get_mut(&slot(kind, key)) {
             Some(r) if !r.consumed && r.expires_at > now => {
                 let row = r.clone();
                 r.consumed = true;

@@ -28,6 +28,14 @@ pub struct Lease {
     pub epoch: i64,
     /// Milliseconds left by the store's clock when the lease was taken or renewed.
     pub remaining_ms: i64,
+    /// When the request that returned `remaining_ms` started; elapsed time counts against it.
+    pub taken: std::time::Instant,
+}
+impl Lease {
+    /// Milliseconds left now, never more than the store reported.
+    pub fn left_ms(&self) -> i64 {
+        self.remaining_ms - self.taken.elapsed().as_millis() as i64
+    }
 }
 
 /// What a fenced account write requires of the lease.
@@ -150,8 +158,9 @@ impl Store {
     pub async fn delete(&self, id: &str, user: &str, deleted_at: i64) -> Result<bool> {
         dispatch!(self, delete(id, user, deleted_at))
     }
-    pub async fn deleted(&self, id: &str, user: &str) -> Result<bool> {
-        dispatch!(self, deleted(id, user))
+    /// The tombstone of a deleted account: its company user and deletion time.
+    pub async fn tombstone(&self, id: &str) -> Result<Option<(String, i64)>> {
+        dispatch!(self, tombstone(id))
     }
     pub async fn acquire_lease(&self, id: &str, ttl_ms: i64) -> Result<Option<Lease>> {
         dispatch!(self, acquire_lease(id, ttl_ms))
