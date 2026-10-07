@@ -82,6 +82,31 @@ struct Configuration {
     allowed_hosted_domains: Option<Vec<String>>,
 }
 impl Configuration {
+    /// The company email of a verified sign-in, or `None`. The email must be verified and in
+    /// an allowed domain; for Google the ID token's `hd` (Workspace) claim must also match,
+    /// so a personal or External-audience account with a matching address is refused.
+    fn company_email<'a>(
+        &self,
+        email: Option<&'a str>,
+        verified: Option<bool>,
+        hd: Option<&str>,
+    ) -> Option<&'a str> {
+        let email = email.filter(|_| verified == Some(true))?;
+        let (_, domain) = email.rsplit_once('@')?;
+        if !self
+            .allowed_domains
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(domain))
+        {
+            return None;
+        }
+        if let Some(domains) = self.hosted_domains()
+            && !hd.is_some_and(|hd| domains.iter().any(|d| d.eq_ignore_ascii_case(hd)))
+        {
+            return None;
+        }
+        Some(email)
+    }
     fn hosted_domains(&self) -> Option<&[String]> {
         self.allowed_hosted_domains
             .as_deref()
@@ -456,28 +481,14 @@ async fn callback(
         }
     }
     let refused = || server.error(StatusCode::FORBIDDEN, "company_identity_required");
-    let email = claims
-        .email()
-        .filter(|_| claims.email_verified() == Some(true))
-        .ok_or_else(refused)?
-        .as_str();
-    if !email.rsplit_once('@').is_some_and(|(_, domain)| {
-        sso.config
-            .allowed_domains
-            .iter()
-            .any(|d| d.eq_ignore_ascii_case(domain))
-    }) {
-        return Err(refused());
-    }
-    if let Some(domains) = sso.config.hosted_domains()
-        && !claims
-            .additional_claims()
-            .hd
-            .as_deref()
-            .is_some_and(|hd| domains.iter().any(|d| d.eq_ignore_ascii_case(hd)))
-    {
-        return Err(refused());
-    }
+    let email = sso
+        .config
+        .company_email(
+            claims.email().map(|e| e.as_str()),
+            claims.email_verified(),
+            claims.additional_claims().hd.as_deref(),
+        )
+        .ok_or_else(refused)?;
     if !server.allowed(email) {
         return Err(server.error(StatusCode::FORBIDDEN, "user_not_allowed"));
     }
@@ -590,4 +601,51 @@ pub(super) fn routes(router: Router<Arc<Server>>) -> Router<Arc<Server>> {
         .route("/enroll", get(verify))
         .route("/auth/callback", get(callback))
         .route("/auth/approve", post(approve))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn google(hosted: Option<Vec<String>>) -> Configuration {
+        Configuration {
+            issuer: GOOGLE_ISSUER.into(),
+            client_id: "client".into(),
+            client_secret_file: "/dev/null".into(),
+            allowed_domains: vec!["sawmills.ai".into()],
+            allowed_hosted_domains: hosted,
+        }
+    }
+
+    #[test]
+    fn google_sign_in_requires_the_company_hd_claim_not_only_the_email_domain() {
+        for config in [google(None), google(Some(vec!["sawmills.ai".into()]))] {
+            let ok = |hd| config.company_email(Some("amir@sawmills.ai"), Some(true), hd);
+            assert_eq!(ok(Some("sawmills.ai")), Some("amir@sawmills.ai"));
+            assert_eq!(ok(Some("SAWMILLS.AI")), Some("amir@sawmills.ai"));
+            // A company email from an External-audience client without the Workspace claim.
+            assert_eq!(ok(None), None);
+            assert_eq!(ok(Some("example.com")), None);
+            assert_eq!(ok(Some("")), None);
+        }
+    }
+
+    #[test]
+    fn google_sign_in_also_requires_a_verified_company_email() {
+        let config = google(None);
+        let check = |email, verified| config.company_email(email, verified, Some("sawmills.ai"));
+        assert_eq!(check(Some("amir@example.com"), Some(true)), None);
+        assert_eq!(check(Some("amir@sawmills.ai"), Some(false)), None);
+        assert_eq!(check(Some("amir@sawmills.ai"), None), None);
+        assert_eq!(check(None, Some(true)), None);
+    }
+
+    #[test]
+    fn an_empty_hosted_domain_list_refuses_every_google_sign_in() {
+        let config = google(Some(vec![]));
+        assert_eq!(
+            config.company_email(Some("amir@sawmills.ai"), Some(true), Some("sawmills.ai")),
+            None
+        );
+    }
 }
