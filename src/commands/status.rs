@@ -18,6 +18,8 @@ pub struct FetchedUsage {
     pub snapshot: Snapshot,
     pub alias: String,
     pub label: Option<String>,
+    /// `subscriptionType` from the saved credentials, such as "max" or "team".
+    pub plan: Option<String>,
     pub usage: Option<UsageResponse>,
     pub token_expiry_secs: Option<i64>,
     pub is_active: bool,
@@ -63,8 +65,13 @@ impl AccountStatus {
     }
 }
 
-pub fn run(alias: Option<&str>, mode: FetchMode, details: bool) -> Result<()> {
+pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> Result<()> {
     let fetched = fetch_usages(alias, mode)?;
+    if json {
+        let report = status_json(&fetched, chrono::Utc::now().timestamp());
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     if fetched.is_empty() {
         println!("no profiles saved. Use 'claudectl save' or 'claudectl login <alias>'.");
         return Ok(());
@@ -84,6 +91,98 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool) -> Result<()> {
         print_summary(&accounts);
     }
     Ok(())
+}
+
+/// Version of the `status --json` shape.
+pub const STATUS_JSON_VERSION: u32 = 1;
+
+/// How an account is paid for. Only `rate_limited` accounts are ever picked
+/// automatically: `usage_based` has extra usage on, so running past a plan
+/// window bills credits, and `unknown` cannot be proven safe.
+pub fn billing_class(usage: Option<&UsageResponse>, plan: Option<&str>) -> &'static str {
+    let Some(usage) = usage else {
+        return "unknown";
+    };
+    if usage
+        .extra_usage
+        .as_ref()
+        .and_then(|extra| extra.is_enabled)
+        .unwrap_or(false)
+    {
+        return "usage_based";
+    }
+    if plan.is_some() && (usage.five_hour.is_some() || usage.seven_day.is_some()) {
+        "rate_limited"
+    } else {
+        "unknown"
+    }
+}
+
+/// Whether any window, including the model-scoped Opus, Sonnet and Fable
+/// limits, is used up.
+pub fn exhausted(usage: &UsageResponse) -> bool {
+    let windows = [
+        &usage.five_hour,
+        &usage.seven_day,
+        &usage.seven_day_opus,
+        &usage.seven_day_sonnet,
+    ];
+    windows
+        .into_iter()
+        .flatten()
+        .filter_map(|window| window.utilization)
+        .chain(usage.fable_weekly().and_then(|limit| limit.percent))
+        .any(|used| used >= 100.0)
+}
+
+fn window_json(window: Option<&api::UsageWindow>) -> serde_json::Value {
+    match window {
+        Some(window) => serde_json::json!({
+            "used_percent": window.utilization,
+            "resets_at": window.resets_at,
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// The `status --json` document: `{version, accounts: [...]}`, sorted by alias.
+pub fn status_json(fetched: &[FetchedUsage], now: i64) -> serde_json::Value {
+    let mut fetched: Vec<&FetchedUsage> = fetched.iter().collect();
+    fetched.sort_by(|a, b| a.alias.cmp(&b.alias));
+    let accounts: Vec<serde_json::Value> = fetched
+        .into_iter()
+        .map(|f| {
+            let usage = f.usage.as_ref();
+            serde_json::json!({
+                "alias": f.alias,
+                "label": f.label,
+                "active": f.is_active,
+                "plan": f.plan,
+                "billing_class": billing_class(usage, f.plan.as_deref()),
+                "exhausted": usage.map(exhausted),
+                "windows": {
+                    "five_hour": window_json(usage.and_then(|u| u.five_hour.as_ref())),
+                    "seven_day": window_json(usage.and_then(|u| u.seven_day.as_ref())),
+                    "seven_day_opus": window_json(usage.and_then(|u| u.seven_day_opus.as_ref())),
+                    "seven_day_sonnet": window_json(usage.and_then(|u| u.seven_day_sonnet.as_ref())),
+                    "fable_weekly": usage
+                        .and_then(|u| u.fable_weekly())
+                        .map(|limit| serde_json::json!({ "used_percent": limit.percent })),
+                },
+                "extra_usage": usage.and_then(|u| u.extra_usage.as_ref()).map(|extra| {
+                    serde_json::json!({
+                        "enabled": extra.is_enabled,
+                        "used_credits": extra.used_credits,
+                    })
+                }),
+                "token_expires_in_seconds": f.token_expiry_secs,
+                "usage_age_seconds": f.snapshot.fetched_at.map(|at| now.saturating_sub(at).max(0)),
+                "usage_stale": !f.snapshot.is_fresh_at(now),
+                "error": f.error,
+            })
+        })
+        .collect();
+    serde_json::json!({ "version": STATUS_JSON_VERSION, "accounts": accounts })
 }
 
 /// Explicit switching stays local: show only this account's cached data.
@@ -190,6 +289,7 @@ fn fetch_usages_with_refresh(
                 }
             };
             result.token_expiry_secs = creds.claude_ai_oauth.expiry_secs();
+            result.plan = creds.claude_ai_oauth.subscription_type.clone();
             if creds.claude_ai_oauth.access_token.trim().is_empty() {
                 result.error = Some("missing access token; log in again".into());
                 fetched.push(result);
@@ -1394,6 +1494,96 @@ mod tests {
             is_error,
             error_msg: String::new(),
         }
+    }
+
+    fn fetched_json(alias: &str, usage: &str, plan: Option<&str>) -> FetchedUsage {
+        FetchedUsage {
+            alias: alias.into(),
+            plan: plan.map(str::to_string),
+            usage: Some(serde_json::from_str(usage).unwrap()),
+            snapshot: Snapshot {
+                fresh: true,
+                fetched_at: Some(1_000),
+                valid_until: Some(2_000),
+                ..Snapshot::default()
+            },
+            ..FetchedUsage::default()
+        }
+    }
+
+    #[test]
+    fn billing_class_follows_extra_usage_and_plan() {
+        let rate = fetched_json("a", r#"{"five_hour":{"utilization":10}}"#, Some("max"));
+        let billed = fetched_json(
+            "b",
+            r#"{"five_hour":{"utilization":10},"extra_usage":{"is_enabled":true,"used_credits":3}}"#,
+            Some("max"),
+        );
+        let no_plan = fetched_json("c", r#"{"five_hour":{"utilization":10}}"#, None);
+        let class = |f: &FetchedUsage| billing_class(f.usage.as_ref(), f.plan.as_deref());
+        assert_eq!(class(&rate), "rate_limited");
+        assert_eq!(class(&billed), "usage_based");
+        assert_eq!(class(&no_plan), "unknown");
+        assert_eq!(billing_class(None, Some("max")), "unknown");
+    }
+
+    #[test]
+    fn exhausted_counts_model_scoped_and_fable_limits() {
+        let usage = |json: &str| serde_json::from_str::<UsageResponse>(json).unwrap();
+        assert!(!exhausted(&usage(r#"{"five_hour":{"utilization":99.9}}"#)));
+        assert!(exhausted(&usage(
+            r#"{"seven_day_opus":{"utilization":100}}"#
+        )));
+        assert!(exhausted(&usage(
+            r#"{"seven_day_sonnet":{"utilization":100}}"#
+        )));
+        assert!(exhausted(&usage(
+            r#"{"limits":[{"kind":"weekly_scoped","percent":100,"scope":{"model":{"display_name":"Fable"}}}]}"#
+        )));
+    }
+
+    #[test]
+    fn status_json_has_a_stable_versioned_shape() {
+        let mut a = fetched_json(
+            "b-work",
+            r#"{"five_hour":{"utilization":20,"resets_at":"2026-10-07T10:00:00Z"},
+                "seven_day":{"utilization":100},
+                "extra_usage":{"is_enabled":false,"used_credits":0}}"#,
+            Some("team"),
+        );
+        a.label = Some("Team seat".into());
+        a.is_active = true;
+        a.token_expiry_secs = Some(600);
+        let mut failed = FetchedUsage {
+            alias: "a-broken".into(),
+            error: Some("credentials unavailable or invalid".into()),
+            ..FetchedUsage::default()
+        };
+        failed.snapshot.fresh = false;
+        let report = status_json(&[a, failed], 1_500);
+        assert_eq!(report["version"], 1);
+        let accounts = report["accounts"].as_array().unwrap();
+        assert_eq!(accounts[0]["alias"], "a-broken", "sorted by alias");
+        assert_eq!(accounts[0]["billing_class"], "unknown");
+        assert_eq!(accounts[0]["exhausted"], serde_json::Value::Null);
+        assert_eq!(accounts[0]["usage_stale"], true);
+        assert_eq!(accounts[0]["error"], "credentials unavailable or invalid");
+        let b = &accounts[1];
+        assert_eq!(b["label"], "Team seat");
+        assert_eq!(b["active"], true);
+        assert_eq!(b["plan"], "team");
+        assert_eq!(b["billing_class"], "rate_limited");
+        assert_eq!(b["exhausted"], true);
+        assert_eq!(b["windows"]["five_hour"]["used_percent"], 20.0);
+        assert_eq!(
+            b["windows"]["five_hour"]["resets_at"],
+            "2026-10-07T10:00:00Z"
+        );
+        assert_eq!(b["windows"]["seven_day_opus"], serde_json::Value::Null);
+        assert_eq!(b["extra_usage"]["enabled"], false);
+        assert_eq!(b["token_expires_in_seconds"], 600);
+        assert_eq!(b["usage_age_seconds"], 500);
+        assert_eq!(b["usage_stale"], false);
     }
 
     #[test]

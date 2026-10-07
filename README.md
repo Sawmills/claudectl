@@ -69,7 +69,18 @@ claudectl status work-main        # one profile
 claudectl status --cached         # no network requests or token refresh
 claudectl status --refresh        # request fresh data; obey saved cooldowns
 claudectl status --details        # token expiry, old usage, and fetch diagnostics
+claudectl status --json           # machine-readable report (version 1)
 ```
+
+`status --json` prints `{"version": 1, "accounts": [...]}`, sorted by alias. Each
+account has `alias`, `label`, `active`, `plan`, `billing_class`, `exhausted`,
+`windows` (`five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet` with
+`used_percent` and `resets_at`; `fable_weekly` with `used_percent`),
+`extra_usage`, `token_expires_in_seconds`, `usage_age_seconds`, `usage_stale`
+and `error`. `billing_class` is `usage_based` when extra usage is on (running past
+a plan window bills credits), `rate_limited` for a subscription plan with usage
+windows, and `unknown` otherwise. `exhausted` is true when any window, including
+Opus, Sonnet and Fable, is at 100%. It combines with `--cached` and `--refresh`.
 
 The default table shows each account's status and next step:
 
