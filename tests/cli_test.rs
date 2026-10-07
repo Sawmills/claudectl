@@ -372,4 +372,5 @@ fn rate_without_lanes_reports_no_activity() {
     assert_eq!(report["version"], 1);
     assert_eq!(report["window_minutes"], 10);
     assert_eq!(report["accounts"], serde_json::json!([]));
+    assert_eq!(report["skipped"], 0);
 }

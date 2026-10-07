@@ -9,16 +9,24 @@ pub fn run(minutes: u32, json: bool) -> Result<()> {
     let paths = config::default_paths()?;
     let now = chrono::Utc::now();
     let since = now - chrono::Duration::minutes(i64::from(minutes));
-    let accounts = rate::collect(&paths, since, now)?;
+    let report = rate::collect(&paths, since, now)?;
     if json {
         let report = serde_json::json!({
             "version": 1,
             "window_minutes": minutes,
-            "accounts": accounts,
+            "accounts": report.accounts,
+            "skipped": report.skipped,
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
+    if report.skipped > 0 {
+        eprintln!(
+            "warning: {} transcript records could not be read; counts may be low",
+            report.skipped
+        );
+    }
+    let accounts = report.accounts;
     if accounts.is_empty() {
         println!("no claudectl claude lane activity in the last {minutes} min");
         return Ok(());

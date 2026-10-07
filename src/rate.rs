@@ -42,20 +42,26 @@ struct Span {
     to: DateTime<Utc>,
 }
 
-/// Counts for every account seen in a lane since `since`, sorted by alias,
-/// unattributed turns first.
-pub fn collect(
-    paths: &Paths,
-    since: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> Result<Vec<AccountRate>> {
+#[derive(Debug, Default, PartialEq, Serialize)]
+pub struct Report {
+    /// Sorted by alias, unattributed turns first.
+    pub accounts: Vec<AccountRate>,
+    /// Complete assistant transcript lines that could not be read. Claude
+    /// Code owns the transcript format, so these are counted and shown
+    /// rather than fail the report.
+    pub skipped: u64,
+}
+
+/// Counts for every account seen in a lane from `since` to `now`.
+pub fn collect(paths: &Paths, since: DateTime<Utc>, now: DateTime<Utc>) -> Result<Report> {
     let lanes = paths.claudectl_dir().join("lanes");
     let entries = match std::fs::read_dir(&lanes) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Report::default()),
         Err(e) => return Err(e).with_context(|| format!("failed to read {}", lanes.display())),
     };
     let mut accounts: BTreeMap<Option<String>, AccountRate> = BTreeMap::new();
+    let mut skipped = 0;
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -70,7 +76,9 @@ pub fn collect(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e).with_context(|| format!("failed to read {}", log.display())),
         };
-        for turn in turns(&entry.path().join("config/projects"), since, now)? {
+        let scan = turns(&entry.path().join("config/projects"), since, now)?;
+        skipped += scan.skipped;
+        for turn in scan.turns {
             let alias = spans
                 .iter()
                 .find(|s| s.from <= turn.at && turn.at <= s.to)
@@ -89,7 +97,10 @@ pub fn collect(
             }
         }
     }
-    Ok(accounts.into_values().collect())
+    Ok(Report {
+        accounts: accounts.into_values().collect(),
+        skipped,
+    })
 }
 
 /// The account spans in a lane log. The log is the only record of which
@@ -156,15 +167,22 @@ struct Turn {
     rate_limited: bool,
 }
 
+#[derive(Debug, Default)]
+struct Scan {
+    turns: Vec<Turn>,
+    skipped: u64,
+}
+
 /// Assistant responses and rate-limit errors in the lane transcripts from
 /// `since` to `now`, the time open spans end at, so a record written during
-/// the scan is left out rather than counted outside a run. Claude Code writes one record per content block, so responses
-/// count once per API message id.
-fn turns(projects: &Path, since: DateTime<Utc>, now: DateTime<Utc>) -> Result<Vec<Turn>> {
-    let mut turns = Vec::new();
+/// the scan is left out rather than counted outside a run. Claude Code
+/// writes one record per content block, so responses count once per API
+/// message id.
+fn turns(projects: &Path, since: DateTime<Utc>, now: DateTime<Utc>) -> Result<Scan> {
+    let mut scan = Scan::default();
     let mut seen = HashSet::new();
     let Some(dirs) = read_dir(projects)? else {
-        return Ok(turns);
+        return Ok(scan);
     };
     for dir in dirs {
         if !dir.file_type()?.is_dir() {
@@ -188,10 +206,10 @@ fn turns(projects: &Path, since: DateTime<Utc>, now: DateTime<Utc>) -> Result<Ve
             }
             let failed = || format!("failed to read {}", path.display());
             let reader = std::io::BufReader::new(std::fs::File::open(&path).with_context(failed)?);
-            turns.extend(turns_in(reader, since, now, &mut seen).with_context(failed)?);
+            turns_in(reader, since, now, &mut seen, &mut scan).with_context(failed)?;
         }
     }
-    Ok(turns)
+    Ok(scan)
 }
 
 /// The entries of `dir`, or `None` when it does not exist. Any other error
@@ -208,41 +226,51 @@ fn read_dir(dir: &Path) -> Result<Option<Vec<std::fs::DirEntry>>> {
     }
 }
 
-/// Reads one line at a time: a long session's transcript can be large.
+/// Reads one line at a time: a long session's transcript can be large. A
+/// last line with no newline is still being written and is left out.
 fn turns_in(
-    reader: impl std::io::BufRead,
+    mut reader: impl std::io::BufRead,
     since: DateTime<Utc>,
     now: DateTime<Utc>,
     seen: &mut HashSet<String>,
-) -> std::io::Result<Vec<Turn>> {
-    let mut turns = Vec::new();
-    for line in reader.split(b'\n') {
-        let line = line?;
-        let line = String::from_utf8_lossy(&line);
-        if !line.contains("\"assistant\"") {
+    scan: &mut Scan,
+) -> std::io::Result<()> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 || line.last() != Some(&b'\n') {
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(&line);
+        if !text.contains("\"assistant\"") {
             continue;
         }
-        // A line still being written does not parse yet and is left out.
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&text) else {
+            scan.skipped += 1;
             continue;
         };
-        turns.extend(turn(&record, since, now, seen));
+        if record["type"] != "assistant" {
+            continue;
+        }
+        let Some(at) = record["timestamp"]
+            .as_str()
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+        else {
+            scan.skipped += 1;
+            continue;
+        };
+        scan.turns
+            .extend(turn(&record, at.with_timezone(&Utc), since, now, seen));
     }
-    Ok(turns)
 }
 
 fn turn(
     record: &serde_json::Value,
+    at: DateTime<Utc>,
     since: DateTime<Utc>,
     now: DateTime<Utc>,
     seen: &mut HashSet<String>,
 ) -> Option<Turn> {
-    if record["type"] != "assistant" {
-        return None;
-    }
-    let at = DateTime::parse_from_rfc3339(record["timestamp"].as_str()?)
-        .ok()?
-        .with_timezone(&Utc);
     if at < since || at > now {
         return None;
     }
@@ -358,16 +386,23 @@ mod tests {
             user,
         ]
         .join("\n");
+        let bad_time = serde_json::json!({"type": "assistant", "timestamp": "soon"}).to_string();
+        let text = [text, bad_time, "{\"type\":\"assistant\",".into()].join("\n")
+            + "\n{\"type\":\"assistant\" partial";
         let mut seen = HashSet::new();
-        let turns = turns_in(
+        let mut scan = Scan::default();
+        turns_in(
             text.as_bytes(),
             at("2026-10-07T10:00:00Z"),
             at("2026-10-07T10:20:00Z"),
             &mut seen,
+            &mut scan,
         )
         .unwrap();
-        let limited: Vec<_> = turns.iter().map(|t| t.rate_limited).collect();
+        let limited: Vec<_> = scan.turns.iter().map(|t| t.rate_limited).collect();
         assert_eq!(limited, [false, false, true]);
+        // The bad time and the broken complete line; not the partial last line.
+        assert_eq!(scan.skipped, 2);
     }
 
     #[test]
@@ -408,6 +443,8 @@ mod tests {
             at("2026-10-07T10:30:00Z"),
         )
         .unwrap();
+        assert_eq!(rates.skipped, 0);
+        let rates = rates.accounts;
         let counts: Vec<_> = rates
             .iter()
             .map(|r| (r.alias.as_deref(), r.ok, r.rate_limited))
@@ -437,6 +474,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(tmp.path().to_path_buf());
         let now = Utc::now();
-        assert!(collect(&paths, now, now).unwrap().is_empty());
+        assert_eq!(collect(&paths, now, now).unwrap(), Report::default());
     }
 }
