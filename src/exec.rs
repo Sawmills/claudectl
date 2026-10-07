@@ -909,7 +909,11 @@ fn run_in_dir(
                     "cancelled by signal {signal} before the child started"
                 )));
             }
+            // The child takes the terminal before its exec; a stop in that
+            // window must still suspend the job.
+            let watchdog = terminal.then(SpawnWatchdog::start);
             let spawned = command.spawn();
+            drop(watchdog);
             if spawned.is_err() {
                 signals::unblock();
                 if terminal && foreground::owned_by_gone_group() {
@@ -1264,6 +1268,88 @@ fn suspend_with(leader: u32) {
     unsafe { libc::kill(-leader, libc::SIGCONT) };
 }
 
+/// Watches for a stop of the forked child while `Command::spawn` blocks. The
+/// child takes the terminal in `pre_exec`, so a Ctrl-Z before its exec stops
+/// it while claudectl waits inside spawn; the shell would never see the job
+/// stop. The watchdog then suspends claudectl's job as `wait_exit_no_reap`
+/// does after the spawn, and `fg` continues the child, which runs its exec.
+#[cfg(unix)]
+struct SpawnWatchdog {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl SpawnWatchdog {
+    /// How often the watchdog looks for a stopped child.
+    const POLL: Duration = Duration::from_millis(2);
+
+    fn start() -> Self {
+        use std::sync::atomic::Ordering;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    if let Some(pid) = stopped_foreground_child() {
+                        suspend_with(pid);
+                    }
+                    std::thread::sleep(Self::POLL);
+                }
+            })
+        };
+        Self {
+            done,
+            thread: Some(thread),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SpawnWatchdog {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A stopped child of claudectl that leads its own group and owns the
+/// terminal: only a child that took the foreground before its exec can.
+/// WNOWAIT leaves its state for `Child::wait`.
+#[cfg(unix)]
+fn stopped_foreground_child() -> Option<u32> {
+    // SAFETY: waitid writes only into `info`; WNOHANG returns at once and
+    // WNOWAIT reaps nothing.
+    let (result, code, pid) = unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let result = libc::waitid(
+            libc::P_ALL,
+            0,
+            &mut info,
+            libc::WSTOPPED | libc::WNOWAIT | libc::WNOHANG,
+        );
+        (result, info.si_code, info.si_pid())
+    };
+    if result != 0 || code != libc::CLD_STOPPED || pid <= 0 {
+        return None;
+    }
+    // SAFETY: getpgid only reads process state.
+    let leads_group = unsafe { libc::getpgid(pid) } == pid;
+    (leads_group && foreground::owned_by(pid)).then_some(pid as u32)
+}
+
+#[cfg(not(unix))]
+struct SpawnWatchdog;
+
+#[cfg(not(unix))]
+impl SpawnWatchdog {
+    fn start() -> Self {
+        Self
+    }
+}
+
 /// Set by the SIGCONT handler while `stop_job` waits.
 #[cfg(unix)]
 static CONTINUED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1355,27 +1441,56 @@ pub(crate) fn set_process_group(_command: &mut Command) {}
 /// Make the child's new group the terminal foreground before it runs, if
 /// claudectl's group owns the foreground at that moment. Rust runs this
 /// after the child's setpgid, and spawn returns only after the exec, so the
-/// child owns the foreground from its first instruction.
-///
-/// Known limit: a Ctrl-Z in the microseconds between this handoff and the
-/// exec stops the forked child while claudectl still waits inside spawn, so
-/// the shell cannot resume the job with `fg`. `kill -CONT <child pid>`
-/// recovers: the child execs and keeps the foreground. Ctrl-C does not,
-/// because the child still has claudectl's SIGINT handler until the exec.
+/// child owns the foreground from its first instruction. A Ctrl-Z between
+/// this handoff and the exec stops the forked child while claudectl waits
+/// inside spawn; `SpawnWatchdog` suspends claudectl's job then.
 #[cfg(unix)]
 fn take_foreground(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: getpgrp only reads process state.
     let claudectl_group = unsafe { libc::getpgrp() };
-    // SAFETY: runs in the forked child; tcgetpgrp, getpid and
-    // foreground::give use only async-signal-safe calls.
+    let pause = test_hooks::pre_exec_pause();
+    // SAFETY: runs in the forked child; tcgetpgrp, getpid,
+    // foreground::give and nanosleep are async-signal-safe.
     unsafe {
         command.pre_exec(move || {
             if libc::tcgetpgrp(libc::STDIN_FILENO) == claudectl_group {
                 foreground::give(libc::getpid())?;
             }
+            if let Some(mut left) = pause {
+                // A stop and continue can end the sleep early: sleep the rest.
+                loop {
+                    let wanted = left;
+                    if libc::nanosleep(&wanted, &mut left) == 0 {
+                        break;
+                    }
+                }
+            }
             Ok(())
         });
+    }
+}
+
+/// Hooks for the integration tests, which run exec in their own process.
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static PRE_EXEC_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+
+    /// Make the child sleep after it takes the terminal and before its exec,
+    /// so a test can stop it in that window.
+    pub fn set_pre_exec_pause(pause: std::time::Duration) {
+        PRE_EXEC_PAUSE_MS.store(pause.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    #[cfg(unix)]
+    pub(super) fn pre_exec_pause() -> Option<libc::timespec> {
+        let ms = PRE_EXEC_PAUSE_MS.load(Ordering::SeqCst);
+        (ms > 0).then(|| libc::timespec {
+            tv_sec: (ms / 1000) as libc::time_t,
+            tv_nsec: ((ms % 1000) * 1_000_000) as libc::c_long,
+        })
     }
 }
 
