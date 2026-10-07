@@ -70,7 +70,7 @@ pub fn collect(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e).with_context(|| format!("failed to read {}", log.display())),
         };
-        for turn in turns(&entry.path().join("config/projects"), since)? {
+        for turn in turns(&entry.path().join("config/projects"), since, now)? {
             let alias = spans
                 .iter()
                 .find(|s| s.from <= turn.at && turn.at <= s.to)
@@ -129,15 +129,14 @@ fn spans(log: &str, now: DateTime<Utc>) -> Result<Vec<Span>> {
                 }
                 open = Some((alias.to_string(), at));
             }
-            "end" | "refused" => {
-                if let Some((alias, from)) = open.take() {
-                    spans.push(Span {
-                        alias,
-                        from,
-                        to: at,
-                    });
-                }
-            }
+            "end" | "refused" => match open.take() {
+                Some((opened, from)) if opened == alias => spans.push(Span {
+                    alias: opened,
+                    from,
+                    to: at,
+                }),
+                _ => anyhow::bail!("line {}: {event} for {alias} without its start", index + 1),
+            },
             _ => {}
         }
     }
@@ -157,10 +156,11 @@ struct Turn {
     rate_limited: bool,
 }
 
-/// Assistant responses and rate-limit errors in the lane transcripts since
-/// `since`. Claude Code writes one record per content block, so responses
+/// Assistant responses and rate-limit errors in the lane transcripts from
+/// `since` to `now`, the time open spans end at, so a record written during
+/// the scan is left out rather than counted outside a run. Claude Code writes one record per content block, so responses
 /// count once per API message id.
-fn turns(projects: &Path, since: DateTime<Utc>) -> Result<Vec<Turn>> {
+fn turns(projects: &Path, since: DateTime<Utc>, now: DateTime<Utc>) -> Result<Vec<Turn>> {
     let mut turns = Vec::new();
     let mut seen = HashSet::new();
     let Some(dirs) = read_dir(projects)? else {
@@ -186,9 +186,9 @@ fn turns(projects: &Path, since: DateTime<Utc>) -> Result<Vec<Turn>> {
             if DateTime::<Utc>::from(modified) < since {
                 continue;
             }
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            turns.extend(turns_in(&text, since, &mut seen));
+            let failed = || format!("failed to read {}", path.display());
+            let reader = std::io::BufReader::new(std::fs::File::open(&path).with_context(failed)?);
+            turns.extend(turns_in(reader, since, now, &mut seen).with_context(failed)?);
         }
     }
     Ok(turns)
@@ -208,34 +208,58 @@ fn read_dir(dir: &Path) -> Result<Option<Vec<std::fs::DirEntry>>> {
     }
 }
 
-fn turns_in(text: &str, since: DateTime<Utc>, seen: &mut HashSet<String>) -> Vec<Turn> {
-    text.lines()
-        .filter(|line| line.contains("\"assistant\""))
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|record| record["type"] == "assistant")
-        .filter_map(|record| {
-            let at = DateTime::parse_from_rfc3339(record["timestamp"].as_str()?)
-                .ok()?
-                .with_timezone(&Utc);
-            if at < since {
-                return None;
-            }
-            if record["isApiErrorMessage"] == true {
-                return (record["error"] == "rate_limit").then_some(Turn {
-                    at,
-                    rate_limited: true,
-                });
-            }
-            let id = record["message"]["id"]
-                .as_str()
-                .or(record["uuid"].as_str())?
-                .to_string();
-            seen.insert(id).then_some(Turn {
-                at,
-                rate_limited: false,
-            })
-        })
-        .collect()
+/// Reads one line at a time: a long session's transcript can be large.
+fn turns_in(
+    reader: impl std::io::BufRead,
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+    seen: &mut HashSet<String>,
+) -> std::io::Result<Vec<Turn>> {
+    let mut turns = Vec::new();
+    for line in reader.split(b'\n') {
+        let line = line?;
+        let line = String::from_utf8_lossy(&line);
+        if !line.contains("\"assistant\"") {
+            continue;
+        }
+        // A line still being written does not parse yet and is left out.
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        turns.extend(turn(&record, since, now, seen));
+    }
+    Ok(turns)
+}
+
+fn turn(
+    record: &serde_json::Value,
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+    seen: &mut HashSet<String>,
+) -> Option<Turn> {
+    if record["type"] != "assistant" {
+        return None;
+    }
+    let at = DateTime::parse_from_rfc3339(record["timestamp"].as_str()?)
+        .ok()?
+        .with_timezone(&Utc);
+    if at < since || at > now {
+        return None;
+    }
+    if record["isApiErrorMessage"] == true {
+        return (record["error"] == "rate_limit").then_some(Turn {
+            at,
+            rate_limited: true,
+        });
+    }
+    let id = record["message"]["id"]
+        .as_str()
+        .or(record["uuid"].as_str())?
+        .to_string();
+    seen.insert(id).then_some(Turn {
+        at,
+        rate_limited: false,
+    })
 }
 
 #[cfg(test)]
@@ -309,6 +333,9 @@ mod tests {
         assert!(spans(&torn, now).is_err());
         let missing = format!("{start}\n{{\"event\":\"end\"}}\n");
         assert!(spans(&missing, now).is_err());
+        let other = event("end", "b", "2026-10-07T10:05:00Z");
+        assert!(spans(&format!("{start}\n{other}\n"), now).is_err());
+        assert!(spans(&format!("{other}\n"), now).is_err());
     }
 
     #[test]
@@ -326,12 +353,19 @@ mod tests {
             assistant("2026-10-07T10:01:01Z", "m1"),
             assistant("2026-10-07T10:02:00Z", "m2"),
             limited("2026-10-07T10:03:00Z"),
+            assistant("2026-10-07T10:30:00Z", "after-now"),
             auth,
             user,
         ]
         .join("\n");
         let mut seen = HashSet::new();
-        let turns = turns_in(&text, at("2026-10-07T10:00:00Z"), &mut seen);
+        let turns = turns_in(
+            text.as_bytes(),
+            at("2026-10-07T10:00:00Z"),
+            at("2026-10-07T10:20:00Z"),
+            &mut seen,
+        )
+        .unwrap();
         let limited: Vec<_> = turns.iter().map(|t| t.rate_limited).collect();
         assert_eq!(limited, [false, false, true]);
     }
