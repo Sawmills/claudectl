@@ -1555,6 +1555,11 @@ mod tests {
             "unknown",
             "null is_enabled is not proof"
         );
+        assert_eq!(
+            billing_class(rate.usage.as_ref(), Some("  ")),
+            "unknown",
+            "blank plan"
+        );
         assert_eq!(billing_class(None, Some("max")), "unknown");
     }
 
