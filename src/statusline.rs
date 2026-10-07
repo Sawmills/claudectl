@@ -31,7 +31,6 @@ pub struct Sample {
     /// The account behind the alias when sampled; an alias saved again for
     /// another login must not show this account's usage.
     pub account_uuid: String,
-    pub label: Option<String>,
     pub five_hour: Option<Window>,
     pub seven_day: Option<Window>,
 }
@@ -60,7 +59,6 @@ fn sample_path(paths: &Paths) -> std::path::PathBuf {
 pub struct Active<'a> {
     pub alias: &'a str,
     pub account_uuid: Option<&'a str>,
-    pub label: Option<&'a str>,
     /// Fresh usage only; None when the check failed or is old.
     pub usage: Option<&'a UsageResponse>,
 }
@@ -77,7 +75,6 @@ pub fn record(paths: &Paths, active: Option<Active<'_>>, now: i64) -> Result<()>
             sampled_at: now,
             alias: active.alias.to_string(),
             account_uuid: active.account_uuid?.to_string(),
-            label: active.label.map(str::to_string),
             five_hour: Window::from_usage(usage.five_hour.as_ref()),
             seven_day: Window::from_usage(usage.seven_day.as_ref()),
         })
@@ -116,7 +113,8 @@ pub fn render(paths: &Paths, now: i64) -> Option<String> {
     if week.resets_at <= now {
         return None;
     }
-    let name = display_name(sample.label.as_deref(), &sample.alias)?;
+    // The current label, so a label change shows at once.
+    let name = display_name(profile.meta.label.as_deref(), &sample.alias)?;
     let mut line = format!(
         "{name} {}% wk · {}",
         remaining(week.used_percent),
@@ -211,14 +209,16 @@ mod tests {
     }
 
     fn active<'a>(
+        paths: &Paths,
         alias: &'a str,
-        label: Option<&'a str>,
+        label: Option<&str>,
         usage: Option<&'a UsageResponse>,
     ) -> Option<Active<'a>> {
+        let store = crate::auth_store::AuthStore::file_only(paths.clone());
+        crate::profile::set_label_from(paths, &store, alias, label).unwrap();
         Some(Active {
             alias,
             account_uuid: Some("u1"),
-            label,
             usage,
         })
     }
@@ -242,7 +242,7 @@ mod tests {
         let u = usage(10.0, 38.0);
         record(
             &paths,
-            active("amir5@sawmills.ai", Some("team"), Some(&u)),
+            active(&paths, "amir5@sawmills.ai", Some("team"), Some(&u)),
             NOW,
         )
         .unwrap();
@@ -256,15 +256,20 @@ mod tests {
     fn falls_back_to_the_alias_local_part_and_strips_unsafe_text() {
         let (_tmp, paths) = setup("amir5@sawmills.ai");
         let u = usage(0.0, 0.0);
-        record(&paths, active("amir5@sawmills.ai", None, Some(&u)), NOW).unwrap();
-        assert!(render(&paths, NOW).unwrap().starts_with("amir5 100% wk"));
-        let label = "\u{1b}]0;evil\u{7}a-very-long-label-that-goes-on";
         record(
             &paths,
-            active("amir5@sawmills.ai", Some(label), Some(&u)),
+            active(&paths, "amir5@sawmills.ai", None, Some(&u)),
             NOW,
         )
         .unwrap();
+        assert!(render(&paths, NOW).unwrap().starts_with("amir5 100% wk"));
+        // `label` refuses control characters; a hand-edited account.json
+        // can still hold them, so render cleans the name too.
+        let meta = paths.profiles_dir().join("amir5@sawmills.ai/account.json");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta).unwrap()).unwrap();
+        json["label"] = "\u{1b}]0;evil\u{7}a-very-long-label-that-goes-on".into();
+        std::fs::write(&meta, json.to_string()).unwrap();
         let line = render(&paths, NOW).unwrap();
         assert!(line.starts_with("0evila-very-long-lab "), "{line}");
         assert!(!line.contains('\u{1b}'));
@@ -274,7 +279,7 @@ mod tests {
     fn is_silent_when_old_for_another_account_or_reset() {
         let (_tmp, paths) = setup("work");
         let u = usage(10.0, 38.0);
-        record(&paths, active("work", None, Some(&u)), NOW).unwrap();
+        record(&paths, active(&paths, "work", None, Some(&u)), NOW).unwrap();
         assert!(render(&paths, NOW + MAX_AGE_SECONDS).is_some());
         assert_eq!(
             render(&paths, NOW + MAX_AGE_SECONDS + 1),
@@ -296,7 +301,7 @@ mod tests {
             }),
             ..UsageResponse::default()
         };
-        record(&paths, active("work", None, Some(&past)), NOW).unwrap();
+        record(&paths, active(&paths, "work", None, Some(&past)), NOW).unwrap();
         assert_eq!(render(&paths, NOW), None, "weekly reset passed");
     }
 
@@ -304,7 +309,7 @@ mod tests {
     fn is_silent_when_the_alias_now_holds_another_account() {
         let (_tmp, paths) = setup("work");
         let u = usage(10.0, 38.0);
-        record(&paths, active("work", None, Some(&u)), NOW).unwrap();
+        record(&paths, active(&paths, "work", None, Some(&u)), NOW).unwrap();
         assert!(render(&paths, NOW).is_some());
         save_profile(&paths, "work", "u2");
         assert_eq!(
@@ -315,13 +320,23 @@ mod tests {
     }
 
     #[test]
+    fn a_label_change_shows_at_once() {
+        let (_tmp, paths) = setup("work");
+        let u = usage(10.0, 38.0);
+        record(&paths, active(&paths, "work", Some("old"), Some(&u)), NOW).unwrap();
+        assert!(render(&paths, NOW).unwrap().starts_with("old "));
+        let store = crate::auth_store::AuthStore::file_only(paths.clone());
+        crate::profile::set_label_from(&paths, &store, "work", Some("new")).unwrap();
+        assert!(render(&paths, NOW).unwrap().starts_with("new "));
+    }
+
+    #[test]
     fn records_nothing_without_a_known_account() {
         let (_tmp, paths) = setup("work");
         let u = usage(10.0, 38.0);
         let unknown = Active {
             alias: "work",
             account_uuid: None,
-            label: None,
             usage: Some(&u),
         };
         record(&paths, Some(unknown), NOW).unwrap();
@@ -333,7 +348,7 @@ mod tests {
         let (_tmp, paths) = setup("work");
         let mut u = usage(10.0, 38.0);
         u.five_hour = None;
-        record(&paths, active("work", None, Some(&u)), NOW).unwrap();
+        record(&paths, active(&paths, "work", None, Some(&u)), NOW).unwrap();
         assert_eq!(render(&paths, NOW).as_deref(), Some("work 62% wk · 6d22h"));
     }
 
@@ -341,10 +356,10 @@ mod tests {
     fn missing_usage_or_no_active_account_removes_the_sample() {
         let (_tmp, paths) = setup("work");
         let u = usage(10.0, 38.0);
-        record(&paths, active("work", None, Some(&u)), NOW).unwrap();
-        record(&paths, active("work", None, None), NOW).unwrap();
+        record(&paths, active(&paths, "work", None, Some(&u)), NOW).unwrap();
+        record(&paths, active(&paths, "work", None, None), NOW).unwrap();
         assert!(!sample_path(&paths).exists());
-        record(&paths, active("work", None, Some(&u)), NOW).unwrap();
+        record(&paths, active(&paths, "work", None, Some(&u)), NOW).unwrap();
         record(&paths, None, NOW).unwrap();
         assert!(!sample_path(&paths).exists());
         record(&paths, None, NOW).unwrap();

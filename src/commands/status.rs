@@ -246,7 +246,6 @@ fn record_statusline_entry(paths: &config::Paths, entry: Option<&FetchedUsage>) 
     let active = entry.map(|f| claudectl::statusline::Active {
         alias: &f.alias,
         account_uuid: f.account_uuid.as_deref(),
-        label: f.label.as_deref(),
         usage: f
             .usage
             .as_ref()
@@ -308,10 +307,21 @@ fn fetch_usages_with_refresh(
                 creds.claude_ai_oauth.refresh_token.as_deref().map(UsageCache::key)
             });
             let is_active = active.as_deref() == Some(profile.meta.alias.as_str());
+            let saved_uuid = profile.meta.account_uuid().map(str::to_string);
+            // The active alias is checked with the live credentials. Name its
+            // account only when the live login is still that account.
+            let account_uuid = if is_active {
+                let live_uuid = store.read_oauth_account().ok().flatten().and_then(|account| {
+                    account.get("accountUuid")?.as_str().map(str::to_string)
+                });
+                saved_uuid.filter(|saved| live_uuid.as_deref() == Some(saved.as_str()))
+            } else {
+                saved_uuid
+            };
             let mut result = FetchedUsage {
                 alias: profile.meta.alias.clone(),
                 label: profile.meta.label.clone(),
-                account_uuid: profile.meta.account_uuid().map(str::to_string),
+                account_uuid,
                 is_active,
                 ..FetchedUsage::default()
             };
@@ -1073,6 +1083,44 @@ mod tests {
         let a = fresh_account(Some(99.6), Some(20.0), false);
         assert_eq!(next_step(&a).0, "Within usage limits");
         assert!(summary_row(&a)[2].content().contains("5h: <100%"));
+    }
+
+    #[test]
+    fn the_active_account_is_named_only_while_the_live_login_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_home(tmp.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let store = AuthStore::file_only(paths.clone());
+        let creds: api::CredentialsFile = serde_json::from_value(serde_json::json!({
+            "claudeAiOauth": {"accessToken":"test-access", "refreshToken":"test-grant", "expiresAt":1}
+        }))
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "work",
+            &creds,
+            Some(serde_json::json!({"accountUuid": "u1"})),
+        )
+        .unwrap();
+        profile::set_active_from(&paths, "work").unwrap();
+        store.write_credentials(&creds).unwrap();
+        for (live, expected) in [("u2", None), ("u1", Some("u1"))] {
+            std::fs::write(
+                paths.claude_json(),
+                serde_json::json!({"oauthAccount": {"accountUuid": live}}).to_string(),
+            )
+            .unwrap();
+            let fetched =
+                fetch_usages_with_refresh(&store, &paths, None, FetchMode::Cached, async |_, _| {
+                    panic!("no refresh in this test")
+                })
+                .unwrap();
+            assert_eq!(
+                fetched[0].account_uuid.as_deref(),
+                expected,
+                "live login {live}"
+            );
+        }
     }
 
     #[test]
