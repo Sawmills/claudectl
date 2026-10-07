@@ -819,6 +819,7 @@ fn run_in_dir(
 ) -> Result<i32, ExecError> {
     // Execute a private copy, so the bytes that run are the bytes that were
     // hashed, even if the original path is replaced during the run.
+    seed_claude_json(paths, config_dir)?;
     let snapshot = snapshot_executable(&prepared.program, config_dir)?;
     let snapshot_sha256 = sha256_file(&snapshot)?;
     if snapshot_sha256 != prepared.program_sha256 {
@@ -1821,6 +1822,109 @@ pub fn fresh_config_dir(paths: &Paths, alias: &str) -> Result<tempfile::TempDir,
             .map_err(|e| ExecError::Spawn(format!("cannot restrict config dir: {e}")))?;
     }
     Ok(dir)
+}
+
+/// Keys of `~/.claude.json` that Claude Code checks before its theme and
+/// login screens.
+const ONBOARDING_KEYS: &[&str] = &["hasCompletedOnboarding", "lastOnboardingVersion"];
+
+/// Per-project approvals for external CLAUDE.md imports, copied for the
+/// current directory only and only when true.
+const IMPORT_KEYS: &[&str] = &[
+    "hasClaudeMdExternalIncludesApproved",
+    "hasClaudeMdExternalIncludesWarningShown",
+];
+
+/// Start the child at its prompt: copy the user's onboarding state, the
+/// folder trust that covers the current directory, and its import approvals
+/// into the private
+/// config dir. Accounts, tokens, approved keys, allowed tools and MCP servers
+/// are never copied. Without a readable `~/.claude.json` nothing is seeded,
+/// and Claude shows its first-run screens as before.
+fn seed_claude_json(paths: &Paths, config_dir: &Path) -> Result<(), ExecError> {
+    let Some(user) = read_claude_json(paths) else {
+        return Ok(());
+    };
+    let mut seed = serde_json::Map::new();
+    for key in ONBOARDING_KEYS {
+        if let Some(value) = user.get(*key) {
+            seed.insert((*key).to_string(), value.clone());
+        }
+    }
+    let projects = user.get("projects");
+    let project = |dir: &str| projects.and_then(|p| p.get(dir));
+    let mut seeded_projects = serde_json::Map::new();
+    let cwd = std::env::current_dir().ok();
+    if let Some(cwd) = cwd.as_deref() {
+        // Claude trusts a directory under any trusted ancestor, and it writes
+        // `false` entries on its own for every directory it opens (Claude
+        // Code 2.1.292, checked live). Copy the closest `true`, under that
+        // directory's own key: the same trust the user's Claude grants.
+        let trusted = cwd.ancestors().filter_map(Path::to_str).find(|dir| {
+            project(dir)
+                .and_then(|entry| entry.get("hasTrustDialogAccepted"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        });
+        if let Some(dir) = trusted {
+            seeded_projects.insert(
+                dir.to_string(),
+                serde_json::json!({ "hasTrustDialogAccepted": true }),
+            );
+        }
+        if let Some((dir, entry)) = cwd.to_str().and_then(|dir| Some((dir, project(dir)?))) {
+            for key in IMPORT_KEYS {
+                if entry.get(*key).and_then(|v| v.as_bool()) == Some(true) {
+                    let slot = seeded_projects
+                        .entry(dir.to_string())
+                        .or_insert_with(|| serde_json::json!({}));
+                    slot[*key] = serde_json::Value::Bool(true);
+                }
+            }
+        }
+    }
+    if !seeded_projects.is_empty() {
+        seed.insert(
+            "projects".into(),
+            serde_json::Value::Object(seeded_projects),
+        );
+    }
+    if seed.is_empty() {
+        return Ok(());
+    }
+    let path = config_dir.join(".claude.json");
+    let mut options = std::fs::File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|e| ExecError::Spawn(format!("cannot create {}: {e}", path.display())))?;
+    file.write_all(serde_json::Value::Object(seed).to_string().as_bytes())
+        .map_err(|e| ExecError::Spawn(format!("cannot write {}: {e}", path.display())))
+}
+
+/// `~/.claude.json` as an object, or None when it is missing. Claude rewrites
+/// the file while it runs, so a parse error gets one retry, then a warning;
+/// a malformed file is refused earlier, by the live identity check.
+fn read_claude_json(paths: &Paths) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let path = paths.claude_json();
+    for attempt in 0..2 {
+        let text = std::fs::read_to_string(&path).ok()?;
+        match serde_json::from_str(&text) {
+            Ok(serde_json::Value::Object(user)) => return Some(user),
+            _ if attempt == 0 => std::thread::sleep(Duration::from_millis(50)),
+            _ => {}
+        }
+    }
+    eprintln!(
+        "claudectl exec: cannot parse {}; the child shows its first-run screens",
+        path.display()
+    );
+    None
 }
 
 fn resolve_program(program: &OsString) -> Result<PathBuf, ExecError> {
