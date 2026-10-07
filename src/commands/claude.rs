@@ -68,6 +68,8 @@ fn run_inner(launch: LaunchArgs) -> Result<i32> {
         .context("no rate-limited account with room; run claudectl status")?,
     };
     let mut args = launch.args.clone();
+    // Only the account named with --account stops the launch when refused.
+    let mut explicit = launch.account.is_some();
     loop {
         // Check first: cleanup would otherwise delete a credentials file.
         lane.assert_no_credentials()?;
@@ -90,6 +92,21 @@ fn run_inner(launch: LaunchArgs) -> Result<i32> {
                 return Ok(code);
             }
             Ok(Outcome::Limited(hit)) => hit,
+            Ok(Outcome::Refused(reason)) => {
+                lane.log("refused", &alias, None)?;
+                if explicit {
+                    bail!("{alias}: {reason}");
+                }
+                eprintln!("claudectl claude: skipping {alias}: {reason}");
+                tried.push(alias.clone());
+                alias = choose(
+                    &status::fetch_all_usages()?,
+                    &tried,
+                    live_uuid(&store).as_deref(),
+                )
+                .context("no other rate-limited account with room; run claudectl status")?;
+                continue;
+            }
             Err(error) => {
                 lane.log("end", &alias, None)?;
                 return Err(error);
@@ -126,12 +143,16 @@ fn run_inner(launch: LaunchArgs) -> Result<i32> {
         );
         args = relaunch_args(&launch.args, &hit.session_id, &launch.recovery_prompt);
         alias = next;
+        explicit = false;
     }
 }
 
 enum Outcome {
     Exited(i32),
     Limited(RateLimitHit),
+    /// exec refused the account before starting Claude, for example as the
+    /// live login.
+    Refused(String),
 }
 
 /// One Claude run in the lane, watched for a confirmed usage limit.
@@ -157,13 +178,20 @@ fn run_once(
         args: args.to_vec(),
         state_dir: Some(lane.config_dir()),
     };
-    let prepared = exec::prepare(
+    let prepared = match exec::prepare(
         paths,
         store,
         &request,
         &LiveIdentity,
         SelfIdentity::current()?,
-    )?;
+    ) {
+        Ok(prepared) => prepared,
+        // exec's credential guard is the authority on which account may run.
+        Err(error @ (exec::ExecError::Refused(_) | exec::ExecError::Identity(_))) => {
+            return Ok(Outcome::Refused(error.to_string()));
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     let stop = Arc::new(AtomicBool::new(false));
     let limited: Arc<Mutex<Option<RateLimitHit>>> = Arc::new(Mutex::new(None));
