@@ -120,8 +120,15 @@ impl LoginFlow for SystemLoginFlow<'_> {
         creds: &CredentialsFile,
         account: Option<serde_json::Value>,
     ) -> Result<()> {
+        // A fence refusal is not a persistence failure: it keeps no recovery copy.
+        claudectl::central::ensure_login_unfenced(
+            &self.paths.claudectl_dir(),
+            alias,
+            creds,
+            &account,
+        )?;
         if let Err(error) = profile::save_profile_to(self.paths, alias, creds, account.clone()) {
-            let retained = claudectl::central::retain_login(self.paths, creds, &account).context(
+            let retained = claudectl::central::retain_login(self.paths, alias, creds, &account).context(
                 "login acquired a grant but neither the profile nor recovery copy could be written",
             )?;
             return Err(error).with_context(|| format!("acquired login retained privately at {}; no activation or refresh was attempted", retained.display()));

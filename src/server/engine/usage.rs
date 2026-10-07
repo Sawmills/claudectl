@@ -77,8 +77,11 @@ impl Engine {
         result.stale = true;
         match response {
             Ok(response) if response.status().is_success() => {
-                match response.json::<Value>().await {
-                    Ok(Value::Object(value)) => {
+                // The same streamed 16 KiB bound as token responses; what is kept is a
+                // filtered subset of at most that.
+                let body = capped_body(response).await.ok();
+                match body.and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+                    Some(Value::Object(value)) => {
                         let data: serde_json::Map<String, Value> = value
                             .into_iter()
                             .filter(|(k, _)| {

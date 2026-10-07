@@ -130,6 +130,18 @@ pub struct PendingRow {
     pub sealed: Vec<u8>,
 }
 
+/// What a login flow expects of its alias when it is written.
+#[derive(Clone, Copy, Debug)]
+pub enum FlowTarget<'a> {
+    /// No live account holds the alias.
+    New,
+    /// This live incarnation still holds the alias.
+    Renew {
+        account: &'a str,
+        incarnation: &'a str,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FlowRow {
     pub user: String,
@@ -256,8 +268,11 @@ impl Store {
     pub async fn flow(&self, user: &str, id: &str) -> Result<Option<FlowRow>> {
         dispatch!(self, flow(user, id))
     }
-    pub async fn put_flow(&self, id: &str, row: &FlowRow) -> Result<()> {
-        dispatch!(self, put_flow(id, row))
+    /// Write a login flow under the alias lock that a delete takes, only while `target`
+    /// still holds: a renewal needs its live incarnation, a new login a free alias. False
+    /// otherwise, so a delete either cancels the flow or the flow is never written.
+    pub async fn put_flow(&self, id: &str, row: &FlowRow, target: FlowTarget<'_>) -> Result<bool> {
+        dispatch!(self, put_flow(id, row, target))
     }
     /// Mark a live flow's exchange as started, once. False otherwise.
     pub async fn start_exchange(&self, user: &str, id: &str) -> Result<bool> {

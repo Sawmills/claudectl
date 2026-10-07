@@ -69,6 +69,23 @@ pub fn ensure_local_grant(
     }
     Ok(())
 }
+/// Refuse keeping a newly acquired login for a fenced alias, a migrated Claude identity, or
+/// a migrated grant: a refused login never leaves a local refresh-grant copy.
+pub fn ensure_login_unfenced(
+    root: &Path,
+    alias: &str,
+    creds: &CredentialsFile,
+    account: &Option<Value>,
+) -> Result<()> {
+    ensure_local(root, alias)?;
+    let meta = profile::AccountMeta {
+        alias: alias.into(),
+        saved_at: String::new(),
+        oauth_account: account.clone(),
+        label: None,
+    };
+    ensure_local_grant(root, &meta, creds)
+}
 fn shared(a: &CredentialsFile, b: &CredentialsFile) -> bool {
     let a = &a.claude_ai_oauth;
     let b = &b.claude_ai_oauth;
@@ -254,4 +271,75 @@ pub fn migrate(paths: &Paths, client: &Client, alias: &str, exclusive_owner: boo
     }
     println!("Migrated {alias}; refresh ownership is on the server. Use claudectl server run.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::OauthCreds;
+
+    fn creds(token: &str) -> CredentialsFile {
+        CredentialsFile {
+            claude_ai_oauth: OauthCreds {
+                access_token: format!("{token}-access"),
+                refresh_token: Some(format!("{token}-refresh")),
+                expires_at: Some(chrono::Utc::now().timestamp_millis() + 3_600_000),
+                scopes: vec!["user:inference".into()],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        }
+    }
+    /// A migration fence for alias `work` and Claude identity a/o.
+    fn fence(paths: &Paths) {
+        let dir = directory(&paths.claudectl_dir(), "work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = Journal {
+            schema: 1,
+            alias: "work".into(),
+            server: "https://server.invalid".into(),
+            user_id: "person".into(),
+            migration_id: "m-1".into(),
+            identity: Identity {
+                account_uuid: "a".into(),
+                organization_uuid: "o".into(),
+            },
+            grant_digests: digests(&creds("migrated")),
+            receipt: None,
+        };
+        let file = dir.join("journal.json");
+        std::fs::write(&file, serde_json::to_vec(&journal).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_login_for_a_fenced_identity_keeps_no_recovery_copy() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().into());
+        fence(&paths);
+        let account = Some(json!({"accountUuid":"a","organizationUuid":"o"}));
+        // A new login of the migrated identity under another alias.
+        assert!(crate::central::retain_login(&paths, "other", &creds("new"), &account).is_err());
+        // A copy of the migrated grant itself, without identity.
+        assert!(crate::central::retain_login(&paths, "other", &creds("migrated"), &None).is_err());
+        // The fenced alias itself.
+        assert!(crate::central::retain_login(&paths, "work", &creds("new"), &None).is_err());
+        assert!(!paths.claudectl_dir().join("retained-logins").exists());
+    }
+
+    #[test]
+    fn a_login_for_an_unfenced_identity_is_still_recoverable() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().into());
+        fence(&paths);
+        let other = Some(json!({"accountUuid":"b","organizationUuid":"o"}));
+        let kept = crate::central::retain_login(&paths, "other", &creds("new"), &other).unwrap();
+        assert!(kept.exists());
+    }
 }

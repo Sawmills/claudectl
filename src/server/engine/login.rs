@@ -28,6 +28,7 @@ impl Engine {
     ) -> Result<Login> {
         let alias = validate_alias(alias)?;
         let existing = self
+            .store
             .accounts(user)
             .await?
             .into_iter()
@@ -35,12 +36,22 @@ impl Engine {
         if existing.is_some() != renew {
             bail!("use login renewal for an existing alias, or a new alias for login");
         }
+        let target = match &existing {
+            Some(a) => store::FlowTarget::Renew {
+                account: &a.id,
+                incarnation: &a.incarnation,
+            },
+            None => store::FlowTarget::New,
+        };
         let flow = Flow {
             machine: machine.into(),
             verifier: URL_SAFE_NO_PAD.encode(vault::random_bytes()),
             state: revision(),
             expires_at: now() + 300_000,
-            expected: existing.map(|a| a.identity),
+            expected: existing.as_ref().map(|a| Identity {
+                account_uuid: a.account_uuid.clone(),
+                organization_uuid: a.organization_uuid.clone(),
+            }),
         };
         let id = revision();
         let row = FlowRow {
@@ -52,7 +63,9 @@ impl Engine {
             cancelled: false,
             consumed: false,
         };
-        self.store.put_flow(&id, &row).await?;
+        if !self.store.put_flow(&id, &row, target).await? {
+            bail!("the alias changed while the login started; start the login again");
+        }
         let mut url = reqwest::Url::parse("https://claude.ai/oauth/authorize")?;
         url.query_pairs_mut().extend_pairs([
             ("code", "true"),

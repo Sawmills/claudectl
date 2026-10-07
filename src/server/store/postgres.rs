@@ -696,16 +696,49 @@ impl PostgresStore {
             .as_ref()
             .map(flow))
     }
-    pub async fn put_flow(&self, id: &str, row: &FlowRow) -> Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "INSERT INTO login_flows (id, user_id, alias, sealed, exchanging, retained, cancelled, consumed)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&id, &row.user, &row.alias, &row.sealed, &row.exchanging, &row.retained, &row.cancelled, &row.consumed],
-            )
-            .await?;
-        Ok(())
+    pub async fn put_flow(&self, id: &str, row: &FlowRow, target: FlowTarget<'_>) -> Result<bool> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        // The same lock as delete(): the flow is written before the delete, which then
+        // cancels it, or after, when the target check below fails.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&alias_lock(&row.user, &row.alias)],
+        )
+        .await?;
+        let holds = match target {
+            FlowTarget::New => tx
+                .query_opt(
+                    "SELECT 1 FROM accounts
+                     WHERE user_id = $1 AND lower(alias) = lower($2) AND NOT deleted",
+                    &[&row.user, &row.alias],
+                )
+                .await?
+                .is_none(),
+            FlowTarget::Renew {
+                account,
+                incarnation,
+            } => tx
+                .query_opt(
+                    "SELECT 1 FROM accounts
+                     WHERE account_id = $1 AND user_id = $2 AND incarnation = $3
+                       AND lower(alias) = lower($4) AND NOT deleted",
+                    &[&account, &row.user, &incarnation, &row.alias],
+                )
+                .await?
+                .is_some(),
+        };
+        if !holds {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO login_flows (id, user_id, alias, sealed, exchanging, retained, cancelled, consumed)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[&id, &row.user, &row.alias, &row.sealed, &row.exchanging, &row.retained, &row.cancelled, &row.consumed],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
     pub async fn start_exchange(&self, user: &str, id: &str) -> Result<bool> {
         let client = self.pool.get().await?;
