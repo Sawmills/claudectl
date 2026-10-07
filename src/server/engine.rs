@@ -3,7 +3,10 @@
 use super::{
     audit,
     fs::validate_alias,
-    store::{self, AdmitOutcome, Fence, Lease, PendingRow, PendingState, Store, StoredAccount},
+    store::{
+        self, AdmissionKind, AdmitOutcome, Admitted, Fence, Lease, PendingRow, PendingState, Store,
+        StoredAccount,
+    },
     vault,
 };
 use anyhow::{Context, Result, bail};
@@ -202,6 +205,10 @@ macro_rules! marker_error {
     };
 }
 marker_error!(Gone, "server account was deleted");
+marker_error!(
+    Superseded,
+    "a login renewal replaced this migration's grant before it rotated; its copies may still be valid"
+);
 marker_error!(NotFound, "server account not found");
 marker_error!(
     RefreshInProgress,
@@ -213,6 +220,8 @@ marker_error!(
 );
 /// A sealed record larger than this is refused.
 const MAX_RECORD: usize = 64 * 1024;
+/// The largest provider response kept before parsing; it must fit in a record.
+const MAX_RESPONSE: usize = 16 * 1024;
 const RECORD_VERSION: u32 = 1;
 /// The usage poll lease: one replica polls the provider at a time.
 const USAGE_LEASE: &str = "__usage";
@@ -387,8 +396,7 @@ impl Engine {
         let alias = validate_alias(alias)?;
         validate_alias(admission_id)?;
         grant.validate()?;
-        if let Some((receipt, _)) = self.admitted(user, admission_id).await? {
-            let stored = self.selected(user, &receipt.account_id).await?;
+        if let Some((receipt, _, stored)) = self.admitted(user, admission_id).await? {
             if !stored.row.alias.eq_ignore_ascii_case(alias) {
                 bail!("migration alias conflicts with its receipt");
             }
@@ -494,12 +502,22 @@ impl Engine {
             organization_uuid: identity.organization_uuid.clone(),
             revision: prior.as_ref().map_or(1, |p| p.row.revision + 1),
             sealed: self.seal(&record)?,
+            // A renewal keeps its incarnation; a new account, even under a deleted ID, gets
+            // a new one.
+            incarnation: prior
+                .as_ref()
+                .map_or_else(vault::secret, |p| p.row.incarnation.clone()),
         };
         let admission = store::Admission {
             account: row,
             expected_revision: prior.as_ref().map(|p| p.row.revision),
             admission_id: admission_id.into(),
             login_id: login_id.map(str::to_owned),
+            kind: if migrated {
+                AdmissionKind::Migration
+            } else {
+                AdmissionKind::Login
+            },
         };
         match self.store.admit(&admission).await? {
             AdmitOutcome::Committed => Ok(Receipt {
@@ -523,9 +541,13 @@ impl Engine {
         grant: Grant,
     ) -> Result<Receipt> {
         let receipt = match self.admitted(user, migration).await? {
-            Some((receipt, Rotation::Rotated | Rotation::NotMigrated)) => return Ok(receipt),
-            Some((_, Rotation::Unrotated)) => return Err(Unrotated.into()),
-            Some((receipt, Rotation::Pending { .. })) => receipt,
+            Some((receipt, Rotation::Rotated, _)) => return Ok(receipt),
+            Some((_, Rotation::Unrotated, _)) => return Err(Unrotated.into()),
+            Some((receipt, Rotation::Pending { .. }, _)) => receipt,
+            // A login admission ID reused as a migration ID.
+            Some((_, Rotation::NotMigrated, _)) => {
+                bail!("admission ID belongs to a login, not a migration")
+            }
             None => match self.admit_migration(user, alias, migration, grant).await {
                 Ok(receipt) => receipt,
                 Err(error) => {
@@ -576,30 +598,37 @@ impl Engine {
             _ => bail!("migration refresh did not complete; retry"),
         }
     }
-    /// The receipt for an admission ID and its account's rotation state. An admission whose
-    /// account was deleted is Gone: a retry cannot recreate it.
-    async fn admitted(&self, user: &str, admission: &str) -> Result<Option<(Receipt, Rotation)>> {
-        let Some((id, revoked)) = self.store.admission(user, admission).await? else {
-            return Ok(None);
+    /// The receipt for an admission ID, its account's rotation state, and the account, all
+    /// from one read bound to the incarnation the admission created. An admission whose
+    /// account was deleted is Gone: a retry cannot recreate it. A migration whose grant a
+    /// login renewal replaced before it rotated is Superseded.
+    async fn admitted(
+        &self,
+        user: &str,
+        admission: &str,
+    ) -> Result<Option<(Receipt, Rotation, Loaded)>> {
+        let (kind, row) = match self.store.admission(user, admission).await? {
+            None => return Ok(None),
+            Some(Admitted::Gone) => return Err(Gone.into()),
+            Some(Admitted::Live { kind, account }) => (kind, account),
         };
-        if revoked {
-            return Err(Gone.into());
+        let loaded = self.load_row(row)?;
+        let rotation = loaded.record.rotation.clone();
+        if kind == AdmissionKind::Migration && rotation == Rotation::NotMigrated {
+            return Err(Superseded.into());
         }
-        let loaded = self.selected(user, &id).await?;
-        Ok(Some((
-            Receipt {
-                account_id: loaded.row.id.clone(),
-                identity: loaded.identity(),
-                migration_id: admission.into(),
-            },
-            loaded.record.rotation.clone(),
-        )))
+        let receipt = Receipt {
+            account_id: loaded.row.id.clone(),
+            identity: loaded.identity(),
+            migration_id: admission.into(),
+        };
+        Ok(Some((receipt, rotation, loaded)))
     }
     /// A completed admission. A migration counts only after a verified, distinct rotation.
     pub async fn receipt(&self, user: &str, admission: &str) -> Result<Option<Receipt>> {
         match self.admitted(user, admission).await? {
-            Some((receipt, Rotation::Rotated | Rotation::NotMigrated)) => Ok(Some(receipt)),
-            Some((_, Rotation::Unrotated)) => Err(Unrotated.into()),
+            Some((receipt, Rotation::Rotated | Rotation::NotMigrated, _)) => Ok(Some(receipt)),
+            Some((_, Rotation::Unrotated, _)) => Err(Unrotated.into()),
             _ => Ok(None),
         }
     }
@@ -713,6 +742,9 @@ impl Engine {
             .bytes()
             .await
             .map_err(|_| anyhow::anyhow!("refresh response incomplete; login renewal required"))?;
+        if bytes.len() > MAX_RESPONSE {
+            bail!("refresh response too large to keep; login renewal required");
+        }
         // Keep the response before parsing. The fence ignores expiry: nobody else took the
         // lease, so nobody else refreshed (H1).
         let mut record = loaded.record.clone();

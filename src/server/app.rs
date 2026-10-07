@@ -1,7 +1,7 @@
 //! HTTP contract, machine authorization, and the company-user allow list.
 use super::{
     audit,
-    engine::{self, Endpoints, Engine, Gone, NotFound, RefreshInProgress, Unrotated},
+    engine::{self, Endpoints, Engine, Gone, NotFound, RefreshInProgress, Superseded, Unrotated},
     enrollment,
     store::{self, Machine, Store},
     vault,
@@ -251,6 +251,8 @@ impl Server {
             self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress")
         } else if error.downcast_ref::<Unrotated>().is_some() {
             self.error(StatusCode::CONFLICT, "refresh_token_not_rotated")
+        } else if error.downcast_ref::<Superseded>().is_some() {
+            self.error(StatusCode::CONFLICT, "migration_superseded")
         } else if error.downcast_ref::<NotFound>().is_some() {
             self.error(StatusCode::NOT_FOUND, "account_not_found")
         } else {
@@ -466,6 +468,8 @@ async fn migrate_account(
         .map_err(|e| {
             if e.downcast_ref::<Unrotated>().is_some() {
                 server.error(StatusCode::CONFLICT, "refresh_token_not_rotated")
+            } else if e.downcast_ref::<Superseded>().is_some() {
+                server.error(StatusCode::CONFLICT, "migration_superseded")
             } else {
                 server.error(StatusCode::CONFLICT, "admission_refused_reconcile_receipt")
             }

@@ -1669,3 +1669,169 @@ async fn the_runtime_role_needs_no_delete_privilege() {
         "a deleted account's usage came back"
     );
 }
+
+/// A provider whose refresh always fails, so a migration stays pending.
+fn failing_refresh() -> Router {
+    Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/token",
+            post(|| async { axum::http::StatusCode::BAD_GATEWAY }),
+        )
+}
+
+#[tokio::test]
+async fn a_login_renewal_never_completes_a_pending_migration() {
+    let f = Fixture::new(failing_refresh()).await;
+    let engine = f.engine().await;
+    assert!(
+        engine
+            .migrate(
+                "person",
+                "mac",
+                "work",
+                "m-1",
+                grant_until("migrated", now() + 3_600_000)
+            )
+            .await
+            .is_err()
+    );
+    let identity = Identity {
+        account_uuid: "a".into(),
+        organization_uuid: "o".into(),
+    };
+    // A login renewal replaces the pending grant; its rotation is NotMigrated.
+    engine
+        .admit(
+            "person",
+            "work",
+            "renew-1",
+            grant_until("renewed", now() + 3_600_000),
+            Some(&identity),
+        )
+        .await
+        .unwrap();
+    // The copies m-1 left on its holders were never made stale: no receipt.
+    assert!(!matches!(
+        engine.receipt("person", "m-1").await,
+        Ok(Some(_))
+    ));
+    assert!(
+        engine
+            .migrate(
+                "person",
+                "mac",
+                "work",
+                "m-1",
+                grant_until("migrated", now() + 3_600_000)
+            )
+            .await
+            .is_err()
+    );
+    // The renewal's own receipt stands.
+    assert!(matches!(
+        engine.receipt("person", "renew-1").await,
+        Ok(Some(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_recreated_account_is_a_new_row_and_the_deleted_row_stays_deleted() {
+    let (_f, engine, _refreshes) = synthetic(3600).await;
+    let id = account_id("person", "work");
+    engine
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    engine.remove("person", "mac", &id).await.unwrap();
+    engine
+        .admit(
+            "person",
+            "work",
+            "m-2",
+            grant_until("second", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = engine.store().account_rows(&id).await.unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows.iter().filter(|(_, deleted)| *deleted).count(), 1);
+    assert_ne!(rows[0].0, rows[1].0, "a recreate needs a new incarnation");
+    assert!(engine.receipt("person", "m-1").await.is_err());
+    assert!(matches!(engine.receipt("person", "m-2").await, Ok(Some(_))));
+}
+
+/// PostgreSQL only: replica A holds a stale admission marker while replica B deletes and
+/// recreates the alias. The marker binds the incarnation, so even a revoked flag that A
+/// read before the delete cannot resolve to the new account.
+#[tokio::test]
+async fn a_stale_migration_marker_resolves_gone_across_replicas() {
+    let f = Fixture::new(failing_refresh()).await;
+    if f.postgres().is_none() {
+        return;
+    }
+    let (a, b) = (f.engine().await, f.engine().await);
+    let grant = || grant_until("migrated", now() + 3_600_000);
+    assert!(
+        a.migrate("person", "mac", "work", "m-1", grant())
+            .await
+            .is_err()
+    );
+    let id = account_id("person", "work");
+    b.remove("person", "mac", &id).await.unwrap();
+    b.admit(
+        "person",
+        "work",
+        "login-2",
+        grant_until("second", now() + 3_600_000),
+        None,
+    )
+    .await
+    .unwrap();
+    // The state A sees when it read the marker before B's delete committed.
+    f.sql("UPDATE admissions SET revoked = false").await;
+    let receipt = a.receipt("person", "m-1").await.err().unwrap();
+    assert!(receipt.downcast_ref::<Gone>().is_some(), "{receipt}");
+    let retry = a
+        .migrate("person", "mac", "work", "m-1", grant())
+        .await
+        .err()
+        .unwrap();
+    assert!(retry.downcast_ref::<Gone>().is_some(), "{retry}");
+    assert!(matches!(b.receipt("person", "login-2").await, Ok(Some(_))));
+}
+
+#[tokio::test]
+async fn an_oversized_refresh_response_is_not_kept_and_the_account_stays_readable() {
+    let app = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route("/token", post(|| async { "x".repeat(MAX_RESPONSE + 1) }));
+    let f = Fixture::new(app).await;
+    let engine = f.engine().await;
+    // An access token close to expiry, so the next acquire refreshes.
+    let receipt = engine
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + USABLE + 1_000),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .acquire("person", &receipt.account_id, None)
+            .await
+            .is_err()
+    );
+    // The record still loads: the oversized body was never sealed into it.
+    assert_eq!(engine.accounts("person").await.unwrap().len(), 1);
+}

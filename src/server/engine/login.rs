@@ -135,6 +135,9 @@ impl Engine {
                     .bytes()
                     .await
                     .map_err(|_| anyhow::anyhow!("login response incomplete"))?;
+                if bytes.len() > MAX_RESPONSE {
+                    bail!("login response too large to keep; start a new login");
+                }
                 let retained = Retained {
                     received_at: now(),
                     body: bytes.to_vec(),

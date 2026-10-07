@@ -17,7 +17,9 @@ CREATE TABLE IF NOT EXISTS schema_info (
     min_reader INT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS accounts (
-    account_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    -- A recreate after a delete inserts a new incarnation; a deleted row is never revived.
+    incarnation TEXT NOT NULL,
     user_id TEXT NOT NULL,
     alias TEXT NOT NULL,
     account_uuid TEXT NOT NULL,
@@ -26,8 +28,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     sealed BYTEA NOT NULL,
     -- A delete keeps the row as a marker and erases the sealed grant; the runtime role
     -- has no DELETE privilege.
-    deleted BOOLEAN NOT NULL DEFAULT false
+    deleted BOOLEAN NOT NULL DEFAULT false,
+    PRIMARY KEY (account_id, incarnation)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS accounts_live ON accounts (account_id) WHERE NOT deleted;
 CREATE UNIQUE INDEX IF NOT EXISTS accounts_user_alias ON accounts (user_id, lower(alias))
     WHERE NOT deleted;
 CREATE UNIQUE INDEX IF NOT EXISTS accounts_identity ON accounts (account_uuid, organization_uuid)
@@ -50,6 +54,9 @@ CREATE TABLE IF NOT EXISTS admissions (
     user_id TEXT NOT NULL,
     admission_id TEXT NOT NULL,
     account_id TEXT NOT NULL,
+    -- The incarnation this admission created or renewed; it never resolves to another.
+    incarnation TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('login', 'migration')),
     revoked BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (user_id, admission_id)
@@ -146,6 +153,7 @@ fn account(row: &Row) -> StoredAccount {
         organization_uuid: row.get("organization_uuid"),
         revision: row.get("revision"),
         sealed: row.get("sealed"),
+        incarnation: row.get("incarnation"),
     }
 }
 fn state_name(state: PendingState) -> &'static str {
@@ -293,8 +301,8 @@ impl PostgresStore {
                     FOR UPDATE
                  )
                  UPDATE accounts SET revision = $3, sealed = $4
-                 WHERE account_id = $1 AND user_id = $2 AND revision = $8 AND NOT deleted
-                   AND EXISTS (SELECT 1 FROM lease)",
+                 WHERE account_id = $1 AND user_id = $2 AND revision = $8 AND incarnation = $9
+                   AND NOT deleted AND EXISTS (SELECT 1 FROM lease)",
                 &[
                     &a.id,
                     &a.user,
@@ -304,6 +312,7 @@ impl PostgresStore {
                     &lease.epoch,
                     &live,
                     &expected,
+                    &a.incarnation,
                 ],
             )
             .await?;
@@ -342,14 +351,14 @@ impl PostgresStore {
         if !live || !flow_live {
             return Ok(AdmitOutcome::Cancelled);
         }
-        let current: Option<i64> = tx
+        let current: Option<(i64, String)> = tx
             .query_opt(
-                "SELECT revision FROM accounts
+                "SELECT revision, incarnation FROM accounts
                  WHERE account_id = $1 AND user_id = $2 AND NOT deleted FOR UPDATE",
                 &[&a.id, &a.user],
             )
             .await?
-            .map(|r| r.get(0));
+            .map(|r| (r.get(0), r.get(1)));
         let conflict = tx
             .query_opt(
                 "SELECT 1 FROM accounts WHERE account_id <> $1 AND NOT deleted AND (
@@ -365,19 +374,52 @@ impl PostgresStore {
             )
             .await?
             .is_some();
-        if current != admission.expected_revision || conflict {
+        let same = match &current {
+            // A renewal writes over the live incarnation it read.
+            Some((revision, incarnation)) => {
+                Some(*revision) == admission.expected_revision && *incarnation == a.incarnation
+            }
+            None => admission.expected_revision.is_none(),
+        };
+        if !same || conflict {
             return Ok(AdmitOutcome::Conflict);
         }
-        let written = tx
-            .execute(
-                "INSERT INTO accounts (account_id, user_id, alias, account_uuid, organization_uuid, revision, sealed)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-                 ON CONFLICT (account_id) DO UPDATE SET alias = $3, account_uuid = $4,
-                    organization_uuid = $5, revision = $6, sealed = $7, deleted = false
-                 WHERE accounts.user_id = $2",
-                &[&a.id, &a.user, &a.alias, &a.account_uuid, &a.organization_uuid, &a.revision, &a.sealed],
+        let written = if current.is_some() {
+            tx.execute(
+                "UPDATE accounts SET alias = $3, account_uuid = $4, organization_uuid = $5,
+                    revision = $6, sealed = $7
+                 WHERE account_id = $1 AND user_id = $2 AND incarnation = $8 AND NOT deleted",
+                &[
+                    &a.id,
+                    &a.user,
+                    &a.alias,
+                    &a.account_uuid,
+                    &a.organization_uuid,
+                    &a.revision,
+                    &a.sealed,
+                    &a.incarnation,
+                ],
             )
-            .await;
+            .await
+        } else {
+            // Always a new row: a deleted incarnation keeps its own row and stays deleted.
+            tx.execute(
+                "INSERT INTO accounts (account_id, incarnation, user_id, alias, account_uuid,
+                    organization_uuid, revision, sealed)
+                 VALUES ($1, $8, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &a.id,
+                    &a.user,
+                    &a.alias,
+                    &a.account_uuid,
+                    &a.organization_uuid,
+                    &a.revision,
+                    &a.sealed,
+                    &a.incarnation,
+                ],
+            )
+            .await
+        };
         match written {
             Ok(1) => {}
             Ok(_) => return Ok(AdmitOutcome::Conflict),
@@ -388,8 +430,15 @@ impl PostgresStore {
             Err(e) => return Err(e.into()),
         }
         tx.execute(
-            "INSERT INTO admissions (user_id, admission_id, account_id) VALUES ($1, $2, $3)",
-            &[&a.user, &admission.admission_id, &a.id],
+            "INSERT INTO admissions (user_id, admission_id, account_id, incarnation, kind)
+             VALUES ($1, $2, $3, $4, $5)",
+            &[
+                &a.user,
+                &admission.admission_id,
+                &a.id,
+                &a.incarnation,
+                &admission.kind.name(),
+            ],
         )
         .await?;
         tx.execute(
@@ -408,19 +457,32 @@ impl PostgresStore {
         tx.commit().await?;
         Ok(AdmitOutcome::Committed)
     }
-    pub async fn admission(
-        &self,
-        user: &str,
-        admission_id: &str,
-    ) -> Result<Option<(String, bool)>> {
+    pub async fn admission(&self, user: &str, admission_id: &str) -> Result<Option<Admitted>> {
         let client = self.pool.get().await?;
-        Ok(client
+        // One statement: the marker and the live row of its own incarnation, or nothing.
+        let Some(row) = client
             .query_opt(
-                "SELECT account_id, revoked FROM admissions WHERE user_id = $1 AND admission_id = $2",
+                "SELECT m.kind, m.revoked, a.*
+                 FROM admissions m
+                 LEFT JOIN accounts a ON a.account_id = m.account_id AND a.user_id = m.user_id
+                    AND a.incarnation = m.incarnation AND NOT a.deleted
+                 WHERE m.user_id = $1 AND m.admission_id = $2",
                 &[&user, &admission_id],
             )
             .await?
-            .map(|r| (r.get(0), r.get(1))))
+        else {
+            return Ok(None);
+        };
+        let kind = AdmissionKind::parse(row.get("kind"))?;
+        let revoked: bool = row.get("revoked");
+        let live: Option<String> = row.get("account_id");
+        Ok(Some(match live {
+            Some(_) if !revoked => Admitted::Live {
+                kind,
+                account: account(&row),
+            },
+            _ => Admitted::Gone,
+        }))
     }
     pub async fn delete(&self, user: &str, id: &str) -> Result<bool> {
         let mut client = self.pool.get().await?;
@@ -499,6 +561,19 @@ impl PostgresStore {
             )
             .await?
             .is_some())
+    }
+    #[cfg(test)]
+    pub async fn account_rows(&self, id: &str) -> Result<Vec<(String, bool)>> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .query(
+                "SELECT incarnation, deleted FROM accounts WHERE account_id = $1",
+                &[&id],
+            )
+            .await?
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect())
     }
     pub async fn acquire_lease(&self, id: &str, ttl_ms: i64) -> Result<Option<Lease>> {
         let taken = std::time::Instant::now();

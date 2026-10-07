@@ -23,6 +23,9 @@ pub struct StoredAccount {
     /// Compare-and-swap counter; every write increments it.
     pub revision: i64,
     pub sealed: Vec<u8>,
+    /// One per creation of this ID. A recreate after a delete is a new row with a new
+    /// incarnation; the deleted row stays as a marker and is never revived.
+    pub incarnation: String,
 }
 
 /// A lease. `epoch` grows on every acquisition, so an old holder's writes fail.
@@ -62,6 +65,43 @@ pub struct Admission {
     pub admission_id: String,
     /// The login flow that produced the grant; it must still be live and is consumed.
     pub login_id: Option<String>,
+    pub kind: AdmissionKind,
+}
+
+/// What produced an admission. Its marker keeps it, so a migration ID completes only on a
+/// verified rotation, never on a grant a login wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionKind {
+    Login,
+    Migration,
+}
+impl AdmissionKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            AdmissionKind::Login => "login",
+            AdmissionKind::Migration => "migration",
+        }
+    }
+    pub fn parse(name: &str) -> Result<Self> {
+        match name {
+            "login" => Ok(AdmissionKind::Login),
+            "migration" => Ok(AdmissionKind::Migration),
+            other => anyhow::bail!("unknown admission kind {other:?}"),
+        }
+    }
+}
+
+/// A committed admission, resolved in one read against the incarnation it created.
+#[derive(Debug)]
+pub enum Admitted {
+    /// The account the admission created or renewed, still live in that incarnation.
+    Live {
+        kind: AdmissionKind,
+        account: StoredAccount,
+    },
+    /// A delete revoked it, or its incarnation is gone.
+    Gone,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -170,13 +210,9 @@ impl Store {
     pub async fn admit(&self, admission: &Admission) -> Result<AdmitOutcome> {
         dispatch!(self, admit(admission))
     }
-    /// The account an admission ID produced, if it committed, and whether a delete of that
-    /// account revoked it. A revoked admission never resolves to a recreated account.
-    pub async fn admission(
-        &self,
-        user: &str,
-        admission_id: &str,
-    ) -> Result<Option<(String, bool)>> {
+    /// The committed admission with this ID, in one read. It resolves only to the
+    /// incarnation it created; a revoked or recreated account is `Gone`.
+    pub async fn admission(&self, user: &str, admission_id: &str) -> Result<Option<Admitted>> {
         dispatch!(self, admission(user, admission_id))
     }
     /// Delete the user's account: erase its grant, log the deletion, and cancel every
@@ -188,6 +224,11 @@ impl Store {
     /// True when the user deleted an account with this ID and none replaced it.
     pub async fn deleted(&self, user: &str, id: &str) -> Result<bool> {
         dispatch!(self, deleted(user, id))
+    }
+    /// Every row ever stored under this account ID as (incarnation, deleted).
+    #[cfg(test)]
+    pub async fn account_rows(&self, id: &str) -> Result<Vec<(String, bool)>> {
+        dispatch!(self, account_rows(id))
     }
     pub async fn acquire_lease(&self, id: &str, ttl_ms: i64) -> Result<Option<Lease>> {
         dispatch!(self, acquire_lease(id, ttl_ms))

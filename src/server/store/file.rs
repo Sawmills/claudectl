@@ -10,13 +10,16 @@ use std::{
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Tables {
+    /// Live accounts by ID.
     accounts: BTreeMap<String, StoredAccount>,
+    /// Deleted incarnations, grant erased, kept as markers like the PostgreSQL rows.
+    retired: Vec<StoredAccount>,
     /// account ID -> (holder, epoch, expires_at in ms)
     leases: BTreeMap<String, (String, i64, i64)>,
     /// Append-only: (user, account ID, alias, deleted_at).
     deletions: Vec<(String, String, String, i64)>,
-    /// "user\u{1f}admission ID" -> (account ID, revoked by a delete)
-    admissions: BTreeMap<String, (String, bool)>,
+    /// "user\u{1f}admission ID" -> marker
+    admissions: BTreeMap<String, Marker>,
     /// "user\u{1f}admission ID" -> row
     pending: BTreeMap<String, PendingRow>,
     flows: BTreeMap<String, FlowRow>,
@@ -26,6 +29,15 @@ struct Tables {
     machines: Vec<Machine>,
     /// "kind\u{1f}key" -> row
     enrollment: BTreeMap<String, EnrollmentRow>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Marker {
+    account: String,
+    incarnation: String,
+    kind: AdmissionKind,
+    /// Revoked by a delete of its account.
+    revoked: bool,
 }
 
 pub struct FileStore {
@@ -121,11 +133,11 @@ impl FileStore {
     ) -> Result<bool> {
         self.transact(|t| {
             let id = &account.id;
-            let allowed = t
-                .accounts
-                .get(id)
-                .is_some_and(|a| a.revision == expected && a.user == account.user)
-                && Self::fenced(t, id, fence);
+            let allowed = t.accounts.get(id).is_some_and(|a| {
+                a.revision == expected
+                    && a.user == account.user
+                    && a.incarnation == account.incarnation
+            }) && Self::fenced(t, id, fence);
             if allowed {
                 t.accounts.insert(id.clone(), account.clone());
             }
@@ -148,7 +160,15 @@ impl FileStore {
             if !live || !flow_live {
                 return (AdmitOutcome::Cancelled, false);
             }
-            let current = t.accounts.get(&a.id).map(|c| c.revision);
+            // A renewal writes over the live incarnation it read; a new account is new.
+            let same = match t.accounts.get(&a.id) {
+                Some(c) => {
+                    Some(c.revision) == admission.expected_revision
+                        && c.incarnation == a.incarnation
+                        && c.user == a.user
+                }
+                None => admission.expected_revision.is_none(),
+            };
             let identity_taken = t.accounts.values().any(|o| {
                 o.id != a.id
                     && o.account_uuid == a.account_uuid
@@ -157,12 +177,19 @@ impl FileStore {
             let alias_taken = t.accounts.values().any(|o| {
                 o.id != a.id && o.user == a.user && o.alias.eq_ignore_ascii_case(&a.alias)
             });
-            if current != admission.expected_revision || identity_taken || alias_taken {
+            if !same || identity_taken || alias_taken {
                 return (AdmitOutcome::Conflict, false);
             }
             t.accounts.insert(a.id.clone(), a.clone());
-            t.admissions
-                .insert(pending_key.clone(), (a.id.clone(), false));
+            t.admissions.insert(
+                pending_key.clone(),
+                Marker {
+                    account: a.id.clone(),
+                    incarnation: a.incarnation.clone(),
+                    kind: admission.kind,
+                    revoked: false,
+                },
+            );
             if let Some(p) = t.pending.get_mut(&pending_key) {
                 p.state = PendingState::Committed;
                 p.sealed.clear();
@@ -176,28 +203,46 @@ impl FileStore {
             (AdmitOutcome::Committed, true)
         })
     }
-    pub fn admission(&self, user: &str, admission_id: &str) -> Result<Option<(String, bool)>> {
-        Ok(self.read(|t| t.admissions.get(&slot(user, admission_id)).cloned()))
+    pub fn admission(&self, user: &str, admission_id: &str) -> Result<Option<Admitted>> {
+        Ok(self.read(|t| {
+            let m = t.admissions.get(&slot(user, admission_id))?;
+            let live = t
+                .accounts
+                .get(&m.account)
+                .filter(|a| !m.revoked && a.user == user && a.incarnation == m.incarnation);
+            Some(match live {
+                Some(account) => Admitted::Live {
+                    kind: m.kind,
+                    account: account.clone(),
+                },
+                None => Admitted::Gone,
+            })
+        }))
     }
     pub fn delete(&self, user: &str, id: &str) -> Result<bool> {
         self.transact(|t| {
-            let Some(alias) = t
-                .accounts
-                .get(id)
-                .filter(|a| a.user == user)
-                .map(|a| a.alias.clone())
-            else {
+            if t.accounts.get(id).is_none_or(|a| a.user != user) {
                 return (false, false);
-            };
-            t.accounts.remove(id);
-            t.leases.remove(id);
+            }
+            // Keep the row as a marker; erase the grant.
+            let mut row = t.accounts.remove(id).expect("checked above");
+            row.sealed.clear();
+            row.revision += 1;
+            let alias = row.alias.clone();
+            t.retired.push(row);
+            // A new epoch fences every write of a refresh that was in flight.
+            if let Some((holder, epoch, expires)) = t.leases.get_mut(id) {
+                *holder = "deleted".into();
+                *epoch += 1;
+                *expires = now();
+            }
             t.usage.remove(id);
             t.deletions
                 .push((user.into(), id.into(), alias.clone(), now()));
             let prefix = slot(user, "");
-            for (key, (account, revoked)) in t.admissions.iter_mut() {
-                if key.starts_with(&prefix) && account == id {
-                    *revoked = true;
+            for (key, m) in t.admissions.iter_mut() {
+                if key.starts_with(&prefix) && m.account == id {
+                    m.revoked = true;
                 }
             }
             for p in t.pending.values_mut() {
@@ -222,6 +267,16 @@ impl FileStore {
         Ok(self.read(|t| {
             !t.accounts.contains_key(id)
                 && t.deletions.iter().any(|(u, i, _, _)| u == user && i == id)
+        }))
+    }
+    #[cfg(test)]
+    pub fn account_rows(&self, id: &str) -> Result<Vec<(String, bool)>> {
+        Ok(self.read(|t| {
+            let retired = t.retired.iter().filter(|a| a.id == id);
+            retired
+                .map(|a| (a.incarnation.clone(), true))
+                .chain(t.accounts.get(id).map(|a| (a.incarnation.clone(), false)))
+                .collect()
         }))
     }
     pub fn acquire_lease(&self, id: &str, ttl_ms: i64) -> Result<Option<Lease>> {

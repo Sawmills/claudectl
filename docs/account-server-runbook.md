@@ -88,6 +88,8 @@ copy afterwards.
 5. **Migrate** on one machine: `claudectl server migrate <alias> --exclusive-owner`. The server
    refreshes once and completes only if the provider returns a new refresh token. If it
    answers `refresh_token_not_rotated`, the old copies stay valid: stop and report.
+   The same holds for `migration_superseded`: a login renewal replaced the grant before it
+   rotated.
 6. **Retire the other copies** by digest match on every other holder.
 7. **Verify** on the Mac and on the devbox: `claudectl server run <alias> -- -p "say ok"` across
    one access-token renewal, then `claudectl server status <alias>`.
