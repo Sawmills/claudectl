@@ -4,12 +4,12 @@ metadata:
   namespace: claudectl
   name: claudectl-sso
 data:
-  # Google Workspace OIDC (A14). client_id comes from the Google OAuth client created in
-  # A15; replace the placeholder before registration.
+  # Google Workspace OIDC (A14). client_id of the Google OAuth client from A26 (1Password
+  # Engineering item claudectl-staging-oauth); the secret is in Secrets Manager.
   sso.json: |
     {
       "issuer": "https://accounts.google.com",
-      "client_id": "REPLACE_WITH_GOOGLE_CLIENT_ID",
+      "client_id": "950651542168-eep4d3mh3qma7diihttcd3c6acg7r0tb.apps.googleusercontent.com",
       "client_secret_file": "/keys/oidc-client-secret",
       "allowed_domains": ["sawmills.ai"],
       "allowed_hosted_domains": ["sawmills.ai"]
