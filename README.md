@@ -304,9 +304,10 @@ claudectl rate --minutes 60 --json
 the rate-limit errors (429) in lane transcripts, and the share of 429s. It
 counts lanes only: `accounts.jsonl` is the only record of which account ran
 when, so a Claude session outside `claudectl claude` has no account to count
-against. A turn outside every logged run shows as `.unattributed`. `--json`
-prints `{"version": 1, "window_minutes": N, "accounts": [{"alias", "lanes",
-"ok", "rate_limited"}]}`.
+against. A turn outside every logged run shows as `(outside a lane run)`, with
+`"alias": null` in `--json`, which prints `{"version": 1, "window_minutes": N,
+"accounts": [{"alias", "lanes", "ok", "rate_limited"}]}`. An unreadable lane
+directory fails the command rather than report no activity.
 
 ### Statusline
 

@@ -11,12 +11,10 @@ use serde::Serialize;
 
 use crate::config::Paths;
 
-/// The account name for turns outside every logged span.
-pub const UNATTRIBUTED: &str = ".unattributed";
-
 #[derive(Debug, Default, Clone, PartialEq, Serialize)]
 pub struct AccountRate {
-    pub alias: String,
+    /// `None` for turns outside every logged span.
+    pub alias: Option<String>,
     pub lanes: BTreeSet<String>,
     /// Assistant responses, one per API message.
     pub ok: u64,
@@ -44,7 +42,8 @@ struct Span {
     to: DateTime<Utc>,
 }
 
-/// Counts for every account seen in a lane since `since`, sorted by alias.
+/// Counts for every account seen in a lane since `since`, sorted by alias,
+/// unattributed turns first.
 pub fn collect(
     paths: &Paths,
     since: DateTime<Utc>,
@@ -56,7 +55,7 @@ pub fn collect(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e).with_context(|| format!("failed to read {}", lanes.display())),
     };
-    let mut accounts: BTreeMap<String, AccountRate> = BTreeMap::new();
+    let mut accounts: BTreeMap<Option<String>, AccountRate> = BTreeMap::new();
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -73,11 +72,11 @@ pub fn collect(
             let alias = spans
                 .iter()
                 .find(|s| s.from <= turn.at && turn.at <= s.to)
-                .map_or(UNATTRIBUTED, |s| s.alias.as_str());
+                .map(|s| s.alias.clone());
             let account = accounts
-                .entry(alias.to_string())
+                .entry(alias.clone())
                 .or_insert_with(|| AccountRate {
-                    alias: alias.to_string(),
+                    alias,
                     ..AccountRate::default()
                 });
             account.lanes.insert(lane.clone());
@@ -153,22 +152,28 @@ struct Turn {
 /// count once per API message id.
 fn turns(projects: &Path, since: DateTime<Utc>) -> Result<Vec<Turn>> {
     let mut turns = Vec::new();
-    let Ok(dirs) = std::fs::read_dir(projects) else {
+    let mut seen = HashSet::new();
+    let Some(dirs) = read_dir(projects)? else {
         return Ok(turns);
     };
-    let mut seen = HashSet::new();
-    for dir in dirs.flatten() {
-        let Ok(files) = std::fs::read_dir(dir.path()) else {
+    for dir in dirs {
+        if !dir.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(files) = read_dir(&dir.path())? else {
             continue;
         };
-        for file in files.flatten() {
+        for file in files {
             let path = file.path();
             if path.extension().is_none_or(|ext| ext != "jsonl") {
                 continue;
             }
             // A file not written since `since` holds nothing newer.
-            let modified = file.metadata().and_then(|m| m.modified()).ok();
-            if modified.is_some_and(|m| DateTime::<Utc>::from(m) < since) {
+            let modified = file
+                .metadata()
+                .and_then(|m| m.modified())
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            if DateTime::<Utc>::from(modified) < since {
                 continue;
             }
             let text = std::fs::read_to_string(&path)
@@ -177,6 +182,20 @@ fn turns(projects: &Path, since: DateTime<Utc>) -> Result<Vec<Turn>> {
         }
     }
     Ok(turns)
+}
+
+/// The entries of `dir`, or `None` when it does not exist. Any other error
+/// fails: a report with unread transcripts would look like no activity.
+fn read_dir(dir: &Path) -> Result<Option<Vec<std::fs::DirEntry>>> {
+    let failed = || format!("failed to read {}", dir.display());
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .collect::<std::io::Result<Vec<_>>>()
+            .map(Some)
+            .with_context(failed),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(failed),
+    }
 }
 
 fn turns_in(text: &str, since: DateTime<Utc>, seen: &mut HashSet<String>) -> Vec<Turn> {
@@ -333,11 +352,26 @@ mod tests {
         .unwrap();
         let counts: Vec<_> = rates
             .iter()
-            .map(|r| (r.alias.as_str(), r.ok, r.rate_limited))
+            .map(|r| (r.alias.as_deref(), r.ok, r.rate_limited))
             .collect();
-        assert_eq!(counts, [(UNATTRIBUTED, 1, 0), ("a", 1, 1), ("b", 2, 0)]);
+        assert_eq!(counts, [(None, 1, 0), (Some("a"), 1, 1), (Some("b"), 2, 0)]);
         assert_eq!(rates[1].rate_limited_percent(), 50.0);
         assert!(rates[2].lanes.contains("work"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_transcript_directory_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().to_path_buf());
+        let projects = paths.claudectl_dir().join("lanes/work/config/projects");
+        std::fs::create_dir_all(projects.join("-repo")).unwrap();
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let now = Utc::now();
+        let result = collect(&paths, now, now);
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
     }
 
     #[test]

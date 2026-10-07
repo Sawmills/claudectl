@@ -42,7 +42,7 @@ fn table(accounts: &[AccountRate]) -> Table {
         let percent = account.rate_limited_percent();
         let rate = Cell::new(format!("{percent:.1}%"));
         table.add_row([
-            Cell::new(&account.alias),
+            Cell::new(account.alias.as_deref().unwrap_or("(outside a lane run)")),
             Cell::new(account.lanes.iter().cloned().collect::<Vec<_>>().join(", ")),
             Cell::new(account.ok),
             Cell::new(account.rate_limited),
