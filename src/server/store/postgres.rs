@@ -502,6 +502,13 @@ impl PostgresStore {
             &[&alias_lock(user, &alias)],
         )
         .await?;
+        // Lock the lease row before the account row, in the same order as put_account(), so
+        // a concurrent refresh write and this delete never deadlock.
+        tx.execute(
+            "SELECT 1 FROM refresh_leases WHERE account_id = $1 FOR UPDATE",
+            &[&id],
+        )
+        .await?;
         // Keep the row as a marker; erase the grant. No DELETE: the runtime role has none.
         if tx
             .execute(
