@@ -48,6 +48,34 @@ The pilot is one inactive Claude account, never the active one.
 4. Run `claudectl server migrate --exclusive-owner` on one machine. The claudectl fence then blocks a restore of that grant or identity there.
 5. On every other holder, delete the copy by digest match and record a fence there too.
 
+### Pilot inventory (K7), 2026-10-07 19:18Z
+
+Read-only. Paths, identities (account UUID prefix) and SHA-256 prefixes only; no token was printed. Tool: a digest script that reads one credential JSON and prints `sha256(token)[:16]`.
+
+**Pilot: `amir6@sawmills.ai`** (account `fd83569a`). Alternate: `amir3@sawmills.ai` (`5a747aa6`). Both are inactive: not the live login on any machine, no session or lane use. Both are at 100% of the 7-day limit (cache); `amir6` resets 2026-10-12T20:00Z. The migration needs only the token refresh. The inference check (runbook step 7) waits for that reset; the token issue and `/api/oauth/profile` checks do not.
+
+No account with capacity is inactive today: `amir7` is the Mac mini login, `amir5` the devbox login, `amir` the MacBook login; `amir2` and `amir4` are at 100% and 98%, and both have lane or session use.
+
+| Holder                     | Path                                                                        | Pilot status                                                                                                                         |
+| -------------------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Mac mini claudectl profile | `~/.claudectl/profiles/amir6@sawmills.ai/credentials.json` (0600)           | **Holds the grant** (access `cc8f4977…`, refresh `3e23bb18…`). The only copy found.                                                  |
+| Mac mini Keychain          | `Claude Code-credentials`                                                   | Not the pilot: live login `amir7` (`08c5d253`), digests `869cf4c9…`/`9d92e358…`.                                                     |
+| Mac mini Keychain          | `Claude Code-credentials-66c25890`                                          | No OAuth fields.                                                                                                                     |
+| Mac mini file              | `~/.claude/.credentials.json`                                               | Not the pilot: matches the `amir7` profile digests.                                                                                  |
+| Mac mini sessions          | `~/.claudectl/run/amir6@sawmills.ai/`                                       | Empty; no open files.                                                                                                                |
+| Mac mini lanes             | `~/.claudectl/lanes/proof-unattended/`                                      | Receipts name `amir` and `amir2` only.                                                                                               |
+| Mac mini recovery copies   | `~/.claudectl/retained-logins/`                                             | Absent.                                                                                                                              |
+| Mac mini usage cache       | `~/.claudectl/usage/cache-v1.json` entry `cc8f4977…`                        | Usage numbers only, no grant.                                                                                                        |
+| Devbox                     | `~/.claudectl/profiles/`                                                    | Only `amir5`.                                                                                                                        |
+| Devbox                     | `~/.claude/.credentials.json`                                               | Not the pilot: live login `amir5` (`05cafa8a`). No other `*.credentials.json` under `~`.                                             |
+| MacBook                    | Keychain `Claude Code-credentials`; `~/.claudectl`                          | Not the pilot: live login `amir` (`f8315bf6`, from `~/.claude.json`); no claudectl state. Token digest not read (Keychain over SSH). |
+| Capacity guard             | `~/Code/.p121/claude-capacity-guard.sh`; `muster/instances/amir/guards.tsv` | No Claude guard runs: the script stopped 2026-09-29 and the guard list has none.                                                     |
+| Headless jobs              | crontab, LaunchAgents, `ps`                                                 | No Claude job or process pinned to `amir6`.                                                                                          |
+
+**Writers to watch.** `claudectl use` saves the outgoing live login into its profile, and `claudectl status` refreshes an expired profile grant and saves the rotation. The `amir6` profile file changed at 04:57 PDT today through one of these, on the Mac mini. Host account switches are manual (guide and operators). Before the migration, the guide and operators confirm that they never switch to `amir6`; after it, the claudectl fence refuses `use`, `status` refresh and any restore of that identity on the Mac mini.
+
+**Residual risk.** Backups (Time Machine) may hold an old copy of the profile file. Claude rotates refresh tokens on use, so an older copy is stale once the server's forced refresh rotates the grant.
+
 ## Deploy access (superseded by the A14 section below)
 
 The single-PVC deploy table is replaced. See "A14 revision: infra PRs".
