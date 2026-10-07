@@ -203,7 +203,7 @@ fn preflight(paths: &Paths, args: &[OsString]) -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
-fn program(path: &Path) -> Result<PathBuf> {
+pub(super) fn program(path: &Path) -> Result<PathBuf> {
     if path.components().count() > 1 {
         return Ok(path.canonicalize()?);
     }
@@ -214,7 +214,9 @@ fn program(path: &Path) -> Result<PathBuf> {
         .canonicalize()
         .map_err(Into::into)
 }
-fn supported(path: &Path) -> Result<()> {
+/// Built-in hashes passed the synthetic checks in experiments/settings-renewal; other builds
+/// need `claudectl server qualify` on this machine.
+fn supported(paths: &Paths, path: &Path) -> Result<()> {
     let digest = exec::sha256_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
     let allowed = if cfg!(target_os = "macos") {
         "bbe93063f7a0879a1021b2891e5c9354e5b3b98433e32efe6750f7710afed750"
@@ -223,8 +225,10 @@ fn supported(path: &Path) -> Result<()> {
     } else {
         bail!("server-account sessions support Linux and macOS");
     };
-    if digest != allowed {
-        bail!("Claude build has not passed account-server compatibility checks");
+    if digest != allowed && !super::qualify::is_qualified(paths, &digest)? {
+        bail!(
+            "Claude build {digest} has not passed account-server compatibility checks; run `claudectl server qualify`"
+        );
     }
     Ok(())
 }
@@ -255,7 +259,7 @@ pub fn run(
     let _slot = exec::RunSlot::take().map_err(|error| anyhow::anyhow!("{error}"))?;
     preflight(paths, args)?;
     let binary = program(binary)?;
-    supported(&binary)?;
+    supported(paths, &binary)?;
     let account = client.account(alias)?;
     let access = client.acquire(&account.account_id, None)?;
     let mut session = Session::new(paths, &account, access)?;
@@ -266,7 +270,7 @@ pub fn run(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o500))?;
     }
-    supported(&snapshot)?;
+    supported(paths, &snapshot)?;
     let mut launch_args = vec![OsString::from("--setting-sources"), OsString::from("user")];
     launch_args.extend_from_slice(args);
     let mut command = session.command(&snapshot, &launch_args)?;

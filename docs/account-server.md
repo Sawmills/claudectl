@@ -20,6 +20,7 @@ claudectl server run work --claude /absolute/path/to/claude
 claudectl server run work -- --resume SESSION_ID
 claudectl server status work
 claudectl server status work --cached
+claudectl server qualify --claude /absolute/path/to/claude
 claudectl server devices
 claudectl server revoke MACHINE_ID
 claudectl server remove work
@@ -43,8 +44,16 @@ these Claude binary hashes have synthetic compatibility evidence:
 | Linux ARM64 | 2.1.280        | `92f2b4fd05d0bdcf7b9a0d4e0ecef4a1e4b368b290cd8fd07cff9a50013f45a2` |
 | macOS ARM64 | 2.1.288        | `bbe93063f7a0879a1021b2891e5c9354e5b3b98433e32efe6750f7710afed750` |
 
-The launcher hashes a private executable snapshot before running it. Other builds
-are refused. Updating this list requires rerunning the compatibility experiments.
+The launcher hashes a private executable snapshot before running it. Any other
+build is refused until `claudectl server qualify --claude PATH` passes on that
+machine. The command runs the full-launcher renewal check from
+`experiments/settings-renewal/supervised.py` against a private snapshot of the build:
+a fake API, an invalid process token, and one settings token change during a Bash
+tool call. Only on a pass does it record the hash in
+`~/.claudectl/server/qualified-builds.json`. A damaged list refuses every build. It
+needs `python3` (and `unshare` on Linux, Homebrew OpenSSL on macOS). On 2026-10-06,
+Claude 2.1.292 on macOS ARM64 (`97a01e5bc74a199e67189435d0331ea3a24eac2e07db4b76d9148c5b0386138f`)
+passed.
 
 ## Session behavior
 

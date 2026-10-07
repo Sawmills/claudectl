@@ -12,6 +12,8 @@ use std::{
 
 #[path = "central_migration.rs"]
 mod migration;
+#[path = "central_qualify.rs"]
+mod qualify;
 #[path = "central_session.rs"]
 pub mod session;
 pub use migration::{ensure_local, ensure_local_grant, migrate};
@@ -563,6 +565,11 @@ pub enum Command {
         #[arg(last = true)]
         args: Vec<std::ffi::OsString>,
     },
+    /// Qualify a Claude build: run the synthetic renewal handoff check, record it only on a pass
+    Qualify {
+        #[arg(long, default_value = "claude")]
+        claude: PathBuf,
+    },
     /// Read subscription usage; --cached works entirely offline
     Status {
         alias: String,
@@ -598,6 +605,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Disconnect => disconnect(&paths),
         Command::Status { alias, cached } => status(&paths, &alias, cached),
         Command::Statusline { account_id } => statusline(&paths, &account_id),
+        Command::Qualify { claude } => qualify::qualify(&paths, &claude),
         command => {
             let client = Client::load(&paths)?;
             match command {
