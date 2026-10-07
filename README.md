@@ -265,6 +265,28 @@ pins the profile's account and the executable's SHA-256. It also keeps a private
 copy of claudectl in `<launcher>.claudectl/`, checks that copy's SHA-256 and runs
 it, so a later claudectl upgrade does not change what the launcher runs.
 
+### Statusline
+
+```bash
+claudectl statusline   # e.g. "team 62% wk · 6d22h · 90% 5h"
+```
+
+`statusline` prints the active account's weekly room, the time to its weekly
+reset and, while a 5-hour window is open, its 5-hour room. The name is the
+account's label, or the alias before the `@`, cleaned to letters, digits, space,
+`.`, `_` and `-` and capped at 20 characters. It only reads a small sample that
+`status`, `use` and `switch` write for the active account
+(`~/.claudectl/statusline.json`, no credentials), so it never touches the
+network or the Keychain. It prints nothing, and exits 0, when the sample is
+missing, older than 5 minutes, for another account (alias, profile or live
+login account UUID),
+past its weekly reset, or slow to read (150 ms). Use it as
+Claude Code's status line in `~/.claude/settings.json`:
+
+```json
+{ "statusLine": { "type": "command", "command": "claudectl statusline" } }
+```
+
 ### Housekeeping
 
 ```bash

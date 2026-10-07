@@ -5,6 +5,7 @@ pub mod exec;
 pub mod oauth;
 pub mod profile;
 pub mod shell;
+pub mod statusline;
 pub mod usage_cache;
 
 pub mod central;
