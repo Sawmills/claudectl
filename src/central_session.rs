@@ -216,6 +216,9 @@ pub(super) fn program(path: &Path) -> Result<PathBuf> {
 }
 /// Built-in hashes passed the synthetic checks in experiments/settings-renewal; other builds
 /// need `claudectl server qualify` on this machine.
+pub(super) fn check_supported(paths: &Paths, path: &Path) -> Result<()> {
+    supported(paths, path)
+}
 fn supported(paths: &Paths, path: &Path) -> Result<()> {
     let digest = exec::sha256_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
     let allowed = if cfg!(target_os = "macos") {

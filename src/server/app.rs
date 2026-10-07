@@ -487,12 +487,12 @@ async fn receipt(
     Query(input): Query<ReceiptQuery>,
 ) -> Result<Response, HttpError> {
     let machine = server.authorize(&headers).await?;
-    let receipt = server
+    let (receipt, state) = server
         .engine
-        .receipt(&machine.user, &input.migration_id)
+        .receipt_state(&machine.user, &input.migration_id)
         .await
         .map_err(|e| server.engine_error(&e, "receipt_unavailable"))?;
-    Ok(private(json!({"receipt": receipt})))
+    Ok(private(json!({"receipt": receipt, "state": state})))
 }
 
 #[derive(Deserialize)]

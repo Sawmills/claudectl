@@ -1,0 +1,516 @@
+#![cfg(all(feature = "server", target_os = "linux"))]
+//! `claudectl server migrate --all` against a scripted account server. Linux only: the live
+//! login is a file there, so no Keychain is touched. Synthetic tokens only.
+use assert_cmd::Command;
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use claudectl::{
+    api::{CredentialsFile, OauthCreds},
+    config::Paths,
+    profile,
+};
+use serde_json::{Value, json};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+/// What the fake server does with an alias's import.
+#[derive(Clone, Copy, PartialEq)]
+enum Script {
+    Ok,
+    /// First import refused (409), later ones succeed.
+    Flaky,
+    Superseded,
+    Unrotated,
+    Gone,
+    /// The import commits but the reply is lost (503).
+    Lost,
+    /// 503 and nothing committed.
+    Down,
+    /// 503 after admitting without a verified rotation.
+    Pending,
+}
+
+#[derive(Default)]
+struct Fake {
+    scripts: HashMap<String, Script>,
+    identities: HashMap<String, String>,
+    receipts: HashMap<String, Value>,
+    pending: HashSet<String>,
+    imports: HashMap<String, usize>,
+    imported_refresh: HashMap<String, String>,
+    me_down: bool,
+}
+type Shared = Arc<Mutex<Fake>>;
+
+fn error(status: StatusCode, reason: &str) -> Response {
+    (status, Json(json!({"error": reason}))).into_response()
+}
+
+async fn me(State(fake): State<Shared>) -> Response {
+    if fake.lock().unwrap().me_down {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+    }
+    Json(json!({"id":"person","machine":"m"})).into_response()
+}
+async fn receipt(State(fake): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let fake = fake.lock().unwrap();
+    let id = &q["migration_id"];
+    match fake.receipts.get(id) {
+        Some(r) => Json(json!({"receipt": r, "state": "complete"})).into_response(),
+        None if fake.pending.contains(id) => {
+            Json(json!({"receipt": null, "state": "pending"})).into_response()
+        }
+        None => Json(json!({"receipt": null, "state": "none"})).into_response(),
+    }
+}
+async fn import(State(fake): State<Shared>, Json(body): Json<Value>) -> Response {
+    let mut fake = fake.lock().unwrap();
+    let alias = body["alias"].as_str().unwrap().to_string();
+    let id = body["migration_id"].as_str().unwrap().to_string();
+    let count = {
+        let c = fake.imports.entry(id.clone()).or_default();
+        *c += 1;
+        *c
+    };
+    fake.imported_refresh.insert(
+        alias.clone(),
+        body["grant"]["refresh_token"].as_str().unwrap().into(),
+    );
+    let receipt = json!({
+        "account_id": "a".repeat(64),
+        "identity": {"account_uuid": fake.identities[&alias], "organization_uuid": "org"},
+        "migration_id": id,
+    });
+    match fake.scripts.get(&alias).copied().unwrap_or(Script::Ok) {
+        Script::Flaky if count == 1 => {
+            error(StatusCode::CONFLICT, "admission_refused_reconcile_receipt")
+        }
+        Script::Superseded => error(StatusCode::CONFLICT, "migration_superseded"),
+        Script::Unrotated => error(StatusCode::CONFLICT, "refresh_token_not_rotated"),
+        Script::Gone => error(StatusCode::GONE, "account_deleted"),
+        Script::Down => error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        Script::Pending => {
+            fake.pending.insert(id);
+            error(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+        }
+        Script::Lost => {
+            fake.receipts.insert(id, receipt);
+            error(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+        }
+        _ => {
+            fake.receipts.insert(id, receipt.clone());
+            Json(receipt).into_response()
+        }
+    }
+}
+async fn token() -> Json<Value> {
+    Json(
+        json!({"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}),
+    )
+}
+
+struct Env {
+    home: tempfile::TempDir,
+    paths: Paths,
+    origin: String,
+    bin: PathBuf,
+    fake: Shared,
+    _server: std::thread::JoinHandle<()>,
+}
+
+fn creds(token: &str, expires_in_ms: i64) -> CredentialsFile {
+    CredentialsFile {
+        claude_ai_oauth: OauthCreds {
+            access_token: format!("{token}-access"),
+            refresh_token: Some(format!("{token}-refresh")),
+            expires_at: Some(chrono::Utc::now().timestamp_millis() + expires_in_ms),
+            scopes: vec!["user:inference".into(), "user:profile".into()],
+            subscription_type: None,
+            rate_limit_tier: None,
+            extra: Default::default(),
+        },
+        extra: Default::default(),
+    }
+}
+fn private_write(path: &Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, contents).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+impl Env {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().into());
+        let fake: Shared = Arc::default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/v1/me", get(me))
+            .route("/v2/anthropic/migrations", get(receipt).post(import))
+            .route("/token", post(token))
+            .with_state(fake.clone());
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                    axum::serve(listener, app).await.unwrap();
+                });
+        });
+        // Connection to the fake server.
+        let dir = paths.claudectl_dir().join("server");
+        private_write(
+            &dir.join("connection.json"),
+            &json!({"server":origin,"user_id":"person","token_file":dir.join("machine.json")})
+                .to_string(),
+        );
+        private_write(
+            &dir.join("machine.json"),
+            &json!("synthetic-machine-token").to_string(),
+        );
+        // A qualified synthetic Claude build on PATH.
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(&claude, "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let env = Self {
+            home,
+            paths,
+            origin,
+            bin,
+            fake,
+            _server: server,
+        };
+        env.qualify();
+        env
+    }
+    fn qualify(&self) {
+        let digest = claudectl::exec::sha256_file(&self.bin.join("claude")).unwrap();
+        private_write(
+            &self
+                .paths
+                .claudectl_dir()
+                .join("server/qualified-builds.json"),
+            &json!([{"sha256":digest,"platform":"linux","qualified_at":"2026-10-07T00:00:00Z"}])
+                .to_string(),
+        );
+    }
+    fn unqualify(&self) {
+        std::fs::remove_file(
+            self.paths
+                .claudectl_dir()
+                .join("server/qualified-builds.json"),
+        )
+        .unwrap();
+    }
+    fn profile(&self, alias: &str, uuid: &str, script: Script, expires_in_ms: i64) {
+        profile::save_profile_to(
+            &self.paths,
+            alias,
+            &creds(alias, expires_in_ms),
+            Some(json!({"accountUuid":uuid,"organizationUuid":"org"})),
+        )
+        .unwrap();
+        let mut fake = self.fake.lock().unwrap();
+        fake.scripts.insert(alias.into(), script);
+        fake.identities.insert(alias.into(), uuid.into());
+    }
+    /// The host's live login for `alias` (Linux: the credentials file and ~/.claude.json).
+    fn live(&self, alias: &str, uuid: &str, token: &str) {
+        self.profile(alias, uuid, Script::Ok, 3_600_000);
+        private_write(
+            &self.paths.claude_credentials_file(),
+            &serde_json::to_string(&creds(token, 3_600_000)).unwrap(),
+        );
+        std::fs::write(
+            self.paths.claude_json(),
+            json!({"oauthAccount":{"accountUuid":uuid,"organizationUuid":"org"}}).to_string(),
+        )
+        .unwrap();
+        profile::set_active_from(&self.paths, alias).unwrap();
+    }
+    fn script(&self, alias: &str, script: Script) {
+        self.fake
+            .lock()
+            .unwrap()
+            .scripts
+            .insert(alias.into(), script);
+    }
+    fn run(&self, args: &[&str], pids: &str) -> (bool, String) {
+        let path = format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap());
+        let output = Command::cargo_bin("claudectl")
+            .unwrap()
+            .env("HOME", self.home.path())
+            .env("PATH", path)
+            .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env("CLAUDECTL_TEST_CLAUDE_PIDS", pids)
+            .env("CLAUDECTL_TEST_TOKEN_URL", format!("{}/token", self.origin))
+            .args(["server", "migrate"])
+            .args(args)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (output.status.success(), text)
+    }
+    fn all(&self) -> (bool, String) {
+        self.run(&["--all"], "")
+    }
+    fn row(text: &str, alias: &str) -> String {
+        text.lines()
+            .find(|l| l.split_whitespace().next() == Some(alias))
+            .unwrap_or_else(|| panic!("no row for {alias} in:\n{text}"))
+            .to_string()
+    }
+    fn has_credentials(&self, alias: &str) -> bool {
+        self.paths
+            .profiles_dir()
+            .join(alias)
+            .join("credentials.json")
+            .exists()
+    }
+    fn fenced(&self, alias: &str) -> bool {
+        use sha2::{Digest, Sha256};
+        let hash = format!(
+            "{:x}",
+            Sha256::digest(alias.to_ascii_lowercase().as_bytes())
+        );
+        self.paths
+            .claudectl_dir()
+            .join("server/migrations")
+            .join(hash)
+            .join("journal.json")
+            .exists()
+    }
+    fn imports(&self) -> usize {
+        self.fake.lock().unwrap().imports.values().sum()
+    }
+}
+
+#[test]
+fn all_saved_accounts_migrate_and_a_rerun_reports_already() {
+    let env = Env::new();
+    for (alias, uuid) in [
+        ("a1", "u-a1-0000"),
+        ("b2", "u-b2-0000"),
+        ("c3", "u-c3-0000"),
+    ] {
+        env.profile(alias, uuid, Script::Ok, 3_600_000);
+    }
+    let (ok, text) = env.all();
+    assert!(ok, "{text}");
+    for alias in ["a1", "b2", "c3"] {
+        assert!(Env::row(&text, alias).contains("migrated"), "{text}");
+        assert!(!env.has_credentials(alias));
+        assert!(env.fenced(alias));
+    }
+    let (ok, text) = env.all();
+    assert!(ok, "{text}");
+    for alias in ["a1", "b2", "c3"] {
+        assert!(Env::row(&text, alias).contains("already"), "{text}");
+    }
+    assert_eq!(env.imports(), 3, "a rerun must not import again");
+}
+
+#[test]
+fn one_account_failing_mid_run_stays_fenced_and_a_rerun_completes_it() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, 3_600_000);
+    env.profile("b2", "u-b2-0000", Script::Flaky, 3_600_000);
+    env.profile("c3", "u-c3-0000", Script::Ok, 3_600_000);
+    let (ok, text) = env.all();
+    assert!(!ok, "{text}");
+    assert!(Env::row(&text, "a1").contains("migrated"), "{text}");
+    assert!(Env::row(&text, "b2").contains("failed:fenced"), "{text}");
+    assert!(Env::row(&text, "c3").contains("migrated"), "{text}");
+    assert!(env.fenced("b2"));
+    let (ok, text) = env.all();
+    assert!(ok, "{text}");
+    assert!(Env::row(&text, "b2").contains("migrated"), "{text}");
+}
+
+#[test]
+fn a_lost_reply_halts_the_run_and_a_rerun_finds_the_receipt_without_a_second_import() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Lost, 3_600_000);
+    env.profile("b2", "u-b2-0000", Script::Ok, 3_600_000);
+    let (ok, text) = env.all();
+    assert!(!ok, "{text}");
+    assert!(Env::row(&text, "a1").contains("lost-reply"), "{text}");
+    assert!(Env::row(&text, "b2").contains("not-attempted"), "{text}");
+    assert!(!env.fenced("b2"), "no fence after the server went down");
+    let (ok, text) = env.all();
+    assert!(ok, "{text}");
+    assert!(Env::row(&text, "a1").contains("migrated"), "{text}");
+    assert!(Env::row(&text, "b2").contains("migrated"), "{text}");
+    assert_eq!(
+        env.imports(),
+        2,
+        "the lost import was found by receipt lookup"
+    );
+}
+
+#[test]
+fn an_unreachable_server_fences_nothing() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, 3_600_000);
+    env.fake.lock().unwrap().me_down = true;
+    let (ok, text) = env.all();
+    assert!(!ok, "{text}");
+    assert!(text.contains("nothing was fenced"), "{text}");
+    assert!(!env.fenced("a1"));
+    assert!(env.has_credentials("a1"));
+    // A 5xx mid-run stops the loop: the next account is not fenced.
+    env.fake.lock().unwrap().me_down = false;
+    env.script("a1", Script::Down);
+    env.profile("b2", "u-b2-0000", Script::Ok, 3_600_000);
+    let (ok, text) = env.all();
+    assert!(!ok, "{text}");
+    assert!(Env::row(&text, "b2").contains("not-attempted"), "{text}");
+    assert!(!env.fenced("b2"));
+}
+
+#[test]
+fn superseded_unrotated_and_gone_accounts_get_their_own_rows() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Superseded, 3_600_000);
+    env.profile("b2", "u-b2-0000", Script::Unrotated, 3_600_000);
+    env.profile("c3", "u-c3-0000", Script::Gone, 3_600_000);
+    env.profile("d4", "u-d4-0000", Script::Ok, 3_600_000);
+    let (ok, text) = env.all();
+    assert!(!ok, "{text}");
+    assert!(Env::row(&text, "a1").contains("superseded"), "{text}");
+    assert!(Env::row(&text, "a1").contains("--abort a1"), "{text}");
+    assert!(Env::row(&text, "b2").contains("unrotated"), "{text}");
+    assert!(Env::row(&text, "c3").contains("gone"), "{text}");
+    assert!(Env::row(&text, "d4").contains("migrated"), "{text}");
+}
+
+#[test]
+fn abort_restores_only_when_the_server_never_admitted() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Down, 3_600_000);
+    let (_, text) = env.all();
+    assert!(env.fenced("a1"), "{text}");
+    assert!(!env.has_credentials("a1"));
+    let (ok, text) = env.run(&["--abort", "a1"], "");
+    assert!(ok, "{text}");
+    assert!(!env.fenced("a1"));
+    assert!(env.has_credentials("a1"), "the grant is restored");
+
+    env.profile("b2", "u-b2-0000", Script::Pending, 3_600_000);
+    env.script("a1", Script::Ok);
+    let (_, text) = env.all();
+    assert!(env.fenced("b2"), "{text}");
+    let (ok, text) = env.run(&["--abort", "b2"], "");
+    assert!(!ok, "{text}");
+    assert!(text.contains("pending"), "{text}");
+    assert!(env.fenced("b2"));
+    assert!(!env.has_credentials("b2"));
+}
+
+#[test]
+fn the_live_login_migrates_last_and_is_deleted_only_while_it_is_the_migrated_grant() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, 3_600_000);
+    env.live("me", "u-me-0000", "live");
+    // Without --exclusive-owner the live login is refused; the others still migrate.
+    let (ok, text) = env.all();
+    assert!(!ok, "{text}");
+    assert!(
+        Env::row(&text, "me").contains("--exclusive-owner"),
+        "{text}"
+    );
+    assert!(Env::row(&text, "a1").contains("migrated"), "{text}");
+    assert!(env.paths.claude_credentials_file().exists());
+
+    // The import commits but the reply is lost; then Claude rotates the live login.
+    env.script("me", Script::Lost);
+    let (ok, text) = env.run(&["--all", "--exclusive-owner"], "");
+    assert!(!ok, "{text}");
+    assert!(Env::row(&text, "me").contains("lost-reply"), "{text}");
+    assert_eq!(
+        env.fake.lock().unwrap().imported_refresh["me"],
+        "live-refresh",
+        "the live Keychain grant was migrated, not the profile copy"
+    );
+    private_write(
+        &env.paths.claude_credentials_file(),
+        &serde_json::to_string(&creds("changed", 3_600_000)).unwrap(),
+    );
+    let (ok, text) = env.run(&["--all", "--exclusive-owner"], "");
+    assert!(!ok, "{text}");
+    assert!(
+        Env::row(&text, "me").contains("live login changed"),
+        "{text}"
+    );
+    assert!(
+        env.paths.claude_credentials_file().exists(),
+        "nothing deleted"
+    );
+
+    // Back to the migrated grant: the cleanup deletes it and clears the active marker.
+    private_write(
+        &env.paths.claude_credentials_file(),
+        &serde_json::to_string(&creds("live", 3_600_000)).unwrap(),
+    );
+    let (ok, text) = env.run(&["--all", "--exclusive-owner"], "");
+    assert!(ok, "{text}");
+    assert!(Env::row(&text, "me").contains("already"), "{text}");
+    assert!(!env.paths.claude_credentials_file().exists());
+    assert!(profile::get_active_from(&env.paths).unwrap().is_none());
+    assert!(!env.has_credentials("me"));
+}
+
+#[test]
+fn a_running_claude_refuses_the_whole_run_even_with_exclusive_owner() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, 3_600_000);
+    let (ok, text) = env.run(&["--all", "--exclusive-owner"], "4242");
+    assert!(!ok, "{text}");
+    assert!(text.contains("4242"), "{text}");
+    assert!(!env.fenced("a1"));
+    assert_eq!(env.imports(), 0);
+}
+
+#[test]
+fn an_unqualified_claude_build_fences_nothing() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, 3_600_000);
+    env.unqualify();
+    let (ok, text) = env.all();
+    assert!(!ok, "{text}");
+    assert!(text.contains("not qualified"), "{text}");
+    assert!(!env.fenced("a1"));
+}
+
+#[test]
+fn an_expired_inactive_profile_is_refreshed_before_its_fence() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, -1_000);
+    let (ok, text) = env.all();
+    assert!(ok, "{text}");
+    assert_eq!(
+        env.fake.lock().unwrap().imported_refresh["a1"],
+        "rotated-refresh",
+        "the rotated grant was migrated"
+    );
+}

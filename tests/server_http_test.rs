@@ -475,3 +475,33 @@ async fn shutdown_lets_a_refresh_in_progress_finish_and_persist() {
 async fn receipt_user(server: &app::Server) -> String {
     server.store().users().await.unwrap()[0].id.clone()
 }
+
+#[tokio::test]
+async fn the_receipt_route_reports_the_admission_state() {
+    let f = Fixture::new(None).await;
+    let (_mac, mac) = f.register(AMIR, "mac").await;
+    let get = reqwest::Method::GET;
+    let (status, body) = f
+        .call(
+            get.clone(),
+            "/v2/anthropic/migrations?migration_id=m-1",
+            Some(&mac),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "none");
+    assert!(body["receipt"].is_null());
+    f.migrate(&mac).await;
+    let (status, body) = f
+        .call(
+            get,
+            "/v2/anthropic/migrations?migration_id=m-1",
+            Some(&mac),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "complete");
+    assert_eq!(body["receipt"]["migration_id"], "m-1");
+}

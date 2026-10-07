@@ -367,6 +367,56 @@ pub fn get_active() -> Result<Option<String>> {
     get_active_from(&config::default_paths()?)
 }
 
+/// Save a rotated grant into its profile and every non-active sibling that held the same
+/// refresh grant (the rotation invalidated their copy too).
+pub fn persist_rotated_grant(
+    paths: &Paths,
+    active: Option<&str>,
+    origin: &Profile,
+    rotated: &CredentialsFile,
+    original_grant_key: &str,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    if origin.write_credentials(rotated).is_err() {
+        failures.push(origin.meta.alias.clone());
+    }
+    // Rotation changes the grant for every saved copy, including unexpired
+    // aliases and aliases excluded by a focused status request.
+    for sibling in list_profiles_from(paths)? {
+        if sibling.meta.alias == origin.meta.alias || active == Some(sibling.meta.alias.as_str()) {
+            continue;
+        }
+        let mut creds = match sibling.read_credentials() {
+            Ok(creds) => creds,
+            // An unreadable profile cannot be identified as a matching grant.
+            // Its status row reports that error independently.
+            Err(_) => continue,
+        };
+        if creds
+            .claude_ai_oauth
+            .refresh_token
+            .as_deref()
+            .map(crate::usage_cache::UsageCache::key)
+            .as_deref()
+            != Some(original_grant_key)
+        {
+            continue;
+        }
+        creds.claude_ai_oauth.access_token = rotated.claude_ai_oauth.access_token.clone();
+        creds.claude_ai_oauth.refresh_token = rotated.claude_ai_oauth.refresh_token.clone();
+        creds.claude_ai_oauth.expires_at = rotated.claude_ai_oauth.expires_at;
+        if sibling.write_credentials(&creds).is_err() {
+            failures.push(sibling.meta.alias.clone());
+        }
+    }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "could not update saved aliases: {}",
+        failures.join(", ")
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

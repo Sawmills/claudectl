@@ -659,10 +659,23 @@ impl Engine {
     }
     /// A completed admission. A migration counts only after a verified, distinct rotation.
     pub async fn receipt(&self, user: &str, admission: &str) -> Result<Option<Receipt>> {
+        Ok(self.receipt_state(user, admission).await?.0)
+    }
+    /// The receipt and where the admission stands: `none` (never admitted, so a client may
+    /// restore its fenced grant), `pending` (admitted, rotation not yet verified) or
+    /// `complete`. Unrotated, Superseded and Gone stay errors.
+    pub async fn receipt_state(
+        &self,
+        user: &str,
+        admission: &str,
+    ) -> Result<(Option<Receipt>, &'static str)> {
         match self.admitted(user, admission).await? {
-            Some((receipt, Rotation::Rotated | Rotation::NotMigrated, _)) => Ok(Some(receipt)),
+            None => Ok((None, "none")),
+            Some((receipt, Rotation::Rotated | Rotation::NotMigrated, _)) => {
+                Ok((Some(receipt), "complete"))
+            }
             Some((_, Rotation::Unrotated, _)) => Err(Unrotated.into()),
-            _ => Ok(None),
+            Some((_, Rotation::Pending { .. }, _)) => Ok((None, "pending")),
         }
     }
     /// Keep the lease long enough for one provider call; a failed renewal stops the work.

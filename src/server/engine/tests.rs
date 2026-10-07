@@ -2016,3 +2016,31 @@ async fn an_oversized_usage_response_is_refused_and_never_stored() {
     assert!(usage.data.is_none());
     assert_eq!(usage.error.as_deref(), Some("invalid_usage"));
 }
+
+#[tokio::test]
+async fn a_receipt_state_tells_no_admission_from_pending_and_complete() {
+    let f = Fixture::new(failing_refresh()).await;
+    let engine = f.engine().await;
+    let grant = || grant_until("migrated", now() + 3_600_000);
+    let (receipt, state) = engine.receipt_state("person", "m-1").await.unwrap();
+    assert!(receipt.is_none());
+    assert_eq!(state, "none");
+    // The forced refresh fails: admitted, rotation not verified.
+    assert!(
+        engine
+            .migrate("person", "mac", "work", "m-1", grant())
+            .await
+            .is_err()
+    );
+    let (receipt, state) = engine.receipt_state("person", "m-1").await.unwrap();
+    assert!(receipt.is_none());
+    assert_eq!(state, "pending");
+    // A completed migration on a working provider.
+    let (_f2, ok, _refreshes) = synthetic(3600).await;
+    ok.migrate("person", "mac", "home", "m-2", grant())
+        .await
+        .unwrap();
+    let (receipt, state) = ok.receipt_state("person", "m-2").await.unwrap();
+    assert!(receipt.is_some());
+    assert_eq!(state, "complete");
+}

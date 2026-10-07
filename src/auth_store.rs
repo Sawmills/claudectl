@@ -155,6 +155,28 @@ impl AuthStore {
         }
     }
 
+    /// Delete the live login: the Keychain credentials item (macOS) and
+    /// ~/.claude/.credentials.json. Callers compare grant digests first; this never reads or
+    /// prints a token. A missing item or file is already deleted.
+    pub fn delete_live_login(&self) -> Result<()> {
+        if self.keychain {
+            let output = Command::new("security")
+                .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE])
+                .stdin(Stdio::null())
+                .output()
+                .context("failed to run security(1)")?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !output.status.success() && !keychain_item_not_found(&stderr) {
+                bail!("could not delete the Keychain login: {}", stderr.trim());
+            }
+        }
+        match std::fs::remove_file(self.paths.claude_credentials_file()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).context("could not delete the live credentials file"),
+        }
+    }
+
     /// The `oauthAccount` blob from ~/.claude.json, if present.
     pub fn read_oauth_account(&self) -> Result<Option<serde_json::Value>> {
         let path = self.paths.claude_json();
