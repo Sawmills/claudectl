@@ -1,6 +1,10 @@
 //! Server state. Every multi-row change is one atomic step: one sealed file write for the
 //! file store, one short transaction for PostgreSQL. No step spans a provider call.
 //! Payloads arrive sealed by the caller; the store sees only routing columns.
+//!
+//! Every read of user data is scoped by the company user in the query itself. Deletes keep
+//! their markers: a deletion log, admission markers, and cancelled flows stay; only sealed
+//! secret payloads are erased.
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +25,7 @@ pub struct StoredAccount {
     pub sealed: Vec<u8>,
 }
 
-/// A refresh lease. `epoch` grows on every acquisition, so an old holder's writes fail.
+/// A lease. `epoch` grows on every acquisition, so an old holder's writes fail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lease {
     pub holder: String,
@@ -48,33 +52,41 @@ pub enum Fence<'a> {
     Held(&'a Lease),
 }
 
+/// One admission: a new account, or a login renewal of an existing one.
 pub struct Admission {
     pub account: StoredAccount,
     /// `None` for a new account; the current revision for a login renewal.
     pub expected_revision: Option<i64>,
-    pub started_at: i64,
-    pub pending_key: String,
-    /// The login flow that produced the grant; it must still exist and is consumed.
+    /// The admission ID (migration ID or login ID), unique per user. Its pending row must
+    /// still be live: a delete cancels it, and a cancelled admission never commits.
+    pub admission_id: String,
+    /// The login flow that produced the grant; it must still be live and is consumed.
     pub login_id: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AdmitOutcome {
     Committed,
-    /// A delete happened at or after the admission started.
-    DeletedSince,
+    /// A delete cancelled the pending admission or the login flow.
+    Cancelled,
     /// Another account holds the alias or the Claude identity, or the expected predecessor
     /// is missing or moved.
     Conflict,
-    /// The login flow was cancelled (a delete) or already consumed.
-    FlowGone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PendingState {
+    Live,
+    Cancelled,
+    Committed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingRow {
     pub user: String,
     pub alias: String,
-    pub started_at: i64,
+    pub state: PendingState,
+    /// Erased (empty) once the admission commits or is cancelled.
     pub sealed: Vec<u8>,
 }
 
@@ -85,6 +97,10 @@ pub struct FlowRow {
     pub sealed: Vec<u8>,
     pub exchanging: bool,
     pub retained: Option<Vec<u8>>,
+    /// A delete cancelled the flow; its retained response is erased.
+    pub cancelled: bool,
+    /// The flow produced an account; its retained response is erased.
+    pub consumed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -135,8 +151,9 @@ impl Store {
     pub async fn ready(&self) -> Result<()> {
         dispatch!(self, ready())
     }
-    pub async fn account(&self, id: &str) -> Result<Option<StoredAccount>> {
-        dispatch!(self, account(id))
+    /// The user's account with this ID.
+    pub async fn account(&self, user: &str, id: &str) -> Result<Option<StoredAccount>> {
+        dispatch!(self, account(user, id))
     }
     pub async fn accounts(&self, user: &str) -> Result<Vec<StoredAccount>> {
         dispatch!(self, accounts(user))
@@ -153,14 +170,19 @@ impl Store {
     pub async fn admit(&self, admission: &Admission) -> Result<AdmitOutcome> {
         dispatch!(self, admit(admission))
     }
-    /// Delete the account and every grant or flow for its alias, and write the tombstone.
-    /// False when the user owns no such account.
-    pub async fn delete(&self, id: &str, user: &str, deleted_at: i64) -> Result<bool> {
-        dispatch!(self, delete(id, user, deleted_at))
+    /// The account an admission ID produced, if it committed.
+    pub async fn admission(&self, user: &str, admission_id: &str) -> Result<Option<String>> {
+        dispatch!(self, admission(user, admission_id))
     }
-    /// The tombstone of a deleted account: its company user and deletion time.
-    pub async fn tombstone(&self, id: &str) -> Result<Option<(String, i64)>> {
-        dispatch!(self, tombstone(id))
+    /// Delete the user's account: erase its grant, log the deletion, and cancel every
+    /// pending admission and login flow for its alias. False when the user owns no such
+    /// account.
+    pub async fn delete(&self, user: &str, id: &str) -> Result<bool> {
+        dispatch!(self, delete(user, id))
+    }
+    /// True when the user deleted an account with this ID and none replaced it.
+    pub async fn deleted(&self, user: &str, id: &str) -> Result<bool> {
+        dispatch!(self, deleted(user, id))
     }
     pub async fn acquire_lease(&self, id: &str, ttl_ms: i64) -> Result<Option<Lease>> {
         dispatch!(self, acquire_lease(id, ttl_ms))
@@ -172,44 +194,47 @@ impl Store {
     pub async fn release_lease(&self, lease: &Lease, id: &str) -> Result<()> {
         dispatch!(self, release_lease(lease, id))
     }
-    pub async fn pending(&self, key: &str) -> Result<Option<PendingRow>> {
-        dispatch!(self, pending(key))
+    pub async fn pending(&self, user: &str, admission_id: &str) -> Result<Option<PendingRow>> {
+        dispatch!(self, pending(user, admission_id))
     }
-    pub async fn put_pending(&self, key: &str, row: &PendingRow) -> Result<()> {
-        dispatch!(self, put_pending(key, row))
+    /// Keep an acquired grant before verification. Never replaces an existing row.
+    pub async fn put_pending(&self, admission_id: &str, row: &PendingRow) -> Result<()> {
+        dispatch!(self, put_pending(admission_id, row))
     }
-    pub async fn delete_pending(&self, key: &str) -> Result<()> {
-        dispatch!(self, delete_pending(key))
-    }
-    pub async fn flow(&self, id: &str) -> Result<Option<FlowRow>> {
-        dispatch!(self, flow(id))
+    pub async fn flow(&self, user: &str, id: &str) -> Result<Option<FlowRow>> {
+        dispatch!(self, flow(user, id))
     }
     pub async fn put_flow(&self, id: &str, row: &FlowRow) -> Result<()> {
         dispatch!(self, put_flow(id, row))
     }
-    /// Mark a flow's exchange as started, once. False when the flow is gone or exchanging.
-    pub async fn start_exchange(&self, id: &str) -> Result<bool> {
-        dispatch!(self, start_exchange(id))
+    /// Mark a live flow's exchange as started, once. False otherwise.
+    pub async fn start_exchange(&self, user: &str, id: &str) -> Result<bool> {
+        dispatch!(self, start_exchange(user, id))
     }
-    /// Keep an acquired login response. False when the flow is gone (a delete).
-    pub async fn retain(&self, id: &str, sealed: &[u8]) -> Result<bool> {
-        dispatch!(self, retain(id, sealed))
+    /// Keep an acquired login response on a live flow. False when it was cancelled.
+    pub async fn retain(&self, user: &str, id: &str, sealed: &[u8]) -> Result<bool> {
+        dispatch!(self, retain(user, id, sealed))
     }
     pub async fn usage(&self, id: &str) -> Result<Option<Vec<u8>>> {
         dispatch!(self, usage(id))
     }
-    /// Store usage only while the account exists, so a delete cannot be undone by a poll.
+    /// Store usage only while the account exists, so a poll cannot outlive a delete.
     pub async fn put_usage(&self, id: &str, sealed: &[u8]) -> Result<()> {
         dispatch!(self, put_usage(id, sealed))
     }
     pub async fn append_audit(&self, sealed: &[u8]) -> Result<()> {
         dispatch!(self, append_audit(sealed))
     }
+    /// The whole audit log, for the operator.
     pub async fn audit(&self) -> Result<Vec<Vec<u8>>> {
         dispatch!(self, audit())
     }
+    /// Every user, for the operator.
     pub async fn users(&self) -> Result<Vec<User>> {
         dispatch!(self, users())
+    }
+    pub async fn user(&self, id: &str) -> Result<Option<User>> {
+        dispatch!(self, user(id))
     }
     /// Add or update a user; returns false for a disabled user and changes nothing.
     pub async fn record_user(&self, id: &str, email: &str) -> Result<bool> {
@@ -218,8 +243,9 @@ impl Store {
     pub async fn set_user_enabled(&self, email: &str, enabled: bool) -> Result<bool> {
         dispatch!(self, set_user_enabled(email, enabled))
     }
-    pub async fn machines(&self) -> Result<Vec<Machine>> {
-        dispatch!(self, machines())
+    /// The user's machines as (ID, revoked), without token hashes.
+    pub async fn machines(&self, user: &str) -> Result<Vec<(String, bool)>> {
+        dispatch!(self, machines(user))
     }
     pub async fn machine_by_token(&self, token_hash: &str) -> Result<Option<Machine>> {
         dispatch!(self, machine_by_token(token_hash))
@@ -251,9 +277,15 @@ impl Store {
     ) -> Result<Option<EnrollmentRow>> {
         dispatch!(self, enrollment(kind, key, now))
     }
-    /// Replace an unconsumed row's payload. False when it is consumed or gone.
-    pub async fn update_enrollment(&self, kind: &str, key: &str, sealed: &[u8]) -> Result<bool> {
-        dispatch!(self, update_enrollment(kind, key, sealed))
+    /// Replace an unconsumed row's payload only while it still equals `expected`.
+    pub async fn swap_enrollment(
+        &self,
+        kind: &str,
+        key: &str,
+        expected: &[u8],
+        sealed: &[u8],
+    ) -> Result<bool> {
+        dispatch!(self, swap_enrollment(kind, key, expected, sealed))
     }
     /// Consume a row exactly once across replicas.
     pub async fn consume_enrollment(

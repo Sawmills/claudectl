@@ -150,9 +150,12 @@ fn setup_if_absent_keeps_existing_state_for_a_restarted_pod() {
     });
     assert!(!setup(&[]).status.success());
     assert!(setup(&["--if-absent"]).status.success());
-    let machines = with_store(&state, &key, async |s| s.machines().await.unwrap());
+    let machines = with_store(&state, &key, async |s| {
+        let user = s.users().await.unwrap()[0].id.clone();
+        s.machines(&user).await.unwrap()
+    });
     assert_eq!(machines.len(), 1);
-    assert_eq!(machines[0].id, machine);
+    assert_eq!(machines[0].0, machine);
 }
 
 #[test]
@@ -187,5 +190,11 @@ fn an_operator_revoke_writes_an_audit_line() {
     assert_eq!(last["operation"], "revoke");
     assert_eq!(last["machine"], "operator");
     assert_eq!(last["target"], machine.as_str());
-    assert!(with_store(&state, &key, async |s| s.machines().await.unwrap())[0].revoked);
+    assert!(
+        with_store(&state, &key, async |s| {
+            let user = s.users().await.unwrap()[0].id.clone();
+            s.machines(&user).await.unwrap()
+        })[0]
+            .1
+    );
 }

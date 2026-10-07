@@ -1,7 +1,7 @@
 //! HTTP contract, machine authorization, and the company-user allow list.
 use super::{
     audit,
-    engine::{self, Endpoints, Engine, Gone, NotFound, RefreshInProgress},
+    engine::{self, Endpoints, Engine, Gone, NotFound, RefreshInProgress, Unrotated},
     enrollment,
     store::{self, Machine, Store},
     vault,
@@ -234,11 +234,10 @@ impl Server {
             .ok_or_else(|| self.error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
         let user = self
             .store()
-            .users()
+            .user(&machine.user)
             .await
             .map_err(unavailable)?
-            .into_iter()
-            .find(|u| u.id == machine.user && u.enabled)
+            .filter(|u| u.enabled)
             .ok_or_else(|| self.error(StatusCode::FORBIDDEN, "user_disabled"))?;
         if !self.allowed(&user.email) {
             return Err(self.error(StatusCode::FORBIDDEN, "user_not_allowed"));
@@ -250,6 +249,8 @@ impl Server {
             self.error(StatusCode::GONE, "account_deleted")
         } else if error.downcast_ref::<RefreshInProgress>().is_some() {
             self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress")
+        } else if error.downcast_ref::<Unrotated>().is_some() {
+            self.error(StatusCode::CONFLICT, "refresh_token_not_rotated")
         } else if error.downcast_ref::<NotFound>().is_some() {
             self.error(StatusCode::NOT_FOUND, "account_not_found")
         } else {
@@ -305,14 +306,13 @@ async fn machines(State(server): Shared, headers: HeaderMap) -> Result<Response,
     let current = server.authorize(&headers).await?;
     let machines = server
         .store()
-        .machines()
+        .machines(&current.user)
         .await
         .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
     Ok(private(
         machines
             .into_iter()
-            .filter(|m| m.user == current.user)
-            .map(|m| json!({"id": m.id, "revoked": m.revoked}))
+            .map(|(id, revoked)| json!({"id": id, "revoked": revoked}))
             .collect::<Vec<_>>(),
     ))
 }
@@ -463,7 +463,13 @@ async fn migrate_account(
                 .await
         })
         .await?
-        .map_err(|_| server.error(StatusCode::CONFLICT, "admission_refused_reconcile_receipt"))?;
+        .map_err(|e| {
+            if e.downcast_ref::<Unrotated>().is_some() {
+                server.error(StatusCode::CONFLICT, "refresh_token_not_rotated")
+            } else {
+                server.error(StatusCode::CONFLICT, "admission_refused_reconcile_receipt")
+            }
+        })?;
     server.authorize(&headers).await?;
     Ok(private(receipt))
 }
@@ -481,7 +487,7 @@ async fn receipt(
         .engine
         .receipt(&machine.user, &input.migration_id)
         .await
-        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "receipt_unavailable"))?;
+        .map_err(|e| server.engine_error(&e, "receipt_unavailable"))?;
     Ok(private(json!({"receipt": receipt})))
 }
 

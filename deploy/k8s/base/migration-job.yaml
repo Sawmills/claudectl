@@ -53,4 +53,4 @@ spec:
       volumes:
         - name: rds-ca
           configMap:
-            name: claudectl-rds-ca
+            name: claudectl-rds-ca-migration

@@ -33,18 +33,28 @@ CREATE TABLE IF NOT EXISTS refresh_leases (
     epoch BIGINT NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL
 );
-CREATE TABLE IF NOT EXISTS tombstones (
-    account_id TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS deletions (
+    id BIGSERIAL PRIMARY KEY,
     user_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
     alias TEXT NOT NULL,
-    deleted_at BIGINT NOT NULL
+    deleted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS deletions_account ON deletions (user_id, account_id);
+CREATE TABLE IF NOT EXISTS admissions (
+    user_id TEXT NOT NULL,
+    admission_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, admission_id)
 );
 CREATE TABLE IF NOT EXISTS pending_admissions (
-    key TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
+    admission_id TEXT NOT NULL,
     alias TEXT NOT NULL,
-    started_at BIGINT NOT NULL,
-    sealed BYTEA NOT NULL
+    state TEXT NOT NULL CHECK (state IN ('live', 'cancelled', 'committed')),
+    sealed BYTEA NOT NULL,
+    PRIMARY KEY (user_id, admission_id)
 );
 CREATE TABLE IF NOT EXISTS login_flows (
     id TEXT PRIMARY KEY,
@@ -52,8 +62,11 @@ CREATE TABLE IF NOT EXISTS login_flows (
     alias TEXT NOT NULL,
     sealed BYTEA NOT NULL,
     exchanging BOOLEAN NOT NULL DEFAULT false,
-    retained BYTEA
+    retained BYTEA,
+    cancelled BOOLEAN NOT NULL DEFAULT false,
+    consumed BOOLEAN NOT NULL DEFAULT false
 );
+CREATE INDEX IF NOT EXISTS login_flows_alias ON login_flows (user_id, lower(alias));
 CREATE TABLE IF NOT EXISTS usage_cache (
     account_id TEXT PRIMARY KEY,
     sealed BYTEA NOT NULL
@@ -73,6 +86,7 @@ CREATE TABLE IF NOT EXISTS machines (
     token_hash TEXT NOT NULL UNIQUE,
     revoked BOOLEAN NOT NULL
 );
+CREATE INDEX IF NOT EXISTS machines_user ON machines (user_id, id);
 CREATE TABLE IF NOT EXISTS enrollment (
     kind TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -126,6 +140,24 @@ fn account(row: &Row) -> StoredAccount {
         organization_uuid: row.get("organization_uuid"),
         revision: row.get("revision"),
         sealed: row.get("sealed"),
+    }
+}
+fn state_name(state: PendingState) -> &'static str {
+    match state {
+        PendingState::Live => "live",
+        PendingState::Cancelled => "cancelled",
+        PendingState::Committed => "committed",
+    }
+}
+fn flow(r: &Row) -> FlowRow {
+    FlowRow {
+        user: r.get("user_id"),
+        alias: r.get("alias"),
+        sealed: r.get("sealed"),
+        exchanging: r.get("exchanging"),
+        retained: r.get("retained"),
+        cancelled: r.get("cancelled"),
+        consumed: r.get("consumed"),
     }
 }
 
@@ -211,10 +243,13 @@ impl PostgresStore {
     pub async fn ready(&self) -> Result<()> {
         self.check_schema().await
     }
-    pub async fn account(&self, id: &str) -> Result<Option<StoredAccount>> {
+    pub async fn account(&self, user: &str, id: &str) -> Result<Option<StoredAccount>> {
         let client = self.pool.get().await?;
         Ok(client
-            .query_opt("SELECT * FROM accounts WHERE account_id = $1", &[&id])
+            .query_opt(
+                "SELECT * FROM accounts WHERE account_id = $1 AND user_id = $2",
+                &[&id, &user],
+            )
             .await?
             .as_ref()
             .map(account))
@@ -247,19 +282,16 @@ impl PostgresStore {
             .execute(
                 "WITH lease AS (
                     SELECT 1 FROM refresh_leases
-                    WHERE account_id = $1 AND holder_id = $8 AND epoch = $9
-                      AND (NOT $10 OR expires_at > now())
+                    WHERE account_id = $1 AND holder_id = $5 AND epoch = $6
+                      AND (NOT $7 OR expires_at > now())
                     FOR UPDATE
                  )
-                 UPDATE accounts SET user_id = $2, alias = $3, account_uuid = $4,
-                    organization_uuid = $5, revision = $6, sealed = $7
-                 WHERE account_id = $1 AND revision = $11 AND EXISTS (SELECT 1 FROM lease)",
+                 UPDATE accounts SET revision = $3, sealed = $4
+                 WHERE account_id = $1 AND user_id = $2 AND revision = $8
+                   AND EXISTS (SELECT 1 FROM lease)",
                 &[
                     &a.id,
                     &a.user,
-                    &a.alias,
-                    &a.account_uuid,
-                    &a.organization_uuid,
                     &a.revision,
                     &a.sealed,
                     &lease.holder,
@@ -280,28 +312,34 @@ impl PostgresStore {
             &[&alias_lock(&a.user, &a.alias)],
         )
         .await?;
-        let deleted: Option<i64> = tx
+        // Existence fencing: a delete cancels these under the same lock, so a cancelled
+        // admission never commits, whatever any clock says.
+        let live = tx
             .query_opt(
-                "SELECT deleted_at FROM tombstones WHERE account_id = $1",
-                &[&a.id],
+                "SELECT 1 FROM pending_admissions
+                 WHERE user_id = $1 AND admission_id = $2 AND state = 'live' FOR UPDATE",
+                &[&a.user, &admission.admission_id],
             )
             .await?
-            .map(|r| r.get(0));
-        if deleted.is_some_and(|d| d >= admission.started_at) {
-            return Ok(AdmitOutcome::DeletedSince);
-        }
-        if let Some(login) = &admission.login_id
-            && tx
-                .execute("DELETE FROM login_flows WHERE id = $1", &[login])
+            .is_some();
+        let flow_live = match &admission.login_id {
+            Some(login) => tx
+                .query_opt(
+                    "SELECT 1 FROM login_flows
+                     WHERE id = $1 AND user_id = $2 AND NOT cancelled AND NOT consumed FOR UPDATE",
+                    &[login, &a.user],
+                )
                 .await?
-                == 0
-        {
-            return Ok(AdmitOutcome::FlowGone);
+                .is_some(),
+            None => true,
+        };
+        if !live || !flow_live {
+            return Ok(AdmitOutcome::Cancelled);
         }
         let current: Option<i64> = tx
             .query_opt(
-                "SELECT revision FROM accounts WHERE account_id = $1 FOR UPDATE",
-                &[&a.id],
+                "SELECT revision FROM accounts WHERE account_id = $1 AND user_id = $2 FOR UPDATE",
+                &[&a.id, &a.user],
             )
             .await?
             .map(|r| r.get(0));
@@ -327,36 +365,53 @@ impl PostgresStore {
             .execute(
                 "INSERT INTO accounts (account_id, user_id, alias, account_uuid, organization_uuid, revision, sealed)
                  VALUES ($1, $2, $3, $4, $5, $6, $7)
-                 ON CONFLICT (account_id) DO UPDATE SET user_id = $2, alias = $3, account_uuid = $4,
-                    organization_uuid = $5, revision = $6, sealed = $7",
-                &[
-                    &a.id,
-                    &a.user,
-                    &a.alias,
-                    &a.account_uuid,
-                    &a.organization_uuid,
-                    &a.revision,
-                    &a.sealed,
-                ],
+                 ON CONFLICT (account_id) DO UPDATE SET alias = $3, account_uuid = $4,
+                    organization_uuid = $5, revision = $6, sealed = $7
+                 WHERE accounts.user_id = $2",
+                &[&a.id, &a.user, &a.alias, &a.account_uuid, &a.organization_uuid, &a.revision, &a.sealed],
             )
             .await;
         match written {
-            Ok(_) => {}
-            // A concurrent admission of the same identity on another alias.
+            Ok(1) => {}
+            Ok(_) => return Ok(AdmitOutcome::Conflict),
+            // A concurrent admission of the same identity under another alias.
             Err(e) if e.code() == Some(&SqlState::UNIQUE_VIOLATION) => {
                 return Ok(AdmitOutcome::Conflict);
             }
             Err(e) => return Err(e.into()),
         }
         tx.execute(
-            "DELETE FROM pending_admissions WHERE key = $1",
-            &[&admission.pending_key],
+            "INSERT INTO admissions (user_id, admission_id, account_id) VALUES ($1, $2, $3)",
+            &[&a.user, &admission.admission_id, &a.id],
         )
         .await?;
+        tx.execute(
+            "UPDATE pending_admissions SET state = 'committed', sealed = ''::BYTEA
+             WHERE user_id = $1 AND admission_id = $2",
+            &[&a.user, &admission.admission_id],
+        )
+        .await?;
+        if let Some(login) = &admission.login_id {
+            tx.execute(
+                "UPDATE login_flows SET consumed = true, retained = NULL WHERE id = $1",
+                &[login],
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(AdmitOutcome::Committed)
     }
-    pub async fn delete(&self, id: &str, user: &str, deleted_at: i64) -> Result<bool> {
+    pub async fn admission(&self, user: &str, admission_id: &str) -> Result<Option<String>> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT account_id FROM admissions WHERE user_id = $1 AND admission_id = $2",
+                &[&user, &admission_id],
+            )
+            .await?
+            .map(|r| r.get(0)))
+    }
+    pub async fn delete(&self, user: &str, id: &str) -> Result<bool> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
         let Some(alias): Option<String> = tx
@@ -374,40 +429,50 @@ impl PostgresStore {
             &[&alias_lock(user, &alias)],
         )
         .await?;
-        tx.execute("DELETE FROM accounts WHERE account_id = $1", &[&id])
-            .await?;
+        if tx
+            .execute(
+                "DELETE FROM accounts WHERE account_id = $1 AND user_id = $2",
+                &[&id, &user],
+            )
+            .await?
+            == 0
+        {
+            return Ok(false);
+        }
         tx.execute("DELETE FROM refresh_leases WHERE account_id = $1", &[&id])
             .await?;
         tx.execute("DELETE FROM usage_cache WHERE account_id = $1", &[&id])
             .await?;
         tx.execute(
-            "INSERT INTO tombstones (account_id, user_id, alias, deleted_at) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (account_id) DO UPDATE SET alias = $3, deleted_at = $4",
-            &[&id, &user, &alias, &deleted_at],
+            "INSERT INTO deletions (user_id, account_id, alias) VALUES ($1, $2, $3)",
+            &[&user, &id, &alias],
         )
         .await?;
         tx.execute(
-            "DELETE FROM pending_admissions WHERE user_id = $1 AND lower(alias) = lower($2)",
+            "UPDATE pending_admissions SET state = 'cancelled', sealed = ''::BYTEA
+             WHERE user_id = $1 AND lower(alias) = lower($2) AND state = 'live'",
             &[&user, &alias],
         )
         .await?;
         tx.execute(
-            "DELETE FROM login_flows WHERE user_id = $1 AND lower(alias) = lower($2)",
+            "UPDATE login_flows SET cancelled = true, retained = NULL
+             WHERE user_id = $1 AND lower(alias) = lower($2) AND NOT consumed",
             &[&user, &alias],
         )
         .await?;
         tx.commit().await?;
         Ok(true)
     }
-    pub async fn tombstone(&self, id: &str) -> Result<Option<(String, i64)>> {
+    pub async fn deleted(&self, user: &str, id: &str) -> Result<bool> {
         let client = self.pool.get().await?;
         Ok(client
             .query_opt(
-                "SELECT user_id, deleted_at FROM tombstones WHERE account_id = $1",
-                &[&id],
+                "SELECT 1 FROM deletions d WHERE d.user_id = $1 AND d.account_id = $2
+                 AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.account_id = $2)",
+                &[&user, &id],
             )
             .await?
-            .map(|r| (r.get(0), r.get(1))))
+            .is_some())
     }
     pub async fn acquire_lease(&self, id: &str, ttl_ms: i64) -> Result<Option<Lease>> {
         let taken = std::time::Instant::now();
@@ -458,89 +523,83 @@ impl PostgresStore {
             .await?;
         Ok(())
     }
-    pub async fn pending(&self, key: &str) -> Result<Option<PendingRow>> {
+    pub async fn pending(&self, user: &str, admission_id: &str) -> Result<Option<PendingRow>> {
         let client = self.pool.get().await?;
         Ok(client
             .query_opt(
-                "SELECT user_id, alias, started_at, sealed FROM pending_admissions WHERE key = $1",
-                &[&key],
+                "SELECT alias, state, sealed FROM pending_admissions
+                 WHERE user_id = $1 AND admission_id = $2",
+                &[&user, &admission_id],
             )
             .await?
             .map(|r| PendingRow {
-                user: r.get(0),
-                alias: r.get(1),
-                started_at: r.get(2),
-                sealed: r.get(3),
-            }))
-    }
-    pub async fn put_pending(&self, key: &str, row: &PendingRow) -> Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "INSERT INTO pending_admissions (key, user_id, alias, started_at, sealed)
-                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (key) DO NOTHING",
-                &[&key, &row.user, &row.alias, &row.started_at, &row.sealed],
-            )
-            .await?;
-        Ok(())
-    }
-    pub async fn delete_pending(&self, key: &str) -> Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute("DELETE FROM pending_admissions WHERE key = $1", &[&key])
-            .await?;
-        Ok(())
-    }
-    pub async fn flow(&self, id: &str) -> Result<Option<FlowRow>> {
-        let client = self.pool.get().await?;
-        Ok(client
-            .query_opt(
-                "SELECT user_id, alias, sealed, exchanging, retained FROM login_flows WHERE id = $1",
-                &[&id],
-            )
-            .await?
-            .map(|r| FlowRow {
-                user: r.get(0),
-                alias: r.get(1),
+                user: user.into(),
+                alias: r.get(0),
+                state: match r.get::<_, String>(1).as_str() {
+                    "live" => PendingState::Live,
+                    "committed" => PendingState::Committed,
+                    _ => PendingState::Cancelled,
+                },
                 sealed: r.get(2),
-                exchanging: r.get(3),
-                retained: r.get(4),
             }))
     }
-    pub async fn put_flow(&self, id: &str, row: &FlowRow) -> Result<()> {
+    pub async fn put_pending(&self, admission_id: &str, row: &PendingRow) -> Result<()> {
         let client = self.pool.get().await?;
         client
             .execute(
-                "INSERT INTO login_flows (id, user_id, alias, sealed, exchanging, retained)
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                "INSERT INTO pending_admissions (user_id, admission_id, alias, state, sealed)
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
                 &[
-                    &id,
                     &row.user,
+                    &admission_id,
                     &row.alias,
+                    &state_name(row.state),
                     &row.sealed,
-                    &row.exchanging,
-                    &row.retained,
                 ],
             )
             .await?;
         Ok(())
     }
-    pub async fn start_exchange(&self, id: &str) -> Result<bool> {
+    pub async fn flow(&self, user: &str, id: &str) -> Result<Option<FlowRow>> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT * FROM login_flows WHERE id = $1 AND user_id = $2",
+                &[&id, &user],
+            )
+            .await?
+            .as_ref()
+            .map(flow))
+    }
+    pub async fn put_flow(&self, id: &str, row: &FlowRow) -> Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO login_flows (id, user_id, alias, sealed, exchanging, retained, cancelled, consumed)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[&id, &row.user, &row.alias, &row.sealed, &row.exchanging, &row.retained, &row.cancelled, &row.consumed],
+            )
+            .await?;
+        Ok(())
+    }
+    pub async fn start_exchange(&self, user: &str, id: &str) -> Result<bool> {
         let client = self.pool.get().await?;
         Ok(client
             .execute(
-                "UPDATE login_flows SET exchanging = true WHERE id = $1 AND NOT exchanging",
-                &[&id],
+                "UPDATE login_flows SET exchanging = true
+                 WHERE id = $1 AND user_id = $2 AND NOT exchanging AND NOT cancelled AND NOT consumed",
+                &[&id, &user],
             )
             .await?
             == 1)
     }
-    pub async fn retain(&self, id: &str, sealed: &[u8]) -> Result<bool> {
+    pub async fn retain(&self, user: &str, id: &str, sealed: &[u8]) -> Result<bool> {
         let client = self.pool.get().await?;
         Ok(client
             .execute(
-                "UPDATE login_flows SET retained = $2 WHERE id = $1",
-                &[&id, &sealed],
+                "UPDATE login_flows SET retained = $3
+                 WHERE id = $1 AND user_id = $2 AND NOT cancelled AND NOT consumed",
+                &[&id, &user, &sealed],
             )
             .await?
             == 1)
@@ -596,6 +655,17 @@ impl PostgresStore {
             })
             .collect())
     }
+    pub async fn user(&self, id: &str) -> Result<Option<User>> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .query_opt("SELECT id, email, enabled FROM users WHERE id = $1", &[&id])
+            .await?
+            .map(|r| User {
+                id: r.get(0),
+                email: r.get(1),
+                enabled: r.get(2),
+            }))
+    }
     pub async fn record_user(&self, id: &str, email: &str) -> Result<bool> {
         let client = self.pool.get().await?;
         Ok(client
@@ -618,21 +688,16 @@ impl PostgresStore {
             .await?
             > 0)
     }
-    pub async fn machines(&self) -> Result<Vec<Machine>> {
+    pub async fn machines(&self, user: &str) -> Result<Vec<(String, bool)>> {
         let client = self.pool.get().await?;
         Ok(client
             .query(
-                "SELECT id, user_id, token_hash, revoked FROM machines ORDER BY id",
-                &[],
+                "SELECT id, revoked FROM machines WHERE user_id = $1 ORDER BY id",
+                &[&user],
             )
             .await?
             .iter()
-            .map(|r| Machine {
-                id: r.get(0),
-                user: r.get(1),
-                token_hash: r.get(2),
-                revoked: r.get(3),
-            })
+            .map(|r| (r.get(0), r.get(1)))
             .collect())
     }
     pub async fn machine_by_token(&self, token_hash: &str) -> Result<Option<Machine>> {
@@ -672,12 +737,6 @@ impl PostgresStore {
     }
     pub async fn put_enrollment(&self, kind: &str, key: &str, row: &EnrollmentRow) -> Result<()> {
         let client = self.pool.get().await?;
-        client
-            .execute(
-                "DELETE FROM enrollment WHERE expires_at < $1",
-                &[&(row.expires_at - 3_600_000)],
-            )
-            .await?;
         client
             .execute(
                 "INSERT INTO enrollment (kind, key, lookup, sealed, expires_at) VALUES ($1, $2, $3, $4, $5)",
@@ -733,12 +792,19 @@ impl PostgresStore {
                 consumed: r.get(3),
             }))
     }
-    pub async fn update_enrollment(&self, kind: &str, key: &str, sealed: &[u8]) -> Result<bool> {
+    pub async fn swap_enrollment(
+        &self,
+        kind: &str,
+        key: &str,
+        expected: &[u8],
+        sealed: &[u8],
+    ) -> Result<bool> {
         let client = self.pool.get().await?;
         Ok(client
             .execute(
-                "UPDATE enrollment SET sealed = $3 WHERE kind = $1 AND key = $2 AND consumed_at IS NULL",
-                &[&kind, &key, &sealed],
+                "UPDATE enrollment SET sealed = $4
+                 WHERE kind = $1 AND key = $2 AND consumed_at IS NULL AND sealed = $3",
+                &[&kind, &key, &expected, &sealed],
             )
             .await?
             == 1)

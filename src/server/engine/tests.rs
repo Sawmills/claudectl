@@ -650,7 +650,7 @@ async fn a_deleted_account_keeps_no_grant_and_answers_gone_after_restart() {
     assert!(
         engine
             .store()
-            .account(&receipt.account_id)
+            .account("person", &receipt.account_id)
             .await
             .unwrap()
             .is_none()
@@ -704,7 +704,12 @@ async fn a_renewal_started_before_a_delete_cannot_recreate_the_account() {
 
 #[tokio::test]
 async fn a_renewal_from_before_a_delete_cannot_overwrite_a_recreated_account() {
-    let (_f, engine, _refreshes) = synthetic(3600).await;
+    let app = Router::new()
+        .route("/token", counted_token(Arc::default()))
+        // Admission passes; the renewal's first verification fails, so its response is kept.
+        .route("/api/oauth/profile", flaky_profile(1));
+    let f = Fixture::new(app).await;
+    let engine = f.engine().await;
     let first = engine
         .admit(
             "person",
@@ -715,12 +720,21 @@ async fn a_renewal_from_before_a_delete_cannot_overwrite_a_recreated_account() {
         )
         .await
         .unwrap();
-    let before_delete = now() - 1;
+    let renewal = engine
+        .start_login("person", "machine", "work", true)
+        .await
+        .unwrap();
+    let code = pasted(&renewal);
+    assert!(
+        engine
+            .finish_login("person", "machine", &renewal.id, &code)
+            .await
+            .is_err()
+    );
     engine
         .remove("person", "mac", &first.account_id)
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(5)).await;
     let second = engine
         .admit(
             "person",
@@ -731,28 +745,214 @@ async fn a_renewal_from_before_a_delete_cannot_overwrite_a_recreated_account() {
         )
         .await
         .unwrap();
-    let options = Admission {
-        rotation_pending: false,
-        started_at: before_delete,
-    };
-    let stale = grant_until("stale", now() + 3_600_000);
-    let late = engine
-        .admit_with(
-            "person",
-            "work",
-            "old-renewal",
-            stale,
-            Some(&second.identity),
-            options,
-            None,
-        )
-        .await;
-    assert!(late.is_err());
+    // The renewal started before the delete; the delete cancelled its flow.
+    assert!(
+        engine
+            .finish_login("person", "machine", &renewal.id, &code)
+            .await
+            .is_err()
+    );
     let access = engine
         .acquire("person", &second.account_id, None)
         .await
         .unwrap();
     assert_eq!(access.access_token, "second");
+}
+
+#[tokio::test]
+async fn a_migration_retried_after_a_delete_is_refused() {
+    let (_f, engine, _refreshes) = synthetic(3600).await;
+    let grant = || grant_until("migrated", now() + 3_600_000);
+    let receipt = engine
+        .migrate("person", "mac", "work", "m-1", grant())
+        .await
+        .unwrap();
+    engine
+        .remove("person", "mac", &receipt.account_id)
+        .await
+        .unwrap();
+    // A lost reply makes the client retry the same migration ID; it must not recreate.
+    let retry = engine
+        .migrate("person", "mac", "work", "m-1", grant())
+        .await
+        .err()
+        .unwrap();
+    assert!(retry.downcast_ref::<Gone>().is_some());
+    assert!(engine.accounts("person").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_provider_that_keeps_the_refresh_token_leaves_the_migration_incomplete() {
+    let app = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/token",
+            post(|| async {
+                Json(json!({"access_token":"successor","refresh_token":"migrated-refresh","expires_in":3600,"scope":"user:inference user:profile"}))
+            }),
+        );
+    let f = Fixture::new(app).await;
+    let engine = f.engine().await;
+    let grant = || grant_until("migrated", now() + 3_600_000);
+    let error = engine
+        .migrate("person", "mac", "work", "m-1", grant())
+        .await
+        .err()
+        .unwrap();
+    assert!(error.downcast_ref::<Unrotated>().is_some());
+    assert!(engine.receipt("person", "m-1").await.is_err());
+    // The account works; only the migration proof is missing.
+    let id = account_id("person", "work");
+    let access = engine.acquire("person", &id, None).await.unwrap();
+    assert_eq!(access.access_token, "successor");
+}
+
+#[tokio::test]
+async fn store_reads_stay_inside_the_user_scope() {
+    let (_f, engine, _refreshes) = synthetic(3600).await;
+    let receipt = engine
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let store = engine.store();
+    assert!(
+        store
+            .account("intruder", &receipt.account_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.accounts("intruder").await.unwrap().is_empty());
+    assert!(store.admission("intruder", "m-1").await.unwrap().is_none());
+    assert!(
+        engine
+            .acquire("intruder", &receipt.account_id, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .remove("intruder", "mac", &receipt.account_id)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .account("person", &receipt.account_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn an_enrollment_swap_never_overwrites_a_newer_payload() {
+    let (_f, engine, _refreshes) = synthetic(3600).await;
+    let store = engine.store();
+    let row = store::EnrollmentRow {
+        lookup: None,
+        sealed: b"pending".to_vec(),
+        expires_at: now() + 60_000,
+        consumed: false,
+    };
+    store.put_enrollment("device", "d", &row).await.unwrap();
+    // An approval lands first; a poll that read the old payload must not undo it.
+    assert!(
+        store
+            .swap_enrollment("device", "d", b"pending", b"granted")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .swap_enrollment("device", "d", b"pending", b"polled")
+            .await
+            .unwrap()
+    );
+    let stored = store
+        .enrollment("device", "d", now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.sealed, b"granted");
+}
+
+#[tokio::test]
+async fn a_follower_never_returns_the_revision_the_caller_rejected() {
+    let Some((f, a, _b)) = replicas(provider(Arc::default(), 3600, None)).await else {
+        return;
+    };
+    let receipt = a
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let current = a
+        .acquire("person", &receipt.account_id, None)
+        .await
+        .unwrap();
+    // Another holder took the lease and stalled before writing anything.
+    f.sql(&format!(
+        "INSERT INTO refresh_leases VALUES ('{}', 'stalled', 1, now() + interval '1 hour')",
+        receipt.account_id
+    ))
+    .await;
+    let error = a
+        .acquire("person", &receipt.account_id, Some(&current.revision))
+        .await
+        .err()
+        .unwrap();
+    assert!(error.downcast_ref::<RefreshInProgress>().is_some());
+}
+
+#[tokio::test]
+async fn two_replicas_reading_usage_poll_the_provider_once() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let calls = count.clone();
+    let app = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/api/oauth/usage",
+            get(move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    Json(json!({"five_hour":{"utilization":1}}))
+                }
+            }),
+        );
+    let Some((_f, a, b)) = replicas(app).await else {
+        return;
+    };
+    let receipt = a
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let (left, right) = tokio::join!(
+        a.usage("person", &receipt.account_id, false),
+        b.usage("person", &receipt.account_id, false)
+    );
+    left.unwrap();
+    right.unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -863,13 +1063,28 @@ async fn a_delete_purges_pending_admission_grants_for_the_alias() {
             .await
             .is_err()
     );
-    let key = vault::digest(b"person\0renewal");
-    assert!(engine.store().pending(&key).await.unwrap().is_some());
+    let pending = engine
+        .store()
+        .pending("person", "renewal")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.state, store::PendingState::Live);
     engine
         .remove("person", "mac", &receipt.account_id)
         .await
         .unwrap();
-    assert!(engine.store().pending(&key).await.unwrap().is_none());
+    let pending = engine
+        .store()
+        .pending("person", "renewal")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.state, store::PendingState::Cancelled);
+    assert!(
+        pending.sealed.is_empty(),
+        "a cancelled admission kept its grant"
+    );
 }
 
 #[tokio::test]
@@ -901,21 +1116,24 @@ async fn a_kept_login_response_cannot_restore_a_deleted_account() {
             .await
             .is_err()
     );
-    assert!(
-        engine
-            .store()
-            .flow(&renewal.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .retained
-            .is_some()
-    );
+    let kept = engine
+        .store()
+        .flow("person", &renewal.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(kept.retained.is_some());
     engine
         .remove("person", "mac", &existing.account_id)
         .await
         .unwrap();
-    assert!(engine.store().flow(&renewal.id).await.unwrap().is_none());
+    let cancelled = engine
+        .store()
+        .flow("person", &renewal.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(cancelled.cancelled && cancelled.retained.is_none());
     assert!(
         engine
             .finish_login("person", "machine", &renewal.id, &code)
@@ -1011,7 +1229,7 @@ async fn a_delete_during_a_refresh_leaves_no_account_and_issues_no_token() {
     assert!(
         engine
             .store()
-            .account(&receipt.account_id)
+            .account("person", &receipt.account_id)
             .await
             .unwrap()
             .is_none()

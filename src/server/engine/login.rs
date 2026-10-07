@@ -11,8 +11,6 @@ struct Flow {
     state: String,
     expires_at: i64,
     expected: Option<Identity>,
-    /// A delete after this time refuses the flow's admission.
-    started_at: i64,
 }
 #[derive(Serialize)]
 pub struct Login {
@@ -43,7 +41,6 @@ impl Engine {
             state: revision(),
             expires_at: now() + 300_000,
             expected: existing.map(|a| a.identity),
-            started_at: now(),
         };
         let id = revision();
         let row = FlowRow {
@@ -52,6 +49,8 @@ impl Engine {
             sealed: self.seal(&flow)?,
             exchanging: false,
             retained: None,
+            cancelled: false,
+            consumed: false,
         };
         self.store.put_flow(&id, &row).await?;
         let mut url = reqwest::Url::parse("https://claude.ai/oauth/authorize")?;
@@ -91,11 +90,12 @@ impl Engine {
         }
         let row = self
             .store
-            .flow(id)
+            .flow(user, id)
             .await?
+            .filter(|f| !f.cancelled && !f.consumed)
             .context("login not found, finished, or cancelled; start a new login")?;
         let flow: Flow = self.unseal(&row.sealed)?;
-        if row.user != user || flow.machine != machine {
+        if flow.machine != machine {
             bail!("login does not belong to this user and machine");
         }
         let retained: Retained = match &row.retained {
@@ -115,7 +115,7 @@ impl Engine {
                     bail!("login state mismatch");
                 }
                 // Exactly one exchange per flow, across replicas.
-                if !self.store.start_exchange(id).await? {
+                if !self.store.start_exchange(user, id).await? {
                     bail!("login exchange already started or the login was cancelled");
                 }
                 let response = self
@@ -139,7 +139,7 @@ impl Engine {
                     received_at: now(),
                     body: bytes.to_vec(),
                 };
-                if !self.store.retain(id, &self.seal(&retained)?).await? {
+                if !self.store.retain(user, id, &self.seal(&retained)?).await? {
                     bail!("the login was cancelled by a delete; the response was not kept");
                 }
                 retained
@@ -166,17 +166,13 @@ impl Engine {
             expires_at: expiry,
             scopes: token.scope.split_whitespace().map(str::to_owned).collect(),
         };
-        let options = Admission {
-            rotation_pending: false,
-            started_at: flow.started_at,
-        };
         self.admit_with(
             user,
             &row.alias,
             id,
             grant,
             flow.expected.as_ref(),
-            options,
+            false,
             Some(id),
         )
         .await

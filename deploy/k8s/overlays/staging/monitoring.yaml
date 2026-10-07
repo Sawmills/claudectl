@@ -11,7 +11,7 @@ spec:
     - name: claudectl
       rules:
         - alert: ClaudectlServerUnavailable
-          expr: up{namespace="claudectl",service="claudectl"} == 0 or absent(up{namespace="claudectl",service="claudectl"})
+          expr: max(up{namespace="claudectl",service="claudectl"}) == 0 or absent(up{namespace="claudectl",service="claudectl"})
           for: 5m
           labels:
             severity: warning
@@ -52,8 +52,15 @@ spec:
     credentials:
       name: claudectl-secrets
       key: metrics-token
-  staticConfigs:
-    - targets: [claudectl.claudectl.svc.cluster.local:80]
-      labels:
-        namespace: claudectl
-        service: claudectl
+  # Failure counters live in each process: scrape every pod, not the load-balanced Service.
+  dnsSDConfigs:
+    - names: [claudectl-pods.claudectl.svc.cluster.local]
+      type: A
+      port: 8787
+  relabelings:
+    - targetLabel: namespace
+      replacement: claudectl
+    - targetLabel: service
+      replacement: claudectl
+    - sourceLabels: [__address__]
+      targetLabel: instance

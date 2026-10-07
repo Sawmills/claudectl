@@ -32,13 +32,26 @@ impl Engine {
     pub async fn usage(&self, user: &str, id: &str, cached: bool) -> Result<Usage> {
         let loaded = self.selected(user, id).await?;
         let _poll = self.usage_poll.lock().await;
-        let mut throttle: Throttle = self.stored(THROTTLE).await?;
         let mut result: Usage = self.stored(id).await?;
         result.stale = result.data.is_none()
             || result.error.is_some()
             || now() >= result.next_retry_at
             || result.observed_at.is_some_and(|t| t > now() + USABLE);
-        if cached || now() < result.next_retry_at || now() < throttle.cooldown_until {
+        if cached || now() < result.next_retry_at {
+            return Ok(result);
+        }
+        // One replica polls the provider at a time; the others answer from the cache. The
+        // holder alone reads and writes the shared throttle state.
+        let Some(lease) = self.store.acquire_lease(USAGE_LEASE, 60_000).await? else {
+            return Ok(result);
+        };
+        let polled = self.poll_usage(&loaded, id, result).await;
+        self.store.release_lease(&lease, USAGE_LEASE).await?;
+        polled
+    }
+    async fn poll_usage(&self, loaded: &Loaded, id: &str, mut result: Usage) -> Result<Usage> {
+        let mut throttle: Throttle = self.stored(THROTTLE).await?;
+        if now() < throttle.cooldown_until {
             result.next_retry_at = result.next_retry_at.max(throttle.cooldown_until);
             return Ok(result);
         }

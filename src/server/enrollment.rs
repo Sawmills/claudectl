@@ -316,8 +316,10 @@ async fn poll(State(server): Shared, Json(input): Json<Poll>) -> Result<Response
     if device.grant.is_none() {
         device.last_poll = Some(now());
         let sealed = server.seal(&device).map_err(|_| server.unavailable())?;
+        // Compare-and-swap: an approval that landed meanwhile is never overwritten. The next
+        // poll then finds the grant.
         store
-            .update_enrollment("device", &key, &sealed)
+            .swap_enrollment("device", &key, &row.sealed, &sealed)
             .await
             .map_err(|_| server.unavailable())?;
         return Ok((StatusCode::ACCEPTED, Json(json!({"status":"pending"}))).into_response());
@@ -553,16 +555,33 @@ async fn approve(State(server): Shared, Form(input): Form<Approve>) -> Result<Re
     let (_, token) = app::add_machine(store, &approval.user, &device.name)
         .await
         .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
-    device.grant = Some(token);
-    let sealed = server.seal(&device).map_err(|_| server.unavailable())?;
-    if !store
-        .update_enrollment("device", &approval.device, &sealed)
-        .await
-        .map_err(|_| server.unavailable())?
-    {
-        return Err(server.error(StatusCode::GONE, "enrollment_expired"));
+    // A poll may have rewritten the row since it was read; retry against the fresh copy.
+    let mut current = device_row.sealed;
+    for _ in 0..5 {
+        device.grant = Some(token.clone());
+        let sealed = server.seal(&device).map_err(|_| server.unavailable())?;
+        if store
+            .swap_enrollment("device", &approval.device, &current, &sealed)
+            .await
+            .map_err(|_| server.unavailable())?
+        {
+            return Ok(page(include_str!("enrollment/connected.html").into()));
+        }
+        let fresh = store
+            .enrollment("device", &approval.device, now())
+            .await
+            .map_err(|_| server.unavailable())?
+            .filter(|r| !r.consumed)
+            .ok_or_else(|| server.error(StatusCode::GONE, "enrollment_expired"))?;
+        device = server
+            .unseal(&fresh.sealed)
+            .map_err(|_| server.unavailable())?;
+        if device.grant.is_some() {
+            return Err(server.error(StatusCode::GONE, "enrollment_expired"));
+        }
+        current = fresh.sealed;
     }
-    Ok(page(include_str!("enrollment/connected.html").into()))
+    Err(server.error(StatusCode::SERVICE_UNAVAILABLE, "registry_busy"))
 }
 pub(super) fn routes(router: Router<Arc<Server>>) -> Router<Arc<Server>> {
     router

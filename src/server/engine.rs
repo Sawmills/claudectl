@@ -3,7 +3,7 @@
 use super::{
     audit,
     fs::validate_alias,
-    store::{self, AdmitOutcome, Fence, Lease, PendingRow, Store, StoredAccount},
+    store::{self, AdmitOutcome, Fence, Lease, PendingRow, PendingState, Store, StoredAccount},
     vault,
 };
 use anyhow::{Context, Result, bail};
@@ -100,17 +100,31 @@ enum Phase {
     Refreshing,
     Unverified,
 }
+/// Where a migrated grant stands. Copies left on other holders are stale only once the
+/// provider has issued a distinct refresh token.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Rotation {
+    /// Admitted by login; nothing to rotate.
+    NotMigrated,
+    /// Migrated; `migrated` is the digest of the migrated refresh token.
+    Pending { migrated: String },
+    /// Refreshed and verified, but the provider kept the refresh token: copies stay valid.
+    Unrotated,
+    /// Refreshed and verified with a distinct refresh token.
+    Rotated,
+}
 /// The sealed part of an account.
 #[derive(Clone, Serialize, Deserialize)]
 struct Record {
+    /// Envelope version of this record.
+    v: u32,
     grant: Grant,
     /// The token revision machines see; it changes with every new access token.
     revision: String,
     generation: u64,
     phase: Phase,
-    admissions: Vec<String>,
-    /// A migrated grant may still exist on other holders until its first verified refresh.
-    rotation_pending: bool,
+    rotation: Rotation,
     /// The refresh attempt that wrote `Refreshing`.
     attempt: Option<String>,
     /// A provider response kept before parsing, so a stop never forces a replay.
@@ -136,7 +150,7 @@ impl Loaded {
     fn needs_refresh(&self, previous: Option<&str>) -> bool {
         let r = &self.record;
         r.phase != Phase::Ready
-            || r.rotation_pending
+            || matches!(r.rotation, Rotation::Pending { .. })
             || r.grant.expires_at <= now() + MARGIN
             || previous == Some(r.revision.as_str())
     }
@@ -175,14 +189,6 @@ impl Default for Endpoints {
         }
     }
 }
-/// How an admission was started.
-#[derive(Clone, Copy)]
-pub(super) struct Admission {
-    /// A migrated grant stays pending until its first verified refresh.
-    pub rotation_pending: bool,
-    /// When the admission's work began: a login flow's start, or now.
-    pub started_at: i64,
-}
 macro_rules! marker_error {
     ($name:ident, $text:literal) => {
         #[derive(Debug)]
@@ -201,6 +207,15 @@ marker_error!(
     RefreshInProgress,
     "another replica is refreshing this account; retry"
 );
+marker_error!(
+    Unrotated,
+    "the provider kept the migrated refresh token, so copies left elsewhere stay valid; migration not complete"
+);
+/// A sealed record larger than this is refused.
+const MAX_RECORD: usize = 64 * 1024;
+const RECORD_VERSION: u32 = 1;
+/// The usage poll lease: one replica polls the provider at a time.
+const USAGE_LEASE: &str = "__usage";
 
 pub struct Engine {
     store: Arc<Store>,
@@ -257,18 +272,21 @@ impl Engine {
             .clone()
     }
     fn load_row(&self, row: StoredAccount) -> Result<Loaded> {
+        if row.sealed.len() > MAX_RECORD {
+            bail!("sealed account record is too large");
+        }
         let record: Record = self.unseal(&row.sealed)?;
+        if record.v != RECORD_VERSION {
+            bail!("unknown account record version {}", record.v);
+        }
         record.grant.validate()?;
         Ok(Loaded { row, record })
     }
     async fn selected(&self, user: &str, id: &str) -> Result<Loaded> {
-        match self.store.account(id).await? {
-            Some(row) if row.user == user => self.load_row(row),
-            Some(_) => Err(NotFound.into()),
-            None => match self.store.tombstone(id).await? {
-                Some((owner, _)) if owner == user => Err(Gone.into()),
-                _ => Err(NotFound.into()),
-            },
+        match self.store.account(user, id).await? {
+            Some(row) => self.load_row(row),
+            None if self.store.deleted(user, id).await? => Err(Gone.into()),
+            None => Err(NotFound.into()),
         }
     }
     /// Write `record` over `loaded` under the lease. False when the fence or revision moved.
@@ -339,15 +357,12 @@ impl Engine {
         grant: Grant,
         replacement: Option<&Identity>,
     ) -> Result<Receipt> {
-        let options = Admission {
-            rotation_pending: false,
-            started_at: now(),
-        };
-        self.admit_with(user, alias, migration, grant, replacement, options, None)
+        self.admit_with(user, alias, migration, grant, replacement, false, None)
             .await
     }
-    /// Admit a grant moved from a machine. Its receipt stays hidden until the first verified
-    /// refresh, so a client keeps its fence until the copies it leaves behind are stale.
+    /// Admit a grant moved from a machine. Its receipt stays hidden until a verified refresh
+    /// produced a distinct refresh token, so a client keeps its fence until the copies it
+    /// leaves behind are stale.
     pub async fn admit_migration(
         &self,
         user: &str,
@@ -355,11 +370,7 @@ impl Engine {
         migration: &str,
         grant: Grant,
     ) -> Result<Receipt> {
-        let options = Admission {
-            rotation_pending: true,
-            started_at: now(),
-        };
-        self.admit_with(user, alias, migration, grant, None, options, None)
+        self.admit_with(user, alias, migration, grant, None, true, None)
             .await
     }
     #[allow(clippy::too_many_arguments)]
@@ -367,16 +378,16 @@ impl Engine {
         &self,
         user: &str,
         alias: &str,
-        migration: &str,
+        admission_id: &str,
         grant: Grant,
         replacement: Option<&Identity>,
-        options: Admission,
+        migrated: bool,
         login_id: Option<&str>,
     ) -> Result<Receipt> {
         let alias = validate_alias(alias)?;
-        validate_alias(migration)?;
+        validate_alias(admission_id)?;
         grant.validate()?;
-        if let Some((receipt, _)) = self.admitted(user, migration).await? {
+        if let Some((receipt, _)) = self.admitted(user, admission_id).await? {
             let stored = self.selected(user, &receipt.account_id).await?;
             if !stored.row.alias.eq_ignore_ascii_case(alias) {
                 bail!("migration alias conflicts with its receipt");
@@ -388,46 +399,43 @@ impl Engine {
             grant: Grant,
             replacement: Option<Identity>,
         }
-        // Retain an acquired grant before any network verification, even if it fails.
-        let pending_key = vault::digest(format!("{user}\0{migration}").as_bytes());
-        let mut started_at = options.started_at;
-        let grant = match self.store.pending(&pending_key).await? {
-            Some(saved) => {
-                let pending: Pending = self.unseal(&saved.sealed)?;
-                if saved.user != user
-                    || !saved.alias.eq_ignore_ascii_case(alias)
-                    || pending.replacement.as_ref() != replacement
-                {
-                    bail!("pending admission conflicts with retry; retained grant unchanged");
-                }
-                started_at = started_at.min(saved.started_at);
-                pending.grant
-            }
-            None => {
-                let sealed = self.seal(&Pending {
-                    grant: grant.clone(),
-                    replacement: replacement.cloned(),
-                })?;
-                let row = PendingRow {
-                    user: user.into(),
-                    alias: alias.into(),
-                    started_at,
-                    sealed,
-                };
-                self.store.put_pending(&pending_key, &row).await?;
-                grant
-            }
-        };
-        let id = account_id(user, alias);
-        // Refuse work that started before a delete, before any provider call.
-        if self
+        let cancelled = || anyhow::anyhow!("a delete cancelled this admission; start a new login");
+        // Retain an acquired grant before any network verification, even if it fails. A
+        // delete cancels this row, and a cancelled admission never commits.
+        if self.store.pending(user, admission_id).await?.is_none() {
+            let sealed = self.seal(&Pending {
+                grant: grant.clone(),
+                replacement: replacement.cloned(),
+            })?;
+            let row = PendingRow {
+                user: user.into(),
+                alias: alias.into(),
+                state: PendingState::Live,
+                sealed,
+            };
+            self.store.put_pending(admission_id, &row).await?;
+        }
+        let saved = self
             .store
-            .tombstone(&id)
+            .pending(user, admission_id)
             .await?
-            .is_some_and(|(_, deleted_at)| deleted_at >= started_at)
+            .context("pending admission vanished")?;
+        if saved.state != PendingState::Live {
+            return Err(cancelled());
+        }
+        let pending: Pending = self.unseal(&saved.sealed)?;
+        if !saved.alias.eq_ignore_ascii_case(alias) || pending.replacement.as_ref() != replacement {
+            bail!("pending admission conflicts with retry; retained grant unchanged");
+        }
+        let grant = pending.grant;
+        if let Some(login) = login_id
+            && self
+                .store
+                .flow(user, login)
+                .await?
+                .is_none_or(|f| f.cancelled || f.consumed)
         {
-            self.store.delete_pending(&pending_key).await?;
-            bail!("the account was deleted after this admission started; start a new login");
+            return Err(cancelled());
         }
         grant.validate()?;
         if grant.expires_at <= now() + USABLE {
@@ -437,26 +445,19 @@ impl Engine {
         if replacement.is_some_and(|expected| expected != &identity) {
             bail!("login renewal changed Claude identity; grant retained");
         }
-        let prior = self.store.account(&id).await?;
-        let prior = match prior {
+        let id = account_id(user, alias);
+        let prior = match self.store.account(user, &id).await? {
             Some(row) => Some(self.load_row(row)?),
             None => None,
         };
         match (&prior, replacement) {
             (None, Some(_)) => bail!("login renewal target no longer exists; start a new login"),
-            (Some(p), None) if p.row.user == user => {
-                bail!("Claude identity or alias already reserved")
-            }
-            (Some(p), Some(_)) if p.identity() != identity || p.row.user != user => {
+            (Some(_), None) => bail!("Claude identity or alias already reserved"),
+            (Some(p), Some(_)) if p.identity() != identity => {
                 bail!("Claude identity or alias already reserved")
             }
             _ => {}
         }
-        let mut admissions = prior
-            .as_ref()
-            .map(|p| p.record.admissions.clone())
-            .unwrap_or_default();
-        admissions.push(migration.into());
         let generation = prior
             .as_ref()
             .map(|p| {
@@ -467,13 +468,20 @@ impl Engine {
             })
             .transpose()?
             .unwrap_or(1);
+        let rotation = if migrated {
+            Rotation::Pending {
+                migrated: vault::digest(grant.refresh_token.as_bytes()),
+            }
+        } else {
+            Rotation::NotMigrated
+        };
         let record = Record {
+            v: RECORD_VERSION,
             grant,
             revision: revision(),
             generation,
             phase: Phase::Ready,
-            admissions,
-            rotation_pending: options.rotation_pending,
+            rotation,
             attempt: None,
             retained: None,
         };
@@ -489,28 +497,20 @@ impl Engine {
         let admission = store::Admission {
             account: row,
             expected_revision: prior.as_ref().map(|p| p.row.revision),
-            started_at,
-            pending_key: pending_key.clone(),
+            admission_id: admission_id.into(),
             login_id: login_id.map(str::to_owned),
         };
         match self.store.admit(&admission).await? {
             AdmitOutcome::Committed => Ok(Receipt {
                 account_id: id,
                 identity,
-                migration_id: migration.into(),
+                migration_id: admission_id.into(),
             }),
-            AdmitOutcome::DeletedSince => {
-                self.store.delete_pending(&pending_key).await?;
-                bail!("the account was deleted after this admission started; start a new login")
-            }
-            AdmitOutcome::FlowGone => {
-                self.store.delete_pending(&pending_key).await?;
-                bail!("the login was cancelled by a delete; start a new login")
-            }
+            AdmitOutcome::Cancelled => Err(cancelled()),
             AdmitOutcome::Conflict => bail!("Claude identity or alias already reserved"),
         }
     }
-    /// Admit a grant moved from a machine, then refresh once under the lease. A single-use
+    /// Admit a grant moved from a machine, then refresh once under the lease. A rotated
     /// refresh token makes every copy left on another holder stale. A retry with the same ID
     /// finishes a stopped rotation, or returns the receipt.
     pub async fn migrate(
@@ -522,8 +522,9 @@ impl Engine {
         grant: Grant,
     ) -> Result<Receipt> {
         let receipt = match self.admitted(user, migration).await? {
-            Some((receipt, false)) => return Ok(receipt),
-            Some((receipt, true)) => receipt,
+            Some((receipt, Rotation::Rotated | Rotation::NotMigrated)) => return Ok(receipt),
+            Some((_, Rotation::Unrotated)) => return Err(Unrotated.into()),
+            Some((receipt, Rotation::Pending { .. })) => receipt,
             None => match self.admit_migration(user, alias, migration, grant).await {
                 Ok(receipt) => receipt,
                 Err(error) => {
@@ -541,49 +542,62 @@ impl Engine {
             },
         };
         // A pending rotation always refreshes before anything is returned.
-        let rotated = self
+        let refreshed = self
             .acquire_for(user, machine, &receipt.account_id, None)
             .await;
+        let rotation = match refreshed {
+            Ok(_) => Some(
+                self.selected(user, &receipt.account_id)
+                    .await?
+                    .record
+                    .rotation,
+            ),
+            Err(_) => None,
+        };
+        let result = match rotation {
+            Some(Rotation::Rotated) => "ok",
+            Some(Rotation::Unrotated) => "unrotated",
+            _ => "admitted_refresh_failed",
+        };
         self.audit(&audit::Event {
             operation: "migrate",
             machine,
             account: &receipt.account_id,
-            result: if rotated.is_ok() {
-                "ok"
-            } else {
-                "admitted_refresh_failed"
-            },
+            result,
             rotated: None,
             target: None,
         })
         .await?;
-        rotated?;
-        Ok(receipt)
-    }
-    /// The receipt for an admission ID and whether its rotation is still pending.
-    async fn admitted(&self, user: &str, migration: &str) -> Result<Option<(Receipt, bool)>> {
-        for row in self.store.accounts(user).await? {
-            let loaded = self.load_row(row)?;
-            if loaded.record.admissions.iter().any(|id| id == migration) {
-                return Ok(Some((
-                    Receipt {
-                        account_id: loaded.row.id.clone(),
-                        identity: loaded.identity(),
-                        migration_id: migration.into(),
-                    },
-                    loaded.record.rotation_pending,
-                )));
-            }
+        refreshed?;
+        match rotation {
+            Some(Rotation::Rotated) => Ok(receipt),
+            Some(Rotation::Unrotated) => Err(Unrotated.into()),
+            _ => bail!("migration refresh did not complete; retry"),
         }
-        Ok(None)
     }
-    /// A completed admission. A migration counts only after its verified rotation.
-    pub async fn receipt(&self, user: &str, migration: &str) -> Result<Option<Receipt>> {
-        Ok(self
-            .admitted(user, migration)
-            .await?
-            .filter(|(_, pending)| !pending)
-            .map(|(receipt, _)| receipt))
+    /// The receipt for an admission ID and its account's rotation state. An admission whose
+    /// account was deleted is Gone: a retry cannot recreate it.
+    async fn admitted(&self, user: &str, admission: &str) -> Result<Option<(Receipt, Rotation)>> {
+        let Some(id) = self.store.admission(user, admission).await? else {
+            return Ok(None);
+        };
+        let loaded = self.selected(user, &id).await?;
+        Ok(Some((
+            Receipt {
+                account_id: loaded.row.id.clone(),
+                identity: loaded.identity(),
+                migration_id: admission.into(),
+            },
+            loaded.record.rotation.clone(),
+        )))
+    }
+    /// A completed admission. A migration counts only after a verified, distinct rotation.
+    pub async fn receipt(&self, user: &str, admission: &str) -> Result<Option<Receipt>> {
+        match self.admitted(user, admission).await? {
+            Some((receipt, Rotation::Rotated | Rotation::NotMigrated)) => Ok(Some(receipt)),
+            Some((_, Rotation::Unrotated)) => Err(Unrotated.into()),
+            _ => Ok(None),
+        }
     }
     /// Keep the lease long enough for one provider call; a failed renewal stops the work.
     async fn budget(&self, lease: &mut Lease, id: &str) -> Result<()> {
@@ -607,9 +621,16 @@ impl Engine {
         }
         self.budget(lease, &loaded.row.id).await?;
         let mut record = loaded.record.clone();
-        // A migration counts as rotated only once its successor is verified.
+        // A migration counts as rotated only once a verified successor carries a distinct
+        // refresh token.
+        if let Rotation::Pending { migrated } = &record.rotation {
+            record.rotation = if vault::digest(record.grant.refresh_token.as_bytes()) != *migrated {
+                Rotation::Rotated
+            } else {
+                Rotation::Unrotated
+            };
+        }
         record.phase = Phase::Ready;
-        record.rotation_pending = false;
         record.attempt = None;
         record.retained = None;
         self.put(loaded, record, Fence::Live(lease)).await
@@ -746,13 +767,15 @@ impl Engine {
         Ok(loaded)
     }
     /// Wait for another replica's refresh to publish a newer token.
-    async fn follow(&self, user: &str, id: &str, seen: &str) -> Result<Access> {
+    /// A rejected revision is never returned: the caller then needs a successor.
+    async fn follow(&self, user: &str, id: &str, seen: &str, rejected: bool) -> Result<Access> {
         let deadline = tokio::time::Instant::now() + FOLLOW_WAIT;
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(250)).await;
             let loaded = self.selected(user, id).await?;
+            let newer = loaded.record.revision != seen;
             if loaded.record.phase == Phase::Ready
-                && (loaded.record.revision != seen || !loaded.needs_refresh(None))
+                && (newer || (!rejected && !loaded.needs_refresh(None)))
             {
                 return Ok(loaded.access());
             }
@@ -776,7 +799,10 @@ impl Engine {
             return Ok(loaded.access());
         }
         let Some(mut lease) = self.store.acquire_lease(id, LEASE_TTL).await? else {
-            return self.follow(user, id, &loaded.record.revision).await;
+            let rejected = previous == Some(loaded.record.revision.as_str());
+            return self
+                .follow(user, id, &loaded.record.revision, rejected)
+                .await;
         };
         // Another replica may have refreshed while this one waited for the lease.
         let previous = previous.filter(|p| *p == loaded.record.revision);
@@ -792,10 +818,11 @@ impl Engine {
     /// Delete an account and its sealed grant. Access tokens already given out stay valid
     /// until they expire; the server stops renewing them now.
     pub async fn remove(&self, user: &str, machine: &str, id: &str) -> Result<()> {
-        if !self.store.delete(id, user, now()).await? {
-            return match self.store.tombstone(id).await? {
-                Some((owner, _)) if owner == user => Err(Gone.into()),
-                _ => Err(NotFound.into()),
+        if !self.store.delete(user, id).await? {
+            return if self.store.deleted(user, id).await? {
+                Err(Gone.into())
+            } else {
+                Err(NotFound.into())
             };
         }
         self.audit(&audit::Event {

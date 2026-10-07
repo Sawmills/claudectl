@@ -13,8 +13,11 @@ struct Tables {
     accounts: BTreeMap<String, StoredAccount>,
     /// account ID -> (holder, epoch, expires_at in ms)
     leases: BTreeMap<String, (String, i64, i64)>,
-    /// account ID -> (user, alias, deleted_at)
-    tombstones: BTreeMap<String, (String, String, i64)>,
+    /// Append-only: (user, account ID, alias, deleted_at).
+    deletions: Vec<(String, String, String, i64)>,
+    /// "user\u{1f}admission ID" -> account ID
+    admissions: BTreeMap<String, String>,
+    /// "user\u{1f}admission ID" -> row
     pending: BTreeMap<String, PendingRow>,
     flows: BTreeMap<String, FlowRow>,
     usage: BTreeMap<String, Vec<u8>>,
@@ -35,8 +38,8 @@ pub struct FileStore {
 fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
-fn slot(kind: &str, key: &str) -> String {
-    format!("{kind}\u{1f}{key}")
+fn slot(a: &str, b: &str) -> String {
+    format!("{a}\u{1f}{b}")
 }
 
 impl FileStore {
@@ -89,8 +92,8 @@ impl FileStore {
     pub fn ready(&self) -> Result<()> {
         Ok(())
     }
-    pub fn account(&self, id: &str) -> Result<Option<StoredAccount>> {
-        Ok(self.read(|t| t.accounts.get(id).cloned()))
+    pub fn account(&self, user: &str, id: &str) -> Result<Option<StoredAccount>> {
+        Ok(self.read(|t| t.accounts.get(id).filter(|a| a.user == user).cloned()))
     }
     pub fn accounts(&self, user: &str) -> Result<Vec<StoredAccount>> {
         Ok(self.read(|t| {
@@ -118,7 +121,10 @@ impl FileStore {
     ) -> Result<bool> {
         self.transact(|t| {
             let id = &account.id;
-            let allowed = t.accounts.get(id).is_some_and(|a| a.revision == expected)
+            let allowed = t
+                .accounts
+                .get(id)
+                .is_some_and(|a| a.revision == expected && a.user == account.user)
                 && Self::fenced(t, id, fence);
             if allowed {
                 t.accounts.insert(id.clone(), account.clone());
@@ -128,17 +134,19 @@ impl FileStore {
     }
     pub fn admit(&self, admission: &Admission) -> Result<AdmitOutcome> {
         let a = &admission.account;
+        let pending_key = slot(&a.user, &admission.admission_id);
         self.transact(|t| {
-            if t.tombstones
-                .get(&a.id)
-                .is_some_and(|(_, _, deleted_at)| *deleted_at >= admission.started_at)
-            {
-                return (AdmitOutcome::DeletedSince, false);
-            }
-            if let Some(login) = &admission.login_id
-                && !t.flows.contains_key(login)
-            {
-                return (AdmitOutcome::FlowGone, false);
+            let live = t
+                .pending
+                .get(&pending_key)
+                .is_some_and(|p| p.state == PendingState::Live);
+            let flow_live = admission.login_id.as_ref().is_none_or(|login| {
+                t.flows
+                    .get(login)
+                    .is_some_and(|f| f.user == a.user && !f.cancelled && !f.consumed)
+            });
+            if !live || !flow_live {
+                return (AdmitOutcome::Cancelled, false);
             }
             let current = t.accounts.get(&a.id).map(|c| c.revision);
             let identity_taken = t.accounts.values().any(|o| {
@@ -153,14 +161,24 @@ impl FileStore {
                 return (AdmitOutcome::Conflict, false);
             }
             t.accounts.insert(a.id.clone(), a.clone());
-            t.pending.remove(&admission.pending_key);
-            if let Some(login) = &admission.login_id {
-                t.flows.remove(login);
+            t.admissions.insert(pending_key.clone(), a.id.clone());
+            if let Some(p) = t.pending.get_mut(&pending_key) {
+                p.state = PendingState::Committed;
+                p.sealed.clear();
+            }
+            if let Some(login) = &admission.login_id
+                && let Some(f) = t.flows.get_mut(login)
+            {
+                f.consumed = true;
+                f.retained = None;
             }
             (AdmitOutcome::Committed, true)
         })
     }
-    pub fn delete(&self, id: &str, user: &str, deleted_at: i64) -> Result<bool> {
+    pub fn admission(&self, user: &str, admission_id: &str) -> Result<Option<String>> {
+        Ok(self.read(|t| t.admissions.get(&slot(user, admission_id)).cloned()))
+    }
+    pub fn delete(&self, user: &str, id: &str) -> Result<bool> {
         self.transact(|t| {
             let Some(alias) = t
                 .accounts
@@ -173,17 +191,31 @@ impl FileStore {
             t.accounts.remove(id);
             t.leases.remove(id);
             t.usage.remove(id);
-            t.tombstones
-                .insert(id.into(), (user.into(), alias.clone(), deleted_at));
-            t.pending
-                .retain(|_, p| !(p.user == user && p.alias.eq_ignore_ascii_case(&alias)));
-            t.flows
-                .retain(|_, f| !(f.user == user && f.alias.eq_ignore_ascii_case(&alias)));
+            t.deletions
+                .push((user.into(), id.into(), alias.clone(), now()));
+            for p in t.pending.values_mut() {
+                if p.user == user
+                    && p.alias.eq_ignore_ascii_case(&alias)
+                    && p.state == PendingState::Live
+                {
+                    p.state = PendingState::Cancelled;
+                    p.sealed.clear();
+                }
+            }
+            for f in t.flows.values_mut() {
+                if f.user == user && f.alias.eq_ignore_ascii_case(&alias) && !f.consumed {
+                    f.cancelled = true;
+                    f.retained = None;
+                }
+            }
             (true, true)
         })
     }
-    pub fn tombstone(&self, id: &str) -> Result<Option<(String, i64)>> {
-        Ok(self.read(|t| t.tombstones.get(id).map(|(u, _, at)| (u.clone(), *at))))
+    pub fn deleted(&self, user: &str, id: &str) -> Result<bool> {
+        Ok(self.read(|t| {
+            !t.accounts.contains_key(id)
+                && t.deletions.iter().any(|(u, i, _, _)| u == user && i == id)
+        }))
     }
     pub fn acquire_lease(&self, id: &str, ttl_ms: i64) -> Result<Option<Lease>> {
         let holder = self.holder().to_owned();
@@ -199,15 +231,13 @@ impl FileStore {
             let epoch = t.leases.get(id).map_or(1, |(_, e, _)| e + 1);
             t.leases
                 .insert(id.into(), (holder.clone(), epoch, now + ttl_ms));
-            (
-                Some(Lease {
-                    holder,
-                    epoch,
-                    remaining_ms: ttl_ms,
-                    taken: std::time::Instant::now(),
-                }),
-                true,
-            )
+            let lease = Lease {
+                holder,
+                epoch,
+                remaining_ms: ttl_ms,
+                taken: std::time::Instant::now(),
+            };
+            (Some(lease), true)
         })
     }
     pub fn renew_lease(&self, lease: &Lease, id: &str, ttl_ms: i64) -> Result<Option<Lease>> {
@@ -221,14 +251,12 @@ impl FileStore {
             }
             t.leases
                 .insert(id.into(), (lease.holder.clone(), lease.epoch, now + ttl_ms));
-            (
-                Some(Lease {
-                    remaining_ms: ttl_ms,
-                    taken: std::time::Instant::now(),
-                    ..lease.clone()
-                }),
-                true,
-            )
+            let renewed = Lease {
+                remaining_ms: ttl_ms,
+                taken: std::time::Instant::now(),
+                ..lease.clone()
+            };
+            (Some(renewed), true)
         })
     }
     pub fn release_lease(&self, lease: &Lease, id: &str) -> Result<()> {
@@ -240,41 +268,43 @@ impl FileStore {
             _ => ((), false),
         })
     }
-    pub fn pending(&self, key: &str) -> Result<Option<PendingRow>> {
-        Ok(self.read(|t| t.pending.get(key).cloned()))
+    pub fn pending(&self, user: &str, admission_id: &str) -> Result<Option<PendingRow>> {
+        Ok(self.read(|t| t.pending.get(&slot(user, admission_id)).cloned()))
     }
-    pub fn put_pending(&self, key: &str, row: &PendingRow) -> Result<()> {
-        self.write(|t| {
-            t.pending.insert(key.into(), row.clone());
+    pub fn put_pending(&self, admission_id: &str, row: &PendingRow) -> Result<()> {
+        let key = slot(&row.user, admission_id);
+        self.transact(|t| {
+            if t.pending.contains_key(&key) {
+                return ((), false);
+            }
+            t.pending.insert(key, row.clone());
+            ((), true)
         })
     }
-    pub fn delete_pending(&self, key: &str) -> Result<()> {
-        self.transact(|t| ((), t.pending.remove(key).is_some()))
-    }
-    pub fn flow(&self, id: &str) -> Result<Option<FlowRow>> {
-        Ok(self.read(|t| t.flows.get(id).cloned()))
+    pub fn flow(&self, user: &str, id: &str) -> Result<Option<FlowRow>> {
+        Ok(self.read(|t| t.flows.get(id).filter(|f| f.user == user).cloned()))
     }
     pub fn put_flow(&self, id: &str, row: &FlowRow) -> Result<()> {
         self.write(|t| {
             t.flows.insert(id.into(), row.clone());
         })
     }
-    pub fn start_exchange(&self, id: &str) -> Result<bool> {
+    pub fn start_exchange(&self, user: &str, id: &str) -> Result<bool> {
         self.transact(|t| match t.flows.get_mut(id) {
-            Some(flow) if !flow.exchanging => {
-                flow.exchanging = true;
+            Some(f) if f.user == user && !f.exchanging && !f.cancelled && !f.consumed => {
+                f.exchanging = true;
                 (true, true)
             }
             _ => (false, false),
         })
     }
-    pub fn retain(&self, id: &str, sealed: &[u8]) -> Result<bool> {
+    pub fn retain(&self, user: &str, id: &str, sealed: &[u8]) -> Result<bool> {
         self.transact(|t| match t.flows.get_mut(id) {
-            Some(flow) => {
-                flow.retained = Some(sealed.to_vec());
+            Some(f) if f.user == user && !f.cancelled && !f.consumed => {
+                f.retained = Some(sealed.to_vec());
                 (true, true)
             }
-            None => (false, false),
+            _ => (false, false),
         })
     }
     pub fn usage(&self, id: &str) -> Result<Option<Vec<u8>>> {
@@ -297,6 +327,9 @@ impl FileStore {
     }
     pub fn users(&self) -> Result<Vec<User>> {
         Ok(self.read(|t| t.users.clone()))
+    }
+    pub fn user(&self, id: &str) -> Result<Option<User>> {
+        Ok(self.read(|t| t.users.iter().find(|u| u.id == id).cloned()))
     }
     pub fn record_user(&self, id: &str, email: &str) -> Result<bool> {
         self.transact(|t| {
@@ -329,8 +362,14 @@ impl FileStore {
             (found, found)
         })
     }
-    pub fn machines(&self) -> Result<Vec<Machine>> {
-        Ok(self.read(|t| t.machines.clone()))
+    pub fn machines(&self, user: &str) -> Result<Vec<(String, bool)>> {
+        Ok(self.read(|t| {
+            t.machines
+                .iter()
+                .filter(|m| m.user == user)
+                .map(|m| (m.id.clone(), m.revoked))
+                .collect()
+        }))
     }
     pub fn machine_by_token(&self, token_hash: &str) -> Result<Option<Machine>> {
         Ok(self.read(|t| {
@@ -358,9 +397,7 @@ impl FileStore {
         })
     }
     pub fn put_enrollment(&self, kind: &str, key: &str, row: &EnrollmentRow) -> Result<()> {
-        let now = now();
         self.write(|t| {
-            t.enrollment.retain(|_, r| r.expires_at > now);
             t.enrollment.insert(slot(kind, key), row.clone());
         })
     }
@@ -371,18 +408,14 @@ impl FileStore {
         now: i64,
     ) -> Result<Option<(String, EnrollmentRow)>> {
         Ok(self.read(|t| {
-            t.enrollment
-                .iter()
-                .find(|(slot, r)| {
-                    slot.split_once('\u{1f}').is_some_and(|(k, _)| k == kind)
-                        && r.lookup.as_deref() == Some(lookup)
-                        && !r.consumed
-                        && r.expires_at > now
-                })
-                .and_then(|(slot, r)| {
-                    slot.split_once('\u{1f}')
-                        .map(|(_, key)| (key.to_owned(), r.clone()))
-                })
+            t.enrollment.iter().find_map(|(slot, r)| {
+                let (k, key) = slot.split_once('\u{1f}')?;
+                (k == kind
+                    && r.lookup.as_deref() == Some(lookup)
+                    && !r.consumed
+                    && r.expires_at > now)
+                    .then(|| (key.to_owned(), r.clone()))
+            })
         }))
     }
     pub fn enrollment(&self, kind: &str, key: &str, now: i64) -> Result<Option<EnrollmentRow>> {
@@ -393,9 +426,15 @@ impl FileStore {
                 .cloned()
         }))
     }
-    pub fn update_enrollment(&self, kind: &str, key: &str, sealed: &[u8]) -> Result<bool> {
+    pub fn swap_enrollment(
+        &self,
+        kind: &str,
+        key: &str,
+        expected: &[u8],
+        sealed: &[u8],
+    ) -> Result<bool> {
         self.transact(|t| match t.enrollment.get_mut(&slot(kind, key)) {
-            Some(r) if !r.consumed => {
+            Some(r) if !r.consumed && r.sealed == expected => {
                 r.sealed = sealed.to_vec();
                 (true, true)
             }
