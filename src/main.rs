@@ -30,6 +30,9 @@ enum Commands {
         /// Show token expiry, old usage data, and fetch diagnostics
         #[arg(long)]
         details: bool,
+        /// Print a JSON document (version 1) instead of a table
+        #[arg(long, conflicts_with = "details")]
+        json: bool,
     },
     /// Log into a Claude account via OAuth and save it as a profile
     Login {
@@ -122,6 +125,7 @@ fn main() {
             cached,
             refresh,
             details,
+            json,
         } => commands::status::run(
             alias.as_deref(),
             if cached {
@@ -132,6 +136,7 @@ fn main() {
                 claudectl::usage_cache::FetchMode::Normal
             },
             details,
+            json,
         ),
         Commands::Login { ref alias } => commands::login::run(alias),
         Commands::Save { ref alias } => commands::save::run(alias.as_deref()),
