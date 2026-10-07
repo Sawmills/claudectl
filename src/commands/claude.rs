@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use claudectl::auth_store::AuthStore;
@@ -16,6 +16,7 @@ use claudectl::lane::{self, Lane, RateLimitHit};
 use claudectl::usage_cache::FetchMode;
 
 use crate::commands::status::{self, FetchedUsage};
+use crate::commands::use_profile;
 
 /// Recoveries allowed in one hour before the launcher stops.
 const MAX_RECOVERIES_PER_HOUR: usize = 3;
@@ -48,7 +49,6 @@ fn run_inner(launch: LaunchArgs) -> Result<i32> {
     let lane = Lane::open(&paths, &launch.lane)?;
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
     let mut tried: Vec<String> = Vec::new();
-    let mut recoveries: Vec<Instant> = Vec::new();
     let mut alias = match &launch.account {
         Some(alias) => {
             confirm_explicit(alias, launch.allow_billing)?;
@@ -59,8 +59,9 @@ fn run_inner(launch: LaunchArgs) -> Result<i32> {
     };
     let mut args = launch.args.clone();
     loop {
-        lane.clear_account_state()?;
+        // Check first: cleanup would otherwise delete a credentials file.
         lane.assert_no_credentials()?;
+        lane.clear_account_state()?;
         lane.log("start", &alias, None)?;
         let launched = chrono::Utc::now();
         let outcome = run_once(
@@ -85,8 +86,8 @@ fn run_inner(launch: LaunchArgs) -> Result<i32> {
             }
         };
         lane.log("end", &alias, Some(&hit.session_id))?;
-        recoveries.retain(|at| at.elapsed() < Duration::from_secs(3600));
-        if recoveries.len() >= MAX_RECOVERIES_PER_HOUR {
+        // Counted from the lane log, so a restarted launcher keeps the cap.
+        if lane.recent_events("recovery", chrono::Duration::hours(1))? >= MAX_RECOVERIES_PER_HOUR {
             bail!(
                 "{alias} reached its limit, and {MAX_RECOVERIES_PER_HOUR} recoveries ran in the last hour; \
                  stopped. Resume with: claudectl claude --lane {} -- --resume {}",
@@ -94,7 +95,7 @@ fn run_inner(launch: LaunchArgs) -> Result<i32> {
                 hit.session_id
             );
         }
-        recoveries.push(Instant::now());
+        lane.log("recovery", &alias, Some(&hit.session_id))?;
         tried.push(alias.clone());
         let Some(next) = choose(&status::fetch_all_usages()?, &tried) else {
             bail!(
@@ -168,8 +169,8 @@ fn run_once(
 }
 
 /// Watch the lane transcripts for a rate-limit error from this run. Confirm
-/// it with one usage read, then end the run through claudectl's own SIGTERM
-/// forwarding, so Claude gets SIGTERM (and SIGCONT) and saves its session.
+/// it with one usage read, then end the run through exec's signal forwarder,
+/// so Claude's group gets SIGTERM (and SIGCONT) and Claude saves its session.
 fn watch(
     config_dir: &Path,
     cwd: &Path,
@@ -192,8 +193,9 @@ fn watch(
             continue;
         }
         *limited.lock().unwrap_or_else(|e| e.into_inner()) = Some(hit);
-        // SAFETY: kill only sends a signal to this process.
-        unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        // Signal the child's group directly, through exec's forwarder: a
+        // SIGTERM to this process would be lost if it was inherited as ignored.
+        exec::signals::forward(libc::SIGTERM);
         return;
     }
 }
@@ -202,44 +204,31 @@ fn watch(
 /// API throttle, not a used-up window.
 fn limit_confirmed(alias: &str) -> bool {
     match status::fetch_alias(alias, FetchMode::Refresh) {
-        Ok(Some(fetched)) => fetched.usage.as_ref().is_some_and(status::exhausted),
+        Ok(Some(fetched)) => {
+            let fresh = fetched.error.is_none()
+                && fetched.snapshot.is_fresh_at(chrono::Utc::now().timestamp());
+            fresh && fetched.usage.as_ref().is_some_and(status::exhausted)
+        }
         _ => false,
     }
 }
 
 /// The next account: rate-limited (never billed), with fresh usage below
-/// every limit, not the live login, and not tried in this launch. Most room
-/// first: lowest weekly, then 5-hour use.
+/// every limit, not the live login, and not tried in this launch, ranked as
+/// `use` ranks: lowest max(5h, 7d), a missing window counting as unavailable.
 fn choose(fetched: &[FetchedUsage], tried: &[String]) -> Option<String> {
-    let now = chrono::Utc::now().timestamp();
-    fetched
+    let candidates: Vec<use_profile::Candidate> = fetched
         .iter()
-        .filter(|f| !f.is_active && f.error.is_none() && !tried.contains(&f.alias))
-        .filter(|f| f.snapshot.is_fresh_at(now))
-        .filter_map(|f| {
-            let usage = f.usage.as_ref()?;
-            let rate_limited =
-                status::billing_class(Some(usage), f.plan.as_deref()) == "rate_limited";
-            (rate_limited && !status::exhausted(usage)).then_some((f, usage))
+        .filter(|f| !f.is_active && !tried.contains(&f.alias))
+        .filter(|f| {
+            f.usage.as_ref().is_some_and(|usage| {
+                status::billing_class(Some(usage), f.plan.as_deref()) == "rate_limited"
+                    && !status::exhausted(usage)
+            })
         })
-        .min_by(|(_, a), (_, b)| {
-            let used = |u: &claudectl::api::UsageResponse| {
-                (
-                    u.seven_day
-                        .as_ref()
-                        .and_then(|w| w.utilization)
-                        .unwrap_or(0.0),
-                    u.five_hour
-                        .as_ref()
-                        .and_then(|w| w.utilization)
-                        .unwrap_or(0.0),
-                )
-            };
-            used(a)
-                .partial_cmp(&used(b))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(f, _)| f.alias.clone())
+        .map(use_profile::candidate_from)
+        .collect();
+    use_profile::select_most_available(&candidates).map(str::to_string)
 }
 
 /// An explicitly chosen account that is not proven rate-limited may bill
@@ -247,7 +236,14 @@ fn choose(fetched: &[FetchedUsage], tried: &[String]) -> Option<String> {
 fn confirm_explicit(alias: &str, allow_billing: bool) -> Result<()> {
     let fetched = status::fetch_alias(alias, FetchMode::Cached)?
         .with_context(|| format!("profile '{alias}' not found"))?;
-    let class = status::billing_class(fetched.usage.as_ref(), fetched.plan.as_deref());
+    let fresh =
+        fetched.error.is_none() && fetched.snapshot.is_fresh_at(chrono::Utc::now().timestamp());
+    // Old or failed data cannot prove that extra usage is still off.
+    let class = if fresh {
+        status::billing_class(fetched.usage.as_ref(), fetched.plan.as_deref())
+    } else {
+        "unknown"
+    };
     if class == "rate_limited" || allow_billing {
         return Ok(());
     }
@@ -318,7 +314,9 @@ mod tests {
     fn chooses_the_rate_limited_account_with_most_room() {
         let mut live = fetched(
             "live",
-            &format!(r#"{{"seven_day":{{"utilization":1}},{OFF}}}"#),
+            &format!(
+                r#"{{"five_hour":{{"utilization":1}},"seven_day":{{"utilization":1}},{OFF}}}"#
+            ),
             Some("max"),
         );
         live.is_active = true;
@@ -326,24 +324,32 @@ mod tests {
             live,
             fetched(
                 "busy",
-                &format!(r#"{{"seven_day":{{"utilization":70}},{OFF}}}"#),
+                &format!(
+                    r#"{{"five_hour":{{"utilization":5}},"seven_day":{{"utilization":70}},{OFF}}}"#
+                ),
                 Some("max"),
             ),
             fetched(
                 "roomy",
-                &format!(r#"{{"seven_day":{{"utilization":20}},{OFF}}}"#),
+                &format!(
+                    r#"{{"five_hour":{{"utilization":5}},"seven_day":{{"utilization":20}},{OFF}}}"#
+                ),
                 Some("max"),
             ),
             fetched(
                 "billed",
-                r#"{"seven_day":{"utilization":0},"extra_usage":{"is_enabled":true}}"#,
+                r#"{"five_hour":{"utilization":0},"seven_day":{"utilization":0},"extra_usage":{"is_enabled":true}}"#,
                 Some("max"),
             ),
-            fetched("unknown", r#"{"seven_day":{"utilization":0}}"#, Some("max")),
+            fetched(
+                "unknown",
+                r#"{"five_hour":{"utilization":0},"seven_day":{"utilization":0}}"#,
+                Some("max"),
+            ),
             fetched(
                 "full",
                 &format!(
-                    r#"{{"seven_day":{{"utilization":30}},"seven_day_opus":{{"utilization":100}},{OFF}}}"#
+                    r#"{{"five_hour":{{"utilization":0}},"seven_day":{{"utilization":30}},"seven_day_opus":{{"utilization":100}},{OFF}}}"#
                 ),
                 Some("max"),
             ),
@@ -357,16 +363,48 @@ mod tests {
     }
 
     #[test]
+    fn a_nearly_full_five_hour_window_ranks_low_and_a_missing_one_is_unavailable() {
+        let accounts = [
+            fetched(
+                "hot",
+                &format!(
+                    r#"{{"five_hour":{{"utilization":99}},"seven_day":{{"utilization":5}},{OFF}}}"#
+                ),
+                Some("max"),
+            ),
+            fetched(
+                "calm",
+                &format!(
+                    r#"{{"five_hour":{{"utilization":20}},"seven_day":{{"utilization":20}},{OFF}}}"#
+                ),
+                Some("max"),
+            ),
+            fetched(
+                "blind",
+                &format!(r#"{{"seven_day":{{"utilization":1}},{OFF}}}"#),
+                Some("max"),
+            ),
+        ];
+        assert_eq!(choose(&accounts, &[]).as_deref(), Some("calm"));
+        assert_eq!(choose(&accounts, &["calm".into()]).as_deref(), Some("hot"));
+        assert_eq!(choose(&accounts[2..], &[]), None, "missing 5h window");
+    }
+
+    #[test]
     fn stale_or_failed_usage_is_never_chosen() {
         let mut stale = fetched(
             "stale",
-            &format!(r#"{{"seven_day":{{"utilization":1}},{OFF}}}"#),
+            &format!(
+                r#"{{"five_hour":{{"utilization":1}},"seven_day":{{"utilization":1}},{OFF}}}"#
+            ),
             Some("max"),
         );
         stale.snapshot.fresh = false;
         let mut failed = fetched(
             "failed",
-            &format!(r#"{{"seven_day":{{"utilization":1}},{OFF}}}"#),
+            &format!(
+                r#"{{"five_hour":{{"utilization":1}},"seven_day":{{"utilization":1}},{OFF}}}"#
+            ),
             Some("max"),
         );
         failed.error = Some("HTTP 500".into());

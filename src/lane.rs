@@ -143,6 +143,24 @@ impl Lane {
         writeln!(file, "{line}").with_context(|| format!("failed to write {}", path.display()))
     }
 
+    /// How many `event` lines the lane log holds from the last `within`.
+    pub fn recent_events(&self, event: &str, within: chrono::Duration) -> Result<usize> {
+        let path = self.root.join("accounts.jsonl");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
+        };
+        let since = chrono::Utc::now() - within;
+        Ok(text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record["event"] == event)
+            .filter_map(|record| chrono::DateTime::parse_from_rfc3339(record["at"].as_str()?).ok())
+            .filter(|at| *at >= since)
+            .count())
+    }
+
     /// The newest rate-limit API error for `cwd` at or after `since`, from
     /// the main thread of a session (not a subagent).
     pub fn find_rate_limit(
@@ -332,6 +350,32 @@ mod tests {
             lane.find_rate_limit(Path::new("/work"), now),
             None,
             "nothing after now"
+        );
+    }
+
+    #[test]
+    fn recent_events_count_only_the_window() {
+        let (_tmp, paths) = paths();
+        let lane = Lane::open(&paths, "lane").unwrap();
+        assert_eq!(
+            lane.recent_events("recovery", chrono::Duration::hours(1))
+                .unwrap(),
+            0
+        );
+        lane.log("recovery", "a", Some("s")).unwrap();
+        lane.log("start", "a", None).unwrap();
+        let log = paths.claudectl_dir().join("lanes/lane/accounts.jsonl");
+        let old = serde_json::json!({
+            "at": (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+            "event": "recovery", "alias": "a", "session_id": "s",
+        });
+        let mut text = std::fs::read_to_string(&log).unwrap();
+        text.push_str(&format!("{old}\n"));
+        std::fs::write(&log, text).unwrap();
+        assert_eq!(
+            lane.recent_events("recovery", chrono::Duration::hours(1))
+                .unwrap(),
+            1
         );
     }
 

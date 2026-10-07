@@ -47,7 +47,7 @@ fn switch_explicit(store: &AuthStore, paths: &config::Paths, alias: &str) -> Res
     Ok(())
 }
 
-struct Candidate {
+pub(crate) struct Candidate {
     alias: String,
     /// max(5h, 7d) utilization; f64::MAX when the account errored.
     score: f64,
@@ -55,7 +55,7 @@ struct Candidate {
     d7_reset_ts: i64,
 }
 
-fn candidate_from(f: &FetchedUsage) -> Candidate {
+pub(crate) fn candidate_from(f: &FetchedUsage) -> Candidate {
     match &f.usage {
         Some(u) if f.snapshot.is_fresh_at(chrono::Utc::now().timestamp()) && f.error.is_none() => {
             let h5 = u
@@ -88,7 +88,7 @@ fn candidate_from(f: &FetchedUsage) -> Candidate {
 
 /// Lowest max-utilization wins; near-ties (within half a percent) break toward
 /// the soonest 7d reset. Errored/expired candidates (score MAX) never win.
-fn select_most_available(candidates: &[Candidate]) -> Option<&str> {
+pub(crate) fn select_most_available(candidates: &[Candidate]) -> Option<&str> {
     candidates
         .iter()
         .filter(|c| c.score < 100.0)
