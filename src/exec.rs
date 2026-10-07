@@ -179,11 +179,16 @@ pub fn check_settings(cwd: &Path, home: &Path, managed: &Path) -> Result<(), Exe
 
 /// `check_settings` for this process's working directory, which the child
 /// inherits.
+/// The settings check for this process, reported as `ExecError::Settings`:
+/// the refusal concerns the directory and settings, not the account.
 fn check_current_settings(paths: &Paths) -> Result<(), ExecError> {
     let cwd = std::env::current_dir().map_err(|e| {
-        ExecError::Refused(format!("cannot read the working directory ({})", e.kind()))
+        ExecError::Settings(format!("cannot read the working directory ({})", e.kind()))
     })?;
-    check_settings(&cwd, &paths.home, &managed_settings_dir())
+    check_settings(&cwd, &paths.home, &managed_settings_dir()).map_err(|error| match error {
+        ExecError::Refused(message) => ExecError::Settings(message),
+        other => other,
+    })
 }
 
 pub struct ExecRequest {
@@ -221,6 +226,9 @@ impl IdentitySource for LiveIdentity {
 
 #[derive(Debug)]
 pub enum ExecError {
+    /// The settings or the working directory make any account unsafe to run
+    /// here (same exit code as Refused).
+    Settings(String),
     /// Policy refusal: active alias, shared grant, short lifetime, bad profile.
     Refused(String),
     /// Identity missing or mismatched.
@@ -240,7 +248,7 @@ impl ExecError {
         match self {
             ExecError::Identity(_) => 3,
             ExecError::Pin(_) => 4,
-            ExecError::Refused(_) => 5,
+            ExecError::Refused(_) | ExecError::Settings(_) => 5,
             ExecError::Receipt(_) => 6,
             ExecError::Spawn(_) => 7,
             ExecError::Cleanup(_) => 8,
@@ -253,7 +261,7 @@ impl std::error::Error for ExecError {}
 impl std::fmt::Display for ExecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExecError::Refused(m) => write!(f, "refused: {m}"),
+            ExecError::Refused(m) | ExecError::Settings(m) => write!(f, "refused: {m}"),
             ExecError::Identity(m) => write!(f, "identity check failed: {m}"),
             ExecError::Pin(m) => write!(f, "executable pin failed: {m}"),
             ExecError::Receipt(m) => write!(f, "receipt write failed: {m}"),

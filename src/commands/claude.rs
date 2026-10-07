@@ -26,6 +26,8 @@ const MAX_RECOVERIES_PER_HOUR: usize = 3;
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 /// Wait before another usage read when one failed or came back old.
 const CONFIRM_RETRY: Duration = Duration::from_secs(30);
+/// Longest the watcher works on after the run ends: one confirmation retry.
+const AFTER_EXIT: Duration = Duration::from_secs(40);
 /// Time Claude gets to save its session after SIGTERM before SIGKILL.
 const STOP_GRACE: Duration = Duration::from_secs(20);
 
@@ -186,7 +188,9 @@ fn run_once(
         SelfIdentity::current()?,
     ) {
         Ok(prepared) => prepared,
-        // exec's credential guard is the authority on which account may run.
+        // exec's credential guard is the authority on which account may run;
+        // a settings refusal (ExecError::Settings) concerns every account and
+        // stays fatal.
         Err(error @ (exec::ExecError::Refused(_) | exec::ExecError::Identity(_))) => {
             return Ok(Outcome::Refused(error.to_string()));
         }
@@ -234,14 +238,18 @@ fn watch(
     let mut handled: Vec<String> = Vec::new();
     let mut retry_at: Option<Instant> = None;
     let mut final_scan_done = false;
+    let mut exited_at: Option<Instant> = None;
     let mut scanner = lane::TranscriptScanner::new(config_dir, cwd, launched);
     loop {
         let exited = stop.load(Ordering::SeqCst);
         if exited {
             // After the run ends: one last scan for a record written at exit,
-            // and keep a pending retry alive, so `claude -p` can recover too.
+            // and keep one pending retry alive, so `claude -p` can recover
+            // too. AFTER_EXIT bounds this: usage reads that keep failing
+            // must not hold the launcher.
+            let since_exit = exited_at.get_or_insert_with(Instant::now).elapsed();
             let pending = retry_at.is_some_and(|at| Instant::now() < at + WATCH_INTERVAL);
-            if final_scan_done && !pending {
+            if (final_scan_done && !pending) || since_exit >= AFTER_EXIT {
                 return;
             }
             final_scan_done = true;
