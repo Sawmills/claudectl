@@ -63,12 +63,15 @@ _claudectl_profiles() {
         println!(r#"complete -F _claudectl_profiles claudectl use"#);
         println!(r#"complete -F _claudectl_profiles claudectl remove"#);
         println!(r#"complete -F _claudectl_profiles claudectl status"#);
-        println!(r#"complete -F _claudectl_profiles claudectl label"#);
     } else if shell == Shell::Fish {
         generate(shell, &mut cmd, name, &mut std::io::stdout());
         println!();
         println!(
-            r#"complete -c claudectl -n '__fish_seen_subcommand_from use remove status label' -xa '(ls ~/.claudectl/profiles/ 2>/dev/null)'"#
+            r#"complete -c claudectl -n '__fish_seen_subcommand_from use remove status' -xa '(ls ~/.claudectl/profiles/ 2>/dev/null)'"#
+        );
+        // Only the alias, the first argument of `label`; not the label text.
+        println!(
+            r#"complete -c claudectl -n '__fish_seen_subcommand_from label; and test (count (commandline -opc)) -eq 2' -xa '(ls ~/.claudectl/profiles/ 2>/dev/null)'"#
         );
     } else {
         generate(shell, &mut cmd, name, &mut std::io::stdout());

@@ -126,7 +126,7 @@ fn zsh_completions_wire_alias_args_to_profile_completer() {
 }
 
 #[test]
-fn bash_and_fish_completions_offer_aliases_for_label() {
+fn fish_completions_offer_aliases_for_the_label_alias_only() {
     let output = |shell: &str| {
         let output = Command::cargo_bin("claudectl")
             .unwrap()
@@ -135,8 +135,11 @@ fn bash_and_fish_completions_offer_aliases_for_label() {
             .unwrap();
         String::from_utf8(output.stdout).unwrap()
     };
-    assert!(output("bash").contains("complete -F _claudectl_profiles claudectl label"));
-    assert!(output("fish").contains("__fish_seen_subcommand_from use remove status label"));
+    assert!(
+        output("fish").contains(
+            "__fish_seen_subcommand_from label; and test (count (commandline -opc)) -eq 2"
+        )
+    );
 }
 
 #[test]
