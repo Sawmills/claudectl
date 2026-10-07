@@ -131,16 +131,16 @@ impl Engine {
                 if !response.status().is_success() {
                     bail!("Claude rejected the login exchange");
                 }
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|_| anyhow::anyhow!("login response incomplete"))?;
-                if bytes.len() > MAX_RESPONSE {
-                    bail!("login response too large to keep; start a new login");
-                }
+                let bytes = match capped_body(response).await {
+                    Ok(bytes) => bytes,
+                    Err(Body::TooLarge) => {
+                        bail!("login response too large to keep; start a new login")
+                    }
+                    Err(Body::Incomplete) => bail!("login response incomplete"),
+                };
                 let retained = Retained {
                     received_at: now(),
-                    body: bytes.to_vec(),
+                    body: bytes,
                 };
                 if !self.store.retain(user, id, &self.seal(&retained)?).await? {
                     bail!("the login was cancelled by a delete; the response was not kept");

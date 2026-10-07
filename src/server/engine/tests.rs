@@ -1835,3 +1835,63 @@ async fn an_oversized_refresh_response_is_not_kept_and_the_account_stays_readabl
     // The record still loads: the oversized body was never sealed into it.
     assert_eq!(engine.accounts("person").await.unwrap().len(), 1);
 }
+
+/// PostgreSQL only. Replica A resolved m-1 as Pending; before its refresh runs, replica B deletes the alias,
+/// re-admits the same identity, and rotates the replacement. A must not publish m-1's
+/// receipt for the replacement incarnation.
+#[tokio::test]
+async fn a_pending_migration_never_returns_a_receipt_for_a_rotated_replacement() {
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let fail_first = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/token",
+            post({
+                let (refreshes, fail_first) = (refreshes.clone(), fail_first.clone());
+                move || {
+                    let (refreshes, fail_first) = (refreshes.clone(), fail_first.clone());
+                    async move {
+                        // The first refresh (m-1's) fails, so m-1 stays pending.
+                        if fail_first.fetch_add(1, Ordering::SeqCst) == 0 {
+                            return axum::http::StatusCode::BAD_GATEWAY.into_response();
+                        }
+                        token_body(refreshes.fetch_add(1, Ordering::SeqCst), 3600).into_response()
+                    }
+                }
+            }),
+        );
+    let f = Fixture::new(app).await;
+    if f.postgres().is_none() {
+        return;
+    }
+    let (a, b) = (f.engine().await, f.engine().await);
+    let grant = || grant_until("migrated", now() + 3_600_000);
+    assert!(
+        a.migrate("person", "mac", "work", "m-1", grant())
+            .await
+            .is_err()
+    );
+    // A read m-1 as Pending: this is the receipt it holds when B acts.
+    let held = Receipt {
+        account_id: account_id("person", "work"),
+        identity: Identity {
+            account_uuid: "a".into(),
+            organization_uuid: "o".into(),
+        },
+        migration_id: "m-1".into(),
+    };
+    b.remove("person", "mac", &held.account_id).await.unwrap();
+    b.migrate(
+        "person",
+        "mac",
+        "work",
+        "m-2",
+        grant_until("other", now() + 3_600_000),
+    )
+    .await
+    .unwrap();
+    let late = a.finish_migration("person", "mac", "m-1", held).await;
+    assert!(late.is_err(), "m-1 published a receipt for the replacement");
+    assert!(late.err().unwrap().downcast_ref::<Gone>().is_some());
+}

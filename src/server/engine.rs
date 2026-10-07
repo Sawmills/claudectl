@@ -222,6 +222,28 @@ marker_error!(
 const MAX_RECORD: usize = 64 * 1024;
 /// The largest provider response kept before parsing; it must fit in a record.
 const MAX_RESPONSE: usize = 16 * 1024;
+enum Body {
+    Incomplete,
+    TooLarge,
+}
+/// Read a provider body chunk by chunk and stop past `MAX_RESPONSE`, so an oversized body
+/// is never fully buffered.
+async fn capped_body(mut response: reqwest::Response) -> Result<Vec<u8>, Body> {
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_RESPONSE as u64)
+    {
+        return Err(Body::TooLarge);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| Body::Incomplete)? {
+        if body.len() + chunk.len() > MAX_RESPONSE {
+            return Err(Body::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 const RECORD_VERSION: u32 = 1;
 /// The usage poll lease: one replica polls the provider at a time.
 const USAGE_LEASE: &str = "__usage";
@@ -564,17 +586,28 @@ impl Engine {
                 }
             },
         };
+        self.finish_migration(user, machine, migration, receipt)
+            .await
+    }
+    /// Refresh a pending migration and publish its receipt. The rotation is read again
+    /// through the admission marker, so it belongs to the incarnation this migration
+    /// created: a replacement admitted meanwhile answers Gone, never this receipt.
+    pub(super) async fn finish_migration(
+        &self,
+        user: &str,
+        machine: &str,
+        migration: &str,
+        receipt: Receipt,
+    ) -> Result<Receipt> {
         // A pending rotation always refreshes before anything is returned.
         let refreshed = self
             .acquire_for(user, machine, &receipt.account_id, None)
             .await;
         let rotation = match refreshed {
-            Ok(_) => Some(
-                self.selected(user, &receipt.account_id)
-                    .await?
-                    .record
-                    .rotation,
-            ),
+            Ok(_) => match self.admitted(user, migration).await? {
+                Some((_, rotation, _)) => Some(rotation),
+                None => bail!("migration admission disappeared"),
+            },
             Err(_) => None,
         };
         let result = match rotation {
@@ -738,19 +771,19 @@ impl Engine {
         if !response.status().is_success() {
             bail!("refresh rejected; login renewal required");
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|_| anyhow::anyhow!("refresh response incomplete; login renewal required"))?;
-        if bytes.len() > MAX_RESPONSE {
-            bail!("refresh response too large to keep; login renewal required");
-        }
+        let bytes = match capped_body(response).await {
+            Ok(bytes) => bytes,
+            Err(Body::TooLarge) => {
+                bail!("refresh response too large to keep; login renewal required")
+            }
+            Err(Body::Incomplete) => bail!("refresh response incomplete; login renewal required"),
+        };
         // Keep the response before parsing. The fence ignores expiry: nobody else took the
         // lease, so nobody else refreshed (H1).
         let mut record = loaded.record.clone();
         record.retained = Some(Retained {
             received_at: now(),
-            body: bytes.to_vec(),
+            body: bytes,
         });
         self.put(loaded, record, Fence::Held(lease)).await?;
         let rotated = self.adopt(lease, loaded).await?;
