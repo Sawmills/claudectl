@@ -8,3 +8,6 @@ pub mod shell;
 pub mod usage_cache;
 
 pub mod central;
+
+#[cfg(feature = "server")]
+pub mod server;

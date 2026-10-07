@@ -74,6 +74,12 @@ def run_case(root, case, inference):
     client = home / '.claudectl/server'
     client.mkdir(mode=0o700, parents=True)
     base.atomic_json(client / 'machine.json', 'synthetic-machine')
+    qualify = os.environ.get('CLAUDECTL_PROBE_QUALIFY_SHA256')
+    if qualify:
+        # `claudectl server qualify`: allow only the candidate build, only in this throwaway HOME.
+        base.atomic_json(client / 'qualified-builds.json', [{
+            'sha256': qualify, 'platform': 'macos' if sys.platform == 'darwin' else 'linux',
+            'qualified_at': 'candidate'}])
     base.atomic_json(client / 'connection.json', {
         'server': 'http://127.0.0.1:' + str(broker.server_port), 'user_id': 'person',
         'token_file': str(client / 'machine.json')})

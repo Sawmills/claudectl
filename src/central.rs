@@ -12,6 +12,8 @@ use std::{
 
 #[path = "central_migration.rs"]
 mod migration;
+#[path = "central_qualify.rs"]
+mod qualify;
 #[path = "central_session.rs"]
 pub mod session;
 pub use migration::{ensure_local, ensure_local_grant, migrate};
@@ -563,6 +565,11 @@ pub enum Command {
         #[arg(last = true)]
         args: Vec<std::ffi::OsString>,
     },
+    /// Qualify a Claude build: run the synthetic renewal handoff check, record it only on a pass
+    Qualify {
+        #[arg(long, default_value = "claude")]
+        claude: PathBuf,
+    },
     /// Read subscription usage; --cached works entirely offline
     Status {
         alias: String,
@@ -582,6 +589,8 @@ pub enum Command {
     Devices,
     /// Stop a machine from acquiring further access tokens
     Revoke { machine_id: String },
+    /// Delete a server account and its refresh grant; tokens already issued expire on their own
+    Remove { alias: String },
     /// Remove this machine's local connection; does not revoke it on the server
     Disconnect,
 }
@@ -596,6 +605,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Disconnect => disconnect(&paths),
         Command::Status { alias, cached } => status(&paths, &alias, cached),
         Command::Statusline { account_id } => statusline(&paths, &account_id),
+        Command::Qualify { claude } => qualify::qualify(&paths, &claude),
         command => {
             let client = Client::load(&paths)?;
             match command {
@@ -656,6 +666,24 @@ pub fn dispatch(command: Command) -> Result<()> {
                             .map_err(|_| anyhow::anyhow!("account server unavailable"))?,
                     )?;
                     println!("Machine revoked.");
+                    Ok(())
+                }
+                Command::Remove { alias } => {
+                    let account = client.account(&alias)?;
+                    checked(
+                        client
+                            .http
+                            .delete(format!(
+                                "{}/v2/anthropic/accounts/{}",
+                                client.connection.server, account.account_id
+                            ))
+                            .bearer_auth(&client.token)
+                            .send()
+                            .map_err(|_| anyhow::anyhow!("account server unavailable"))?,
+                    )?;
+                    println!(
+                        "Server account removed. Access tokens already issued stay valid until they expire."
+                    );
                     Ok(())
                 }
                 _ => unreachable!(),

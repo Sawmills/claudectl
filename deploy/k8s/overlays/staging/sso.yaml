@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: claudectl
+  name: claudectl-sso
+data:
+  # Google Workspace OIDC (A14). client_id comes from the Google OAuth client created in
+  # A15; replace the placeholder before registration.
+  sso.json: |
+    {
+      "issuer": "https://accounts.google.com",
+      "client_id": "REPLACE_WITH_GOOGLE_CLIENT_ID",
+      "client_secret_file": "/keys/oidc-client-secret",
+      "allowed_domains": ["sawmills.ai"],
+      "allowed_hosted_domains": ["sawmills.ai"]
+    }
