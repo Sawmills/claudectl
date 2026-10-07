@@ -2,6 +2,9 @@
 //! Company SSO against a synthetic OIDC issuer that signs real RS256 ID tokens. The
 //! authorization URL always carries the `hd` hint; the server must decide on the signed
 //! `hd` claim alone. No real Google account or credential.
+//!
+//! Test requirement: the `openssl` CLI on PATH (Linux CI and the devbox have it). It
+//! generates a throwaway signing key per run, so no private key is committed.
 use axum::{
     Json, Router,
     extract::State,
@@ -31,7 +34,7 @@ type IdToken = openidconnect::IdToken<
     CoreJwsSigningAlgorithm,
 >;
 
-/// A throwaway PKCS#1 RSA key from the system OpenSSL; nothing is committed.
+/// A throwaway PKCS#1 RSA key from the system OpenSSL CLI; nothing is committed.
 fn rsa_pem() -> String {
     let run = |args: &[&str]| {
         std::process::Command::new("openssl")
@@ -43,36 +46,61 @@ fn rsa_pem() -> String {
     };
     run(&["genrsa", "-traditional", "2048"])
         .or_else(|| run(&["genrsa", "2048"]))
-        .expect("openssl genrsa")
+        .expect("these tests need the openssl CLI on PATH to generate a throwaway key")
+}
+
+/// What the next ID token claims and how it is signed.
+struct Token<'a> {
+    email: &'a str,
+    hd: Option<&'a str>,
+    verified: bool,
+    /// Sign with a key the issuer's JWKS does not publish.
+    rogue: bool,
+    /// Use this nonce instead of the login's.
+    nonce: Option<&'a str>,
+}
+impl<'a> Token<'a> {
+    fn new(email: &'a str, hd: Option<&'a str>) -> Self {
+        Self {
+            email,
+            hd,
+            verified: true,
+            rogue: false,
+            nonce: None,
+        }
+    }
 }
 
 #[derive(Clone)]
 struct Issuer {
     origin: String,
     key: Arc<CoreRsaPrivateSigningKey>,
+    /// Same key ID as `key`, never published.
+    rogue: Arc<CoreRsaPrivateSigningKey>,
     /// The ID token the next token request returns.
     next: Arc<Mutex<Option<String>>>,
 }
 impl Issuer {
-    /// Sign an ID token for `email` with this `hd` and the nonce of the pending login.
-    fn prepare(&self, nonce: &str, email: &str, hd: Option<&str>) {
+    /// Sign the next ID token for the pending login with `nonce`.
+    fn prepare(&self, nonce: &str, token: &Token) {
         let now = chrono::Utc::now();
         let claims = Claims::new(
             IssuerUrl::new(self.origin.clone()).unwrap(),
             vec![Audience::new("test-client".into())],
             now + chrono::Duration::minutes(5),
             now,
-            StandardClaims::new(SubjectIdentifier::new(format!("sub-{email}")))
-                .set_email(Some(EndUserEmail::new(email.into())))
-                .set_email_verified(Some(true)),
+            StandardClaims::new(SubjectIdentifier::new(format!("sub-{}", token.email)))
+                .set_email(Some(EndUserEmail::new(token.email.into())))
+                .set_email_verified(Some(token.verified)),
             Hd {
-                hd: hd.map(str::to_owned),
+                hd: token.hd.map(str::to_owned),
             },
         )
-        .set_nonce(Some(Nonce::new(nonce.into())));
+        .set_nonce(Some(Nonce::new(token.nonce.unwrap_or(nonce).into())));
+        let key = if token.rogue { &self.rogue } else { &self.key };
         let token = IdToken::new(
             claims,
-            self.key.as_ref(),
+            key.as_ref(),
             CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
             None,
             None,
@@ -85,11 +113,14 @@ impl Issuer {
 async fn issuer() -> (Issuer, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
-    let key = CoreRsaPrivateSigningKey::from_pem(&rsa_pem(), Some(JsonWebKeyId::new("k1".into())))
-        .unwrap();
+    let key = || {
+        CoreRsaPrivateSigningKey::from_pem(&rsa_pem(), Some(JsonWebKeyId::new("k1".into())))
+            .unwrap()
+    };
     let issuer = Issuer {
         origin: origin.clone(),
-        key: Arc::new(key),
+        key: Arc::new(key()),
+        rogue: Arc::new(key()),
         next: Arc::default(),
     };
     let app = Router::new()
@@ -219,12 +250,12 @@ impl Fixture {
         assert!(location.starts_with(&format!("{}/auth", self.issuer.origin)));
         url.query_pairs().into_owned().collect()
     }
-    /// Complete the callback with an ID token for `email` and `hd`: (status, body).
-    async fn callback(&self, email: &str, hd: Option<&str>) -> (u16, String) {
+    /// Complete the callback with this ID token: (status, body).
+    async fn callback(&self, token: Token<'_>) -> (u16, String) {
         let query = self.sign_in().await;
         // The hint asks Google for the company account chooser; it is not a decision.
         assert_eq!(query.get("hd").map(String::as_str), Some("sawmills.ai"));
-        self.issuer.prepare(&query["nonce"], email, hd);
+        self.issuer.prepare(&query["nonce"], &token);
         let response = self
             .http
             .get(format!("{}/auth/callback", self.origin))
@@ -239,28 +270,78 @@ impl Fixture {
     }
 }
 
+/// The approval token a successful callback page carries, if any.
+fn approval(body: &str) -> Option<String> {
+    let start = body.find(r#"name="approval" value=""#)? + r#"name="approval" value=""#.len();
+    Some(body[start..start + body[start..].find('"')?].to_owned())
+}
+
 #[tokio::test]
-async fn a_signed_company_hd_claim_reaches_approval() {
+async fn a_signed_company_hd_claim_reaches_approval_and_creates_the_user() {
     let f = Fixture::new().await;
-    let (status, body) = f.callback("amir@sawmills.ai", Some("sawmills.ai")).await;
+    assert_eq!(f.users().await, 0);
+    let (status, body) = f
+        .callback(Token::new("amir@sawmills.ai", Some("sawmills.ai")))
+        .await;
     assert_eq!(status, 200, "{body}");
+    let token = approval(&body).expect("approval token on the callback page");
+    let approve = f
+        .http
+        .post(format!("{}/auth/approve", f.origin))
+        .form(&[("approval", token.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approve.status().as_u16(), 200);
+    assert_eq!(f.users().await, 1, "an approved sign-in creates the user");
+}
+
+/// A refused callback carries no approval token, so no user can be created from it.
+fn assert_refused(status: u16, body: &str, code: u16, reason: &str) {
+    assert_eq!(status, code, "{body}");
+    assert!(body.contains(reason), "{body}");
+    assert!(
+        approval(body).is_none(),
+        "a refused sign-in offered approval"
+    );
 }
 
 #[tokio::test]
 async fn a_token_without_the_company_hd_claim_is_refused_despite_the_url_hint() {
     let f = Fixture::new().await;
-    let before = f.users().await;
-    // A personal Gmail account: no hd claim.
-    let (status, body) = f.callback("someone@gmail.com", None).await;
-    assert_eq!(status, 403, "{body}");
-    assert!(body.contains("company_identity_required"), "{body}");
-    // A company-looking address on an account outside the Workspace: no hd claim.
-    let (status, body) = f.callback("amir@sawmills.ai", None).await;
-    assert_eq!(status, 403, "{body}");
-    assert!(body.contains("company_identity_required"), "{body}");
+    // A company-looking address on an account outside the Workspace: only hd is wrong.
+    let (status, body) = f.callback(Token::new("amir@sawmills.ai", None)).await;
+    assert_refused(status, &body, 403, "company_identity_required");
     // Another Workspace: the URL hint said sawmills.ai, the signed claim decides.
-    let (status, body) = f.callback("amir@sawmills.ai", Some("example.com")).await;
-    assert_eq!(status, 403, "{body}");
-    assert!(body.contains("company_identity_required"), "{body}");
-    assert_eq!(f.users().await, before, "a refused sign-in created a user");
+    let (status, body) = f
+        .callback(Token::new("amir@sawmills.ai", Some("example.com")))
+        .await;
+    assert_refused(status, &body, 403, "company_identity_required");
+    // A personal Gmail account: refused by the email domain already, and it has no hd.
+    let (status, body) = f.callback(Token::new("someone@gmail.com", None)).await;
+    assert_refused(status, &body, 403, "company_identity_required");
+    assert_eq!(f.users().await, 0);
+}
+
+#[tokio::test]
+async fn an_unverified_company_email_is_refused() {
+    let f = Fixture::new().await;
+    let mut token = Token::new("amir@sawmills.ai", Some("sawmills.ai"));
+    token.verified = false;
+    let (status, body) = f.callback(token).await;
+    assert_refused(status, &body, 403, "company_identity_required");
+}
+
+#[tokio::test]
+async fn a_token_the_issuer_did_not_sign_or_for_another_login_is_denied() {
+    let f = Fixture::new().await;
+    let mut token = Token::new("amir@sawmills.ai", Some("sawmills.ai"));
+    token.rogue = true;
+    let (status, body) = f.callback(token).await;
+    assert_refused(status, &body, 401, "sso_denied");
+    let mut token = Token::new("amir@sawmills.ai", Some("sawmills.ai"));
+    token.nonce = Some("another-login");
+    let (status, body) = f.callback(token).await;
+    assert_refused(status, &body, 401, "sso_denied");
+    assert_eq!(f.users().await, 0);
 }
