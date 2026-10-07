@@ -892,9 +892,8 @@ fn run_in_dir(
             let spawned = command.spawn();
             if spawned.is_err() {
                 signals::unblock();
-                if interactive {
-                    // The child may have taken the foreground before its
-                    // exec failed.
+                if interactive && foreground::owned_by_gone_group() {
+                    // The child took the foreground before its exec failed.
                     foreground::reclaim();
                 }
             }
@@ -940,7 +939,9 @@ fn run_in_dir(
     // zombie its PID stays reserved, so every signal to its process group,
     // through the final SIGKILL, can only reach this run's processes.
     let waited = wait_exit_no_reap(pid, interactive);
-    if interactive {
+    // Take the terminal back only from this run's child. After Ctrl-Z and
+    // `bg` the shell owns it, and a background claudectl must not take it.
+    if interactive && i32::try_from(pid).is_ok_and(foreground::owned_by) {
         foreground::reclaim();
     }
     let descendants = if waited.is_ok() {
@@ -1328,6 +1329,20 @@ mod foreground {
         foreground != -1 && foreground == group
     }
 
+    /// Whether the foreground belongs to a group with no live process, as
+    /// after a child that took it failed its exec.
+    pub fn owned_by_gone_group() -> bool {
+        // SAFETY: tcgetpgrp and getpgrp only read state; kill with signal 0
+        // only checks that the group exists.
+        unsafe {
+            let foreground = libc::tcgetpgrp(libc::STDIN_FILENO);
+            foreground > 0
+                && foreground != libc::getpgrp()
+                && libc::kill(-foreground, 0) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        }
+    }
+
     /// Make `group` the foreground. SIGTTOU is blocked for the call, so a
     /// caller outside the foreground group is not stopped, and the previous
     /// signal mask is restored. Async-signal-safe.
@@ -1369,6 +1384,12 @@ mod foreground {
 #[cfg(not(unix))]
 mod foreground {
     pub fn owned() -> bool {
+        false
+    }
+    pub fn owned_by(_group: i32) -> bool {
+        false
+    }
+    pub fn owned_by_gone_group() -> bool {
         false
     }
     pub fn reclaim() {}
@@ -1459,17 +1480,15 @@ pub mod signals {
             .map_or(0, |index| 1 << index)
     }
 
-    /// Send `signal` to the child's group. A stopped process acts on SIGTERM
-    /// or SIGHUP only after it is continued, so SIGCONT follows them.
+    /// Send `signal` to the child's group. A stopped process acts on a
+    /// handled signal only after it is continued, so SIGCONT follows.
     /// Async-signal-safe.
     fn send(pid: i32, signal: libc::c_int) {
         // SAFETY: kill is async-signal-safe. The child leads its own process
         // group, so this reaches its descendants too.
         unsafe {
             libc::kill(-pid, signal);
-            if signal != libc::SIGINT {
-                libc::kill(-pid, libc::SIGCONT);
-            }
+            libc::kill(-pid, libc::SIGCONT);
         }
     }
 

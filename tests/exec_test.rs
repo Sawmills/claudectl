@@ -2174,7 +2174,8 @@ ps -o tpgid= -p $$ | tr -d ' ' > "$out/tpgid"
 
 /// `helper_run_one_alias` as a job of a job-control shell that leads a new
 /// session on a pty, as in a terminal pane. When the job stops on SIGTSTP the
-/// shell records that and runs `fg`.
+/// shell records that and resumes it with `fg`, or with `bg` when `resume`
+/// is "bg".
 #[cfg(unix)]
 struct PtyJob {
     shell: std::process::Child,
@@ -2195,7 +2196,18 @@ const JOB_SHELL: &str = r#"set -m
 "$@"
 s=$?
 echo "$s" >> "$CLAUDECTL_TEST_OUT/job_status"
-if [ "$s" = "$TSTP_STATUS" ]; then
+if [ "$s" = "$TSTP_STATUS" ] && [ "$JOB_RESUME" = bg ]; then
+  bg
+  : > "$CLAUDECTL_TEST_OUT/in_background"
+  wait
+  s=$?
+  echo "$s" >> "$CLAUDECTL_TEST_OUT/job_status"
+  # Who owns the terminal once the background job is done. Without job
+  # control, so the probe does not become a foreground job itself.
+  set +m
+  ps -o tpgid= -p $$ | tr -d ' ' > "$CLAUDECTL_TEST_OUT/shell_tpgid"
+  ps -o pgid= -p $$ | tr -d ' ' > "$CLAUDECTL_TEST_OUT/shell_pgid"
+elif [ "$s" = "$TSTP_STATUS" ]; then
   fg
   s=$?
   echo "$s" >> "$CLAUDECTL_TEST_OUT/job_status"
@@ -2206,6 +2218,10 @@ exit "$s"
 #[cfg(unix)]
 impl PtyJob {
     fn start(home: &Path, alias: &str, out: &Path) -> Self {
+        Self::start_resuming(home, alias, out, "fg")
+    }
+
+    fn start_resuming(home: &Path, alias: &str, out: &Path, resume: &str) -> Self {
         use std::io::Read;
         use std::os::fd::FromRawFd;
         use std::os::unix::fs::OpenOptionsExt;
@@ -2246,6 +2262,7 @@ impl PtyJob {
             .env("CLAUDECTL_TEST_ALIAS", alias)
             .env("CLAUDECTL_TEST_OUT", out)
             .env("TSTP_STATUS", (128 + libc::SIGTSTP).to_string())
+            .env("JOB_RESUME", resume)
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave);
@@ -2479,12 +2496,17 @@ fn claudectl_owns_the_terminal_again_after_an_interactive_child() {
     assert_eq!(read_out(&out, "foreground_after"), "owned");
 }
 
+/// A child that handles `signal` and stopped itself; claudectl receives
+/// `signal` and must still end the run.
 #[cfg(unix)]
-#[test]
-fn a_forwarded_sigterm_ends_a_stopped_child() {
+fn forwarded_signal_ends_a_stopped_child(signal: libc::c_int) {
     let _guard = run_guard();
+    // Handlers like the Claude TUI's: macOS ends a stopped process on a
+    // default-action signal, but a handled one waits for SIGCONT.
     let (home, out) = tty_child_setup(
-        r#"echo ready > "$out/ready"
+        r#"trap 'exit 130' INT
+trap 'exit 143' TERM
+echo ready > "$out/ready"
 kill -STOP $$"#,
     );
     let mut helper = std::process::Command::new(std::env::current_exe().unwrap())
@@ -2513,7 +2535,7 @@ kill -STOP $$"#,
     }
     assert!(stopped, "test setup: the child stopped itself");
     // SAFETY: kill only sends a signal to the helper.
-    unsafe { libc::kill(helper.id() as i32, libc::SIGTERM) };
+    unsafe { libc::kill(helper.id() as i32, signal) };
     let started = std::time::Instant::now();
     let mut status = None;
     while started.elapsed() < LIMIT && status.is_none() {
@@ -2528,5 +2550,56 @@ kill -STOP $$"#,
         }
     }
     let _ = helper.wait();
-    assert!(status.is_some(), "claudectl did not end the stopped child");
+    assert!(
+        status.is_some(),
+        "claudectl did not end the stopped child on signal {signal}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_forwarded_sigterm_ends_a_stopped_child() {
+    forwarded_signal_ends_a_stopped_child(libc::SIGTERM);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_forwarded_sigint_ends_a_stopped_child() {
+    forwarded_signal_ends_a_stopped_child(libc::SIGINT);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_that_exits_in_the_background_leaves_the_terminal_to_the_shell() {
+    if !Path::new(STOP_SHELL).exists() {
+        eprintln!(
+            "skipped: {STOP_SHELL} is missing, and no other shell is known to see a job stop"
+        );
+        return;
+    }
+    let _guard = run_guard();
+    let (home, out) = tty_child_setup(
+        r#"echo ready > "$out/ready"
+while [ ! -e "$out/go" ]; do sleep 0.1; done"#,
+    );
+    let mut job = PtyJob::start_resuming(home.path(), "one", &out, "bg");
+    assert!(wait_for(&out.join("ready"), LIMIT), "{}", job.transcript());
+    job.type_text(b"\x1a");
+    assert!(
+        wait_for(&out.join("in_background"), LIMIT),
+        "the job did not stop: {}",
+        job.transcript()
+    );
+    std::fs::write(out.join("go"), "").unwrap();
+    let status = job.wait(LIMIT);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the background job did not finish: {:?}\n{}",
+        status,
+        job.transcript()
+    );
+    // claudectl ran in the background when its child exited; the shell
+    // keeps the terminal.
+    assert_eq!(read_out(&out, "shell_tpgid"), read_out(&out, "shell_pgid"));
+    assert_eq!(read_out(&out, "foreground_after"), "not_owned");
 }

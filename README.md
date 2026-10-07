@@ -179,14 +179,15 @@ The child gets the saved access token through an inherited pipe
 `CLAUDE_CONFIG_DIR` that is removed when the run ends. The child runs
 in its own process group: `SIGTERM`, `SIGINT` and `SIGHUP` sent to claudectl
 reach the whole group once, and descendants left after the child exits get
-`SIGTERM`, then `SIGKILL`. `SIGCONT` follows each `SIGTERM` and `SIGHUP`, so a
+`SIGTERM`, then `SIGKILL`. `SIGCONT` follows each of these signals, so a
 stopped process acts on them.
 
 `exec` also runs an interactive child such as the Claude Code TUI. When
 claudectl owns the terminal foreground, the child's group takes it, as a shell
 job does: the terminal sends Ctrl-C and window size changes to the child
 directly. Ctrl-Z stops the child and claudectl together, and `fg` resumes both.
-claudectl takes the foreground back when the child exits. If the terminal hangs
+claudectl takes the foreground back when the child exits, unless the shell
+owns it (after `bg`). If the terminal hangs
 up (for example, the pane closes), the child gets `SIGHUP` from the terminal,
 and the private directory is still removed after it exits. `exec` runs a
 private copy of the executable, so use it for a single-file program such as the
