@@ -15,7 +15,7 @@ Reference: [account-server.md](account-server.md) describes the commands and the
 | Argo CD application             | Sawmills/argocd-deploy `plat/ue1-staging/argocd/claudectl-application.yaml`                                                       |
 | Database `claudectl`            | staging quota-manager RDS, Sawmills/infra component `rds/claudectl`                                                               |
 | Database secrets                | `claudectl-postgres` (runtime), `claudectl-migrator-postgres` (schema owner), infra `eks/claudectl-db-secret`                     |
-| App secrets                     | SSM `/app/claudectl/vault-key`, `/app/claudectl/metrics-token`; Secrets Manager `/app/claudectl/oidc-client-secret`               |
+| App secrets                     | SSM `/app/claudectl/vault-key`, `/app/claudectl/metrics-token`, `/app/claudectl/oidc-client-secret`                               |
 | Sign-in                         | Google Workspace OAuth client (Internal, Web application), redirect `https://claudectl.ue1.staging.plat.sm-svc.com/auth/callback` |
 | Endpoint                        | `https://claudectl.ue1.staging.plat.sm-svc.com` (internal ALB, Twingate)                                                          |
 
@@ -43,8 +43,8 @@ Each step needs the one before it. Stop at the first failure.
      --type SecureString --value file:///dev/stdin
    ```
 
-   The OAuth client secret goes to Secrets Manager `/app/claudectl/oidc-client-secret`, the same
-   way. A lost vault key loses every grant; there is no recovery without it.
+   The OAuth client secret goes to SSM `/app/claudectl/oidc-client-secret` (SecureString), the
+   same way; staging has no Secrets Manager store. A lost vault key loses every grant; there is no recovery without it.
 
 3. **Image.** Merge Sawmills/claudectl. The Server image workflow prints
    `Deploy after review: <image>@sha256:...`. Pin that digest in

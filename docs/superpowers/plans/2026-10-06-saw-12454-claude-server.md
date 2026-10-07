@@ -109,7 +109,7 @@ Amir A14 to A16 (2026-10-06 17:46 to 17:49 PDT). Done so far, on the file store,
 ### Google Workspace OIDC (replaces Clerk)
 
 - Issuer `https://accounts.google.com`, `allowed_domains` and `allowed_hosted_domains` = `sawmills.ai`. Port the codexctl checks: the `hd` hint on the request (`enrollment.rs:426`), `email_verified == true` (:532), and a case-insensitive `hd` claim match (:543). The `--allow-user` list (Amir only) stays on top.
-- Client secret in AWS Secrets Manager `/app/claudectl/oidc-client-secret`, read by `ClusterSecretStore/aws-secrets-manager`, as for codexctl.
+- Client secret in SSM SecureString `/app/claudectl/oidc-client-secret`, read by `ClusterSecretStore/aws-parameter-store`, as for codexctl (staging has no Secrets Manager store).
 
 ### Infra PRs (this lane writes them; A14 item 3)
 
