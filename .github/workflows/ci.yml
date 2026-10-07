@@ -3,8 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  pull_request: {}
 
 permissions:
   contents: read
@@ -17,6 +16,18 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -30,11 +41,25 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets
 
+      - name: Clippy (account server)
+        run: cargo clippy --all-targets --all-features
+
       - name: Test
         run: cargo test --all-targets
 
+      - name: Test (account server, file store)
+        run: cargo test --all-targets --features server
+
+      - name: Test (account server, PostgreSQL)
+        env:
+          CLAUDECTL_TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: cargo test --all-targets --features server
+
       - name: Build
         run: cargo build --release
+
+      - name: Build (account server)
+        run: cargo build --release --features server --bin claudectl-server
 
   trunk:
     name: Trunk Check
@@ -69,4 +94,8 @@ jobs:
       - name: Build
         run: cargo build --release
       - name: Test
+        # Cargo may create jobserver pipes after starting; isolate each test binary.
+        env:
+          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER: python3 .github/clean-test-runner.py
+          CARGO_TARGET_X86_64_APPLE_DARWIN_RUNNER: python3 .github/clean-test-runner.py
         run: cargo test --all-targets

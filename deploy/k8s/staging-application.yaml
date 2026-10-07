@@ -1,0 +1,19 @@
+# Review before registering this application. It does not sync automatically.
+# Registration is the platform owner's step (deploy item 5 in the SAW-12454 plan).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: claudectl
+  namespace: argocd
+spec:
+  project: sawmills
+  source:
+    repoURL: https://github.com/Sawmills/claudectl.git
+    targetRevision: main
+    path: deploy/k8s/overlays/staging
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: claudectl
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true

@@ -1,0 +1,18 @@
+{
+  "saved_subscription": "team",
+  "identity_verified": true,
+  "claude_exit": 0,
+  "result_type": "success",
+  "is_error": false,
+  "inference_accepted": true,
+  "output_tokens": 8,
+  "visible_reply_length": 9,
+  "refresh_transferred": false,
+  "refresh_attempted": false,
+  "ownership_transferred": false,
+  "private_sessions_remaining": 0,
+  "refresh_fields_in_client_state": false,
+  "temporary_home_removed": true,
+  "exact_reply_marker_matched": false,
+  "scope": "Existing access token through a temporary loopback protocol fixture; no production SSO or refresh ownership transfer."
+}

@@ -17,6 +17,20 @@ const HOUR_MS: i64 = 3_600_000;
 /// it. Tests that start processes run one at a time.
 static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[test]
+fn secure_storage_override_is_refused_even_when_empty() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir_all(project.join(".claude")).unwrap();
+    std::fs::write(
+        project.join(".claude/settings.json"),
+        r#"{"env":{"CLAUDE_SECURESTORAGE_CONFIG_DIR":""}}"#,
+    )
+    .unwrap();
+    assert!(check_settings(&project, root.path(), &root.path().join("managed")).is_err());
+    assert!(is_scrubbed_env("CLAUDE_SECURESTORAGE_CONFIG_DIR"));
+}
+
 fn run_guard() -> std::sync::MutexGuard<'static, ()> {
     RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -1055,6 +1069,30 @@ fn an_overlapping_run_in_the_same_process_is_refused() {
         !second_out.join("token").exists(),
         "the overlapping run started no child"
     );
+    let server_dir = paths.claudectl_dir().join("server");
+    std::fs::create_dir_all(&server_dir).unwrap();
+    let connection = server_dir.join("connection.json");
+    let machine = server_dir.join("machine.json");
+    std::fs::write(
+        &connection,
+        serde_json::to_vec(&serde_json::json!({
+            "server": "https://127.0.0.1:1",
+            "user_id": "synthetic-user",
+            "token_file": machine,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(&machine, br#""synthetic-machine""#).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for file in [&connection, &machine] {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    let client = claudectl::central::Client::load(&paths).unwrap();
+    let server_error =
+        claudectl::central::session::run(&paths, &client, "work", &second_child, &[]).unwrap_err();
     {
         use std::os::unix::thread::JoinHandleExt;
         // SAFETY: the first runner is alive with its handler installed.
@@ -1065,6 +1103,12 @@ fn an_overlapping_run_in_the_same_process_is_refused() {
         code,
         128 + libc::SIGTERM,
         "the first run still owns its signals"
+    );
+    assert!(
+        server_error
+            .to_string()
+            .contains("another exec run is active"),
+        "server launch must share local launch signal ownership: {server_error}"
     );
 }
 

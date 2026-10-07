@@ -1,0 +1,66 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  namespace: claudectl
+  name: claudectl
+  labels:
+    release: kube-prometheus
+    environment: staging
+spec:
+  groups:
+    - name: claudectl
+      rules:
+        - alert: ClaudectlServerUnavailable
+          expr: max(up{namespace="claudectl",service="claudectl"}) == 0 or absent(up{namespace="claudectl",service="claudectl"})
+          for: 5m
+          labels:
+            severity: warning
+            service: claudectl
+            environment: staging
+          annotations:
+            summary: Claudectl account server is unavailable
+            description: Check the pod, SSO configuration, and the state volume. Preserve the state volume before recovery.
+            runbook_url: https://github.com/Sawmills/claudectl/blob/main/docs/account-server.md
+        - alert: ClaudectlCredentialOperationFailed
+          expr: time() - max by (reason) (claudectl_server_last_failure_timestamp_seconds{reason=~"account_unavailable_or_login_required|usage_login_required|usage_failed|admission_refused_reconcile_receipt|audit_unavailable|login_incomplete_grant_retained|owner_unavailable|persistence_failed|registry_unavailable|registry_busy"} > 0) < 300
+          for: 0m
+          labels:
+            severity: warning
+            service: claudectl
+            environment: staging
+          annotations:
+            summary: Claudectl account operation failed
+            description: Read the reason in the structured logs and the audit log. A refresh that failed needs login renewal; never replay a lost refresh response.
+            runbook_url: https://github.com/Sawmills/claudectl/blob/main/docs/account-server.md
+---
+# The staging ServiceMonitor schema lacks authentication. ScrapeConfig supports credentials.
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  namespace: claudectl
+  name: claudectl
+  labels:
+    release: kube-prometheus
+spec:
+  jobName: claudectl
+  metricsPath: /metrics
+  scrapeInterval: 30s
+  scrapeTimeout: 5s
+  scrapeProtocols: [PrometheusText0.0.4]
+  authorization:
+    type: Bearer
+    credentials:
+      name: claudectl-secrets
+      key: metrics-token
+  # Failure counters live in each process: scrape every pod, not the load-balanced Service.
+  dnsSDConfigs:
+    - names: [claudectl-pods.claudectl.svc.cluster.local]
+      type: A
+      port: 8787
+  relabelings:
+    - targetLabel: namespace
+      replacement: claudectl
+    - targetLabel: service
+      replacement: claudectl
+    - sourceLabels: [__address__]
+      targetLabel: instance

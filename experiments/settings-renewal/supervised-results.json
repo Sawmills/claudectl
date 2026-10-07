@@ -1,0 +1,34 @@
+{
+  "linux": {
+    "case": "supervised_tool_renewal",
+    "checks": "passed",
+    "requests": [
+      {
+        "generation": "A",
+        "tool_result": false
+      },
+      {
+        "generation": "B",
+        "tool_result": true
+      }
+    ],
+    "tool_executions": 1,
+    "private_sessions_after_exit": 0
+  },
+  "macos": {
+    "case": "supervised_tool_renewal",
+    "checks": "passed",
+    "requests": [
+      {
+        "generation": "A",
+        "tool_result": false
+      },
+      {
+        "generation": "B",
+        "tool_result": true
+      }
+    ],
+    "tool_executions": 1,
+    "private_sessions_after_exit": 0
+  }
+}

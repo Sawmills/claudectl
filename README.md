@@ -309,3 +309,9 @@ Two safety rules are baked in:
 If `status --details` shows an expired token, follow the default view's `Next step`.
 Claude Code refreshes the active login. Status can refresh saved accounts when
 refresh ownership is known. Log in again when the login is missing or rejected.
+
+## Company account server (implementation preview)
+
+`claudectl server` connects to a private company account server and runs Claude with
+access-only credentials. Claude-only users do not need Codex. See the
+[commands, migration contract, and remaining pilot gates](docs/account-server.md).

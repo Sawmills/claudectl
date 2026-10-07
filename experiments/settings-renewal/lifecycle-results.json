@@ -1,0 +1,180 @@
+{
+  "linux": [
+    {
+      "fixture": "file_proactive",
+      "case": "file_proactive",
+      "sequence": [
+        ["A", 200],
+        ["B", 200]
+      ],
+      "same_process_alive": true,
+      "oauth_headers_only": true
+    },
+    {
+      "fixture": "file_401",
+      "case": "file_401",
+      "sequence": [
+        ["A", 200],
+        ["A", 401],
+        ["A", 401],
+        ["B", 200]
+      ],
+      "same_process_alive": true,
+      "oauth_headers_only": true
+    },
+    {
+      "fixture": "file_expired",
+      "case": "file_expired",
+      "sequence": [
+        ["A", 200],
+        ["B", 200]
+      ],
+      "same_process_alive": true,
+      "oauth_headers_only": true
+    },
+    {
+      "fixture": "file_outage",
+      "case": "file_outage",
+      "sequence": [
+        ["A", 200],
+        ["A", 401],
+        ["A", 401],
+        ["B", 200]
+      ],
+      "same_process_alive": true,
+      "oauth_headers_only": true
+    },
+    {
+      "fixture": "file_missing",
+      "case": "file_missing",
+      "sequence": [
+        ["A", 200],
+        ["A", 401],
+        ["A", 401]
+      ],
+      "same_process_alive": true,
+      "oauth_headers_only": true
+    },
+    {
+      "fixture": "file_malformed",
+      "case": "file_malformed",
+      "sequence": [
+        ["A", 200],
+        ["A", 401],
+        ["A", 401]
+      ],
+      "same_process_alive": true,
+      "oauth_headers_only": true
+    },
+    {
+      "fixture": "file_tui",
+      "case": "file_tui",
+      "sequence": [
+        ["A", 200],
+        ["A", 200],
+        ["A", 401],
+        ["A", 401],
+        ["A", 401],
+        ["A", 401],
+        ["B", 200],
+        ["B", 200]
+      ],
+      "same_process_alive": true,
+      "oauth_headers_only": true
+    }
+  ],
+  "macos": [
+    {
+      "fixture": "proactive",
+      "case": "file_proactive",
+      "sequence": [
+        ["A", 200],
+        ["B", 200]
+      ],
+      "same_process_alive": true,
+      "oauth_headers_only": true
+    },
+    {
+      "fixture": "retry_401",
+      "case": "file_401",
+      "sequence": [
+        ["A", 200],
+        ["A", 401],
+        ["A", 401],
+        ["B", 200]
+      ],
+      "same_process_alive": true,
+      "oauth_headers_only": true
+    },
+    {
+      "fixture": "expired",
+      "case": "file_expired",
+      "sequence": [
+        ["A", 200],
+        ["B", 200]
+      ],
+      "same_process_alive": true,
+      "oauth_headers_only": true
+    },
+    {
+      "fixture": "outage",
+      "case": "file_outage",
+      "sequence": [
+        ["A", 200],
+        ["A", 401],
+        ["A", 401],
+        ["B", 200]
+      ],
+      "same_process_alive": true,
+      "oauth_headers_only": true
+    },
+    {
+      "fixture": "missing",
+      "case": "file_missing",
+      "sequence": [
+        ["A", 200],
+        ["A", 401],
+        ["A", 401]
+      ],
+      "same_process_alive": true,
+      "oauth_headers_only": true
+    },
+    {
+      "fixture": "malformed",
+      "case": "file_malformed",
+      "sequence": [
+        ["A", 200],
+        ["A", 401],
+        ["A", 401]
+      ],
+      "same_process_alive": true,
+      "oauth_headers_only": true
+    },
+    {
+      "fixture": "late",
+      "case": "file_proactive",
+      "sequence": [
+        ["A", 200],
+        ["B", 200]
+      ],
+      "same_process_alive": true,
+      "oauth_headers_only": true
+    },
+    {
+      "fixture": "terminal",
+      "case": "file_tui",
+      "sequence": [
+        ["A", 200],
+        ["A", 200],
+        ["A", 401],
+        ["A", 401],
+        ["A", 401],
+        ["A", 401],
+        ["B", 200],
+        ["B", 200]
+      ],
+      "same_process_alive": true,
+      "oauth_headers_only": true
+    }
+  ]
+}

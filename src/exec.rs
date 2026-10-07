@@ -28,6 +28,7 @@ pub const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 /// Credential sources the child must not inherit that `is_scrubbed_env`'s
 /// name rules do not cover.
 const SCRUBBED_ENV: &[&str] = &[
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_SCOPES",
     "CLAUDE_CODE_HOST_CREDS_FILE",
     "CCR_OAUTH_TOKEN_FILE",
@@ -732,10 +733,10 @@ pub fn run_with_writer(
 /// Signal handling is process-wide, so one process runs one `exec` at a time.
 static RUN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-struct RunSlot;
+pub(crate) struct RunSlot;
 
 impl RunSlot {
-    fn take() -> Result<Self, ExecError> {
+    pub(crate) fn take() -> Result<Self, ExecError> {
         use std::sync::atomic::Ordering;
         RUN_ACTIVE
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -994,7 +995,7 @@ fn run_in_dir(
     Ok(code)
 }
 
-enum Descendants {
+pub(crate) enum Descendants {
     None,
     Terminated,
     Killed,
@@ -1018,7 +1019,7 @@ impl Descendants {
 
 /// Bounded TERM-to-KILL teardown of the child's process group. The caller
 /// keeps the leader unreaped for the whole call.
-fn teardown_group(leader: u32) -> Descendants {
+pub(crate) fn teardown_group(leader: u32) -> Descendants {
     let members = match descendants_in_group(leader) {
         Ok(members) => members,
         Err(_) => {
@@ -1195,7 +1196,7 @@ fn descendants_in_group(_leader: u32) -> std::io::Result<Vec<i32>> {
 /// Wait until the child exits, without reaping it. For an interactive child,
 /// a stop (Ctrl-Z) also suspends claudectl, as its shell job.
 #[cfg(unix)]
-fn wait_exit_no_reap(pid: u32, interactive: bool) -> std::io::Result<()> {
+pub(crate) fn wait_exit_no_reap(pid: u32, interactive: bool) -> std::io::Result<()> {
     let flags = if interactive {
         libc::WEXITED | libc::WSTOPPED | libc::WNOWAIT
     } else {
@@ -1284,7 +1285,7 @@ fn stop_job() {
 }
 
 #[cfg(not(unix))]
-fn wait_exit_no_reap(_pid: u32, _interactive: bool) -> std::io::Result<()> {
+pub(crate) fn wait_exit_no_reap(_pid: u32, _interactive: bool) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1325,13 +1326,13 @@ fn ask_to_exit(leader: u32) {
 }
 
 #[cfg(unix)]
-fn set_process_group(command: &mut Command) {
+pub(crate) fn set_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
 }
 
 #[cfg(not(unix))]
-fn set_process_group(_command: &mut Command) {}
+pub(crate) fn set_process_group(_command: &mut Command) {}
 
 /// Make the child's new group the terminal foreground before it runs, if
 /// claudectl's group owns the foreground at that moment. Rust runs this
@@ -1965,7 +1966,7 @@ pub fn sha256_file(path: &Path) -> Result<String, ExecError> {
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
-fn exit_code_of(status: &std::process::ExitStatus) -> i32 {
+pub(crate) fn exit_code_of(status: &std::process::ExitStatus) -> i32 {
     status
         .code()
         .unwrap_or_else(|| 128 + signal_of(status).unwrap_or(1))

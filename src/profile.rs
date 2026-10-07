@@ -35,6 +35,14 @@ pub struct Profile {
 }
 
 impl Profile {
+    fn ensure_local(&self) -> Result<()> {
+        let root = self
+            .dir
+            .parent()
+            .and_then(|p| p.parent())
+            .context("invalid profile path")?;
+        crate::central::ensure_local(root, &self.meta.alias)
+    }
     pub fn credentials_path(&self) -> PathBuf {
         self.dir.join("credentials.json")
     }
@@ -44,14 +52,33 @@ impl Profile {
     }
 
     pub fn read_credentials(&self) -> Result<CredentialsFile> {
+        self.ensure_local()?;
         let path = self.credentials_path();
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        serde_json::from_str(&contents)
-            .with_context(|| format!("failed to parse {}", path.display()))
+        let creds = serde_json::from_str(&contents)
+            .map_err(|_| anyhow::anyhow!("failed to parse saved credentials"))?;
+        crate::central::ensure_local_grant(
+            self.dir
+                .parent()
+                .and_then(|p| p.parent())
+                .context("invalid profile path")?,
+            &self.meta,
+            &creds,
+        )?;
+        Ok(creds)
     }
 
     pub fn write_credentials(&self, creds: &CredentialsFile) -> Result<()> {
+        self.ensure_local()?;
+        crate::central::ensure_local_grant(
+            self.dir
+                .parent()
+                .and_then(|p| p.parent())
+                .context("invalid profile path")?,
+            &self.meta,
+            creds,
+        )?;
         let json = serde_json::to_string(creds)?;
         let path = self.credentials_path();
         std::fs::write(&path, json)
@@ -114,6 +141,7 @@ pub fn save_profile_to(
     oauth_account: Option<serde_json::Value>,
 ) -> Result<Profile> {
     let alias = validate_alias(alias)?;
+    crate::central::ensure_local(&paths.claudectl_dir(), alias)?;
     let dir = paths.profiles_dir().join(alias);
     std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
 
