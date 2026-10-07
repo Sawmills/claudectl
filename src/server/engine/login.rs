@@ -13,6 +13,9 @@ struct Flow {
     expires_at: i64,
     expected: Option<Identity>,
     exchanging: bool,
+    /// A delete after this time refuses the flow's admission.
+    #[serde(default)]
+    started_at: i64,
 }
 #[derive(Serialize)]
 pub struct Login {
@@ -69,6 +72,7 @@ impl Engine {
             expires_at: now() + 300_000,
             expected: existing.map(|a| a.identity),
             exchanging: false,
+            started_at: now(),
         };
         let id = revision();
         let directory = self.state.join("logins");
@@ -190,7 +194,17 @@ impl Engine {
             scopes: token.scope.split_whitespace().map(str::to_owned).collect(),
         };
         let receipt = self
-            .admit(user, &flow.alias, id, grant, flow.expected.as_ref())
+            .admit_with(
+                user,
+                &flow.alias,
+                id,
+                grant,
+                flow.expected.as_ref(),
+                Admission {
+                    rotation_pending: false,
+                    started_at: flow.started_at,
+                },
+            )
             .await?;
         for file in [path, retained] {
             match std::fs::remove_file(file) {

@@ -1283,3 +1283,185 @@ async fn a_new_account_never_reuses_a_residual_deleted_directory() {
     assert!(!residual.join("refresh-response.enc").exists());
     task.abort();
 }
+
+/// A provider whose second token exchange waits for `gate`.
+async fn gated_provider(
+    gate: Arc<tokio::sync::Notify>,
+) -> (tempfile::TempDir, Engine, tokio::task::JoinHandle<()>) {
+    let exchanges = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/api/oauth/profile",
+            get(|| async { Json(json!({"account":{"uuid":"a"},"organization":{"uuid":"o"}})) }),
+        )
+        .route(
+            "/token",
+            post(move || {
+                let (gate, exchanges) = (gate.clone(), exchanges.clone());
+                async move {
+                    if exchanges.fetch_add(1, Ordering::SeqCst) == 1 {
+                        gate.notified().await;
+                    }
+                    Json(json!({"access_token":"access","refresh_token":"refresh","expires_in":3600,"scope":"user:inference user:profile"}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let key = root.path().join("key");
+    vault::create_secret(&key, &[26; 32]).unwrap();
+    let engine = Engine::open_at(
+        &root.path().join("store"),
+        &key,
+        Endpoints {
+            api: origin.clone(),
+            token: format!("{origin}/token"),
+        },
+    )
+    .unwrap();
+    (root, engine, task)
+}
+
+fn pasted(login: &Login) -> String {
+    let url = reqwest::Url::parse(&login.authorize_url).unwrap();
+    let state = url
+        .query_pairs()
+        .find(|(n, _)| n == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    format!("fake-code#{state}")
+}
+
+#[tokio::test]
+async fn a_login_exchange_in_flight_during_a_delete_cannot_recreate_the_account() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let (_root, engine, task) = gated_provider(gate.clone()).await;
+    let engine = Arc::new(engine);
+    let first = engine
+        .start_login("person", "machine", "work", false)
+        .await
+        .unwrap();
+    let second = engine
+        .start_login("person", "machine", "work", false)
+        .await
+        .unwrap();
+    let receipt = engine
+        .finish_login("person", "machine", &first.id, &pasted(&first))
+        .await
+        .unwrap();
+    let late = {
+        let engine = engine.clone();
+        let code = pasted(&second);
+        tokio::spawn(async move {
+            engine
+                .finish_login("person", "machine", &second.id, &code)
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    engine
+        .remove("person", "mac", &receipt.account_id)
+        .await
+        .unwrap();
+    gate.notify_one();
+    assert!(late.await.unwrap().is_err());
+    assert!(engine.accounts("person").await.is_empty());
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_login_flow_surviving_a_stopped_delete_cannot_restore_the_account() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    gate.notify_one();
+    let (root, engine, task) = gated_provider(gate).await;
+    let store = root.path().join("store");
+    let first = engine
+        .start_login("person", "machine", "work", false)
+        .await
+        .unwrap();
+    let second = engine
+        .start_login("person", "machine", "work", false)
+        .await
+        .unwrap();
+    let receipt = engine
+        .finish_login("person", "machine", &first.id, &pasted(&first))
+        .await
+        .unwrap();
+    let flow = store.join("logins").join(format!("{}.enc", second.id));
+    let saved = std::fs::read(&flow).unwrap();
+    engine
+        .remove("person", "mac", &receipt.account_id)
+        .await
+        .unwrap();
+    drop(engine);
+    // A stop after the tombstone, before the login cleanup.
+    crate::server::fs::atomic_write(&flow, &saved).unwrap();
+    let key = root.path().join("key");
+    let engine = Engine::open_at(&store, &key, Endpoints::default()).unwrap();
+    assert!(!flow.exists(), "startup recovery kept the stale login flow");
+    drop(engine);
+    // Even a flow that escapes cleanup started before the delete, so admission refuses it.
+    crate::server::fs::atomic_write(&flow, &saved).unwrap();
+    let engine = Engine::open_at(&store, &key, Endpoints::default()).unwrap();
+    // The ordering check runs before any provider call, so default endpoints are never used.
+    let late = engine
+        .admit_with(
+            "person",
+            "work",
+            &second.id,
+            grant_until("late", now() + 3_600_000),
+            None,
+            Admission {
+                rotation_pending: false,
+                started_at: now() - 60_000,
+            },
+        )
+        .await;
+    assert!(late.is_err());
+    assert!(engine.accounts("person").await.is_empty());
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_delete_purges_pending_admission_grants_for_the_alias() {
+    let (root, engine, _refreshes, task) = synthetic_provider(3600).await;
+    let receipt = engine
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let wrong = Identity {
+        account_uuid: "other".into(),
+        organization_uuid: "o".into(),
+    };
+    assert!(
+        engine
+            .admit(
+                "person",
+                "work",
+                "renewal",
+                grant_until("renewed", now() + 3_600_000),
+                Some(&wrong)
+            )
+            .await
+            .is_err()
+    );
+    let pending = root.path().join("store").join("pending");
+    assert_eq!(std::fs::read_dir(&pending).unwrap().count(), 1);
+    engine
+        .remove("person", "mac", &receipt.account_id)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_dir(&pending).unwrap().count(), 0);
+    task.abort();
+}

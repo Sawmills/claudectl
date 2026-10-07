@@ -128,6 +128,14 @@ impl Default for Endpoints {
     }
 }
 type Accounts = BTreeMap<String, Arc<Mutex<Record>>>;
+/// How an admission was started.
+#[derive(Clone, Copy)]
+pub(super) struct Admission {
+    /// A migrated grant stays pending until its first verified refresh.
+    pub rotation_pending: bool,
+    /// When the admission's work began: a login flow's start, or now.
+    pub started_at: i64,
+}
 /// The account was deleted. A machine must not retry with it.
 #[derive(Debug)]
 pub struct Gone;
@@ -151,6 +159,11 @@ impl std::error::Error for NotFound {}
 struct Tombstone {
     id: String,
     user: String,
+    #[serde(default)]
+    alias: String,
+    /// An admission whose work started at or before this time cannot recreate the account.
+    #[serde(default)]
+    deleted_at: i64,
 }
 pub struct Engine {
     state: PathBuf,
@@ -212,7 +225,8 @@ impl Engine {
         for tombstone in &deleted {
             usage_state.forget(state, &tombstone.id)?;
         }
-        Ok(Self {
+        let tombstones = deleted.clone();
+        let engine = Self {
             state: state.into(),
             key: key.into(),
             endpoints,
@@ -227,7 +241,15 @@ impl Engine {
             admissions: Mutex::new(()),
             usage_state: Mutex::new(usage_state),
             _owner: owner,
-        })
+        };
+        // A delete that stopped after its tombstone may have left login or pending grants.
+        for tombstone in tombstones.iter() {
+            if !tombstone.alias.is_empty() {
+                engine.cancel_logins(&tombstone.user, &tombstone.alias)?;
+                engine.purge_pending(&tombstone.user, &tombstone.alias)?;
+            }
+        }
+        Ok(engine)
     }
     fn persist(&self, record: &Record) -> Result<()> {
         let dir = self.state.join("accounts").join(&record.id);
@@ -289,8 +311,18 @@ impl Engine {
         grant: Grant,
         replacement: Option<&Identity>,
     ) -> Result<Receipt> {
-        self.admit_with(user, alias, migration, grant, replacement, false)
-            .await
+        self.admit_with(
+            user,
+            alias,
+            migration,
+            grant,
+            replacement,
+            Admission {
+                rotation_pending: false,
+                started_at: now(),
+            },
+        )
+        .await
     }
     /// Admit a grant moved from a machine. Its receipt stays hidden until the first refresh,
     /// so a client keeps its fence until the copies it leaves behind are stale.
@@ -301,18 +333,34 @@ impl Engine {
         migration: &str,
         grant: Grant,
     ) -> Result<Receipt> {
-        self.admit_with(user, alias, migration, grant, None, true)
-            .await
+        self.admit_with(
+            user,
+            alias,
+            migration,
+            grant,
+            None,
+            Admission {
+                rotation_pending: true,
+                started_at: now(),
+            },
+        )
+        .await
     }
-    async fn admit_with(
+    /// `options.started_at` is when this admission's work began: a login flow's start, or now. A retry
+    /// of a retained pending grant keeps the time that grant was first retained.
+    pub(super) async fn admit_with(
         &self,
         user: &str,
         alias: &str,
         migration: &str,
         grant: Grant,
         replacement: Option<&Identity>,
-        rotation_pending: bool,
+        options: Admission,
     ) -> Result<Receipt> {
+        let Admission {
+            rotation_pending,
+            started_at,
+        } = options;
         let alias = store::validate_alias(alias)?;
         store::validate_alias(migration)?;
         grant.validate()?;
@@ -343,9 +391,13 @@ impl Engine {
             migration_id: String,
             grant: Grant,
             replacement: Option<Identity>,
+            #[serde(default)]
+            started_at: i64,
         }
+        let mut started_at = started_at;
         let grant = if pending.exists() {
             let saved: Pending = vault::unseal(&pending, &self.key)?;
+            started_at = started_at.min(saved.started_at);
             if saved.user != user
                 || !saved.alias.eq_ignore_ascii_case(alias)
                 || saved.migration_id != migration
@@ -364,11 +416,24 @@ impl Engine {
                     migration_id: migration.into(),
                     grant: grant.clone(),
                     replacement: replacement.cloned(),
+                    started_at,
                 },
             )?;
             grant
         };
         grant.validate()?;
+        // The admission lock is held, and a delete takes it too, so this cannot change below.
+        let id = account_id(user, alias);
+        let deleted_since = self
+            .deleted
+            .lock()
+            .await
+            .iter()
+            .any(|t| t.id == id && t.deleted_at >= started_at);
+        if deleted_since {
+            store::remove_if_present(&pending)?;
+            bail!("the account was deleted after this admission started; start a new login");
+        }
         if grant.expires_at <= now() + USABLE {
             bail!("admission requires a usable access token; grant retained for login renewal");
         }
@@ -376,7 +441,6 @@ impl Engine {
         if replacement.is_some_and(|expected| expected != &identity) {
             bail!("login renewal changed Claude identity; grant retained");
         }
-        let id = account_id(user, alias);
         let mut prior = None;
         for record in records {
             let r = record.lock().await;
@@ -627,6 +691,23 @@ impl Engine {
         self.verify_successor(record).await?;
         Ok(rotated)
     }
+    /// Drop retained admission grants for one alias; a delete leaves no grant behind.
+    fn purge_pending(&self, user: &str, alias: &str) -> Result<()> {
+        #[derive(Deserialize)]
+        struct Owner {
+            user: String,
+            alias: String,
+        }
+        let directory = self.state.join("pending");
+        for entry in std::fs::read_dir(&directory)? {
+            let path = entry?.path();
+            let owner: Owner = vault::unseal(&path, &self.key)?;
+            if owner.user == user && owner.alias.eq_ignore_ascii_case(alias) {
+                std::fs::remove_file(&path)?;
+            }
+        }
+        store::sync_directory(&directory)
+    }
     async fn save_tombstones(&self, deleted: &[Tombstone]) -> Result<()> {
         store::atomic_write(
             &self.state.join("deleted.json"),
@@ -665,6 +746,8 @@ impl Engine {
             next.push(Tombstone {
                 id: id.into(),
                 user: user.into(),
+                alias: record.alias.clone(),
+                deleted_at: now(),
             });
             // Until the tombstone is durable, the account stays usable and the delete retryable.
             self.save_tombstones(&next).await?;
@@ -674,6 +757,7 @@ impl Engine {
         self.records.write().await.remove(id);
         // The admission lock is held, so no login completion runs concurrently.
         self.cancel_logins(user, &record.alias)?;
+        self.purge_pending(user, &record.alias)?;
         // A usage read takes the cache lock before an account lock; never hold both here.
         drop(record);
         self.usage_state.lock().await.forget(&self.state, id)?;
