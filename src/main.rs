@@ -59,7 +59,7 @@ enum Commands {
     Whoami,
     /// Set or clear a profile's display label
     Label {
-        /// Profile alias
+        /// Profile alias to label
         alias: String,
         /// Label text (omit or leave blank to clear)
         text: Option<String>,

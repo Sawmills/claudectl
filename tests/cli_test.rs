@@ -121,7 +121,22 @@ fn zsh_completions_wire_alias_args_to_profile_completer() {
     let mut cmd = Command::cargo_bin("claudectl").unwrap();
     let output = cmd.args(["completions", "zsh"]).output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(stdout.matches("_claudectl_profiles'").count(), 3);
+    assert_eq!(stdout.matches("_claudectl_profiles'").count(), 4);
+    assert!(stdout.contains("':alias -- Profile alias to label:_claudectl_profiles'"));
+}
+
+#[test]
+fn bash_and_fish_completions_offer_aliases_for_label() {
+    let output = |shell: &str| {
+        let output = Command::cargo_bin("claudectl")
+            .unwrap()
+            .args(["completions", shell])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert!(output("bash").contains("complete -F _claudectl_profiles claudectl label"));
+    assert!(output("fish").contains("__fish_seen_subcommand_from use remove status label"));
 }
 
 #[test]
