@@ -293,6 +293,24 @@ account with the most room. `--lane` names the lane; `accounts.jsonl` in the
 lane records which account ran when, and `receipts.jsonl` holds the `exec`
 receipts.
 
+### Rate: responses and limits per account
+
+```bash
+claudectl rate              # last 10 minutes
+claudectl rate --minutes 60 --json
+```
+
+`rate` counts, per account, the assistant responses (one per API message) and
+the rate-limit errors (429) in lane transcripts, and the share of 429s. It
+counts lanes only: `accounts.jsonl` is the only record of which account ran
+when, so a Claude session outside `claudectl claude` has no account to count
+against. A turn outside every logged run shows as `(outside a lane run)`, with
+`"alias": null` in `--json`, which prints `{"version": 1, "window_minutes": N,
+"accounts": [{"alias", "lanes", "ok", "rate_limited"}], "skipped": N}`.
+`skipped` counts transcript records that could not be read (the table shows a
+warning instead), so low counts are visible as such. An unreadable lane
+directory fails the command rather than report no activity.
+
 ### Statusline
 
 ```bash

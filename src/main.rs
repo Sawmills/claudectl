@@ -65,6 +65,15 @@ enum Commands {
     },
     /// Show current active account
     Whoami,
+    /// Count responses and rate-limit errors per account in claudectl claude lanes
+    Rate {
+        /// Count the last N minutes
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..))]
+        minutes: u32,
+        /// Print a JSON document (version 1) instead of a table
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the active account's usage in one line for a prompt; silent on any doubt
     Statusline,
     /// Set or clear a profile's display label
@@ -180,6 +189,7 @@ fn main() {
         Commands::List => commands::list::run(),
         Commands::Remove { ref alias } => commands::remove::run(alias),
         Commands::Whoami => commands::whoami::run(),
+        Commands::Rate { minutes, json } => commands::rate::run(minutes, json),
         Commands::Statusline => unreachable!("handled before setup"),
         Commands::Label {
             ref alias,
