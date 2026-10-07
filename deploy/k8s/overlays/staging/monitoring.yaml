@@ -22,7 +22,7 @@ spec:
             description: Check the pod, SSO configuration, and the state volume. Preserve the state volume before recovery.
             runbook_url: https://github.com/Sawmills/claudectl/blob/main/docs/account-server.md
         - alert: ClaudectlCredentialOperationFailed
-          expr: time() - max by (reason) (claudectl_server_last_failure_timestamp_seconds{reason=~"account_unavailable_or_login_required|usage_login_required|admission_refused_reconcile_receipt|audit_unavailable|login_incomplete_grant_retained|owner_unavailable|persistence_failed|registry_unavailable|registry_busy"} > 0) < 300
+          expr: time() - max by (reason) (claudectl_server_last_failure_timestamp_seconds{reason=~"account_unavailable_or_login_required|usage_login_required|usage_failed|admission_refused_reconcile_receipt|audit_unavailable|login_incomplete_grant_retained|owner_unavailable|persistence_failed|registry_unavailable|registry_busy"} > 0) < 300
           for: 0m
           labels:
             severity: warning

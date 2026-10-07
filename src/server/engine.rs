@@ -424,8 +424,9 @@ impl Engine {
             rotation_pending,
             removed: false,
         };
-        self.persist(&record)?;
+        // Clear the tombstone first: a restart must never delete the new record.
         self.forget_tombstone(&id).await?;
+        self.persist(&record)?;
         if let Some(ref mut old) = old {
             **old = record;
         } else {
@@ -635,8 +636,10 @@ impl Engine {
     async fn forget_tombstone(&self, id: &str) -> Result<()> {
         let mut deleted = self.deleted.lock().await;
         if deleted.iter().any(|t| t.id == id) {
-            deleted.retain(|t| t.id != id);
-            self.save_tombstones(&deleted).await?;
+            let next: Vec<_> = deleted.iter().filter(|t| t.id != id).cloned().collect();
+            // Keep the tombstone in memory until its removal is durable.
+            self.save_tombstones(&next).await?;
+            *deleted = next;
         }
         Ok(())
     }

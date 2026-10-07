@@ -1107,3 +1107,36 @@ async fn startup_drops_cached_usage_of_an_account_deleted_before_a_stop() {
     );
     task.abort();
 }
+
+#[tokio::test]
+async fn a_new_account_survives_restart_after_a_failed_tombstone_cleanup() {
+    let (root, engine, _refreshes, task) = synthetic_provider(3600).await;
+    let store = root.path().join("store");
+    let first = engine
+        .admit("person", "work", "m-1", grant_until("first", now() + 3_600_000), None)
+        .await
+        .unwrap();
+    engine.remove("person", "mac", &first.account_id).await.unwrap();
+    let tombstones = store.join("deleted.json");
+    let saved = store.join("deleted.saved");
+    std::fs::rename(&tombstones, &saved).unwrap();
+    std::fs::create_dir(&tombstones).unwrap();
+    assert!(
+        engine
+            .admit("person", "work", "m-2", grant_until("second", now() + 3_600_000), None)
+            .await
+            .is_err()
+    );
+    std::fs::remove_dir(&tombstones).unwrap();
+    std::fs::rename(&saved, &tombstones).unwrap();
+    let second = engine
+        .admit("person", "work", "m-2", grant_until("second", now() + 3_600_000), None)
+        .await
+        .unwrap();
+    drop(engine);
+    let engine = Engine::open_at(&store, &root.path().join("key"), Endpoints::default()).unwrap();
+    assert_eq!(engine.accounts("person").await.len(), 1);
+    assert!(engine.receipt("person", "m-2").await.unwrap().is_some());
+    assert_eq!(second.account_id, first.account_id);
+    task.abort();
+}
