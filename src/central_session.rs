@@ -347,7 +347,7 @@ pub fn run(
         }
         session
     });
-    let waited = exec::wait_exit_no_reap(pid);
+    let waited = exec::wait_exit_no_reap(pid, false);
     let _ = stop.send(());
     let session = writer
         .join()

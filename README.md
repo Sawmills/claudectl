@@ -176,16 +176,31 @@ claudectl launcher --profile amir+2@example.com --claude "$(command -v claude)" 
 `exec` runs one command on a saved profile and leaves the live login alone.
 The child gets the saved access token through an inherited pipe
 (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`) and a fresh private
-`CLAUDE_CONFIG_DIR` that is removed when the run ends. The child runs
+`CLAUDE_CONFIG_DIR` that is removed when the run ends. So that the child
+starts at its prompt, that directory gets a `.claude.json` with only your
+onboarding state (`hasCompletedOnboarding`, `lastOnboardingVersion`) and the
+start-up approvals that cover the current directory (folder trust, also when
+it comes from a parent directory, and external CLAUDE.md imports). Accounts, tokens, allowed tools and MCP servers are never
+copied. The child runs
 in its own process group: `SIGTERM`, `SIGINT` and `SIGHUP` sent to claudectl
 reach the whole group once, and descendants left after the child exits get
-`SIGTERM`, then `SIGKILL`.
+`SIGTERM`, then `SIGKILL`. `SIGCONT` follows each of these signals, so a
+stopped process acts on them.
 
-`exec` is for non-interactive runs such as `claude -p`. A child that reads the
-terminal is stopped by the terminal driver, because it runs in a background
-process group. `exec` runs a private copy of the executable, so use it for a
-single-file program such as the Claude Code native binary; a program that loads
-files next to its own path does not find them. The Keychain entry,
+`exec` also runs an interactive child such as the Claude Code TUI. When
+claudectl owns the terminal foreground, the child's group takes it, as a shell
+job does: the terminal sends Ctrl-C and window size changes to the child
+directly. Ctrl-Z stops the child and claudectl together, and `fg` resumes both.
+claudectl takes the foreground back when the child exits, unless the shell
+owns it (after `bg`). Known limit: a Ctrl-Z in the few microseconds between
+the terminal handoff and the start of the child can leave the child stopped
+while `fg` cannot resume claudectl. Run `kill -CONT <child pid>` to recover;
+Ctrl-C does not help in that state. If the terminal hangs
+up (for example, the pane closes), the child gets `SIGHUP` from the terminal,
+and the private directory is still removed after it exits. `exec` runs a
+private copy of the executable, so use it for a single-file program such as the
+Claude Code native binary; a program that loads files next to its own path does
+not find them. The Keychain entry,
 `~/.claude/.credentials.json`, `~/.claude.json` and the active marker are not
 written.
 
@@ -244,7 +259,12 @@ it, so a later claudectl upgrade does not change what the launcher runs.
 claudectl list      # saved profiles, * marks active
 claudectl whoami    # active profile
 claudectl remove <alias>
+claudectl label <alias> "Team seat"   # display label; omit the text to clear
 ```
+
+A label is a display name only: `list` shows it in brackets, and `status` adds a
+Label column when any account has one. It is at most 40 characters and need
+not be unique. Saving the alias again keeps it.
 
 ### Shell completions
 
