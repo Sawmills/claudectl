@@ -1096,6 +1096,7 @@ async fn startup_drops_cached_usage_of_an_account_deleted_before_a_stop() {
     drop(engine);
     // A stop after the tombstone, before the cache cleanup.
     crate::server::fs::atomic_write(&store.join("usage.json"), &cached).unwrap();
+    unsettle(&store);
     let engine = Engine::open_at(&store, &root.path().join("key"), Endpoints::default()).unwrap();
     let cached = engine.usage("person", &first.account_id, true).await;
     assert!(cached.is_err(), "a deleted account has no usage");
@@ -1108,6 +1109,7 @@ async fn startup_drops_cached_usage_of_an_account_deleted_before_a_stop() {
     task.abort();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_new_account_survives_restart_after_a_failed_tombstone_cleanup() {
     let (root, engine, _refreshes, task) = synthetic_provider(3600).await;
@@ -1122,10 +1124,7 @@ async fn a_new_account_survives_restart_after_a_failed_tombstone_cleanup() {
         )
         .await
         .unwrap();
-    engine
-        .remove("person", "mac", &first.account_id)
-        .await
-        .unwrap();
+    stopped_remove(&engine, &store, &first.account_id).await;
     let tombstones = store.join("deleted.json");
     let saved = store.join("deleted.saved");
     std::fs::rename(&tombstones, &saved).unwrap();
@@ -1248,6 +1247,7 @@ async fn a_retained_login_cannot_restore_a_deleted_account() {
     task.abort();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_new_account_never_reuses_a_residual_deleted_directory() {
     let (root, engine, _refreshes, task) = synthetic_provider(3600).await;
@@ -1262,13 +1262,8 @@ async fn a_new_account_never_reuses_a_residual_deleted_directory() {
         )
         .await
         .unwrap();
-    engine
-        .remove("person", "mac", &first.account_id)
-        .await
-        .unwrap();
-    // A delete that stopped before its directory removal.
+    stopped_remove(&engine, &store, &first.account_id).await;
     let residual = store.join("accounts").join(&first.account_id);
-    crate::server::fs::ensure_private_dir(&residual).unwrap();
     crate::server::fs::atomic_write(&residual.join("refresh-response.enc"), b"old").unwrap();
     engine
         .admit(
@@ -1281,60 +1276,12 @@ async fn a_new_account_never_reuses_a_residual_deleted_directory() {
         .await
         .unwrap();
     assert!(!residual.join("refresh-response.enc").exists());
+    let access = engine
+        .acquire("person", &first.account_id, None)
+        .await
+        .unwrap();
+    assert_eq!(access.access_token, "second");
     task.abort();
-}
-
-/// A provider whose second token exchange waits for `gate`.
-async fn gated_provider(
-    gate: Arc<tokio::sync::Notify>,
-) -> (tempfile::TempDir, Engine, tokio::task::JoinHandle<()>) {
-    let exchanges = Arc::new(AtomicUsize::new(0));
-    let app = Router::new()
-        .route(
-            "/api/oauth/profile",
-            get(|| async { Json(json!({"account":{"uuid":"a"},"organization":{"uuid":"o"}})) }),
-        )
-        .route(
-            "/token",
-            post(move || {
-                let (gate, exchanges) = (gate.clone(), exchanges.clone());
-                async move {
-                    if exchanges.fetch_add(1, Ordering::SeqCst) == 1 {
-                        gate.notified().await;
-                    }
-                    Json(json!({"access_token":"access","refresh_token":"refresh","expires_in":3600,"scope":"user:inference user:profile"}))
-                }
-            }),
-        );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin = format!("http://{}", listener.local_addr().unwrap());
-    let task = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    let root = tempfile::tempdir().unwrap();
-    let key = root.path().join("key");
-    vault::create_secret(&key, &[26; 32]).unwrap();
-    let engine = Engine::open_at(
-        &root.path().join("store"),
-        &key,
-        Endpoints {
-            api: origin.clone(),
-            token: format!("{origin}/token"),
-        },
-    )
-    .unwrap();
-    (root, engine, task)
-}
-
-fn pasted(login: &Login) -> String {
-    let url = reqwest::Url::parse(&login.authorize_url).unwrap();
-    let state = url
-        .query_pairs()
-        .find(|(n, _)| n == "state")
-        .unwrap()
-        .1
-        .into_owned();
-    format!("fake-code#{state}")
 }
 
 #[tokio::test]
@@ -1371,6 +1318,23 @@ async fn a_login_exchange_in_flight_during_a_delete_cannot_recreate_the_account(
     gate.notify_one();
     assert!(late.await.unwrap().is_err());
     assert!(engine.accounts("person").await.is_empty());
+    let retained = |store: &std::path::Path| {
+        std::fs::read_dir(store.join("logins"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with("-grant.enc")
+            })
+            .count()
+    };
+    assert_eq!(
+        retained(&_root.path().join("store")),
+        0,
+        "a late OAuth response stayed on disk"
+    );
     task.abort();
 }
 
@@ -1401,6 +1365,7 @@ async fn a_login_flow_surviving_a_stopped_delete_cannot_restore_the_account() {
     drop(engine);
     // A stop after the tombstone, before the login cleanup.
     crate::server::fs::atomic_write(&flow, &saved).unwrap();
+    unsettle(&store);
     let key = root.path().join("key");
     let engine = Engine::open_at(&store, &key, Endpoints::default()).unwrap();
     assert!(!flow.exists(), "startup recovery kept the stale login flow");
@@ -1464,4 +1429,142 @@ async fn a_delete_purges_pending_admission_grants_for_the_alias() {
         .unwrap();
     assert_eq!(std::fs::read_dir(&pending).unwrap().count(), 0);
     task.abort();
+}
+
+#[tokio::test]
+async fn a_renewal_from_before_a_delete_cannot_overwrite_a_recreated_account() {
+    let (root, engine, _refreshes, task) = synthetic_provider(3600).await;
+    let first = engine
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let before_delete = now() - 1;
+    engine
+        .remove("person", "mac", &first.account_id)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let second = engine
+        .admit(
+            "person",
+            "work",
+            "m-2",
+            grant_until("second", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let late = engine
+        .admit_with(
+            "person",
+            "work",
+            "old-renewal",
+            grant_until("stale", now() + 3_600_000),
+            Some(&second.identity),
+            Admission {
+                rotation_pending: false,
+                started_at: before_delete,
+            },
+        )
+        .await;
+    assert!(late.is_err());
+    let access = engine
+        .acquire("person", &second.account_id, None)
+        .await
+        .unwrap();
+    assert_eq!(access.access_token, "second");
+    // The recreated account also survives a restart.
+    drop(engine);
+    let engine = Engine::open_at(
+        &root.path().join("store"),
+        &root.path().join("key"),
+        Endpoints::default(),
+    )
+    .unwrap();
+    assert_eq!(engine.accounts("person").await.len(), 1);
+    task.abort();
+}
+
+/// Mark every tombstone unfinished: the state a delete leaves when it stops before cleanup.
+fn unsettle(store: &std::path::Path) {
+    let path = store.join("deleted.json");
+    let mut tombstones: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for t in &mut tombstones {
+        t["cleaned"] = false.into();
+    }
+    crate::server::fs::atomic_write(&path, &serde_json::to_vec(&tombstones).unwrap()).unwrap();
+}
+
+/// Make a delete fail after its tombstone is saved: the account directory cannot be removed.
+#[cfg(unix)]
+async fn stopped_remove(engine: &Engine, store: &std::path::Path, id: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let accounts = store.join("accounts");
+    std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = engine.remove("person", "mac", id).await;
+    std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        result.is_err(),
+        "the delete was meant to stop before its cleanup"
+    );
+}
+
+/// A provider whose second token exchange waits for `gate`.
+async fn gated_provider(
+    gate: Arc<tokio::sync::Notify>,
+) -> (tempfile::TempDir, Engine, tokio::task::JoinHandle<()>) {
+    let exchanges = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/api/oauth/profile",
+            get(|| async { Json(json!({"account":{"uuid":"a"},"organization":{"uuid":"o"}})) }),
+        )
+        .route(
+            "/token",
+            post(move || {
+                let (gate, exchanges) = (gate.clone(), exchanges.clone());
+                async move {
+                    if exchanges.fetch_add(1, Ordering::SeqCst) == 1 {
+                        gate.notified().await;
+                    }
+                    Json(json!({"access_token":"access","refresh_token":"refresh","expires_in":3600,"scope":"user:inference user:profile"}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let key = root.path().join("key");
+    vault::create_secret(&key, &[26; 32]).unwrap();
+    let engine = Engine::open_at(
+        &root.path().join("store"),
+        &key,
+        Endpoints {
+            api: origin.clone(),
+            token: format!("{origin}/token"),
+        },
+    )
+    .unwrap();
+    (root, engine, task)
+}
+
+fn pasted(login: &Login) -> String {
+    let url = reqwest::Url::parse(&login.authorize_url).unwrap();
+    let state = url
+        .query_pairs()
+        .find(|(n, _)| n == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    format!("fake-code#{state}")
 }

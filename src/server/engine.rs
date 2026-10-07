@@ -164,6 +164,10 @@ struct Tombstone {
     /// An admission whose work started at or before this time cannot recreate the account.
     #[serde(default)]
     deleted_at: i64,
+    /// The delete finished its cleanup. A tombstone stays after that as a permanent fence,
+    /// also when the alias is recreated.
+    #[serde(default)]
+    cleaned: bool,
 }
 pub struct Engine {
     state: PathBuf,
@@ -190,7 +194,7 @@ impl Engine {
             Vec::new()
         };
         // Finish a delete that stopped after its tombstone was written.
-        for tombstone in &deleted {
+        for tombstone in deleted.iter().filter(|t| !t.cleaned) {
             let dir = state.join("accounts").join(&tombstone.id);
             if dir.try_exists()? {
                 std::fs::remove_dir_all(&dir)?;
@@ -222,7 +226,7 @@ impl Engine {
             Default::default()
         };
         // A delete that stopped after its tombstone may have left cached usage behind.
-        for tombstone in &deleted {
+        for tombstone in deleted.iter().filter(|t| !t.cleaned) {
             usage_state.forget(state, &tombstone.id)?;
         }
         let tombstones = deleted.clone();
@@ -243,12 +247,21 @@ impl Engine {
             _owner: owner,
         };
         // A delete that stopped after its tombstone may have left login or pending grants.
-        for tombstone in tombstones.iter() {
+        for tombstone in tombstones.iter().filter(|t| !t.cleaned) {
             if !tombstone.alias.is_empty() {
                 engine.cancel_logins(&tombstone.user, &tombstone.alias)?;
                 engine.purge_pending(&tombstone.user, &tombstone.alias)?;
             }
         }
+        if tombstones.iter().any(|t| !t.cleaned) {
+            let settled: Vec<_> = tombstones
+                .into_iter()
+                .map(|t| Tombstone { cleaned: true, ..t })
+                .collect();
+            store::atomic_write(&state.join("deleted.json"), &serde_json::to_vec(&settled)?)?;
+            *engine.deleted.try_lock().expect("unshared at startup") = settled;
+        }
+        engine.sweep_orphan_logins()?;
         Ok(engine)
     }
     fn persist(&self, record: &Record) -> Result<()> {
@@ -489,7 +502,7 @@ impl Engine {
             removed: false,
         };
         // Clear the tombstone first: a restart must never delete the new record.
-        self.forget_tombstone(&id).await?;
+        self.settle_tombstone(&id).await?;
         self.persist(&record)?;
         if let Some(ref mut old) = old {
             **old = record;
@@ -714,17 +727,28 @@ impl Engine {
             &serde_json::to_vec(deleted)?,
         )
     }
-    async fn forget_tombstone(&self, id: &str) -> Result<()> {
+    /// Before an alias is recreated, finish any cleanup its last delete left. The tombstone
+    /// stays as the fence for admissions that started before that delete.
+    async fn settle_tombstone(&self, id: &str) -> Result<()> {
         let mut deleted = self.deleted.lock().await;
-        if deleted.iter().any(|t| t.id == id) {
-            // Finish a residual delete before its marker goes.
+        if deleted.iter().any(|t| t.id == id && !t.cleaned) {
             let residual = self.state.join("accounts").join(id);
             if residual.try_exists()? {
                 std::fs::remove_dir_all(&residual)?;
                 store::sync_directory(&self.state.join("accounts"))?;
             }
-            let next: Vec<_> = deleted.iter().filter(|t| t.id != id).cloned().collect();
-            // Keep the tombstone in memory until its removal is durable.
+            self.usage_state.lock().await.forget(&self.state, id)?;
+            let next: Vec<_> = deleted
+                .iter()
+                .cloned()
+                .map(|t| {
+                    if t.id == id {
+                        Tombstone { cleaned: true, ..t }
+                    } else {
+                        t
+                    }
+                })
+                .collect();
             self.save_tombstones(&next).await?;
             *deleted = next;
         }
@@ -742,12 +766,13 @@ impl Engine {
         }
         {
             let mut deleted = self.deleted.lock().await;
-            let mut next = deleted.clone();
+            let mut next: Vec<_> = deleted.iter().filter(|t| t.id != id).cloned().collect();
             next.push(Tombstone {
                 id: id.into(),
                 user: user.into(),
                 alias: record.alias.clone(),
                 deleted_at: now(),
+                cleaned: false,
             });
             // Until the tombstone is durable, the account stays usable and the delete retryable.
             self.save_tombstones(&next).await?;
@@ -764,6 +789,22 @@ impl Engine {
         // A restart finishes this removal from the tombstone if it stops here.
         std::fs::remove_dir_all(self.state.join("accounts").join(id))?;
         store::sync_directory(&self.state.join("accounts"))?;
+        {
+            let mut deleted = self.deleted.lock().await;
+            let next: Vec<_> = deleted
+                .iter()
+                .cloned()
+                .map(|t| {
+                    if t.id == id {
+                        Tombstone { cleaned: true, ..t }
+                    } else {
+                        t
+                    }
+                })
+                .collect();
+            self.save_tombstones(&next).await?;
+            *deleted = next;
+        }
         self.audit(&audit::Event {
             operation: "revoke",
             machine,

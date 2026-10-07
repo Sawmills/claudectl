@@ -24,6 +24,26 @@ pub struct Login {
     pub expires_at: i64,
 }
 impl Engine {
+    /// Remove retained login responses whose flow no longer exists.
+    pub(super) fn sweep_orphan_logins(&self) -> Result<()> {
+        let directory = self.state.join("logins");
+        if !directory.try_exists()? {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(&directory)? {
+            let path = entry?.path();
+            let id = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix("-grant.enc"));
+            if let Some(id) = id
+                && !directory.join(format!("{id}.enc")).try_exists()?
+            {
+                std::fs::remove_file(&path)?;
+            }
+        }
+        store::sync_directory(&directory)
+    }
     /// Drop every login flow and retained login grant for one alias. A delete calls this so a
     /// replayed login completion cannot restore the account.
     pub(super) fn cancel_logins(&self, user: &str, alias: &str) -> Result<()> {
@@ -193,7 +213,7 @@ impl Engine {
             expires_at: expiry,
             scopes: token.scope.split_whitespace().map(str::to_owned).collect(),
         };
-        let receipt = self
+        let admitted = self
             .admit_with(
                 user,
                 &flow.alias,
@@ -205,7 +225,17 @@ impl Engine {
                     started_at: flow.started_at,
                 },
             )
-            .await?;
+            .await;
+        let receipt = match admitted {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                // A delete cancelled this flow while its exchange ran; keep no grant.
+                if !path.try_exists()? {
+                    store::remove_if_present(&retained)?;
+                }
+                return Err(error);
+            }
+        };
         for file in [path, retained] {
             match std::fs::remove_file(file) {
                 Ok(()) => {}
