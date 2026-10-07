@@ -9,6 +9,7 @@ metadata:
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
     checkov.io/skip1: CKV_K8S_43=Release must replace template workload images with the published digest before Argo registration.
     checkov.io/skip2: CKV_K8S_35=Database credentials come from the ExternalSecret by design.
+    checkov.io/skip3: CKV2_K8S_6=Checkov graph excludes Jobs. networkpolicy.yaml selects the migration pod labels.
 spec:
   backoffLimit: 2
   activeDeadlineSeconds: 300
@@ -35,7 +36,8 @@ spec:
             # The migrator role owns the schema; the runtime role has DML only.
             - name: DATABASE_URL
               valueFrom:
-                secretKeyRef: { name: claudectl-migrator-postgres, key: DATABASE_URL }
+                secretKeyRef:
+                  { name: claudectl-migrator-postgres, key: DATABASE_URL }
             - name: CLAUDECTL_SERVER_DB_CA_FILE
               value: /etc/claudectl/rds-ca/global-bundle.pem
           securityContext:

@@ -6,6 +6,7 @@ metadata:
   annotations:
     checkov.io/skip1: CKV_K8S_43=Release must replace template workload images with the published digest before Argo registration.
     checkov.io/skip2: CKV_K8S_35=Database credentials come from the ExternalSecret by design.
+    checkov.io/skip3: CKV2_K8S_6=Checkov graph excludes Deployments. networkpolicy.yaml selects the same namespace and pod labels.
 spec:
   # Every replica serves; a per-account database lease keeps one refresh owner.
   replicas: 2

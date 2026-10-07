@@ -78,18 +78,18 @@ Amir A14 to A16 (2026-10-06 17:46 to 17:49 PDT). Done so far, on the file store,
 - Crates as in codexctl: `tokio-postgres`, `tokio-postgres-rustls`, `rustls`, `webpki-roots`, plus the RDS CA bundle as a ConfigMap. `sslmode=require`. One reconnecting client per pod, 2 s statement timeout.
 - Schema (version 1), all payloads sealed with the vault key before insert; the key never enters the database:
 
-| Table | Holds |
-|---|---|
-| `accounts` | `account_id` PK, `user_id`, `alias`, identity UUIDs, sealed record (grant, phase, revision, generation, admissions, `rotation_pending`), `revision` BIGINT |
-| `refresh_leases` | `account_id` PK, `holder_id`, `epoch`, `expires_at` |
-| `tombstones` | `account_id` PK, `user_id`, `alias`, `deleted_at`, `cleaned` |
-| `pending_admissions` | digest PK, `user_id`, `alias`, sealed grant, `started_at` |
-| `login_flows` | `id` PK, `user_id`, `alias`, sealed flow, `exchanging`, sealed retained response |
-| `enrollment_flows` | device-code, SSO login, and approval state (today in process memory) |
-| `users`, `machines` | registries with a `revision` for compare-and-swap |
-| `usage_cache` | `account_id` PK, sealed usage, `next_retry_at`, poll lease |
-| `audit_events` | sealed audit lines |
-| `schema_migrations` | version |
+| Table                | Holds                                                                                                                                                      |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `accounts`           | `account_id` PK, `user_id`, `alias`, identity UUIDs, sealed record (grant, phase, revision, generation, admissions, `rotation_pending`), `revision` BIGINT |
+| `refresh_leases`     | `account_id` PK, `holder_id`, `epoch`, `expires_at`                                                                                                        |
+| `tombstones`         | `account_id` PK, `user_id`, `alias`, `deleted_at`, `cleaned`                                                                                               |
+| `pending_admissions` | digest PK, `user_id`, `alias`, sealed grant, `started_at`                                                                                                  |
+| `login_flows`        | `id` PK, `user_id`, `alias`, sealed flow, `exchanging`, sealed retained response                                                                           |
+| `enrollment_flows`   | device-code, SSO login, and approval state (today in process memory)                                                                                       |
+| `users`, `machines`  | registries with a `revision` for compare-and-swap                                                                                                          |
+| `usage_cache`        | `account_id` PK, sealed usage, `next_retry_at`, poll lease                                                                                                 |
+| `audit_events`       | sealed audit lines                                                                                                                                         |
+| `schema_migrations`  | version                                                                                                                                                    |
 
 ### One refresh owner across replicas
 
@@ -113,14 +113,14 @@ Amir A14 to A16 (2026-10-06 17:46 to 17:49 PDT). Done so far, on the file store,
 
 ### Infra PRs (this lane writes them; A14 item 3)
 
-| # | Repo | Change (copy of the codexctl B34 pattern) |
-|---|---|---|
-| 1 | Sawmills/infra | `stacks/catalog/ecr.yaml`: repository `claudectl-server` |
-| 2 | Sawmills/infra | `stacks/catalog/github-oidc-role/claudectl.yaml` (`gha-claudectl`, `repo:Sawmills/claudectl:ref:refs/heads/main`, ECR push to `claudectl-server` only) and its import in `core/artifacts/global-region/baseline.yaml` |
-| 3 | Sawmills/infra | `components/terraform/rds/claudectl` and `stacks/catalog/rds/claudectl.yaml` on the STAGING quota-manager instance: database `claudectl`, a login role (no superuser, createdb, createrole, inherit; connection limit 30), `REVOKE CONNECT, TEMPORARY ON DATABASE claudectl FROM PUBLIC`, SSM `/rds/quota-manager/claudectl/*` |
-| 4 | Sawmills/infra | `manifests/claudectl/external-secret.yaml` (`claudectl-postgres`) as `eks/claudectl-db-secret` |
-| 5 | Sawmills/argocd-deploy | `plat/ue1-staging/argocd/claudectl-application.yaml` (path `deploy/k8s/overlays/staging`) |
-| 6 | Sawmills/claudectl | overlay: Deployment, PDB, PreSync migration Job and its NetworkPolicy, RDS CA ConfigMap, ExternalSecrets, ingress `claudectl.ue1.staging.plat.sm-svc.com`, egress 443 and 5432, alerts |
+| #   | Repo                   | Change (copy of the codexctl B34 pattern)                                                                                                                                                                                                                                                                                      |
+| --- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1   | Sawmills/infra         | `stacks/catalog/ecr.yaml`: repository `claudectl-server`                                                                                                                                                                                                                                                                       |
+| 2   | Sawmills/infra         | `stacks/catalog/github-oidc-role/claudectl.yaml` (`gha-claudectl`, `repo:Sawmills/claudectl:ref:refs/heads/main`, ECR push to `claudectl-server` only) and its import in `core/artifacts/global-region/baseline.yaml`                                                                                                          |
+| 3   | Sawmills/infra         | `components/terraform/rds/claudectl` and `stacks/catalog/rds/claudectl.yaml` on the STAGING quota-manager instance: database `claudectl`, a login role (no superuser, createdb, createrole, inherit; connection limit 30), `REVOKE CONNECT, TEMPORARY ON DATABASE claudectl FROM PUBLIC`, SSM `/rds/quota-manager/claudectl/*` |
+| 4   | Sawmills/infra         | `manifests/claudectl/external-secret.yaml` (`claudectl-postgres`) as `eks/claudectl-db-secret`                                                                                                                                                                                                                                 |
+| 5   | Sawmills/argocd-deploy | `plat/ue1-staging/argocd/claudectl-application.yaml` (path `deploy/k8s/overlays/staging`)                                                                                                                                                                                                                                      |
+| 6   | Sawmills/claudectl     | overlay: Deployment, PDB, PreSync migration Job and its NetworkPolicy, RDS CA ConfigMap, ExternalSecrets, ingress `claudectl.ue1.staging.plat.sm-svc.com`, egress 443 and 5432, alerts                                                                                                                                         |
 
 The shared ExternalSecrets IAM grant already covers `app/*` and `rds/*`, so no store change is needed (`eks.yaml:75-79`).
 
