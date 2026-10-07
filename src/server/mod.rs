@@ -5,4 +5,5 @@ pub mod audit;
 pub mod engine;
 pub mod enrollment;
 pub mod fs;
+pub mod store;
 pub mod vault;

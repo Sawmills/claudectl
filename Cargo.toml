@@ -35,10 +35,32 @@ openidconnect = { version = "4", optional = true, default-features = false, feat
   "reqwest",
   "rustls-tls",
 ] }
+deadpool-postgres = { version = "0.14", optional = true }
+tokio-postgres = { version = "0.7", optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true, features = [
+  "ring",
+  "webpki-roots",
+] }
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+  "ring",
+] }
+webpki-roots = { version = "1", optional = true }
 
 [features]
 # The account server binary. The client build never pulls server dependencies.
-server = ["dep:aes-gcm", "dep:axum", "dep:openidconnect", "tokio/net", "tokio/sync", "tokio/signal"]
+server = [
+  "dep:aes-gcm",
+  "dep:axum",
+  "dep:openidconnect",
+  "dep:deadpool-postgres",
+  "dep:tokio-postgres",
+  "dep:tokio-postgres-rustls",
+  "dep:rustls",
+  "dep:webpki-roots",
+  "tokio/net",
+  "tokio/sync",
+  "tokio/signal",
+]
 
 [[bin]]
 name = "claudectl"
