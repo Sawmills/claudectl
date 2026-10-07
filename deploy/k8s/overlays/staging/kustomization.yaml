@@ -9,6 +9,7 @@ resources:
   - sso.yaml
   - monitoring.yaml
 images:
-  # Replace with the digest that the Server image workflow prints, before Argo registration.
+  # The digest the Server image workflow published for main e5a3e8f7 (run 37593292131).
   - name: claudectl-server
     newName: 767398060436.dkr.ecr.us-east-1.amazonaws.com/claudectl-server
+    digest: sha256:5fe720eccc06194cf16bdce0a473a9bc20025d8d02aed8fe9a21c1e25d88be19
