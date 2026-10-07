@@ -90,6 +90,7 @@ fn help_shows_all_subcommands() {
         "remove",
         "whoami",
         "label",
+        "rate",
         "completions",
     ] {
         assert!(stdout.contains(subcommand), "missing {subcommand}");
@@ -355,4 +356,20 @@ fn bash_completions_offer_aliases_only_for_the_alias_argument() {
             .lines()
             .any(|w| w == "work")
     );
+}
+
+#[test]
+fn rate_without_lanes_reports_no_activity() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("claudectl")
+        .unwrap()
+        .args(["rate", "--json"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["version"], 1);
+    assert_eq!(report["window_minutes"], 10);
+    assert_eq!(report["accounts"], serde_json::json!([]));
 }

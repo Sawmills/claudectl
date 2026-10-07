@@ -5,6 +5,7 @@ pub mod label;
 pub mod launcher;
 pub mod list;
 pub mod login;
+pub mod rate;
 pub mod remove;
 pub mod save;
 pub mod status;
