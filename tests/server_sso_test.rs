@@ -366,7 +366,11 @@ async fn a_browser_gets_an_error_page_with_the_same_status() {
             .contains("This link has expired")
     );
     // CLI and API clients keep the exact JSON body and status.
-    for accept in [None, Some("application/json")] {
+    for accept in [
+        None,
+        Some("application/json"),
+        Some("application/json, text/html;q=0"),
+    ] {
         let mut request = f.http.get(format!("{}/enroll?code=UNKNOWN", f.origin));
         if let Some(accept) = accept {
             request = request.header("accept", accept);
