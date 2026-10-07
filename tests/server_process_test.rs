@@ -129,3 +129,32 @@ fn setup_if_absent_keeps_existing_state_for_a_restarted_pod() {
     assert_eq!(machines.len(), 1);
     assert_eq!(machines[0].id, machine);
 }
+
+#[test]
+fn an_operator_revoke_writes_an_audit_line() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let key = root.path().join("key");
+    server()
+        .args(["setup", "--state"])
+        .arg(&state)
+        .arg("--key-file")
+        .arg(&key)
+        .assert()
+        .success();
+    let (machine, _) = claudectl::server::app::register(&state, "amir@sawmills.ai", "mac").unwrap();
+    server()
+        .args(["revoke", "--state"])
+        .arg(&state)
+        .arg("--key-file")
+        .arg(&key)
+        .args(["--machine", &machine])
+        .assert()
+        .success();
+    let events = claudectl::server::audit::read(&state, &key).unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last["operation"], "revoke");
+    assert_eq!(last["machine"], "operator");
+    assert_eq!(last["target"], machine.as_str());
+    assert!(claudectl::server::vault::machines(&state).unwrap()[0].revoked);
+}

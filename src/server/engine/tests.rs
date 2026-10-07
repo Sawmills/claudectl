@@ -703,3 +703,149 @@ async fn a_deleted_account_keeps_no_grant_and_answers_gone_after_restart() {
     assert_eq!(last["machine"], "mac-1");
     task.abort();
 }
+
+#[tokio::test]
+async fn a_migration_stopped_before_its_refresh_shows_no_receipt_until_it_rotates() {
+    let (_root, engine, refreshes, task) = synthetic_provider(3600).await;
+    // A stop after admission, before the forced refresh.
+    let admitted = engine
+        .admit_migration(
+            "person",
+            "work",
+            "m-1",
+            grant_until("migrated", now() + 3_600_000),
+        )
+        .await
+        .unwrap();
+    assert!(engine.receipt("person", "m-1").await.unwrap().is_none());
+    // Even a token request rotates first, so it never hands out the migrated token.
+    let access = engine
+        .acquire("person", &admitted.account_id, None)
+        .await
+        .unwrap();
+    assert_eq!(access.access_token, "successor-0");
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    let receipt = engine
+        .migrate(
+            "person",
+            "machine",
+            "work",
+            "m-1",
+            grant_until("migrated", now() + 3_600_000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.account_id, admitted.account_id);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    assert!(engine.receipt("person", "m-1").await.unwrap().is_some());
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_near_expiry_migration_refreshes_exactly_once() {
+    let (_root, engine, refreshes, task) = synthetic_provider(3600).await;
+    engine
+        .migrate(
+            "person",
+            "machine",
+            "work",
+            "m-1",
+            grant_until("migrated", now() + 240_000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_renewal_started_before_a_delete_cannot_recreate_the_account() {
+    let (_root, engine, _refreshes, task) = synthetic_provider(3600).await;
+    let receipt = engine
+        .admit(
+            "person",
+            "work",
+            "m-1",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let identity = receipt.identity.clone();
+    engine
+        .remove("person", "mac", &receipt.account_id)
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .admit(
+                "person",
+                "work",
+                "renewal",
+                grant_until("renewed", now() + 3_600_000),
+                Some(&identity)
+            )
+            .await
+            .is_err()
+    );
+    assert!(engine.accounts("person").await.is_empty());
+    let error = engine
+        .acquire("person", &receipt.account_id, None)
+        .await
+        .err()
+        .unwrap();
+    assert!(error.downcast_ref::<Gone>().is_some());
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_usage_read_reports_a_failed_refresh_once() {
+    let app = Router::new()
+        .route(
+            "/api/oauth/profile",
+            get(|| async { Json(json!({"account":{"uuid":"a"},"organization":{"uuid":"o"}})) }),
+        )
+        .route(
+            "/token",
+            post(|| async { axum::http::StatusCode::BAD_REQUEST }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let key = root.path().join("key");
+    vault::create_secret(&key, &[22; 32]).unwrap();
+    let engine = Engine::open_at(
+        &root.path().join("store"),
+        &key,
+        Endpoints {
+            api: origin.clone(),
+            token: format!("{origin}/token"),
+        },
+    )
+    .unwrap();
+    let receipt = engine
+        .admit(
+            "person",
+            "work",
+            "m",
+            grant_until("due", now() + 120_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let usage = engine
+        .usage("person", &receipt.account_id, false)
+        .await
+        .unwrap();
+    assert_eq!(usage.error.as_deref(), Some("login_required"));
+    assert_eq!(usage.failure, Some("usage_login_required"));
+    let cached = engine
+        .usage("person", &receipt.account_id, true)
+        .await
+        .unwrap();
+    assert_eq!(cached.failure, None);
+    task.abort();
+}

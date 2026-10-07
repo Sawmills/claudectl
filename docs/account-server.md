@@ -121,7 +121,7 @@ claudectl-server serve --state /data/state --key-file /keys/vault-key \
   --sso-config /configuration/sso.json --metrics-token-file /keys/metrics-token \
   --allow-user person@example.com
 claudectl-server users --state /data/state
-claudectl-server revoke --state /data/state --machine MACHINE_ID
+claudectl-server revoke --state /data/state --key-file /keys/vault-key --machine MACHINE_ID
 claudectl-server audit --state /data/state --key-file /keys/vault-key
 ```
 

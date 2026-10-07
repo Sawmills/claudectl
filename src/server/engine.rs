@@ -99,6 +99,9 @@ struct Record {
     generation: u64,
     phase: Phase,
     admissions: Vec<String>,
+    /// A migrated grant may still exist on other holders until the first refresh.
+    #[serde(default)]
+    rotation_pending: bool,
     /// Set when a delete wins the lock; a waiting request must not persist the record again.
     #[serde(skip)]
     removed: bool,
@@ -272,6 +275,30 @@ impl Engine {
         grant: Grant,
         replacement: Option<&Identity>,
     ) -> Result<Receipt> {
+        self.admit_with(user, alias, migration, grant, replacement, false)
+            .await
+    }
+    /// Admit a grant moved from a machine. Its receipt stays hidden until the first refresh,
+    /// so a client keeps its fence until the copies it leaves behind are stale.
+    pub async fn admit_migration(
+        &self,
+        user: &str,
+        alias: &str,
+        migration: &str,
+        grant: Grant,
+    ) -> Result<Receipt> {
+        self.admit_with(user, alias, migration, grant, None, true)
+            .await
+    }
+    async fn admit_with(
+        &self,
+        user: &str,
+        alias: &str,
+        migration: &str,
+        grant: Grant,
+        replacement: Option<&Identity>,
+        rotation_pending: bool,
+    ) -> Result<Receipt> {
         let alias = store::validate_alias(alias)?;
         store::validate_alias(migration)?;
         grant.validate()?;
@@ -351,6 +378,10 @@ impl Engine {
                 prior = Some(record);
             }
         }
+        // A delete holds the admission lock, so a missing predecessor was deleted.
+        if replacement.is_some() && prior.is_none() {
+            bail!("login renewal target no longer exists; start a new login");
+        }
         let mut old = match prior.as_ref() {
             Some(r) => Some(r.lock().await),
             None => None,
@@ -376,6 +407,7 @@ impl Engine {
             generation,
             phase: Phase::Ready,
             admissions,
+            rotation_pending,
             removed: false,
         };
         self.persist(&record)?;
@@ -397,7 +429,8 @@ impl Engine {
         })
     }
     /// Admit a grant moved from a machine, then refresh once. A single-use refresh token makes
-    /// every copy left on another holder stale. A retry with the same ID returns the receipt.
+    /// every copy left on another holder stale. A retry with the same ID finishes a stopped
+    /// rotation, or returns the receipt.
     pub async fn migrate(
         &self,
         user: &str,
@@ -406,39 +439,33 @@ impl Engine {
         migration: &str,
         grant: Grant,
     ) -> Result<Receipt> {
-        if let Some(receipt) = self.receipt(user, migration).await? {
-            return Ok(receipt);
-        }
-        let admitted = self.admit(user, alias, migration, grant, None).await;
-        let receipt = match admitted {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                self.audit(&audit::Event {
-                    operation: "migrate",
-                    machine,
-                    account: &account_id(user, alias),
-                    result: "refused",
-                    rotated: None,
-                    target: None,
-                })?;
-                return Err(error);
-            }
+        let receipt = match self.admitted(user, migration).await {
+            Some((receipt, false)) => return Ok(receipt),
+            Some((receipt, true)) => receipt,
+            None => match self.admit_migration(user, alias, migration, grant).await {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    self.audit(&audit::Event {
+                        operation: "migrate",
+                        machine,
+                        account: &account_id(user, alias),
+                        result: "refused",
+                        rotated: None,
+                        target: None,
+                    })?;
+                    return Err(error);
+                }
+            },
         };
-        let current = self
+        // The token request rotates a pending record before it returns anything.
+        let rotated = self
             .acquire_for(user, machine, &receipt.account_id, None)
             .await;
-        let refreshed = match current {
-            Ok(current) => {
-                self.acquire_for(user, machine, &receipt.account_id, Some(&current.revision))
-                    .await
-            }
-            Err(error) => Err(error),
-        };
         self.audit(&audit::Event {
             operation: "migrate",
             machine,
             account: &receipt.account_id,
-            result: if refreshed.is_ok() {
+            result: if rotated.is_ok() {
                 "ok"
             } else {
                 "admitted_refresh_failed"
@@ -446,8 +473,26 @@ impl Engine {
             rotated: None,
             target: None,
         })?;
-        refreshed?;
+        rotated?;
         Ok(receipt)
+    }
+    /// The receipt for an admission ID and whether its rotation is still pending.
+    async fn admitted(&self, user: &str, migration: &str) -> Option<(Receipt, bool)> {
+        let records: Vec<_> = self.records.read().await.values().cloned().collect();
+        for record in records {
+            let record = record.lock().await;
+            if record.user == user && record.admissions.iter().any(|id| id == migration) {
+                return Some((
+                    Receipt {
+                        account_id: record.id.clone(),
+                        identity: record.identity.clone(),
+                        migration_id: migration.into(),
+                    },
+                    record.rotation_pending,
+                ));
+            }
+        }
+        None
     }
     async fn selected(&self, user: &str, id: &str) -> Result<Arc<Mutex<Record>>> {
         let record = self.records.read().await.get(id).cloned();
@@ -468,19 +513,13 @@ impl Engine {
         }
         Ok(record)
     }
+    /// A completed admission. A migration counts only after its rotation.
     pub async fn receipt(&self, user: &str, migration: &str) -> Result<Option<Receipt>> {
-        let records: Vec<_> = self.records.read().await.values().cloned().collect();
-        for record in records {
-            let record = record.lock().await;
-            if record.user == user && record.admissions.iter().any(|id| id == migration) {
-                return Ok(Some(Receipt {
-                    account_id: record.id.clone(),
-                    identity: record.identity.clone(),
-                    migration_id: migration.into(),
-                }));
-            }
-        }
-        Ok(None)
+        Ok(self
+            .admitted(user, migration)
+            .await
+            .filter(|(_, pending)| !pending)
+            .map(|(receipt, _)| receipt))
     }
     async fn verify_successor(&self, record: &mut Record) -> Result<()> {
         record.grant.validate()?;
@@ -559,6 +598,7 @@ impl Engine {
         };
         grant.validate()?;
         record.grant = grant;
+        record.rotation_pending = false;
         record.revision = revision();
         record.generation = record
             .generation
@@ -586,6 +626,8 @@ impl Engine {
     /// Delete an account and its sealed grant. Access tokens already given out stay valid
     /// until they expire; the server stops renewing them now.
     pub async fn remove(&self, user: &str, machine: &str, id: &str) -> Result<()> {
+        // Serialize with admission, so a renewal in flight cannot recreate the account.
+        let _admission = self.admissions.lock().await;
         let selected = self.selected(user, id).await?;
         let mut record = selected.lock().await;
         if record.removed {
@@ -636,8 +678,9 @@ impl Engine {
         if record.phase != Phase::Ready {
             bail!("refresh outcome uncertain; login renewal or reconciliation required");
         }
-        let refresh =
-            record.grant.expires_at <= now() + MARGIN || previous == Some(record.revision.as_str());
+        let refresh = record.rotation_pending
+            || record.grant.expires_at <= now() + MARGIN
+            || previous == Some(record.revision.as_str());
         if refresh {
             let outcome = self.refresh(&mut record).await;
             self.audit(&audit::Event {

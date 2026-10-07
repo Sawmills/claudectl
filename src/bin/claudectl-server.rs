@@ -48,6 +48,8 @@ enum Commands {
         #[arg(long)]
         state: PathBuf,
         #[arg(long)]
+        key_file: PathBuf,
+        #[arg(long)]
         machine: String,
     },
     /// Decrypt and print the audit log
@@ -127,7 +129,11 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
-        Commands::Revoke { state, machine } => app::revoke(&state, &machine)?,
+        Commands::Revoke {
+            state,
+            key_file,
+            machine,
+        } => app::revoke(&state, &key_file, &machine)?,
         Commands::Audit { state, key_file } => {
             for event in claudectl::server::audit::read(&state, &key_file)? {
                 println!("{event}");

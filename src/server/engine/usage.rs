@@ -7,6 +7,9 @@ pub struct Usage {
     pub next_retry_at: i64,
     pub stale: bool,
     pub error: Option<String>,
+    /// Set only on the response to a fresh attempt that failed; never cached.
+    #[serde(skip)]
+    pub failure: Option<&'static str>,
 }
 #[derive(Default, Serialize, Deserialize)]
 pub(super) struct UsageState {
@@ -34,6 +37,7 @@ impl Engine {
             Err(_) => {
                 result.error = Some("login_required".into());
                 result.stale = true;
+                result.failure = Some("usage_login_required");
                 return Ok(result);
             }
         };
@@ -124,7 +128,16 @@ impl Engine {
             }
             Err(_) => result.error = Some("usage_unavailable".into()),
         }
-        state.accounts.insert(id.into(), result.clone());
+        state.accounts.insert(
+            id.into(),
+            Usage {
+                failure: None,
+                ..result.clone()
+            },
+        );
+        if result.error.is_some() {
+            result.failure = Some("usage_failed");
+        }
         store::atomic_write(
             &self.state.join("usage.json"),
             &serde_json::to_vec(&*state)?,

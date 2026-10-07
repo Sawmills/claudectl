@@ -126,15 +126,30 @@ pub fn register(state: &Path, email: &str, name: &str) -> Result<(String, String
     add_machine(state, &id, name)
 }
 
-pub fn revoke(state: &Path, machine: &str) -> Result<()> {
-    let _lock = vault::registry_lock(state, "registry.lock")?;
-    let mut machines = vault::machines(state)?;
-    machines
-        .iter_mut()
-        .find(|m| m.id == machine)
-        .context("machine not found")?
-        .revoked = true;
-    vault::save_machines(state, &machines)
+/// Revoke a machine from the server host, with an audit line.
+pub fn revoke(state: &Path, key: &Path, machine: &str) -> Result<()> {
+    {
+        let _lock = vault::registry_lock(state, "registry.lock")?;
+        let mut machines = vault::machines(state)?;
+        machines
+            .iter_mut()
+            .find(|m| m.id == machine)
+            .context("machine not found")?
+            .revoked = true;
+        vault::save_machines(state, &machines)?;
+    }
+    audit::record(
+        state,
+        key,
+        &audit::Event {
+            operation: "revoke",
+            machine: "operator",
+            account: "-",
+            result: "ok",
+            rotated: None,
+            target: Some(machine),
+        },
+    )
 }
 
 impl Server {
@@ -170,6 +185,11 @@ impl Server {
         }))
     }
     pub(super) fn error(&self, status: StatusCode, reason: &'static str) -> HttpError {
+        self.record_failure(status, reason);
+        HttpError { status, reason }
+    }
+    /// Count one failed attempt and log it. The request itself may still succeed.
+    fn record_failure(&self, status: StatusCode, reason: &'static str) {
         {
             let mut failures = self.failures.lock().expect("metrics lock");
             let failure = failures.entry(reason).or_default();
@@ -180,7 +200,6 @@ impl Server {
             "{}",
             json!({"operation":"request","stage":"http","reason":reason,"status":status.as_u16()})
         );
-        HttpError { status, reason }
     }
     pub(super) fn allowed(&self, email: &str) -> bool {
         self.allowed.iter().any(|a| a.eq_ignore_ascii_case(email))
@@ -452,6 +471,9 @@ async fn usage(
         })
         .await?
         .map_err(|e| server.engine_error(&e, "usage_unavailable"))?;
+    if let Some(reason) = result.failure {
+        server.record_failure(StatusCode::SERVICE_UNAVAILABLE, reason);
+    }
     server.authorize(&headers)?;
     Ok(private(result))
 }
