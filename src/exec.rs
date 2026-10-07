@@ -852,10 +852,16 @@ fn run_in_dir(
     map_token_fd(&mut command, &reader);
 
     // The child gets its own process group, so cancellation and teardown
-    // reach its descendants and every signal reaches it exactly once, through
-    // claudectl. `exec` is for non-interactive runs; a child in a background
-    // group that reads the terminal is stopped by the terminal driver.
+    // reach its descendants and every signal reaches it exactly once. When
+    // claudectl owns the terminal foreground at the spawn, the child's group
+    // takes it, as a shell job does: terminal keys (Ctrl-C, Ctrl-Z) and
+    // window size changes then go to the child directly, and claudectl gets
+    // the foreground back when the child exits.
     set_process_group(&mut command);
+    let terminal = foreground::is_terminal();
+    if terminal {
+        take_foreground(&mut command);
+    }
 
     let spawned = {
         // Hold the lock from the final ownership check through the spawn, so
@@ -886,6 +892,10 @@ fn run_in_dir(
             let spawned = command.spawn();
             if spawned.is_err() {
                 signals::unblock();
+                if terminal && foreground::owned_by_gone_group() {
+                    // The child took the foreground before its exec failed.
+                    foreground::reclaim();
+                }
             }
             Ok(spawned)
         });
@@ -918,6 +928,9 @@ fn run_in_dir(
         }
     };
     let pid = child.id();
+    // Interactive only if the child really took the foreground: claudectl
+    // may have been stopped and resumed with `bg` before the spawn.
+    let interactive = terminal && i32::try_from(pid).is_ok_and(foreground::owned_by);
     // Held signals are released here and forwarded once, with their own
     // numbers, now that the child is registered.
     signals::watch(pid);
@@ -928,7 +941,12 @@ fn run_in_dir(
     // Wait for the exit without reaping. While the child is an unreaped
     // zombie its PID stays reserved, so every signal to its process group,
     // through the final SIGKILL, can only reach this run's processes.
-    let waited = wait_exit_no_reap(pid);
+    let waited = wait_exit_no_reap(pid, interactive);
+    // Take the terminal back only from this run's child. After Ctrl-Z and
+    // `bg` the shell owns it, and a background claudectl must not take it.
+    if interactive && i32::try_from(pid).is_ok_and(foreground::owned_by) {
+        foreground::reclaim();
+    }
     let descendants = if waited.is_ok() {
         teardown_group(pid)
     } else {
@@ -1005,7 +1023,7 @@ fn teardown_group(leader: u32) -> Descendants {
         Err(_) => {
             // Membership is unknown, but the leader is still reserved, so
             // signalling its group is safe. Tear down blind and say so.
-            terminate(leader, SIGTERM);
+            ask_to_exit(leader);
             std::thread::sleep(Duration::from_secs(2));
             terminate(leader, SIGKILL);
             return Descendants::Unverified;
@@ -1014,7 +1032,7 @@ fn teardown_group(leader: u32) -> Descendants {
     if members.is_empty() {
         return Descendants::None;
     }
-    terminate(leader, SIGTERM);
+    ask_to_exit(leader);
     match wait_descendants_gone(leader, Duration::from_secs(2)) {
         Remaining::Gone => return Descendants::Terminated,
         Remaining::ListingFailed => {
@@ -1173,22 +1191,32 @@ fn descendants_in_group(_leader: u32) -> std::io::Result<Vec<i32>> {
     Ok(Vec::new())
 }
 
+/// Wait until the child exits, without reaping it. For an interactive child,
+/// a stop (Ctrl-Z) also suspends claudectl, as its shell job.
 #[cfg(unix)]
-fn wait_exit_no_reap(pid: u32) -> std::io::Result<()> {
+fn wait_exit_no_reap(pid: u32, interactive: bool) -> std::io::Result<()> {
+    let flags = if interactive {
+        libc::WEXITED | libc::WSTOPPED | libc::WNOWAIT
+    } else {
+        libc::WEXITED | libc::WNOWAIT
+    };
     loop {
         // SAFETY: waitid writes only into `info`; WNOWAIT leaves the child
         // reapable by Child::wait.
-        let result = unsafe {
+        let (result, code) = unsafe {
             let mut info: libc::siginfo_t = std::mem::zeroed();
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
+            let result = libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags);
+            (result, info.si_code)
         };
         if result == 0 {
-            return Ok(());
+            match code {
+                libc::CLD_STOPPED if interactive => suspend_with(pid),
+                // macOS reports a stop even without WSTOPPED. A stopped
+                // child has not exited: wait until someone continues it.
+                libc::CLD_STOPPED => std::thread::sleep(Duration::from_millis(100)),
+                _ => return Ok(()),
+            }
+            continue;
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::Interrupted {
@@ -1197,8 +1225,65 @@ fn wait_exit_no_reap(pid: u32) -> std::io::Result<()> {
     }
 }
 
+/// The child stopped. Take the foreground back, stop claudectl's shell job
+/// as the terminal would, and when claudectl is continued, continue the
+/// child, in the foreground again if claudectl was resumed there (`fg`).
+#[cfg(unix)]
+fn suspend_with(leader: u32) {
+    let Ok(leader) = i32::try_from(leader) else {
+        return;
+    };
+    if foreground::owned_by(leader) {
+        foreground::reclaim();
+    }
+    stop_job();
+    if foreground::owned() {
+        let _ = foreground::give(leader);
+    }
+    // SAFETY: kill only sends a signal to the child's group.
+    unsafe { libc::kill(-leader, libc::SIGCONT) };
+}
+
+/// Set by the SIGCONT handler while `stop_job` waits.
+#[cfg(unix)]
+static CONTINUED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn note_continued(_signal: libc::c_int) {
+    CONTINUED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Stop claudectl's shell job (a pipeline shares claudectl's group) as the
+/// terminal would, and return once claudectl is continued. The SIGTSTP can go
+/// to another thread of claudectl and leave this one running for a moment, so
+/// this thread waits for the SIGCONT. The kernel discards SIGTSTP for an
+/// orphaned group; then no SIGCONT comes, and the wait ends after a bound.
+#[cfg(unix)]
+fn stop_job() {
+    use std::sync::atomic::Ordering;
+    CONTINUED.store(false, Ordering::SeqCst);
+    // SAFETY: installs a handler that only stores an atomic, saves the
+    // previous action, and restores it below; kill only sends a signal.
+    let previous = unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = note_continued as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        let mut previous: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGCONT, &action, &mut previous);
+        libc::kill(0, libc::SIGTSTP);
+        previous
+    };
+    let started = std::time::Instant::now();
+    while !CONTINUED.load(Ordering::SeqCst) && started.elapsed() < Duration::from_millis(250) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // SAFETY: restores the SIGCONT action saved above.
+    unsafe { libc::sigaction(libc::SIGCONT, &previous, std::ptr::null_mut()) };
+}
+
 #[cfg(not(unix))]
-fn wait_exit_no_reap(_pid: u32) -> std::io::Result<()> {
+fn wait_exit_no_reap(_pid: u32, _interactive: bool) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1206,10 +1291,14 @@ fn wait_exit_no_reap(_pid: u32) -> std::io::Result<()> {
 const SIGTERM: i32 = libc::SIGTERM;
 #[cfg(unix)]
 const SIGKILL: i32 = libc::SIGKILL;
+#[cfg(unix)]
+const SIGCONT: i32 = libc::SIGCONT;
 #[cfg(not(unix))]
 const SIGTERM: i32 = 15;
 #[cfg(not(unix))]
 const SIGKILL: i32 = 9;
+#[cfg(not(unix))]
+const SIGCONT: i32 = 18;
 
 /// Signal the child's whole process group. Returns whether any process
 /// received the signal.
@@ -1227,6 +1316,13 @@ fn terminate(_leader: u32, _signal: i32) -> bool {
     false
 }
 
+/// SIGTERM to the child's group, then SIGCONT, because a stopped process
+/// acts on SIGTERM only after it is continued.
+fn ask_to_exit(leader: u32) {
+    terminate(leader, SIGTERM);
+    terminate(leader, SIGCONT);
+}
+
 #[cfg(unix)]
 fn set_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -1235,6 +1331,129 @@ fn set_process_group(command: &mut Command) {
 
 #[cfg(not(unix))]
 fn set_process_group(_command: &mut Command) {}
+
+/// Make the child's new group the terminal foreground before it runs, if
+/// claudectl's group owns the foreground at that moment. Rust runs this
+/// after the child's setpgid, and spawn returns only after the exec, so the
+/// child owns the foreground from its first instruction.
+///
+/// Known limit: a Ctrl-Z in the microseconds between this handoff and the
+/// exec stops the forked child while claudectl still waits inside spawn, so
+/// the shell cannot resume the job with `fg`. `kill -CONT <child pid>`
+/// recovers: the child execs and keeps the foreground. Ctrl-C does not,
+/// because the child still has claudectl's SIGINT handler until the exec.
+#[cfg(unix)]
+fn take_foreground(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: getpgrp only reads process state.
+    let claudectl_group = unsafe { libc::getpgrp() };
+    // SAFETY: runs in the forked child; tcgetpgrp, getpid and
+    // foreground::give use only async-signal-safe calls.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::tcgetpgrp(libc::STDIN_FILENO) == claudectl_group {
+                foreground::give(libc::getpid())?;
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn take_foreground(_command: &mut Command) {}
+
+/// The terminal foreground on stdin, handed between claudectl and an
+/// interactive child as a shell hands it to a job.
+#[cfg(unix)]
+mod foreground {
+    /// Whether stdin is a terminal with a foreground group.
+    pub fn is_terminal() -> bool {
+        // SAFETY: tcgetpgrp only reads terminal state.
+        unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) != -1 }
+    }
+
+    /// Whether claudectl's group owns the foreground. A stdin that is not a
+    /// terminal (tcgetpgrp fails) is not interactive.
+    pub fn owned() -> bool {
+        // SAFETY: getpgrp only reads process state.
+        owned_by(unsafe { libc::getpgrp() })
+    }
+
+    /// Whether the group `group` owns the foreground.
+    pub fn owned_by(group: libc::pid_t) -> bool {
+        // SAFETY: tcgetpgrp only reads terminal state.
+        let foreground = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+        foreground != -1 && foreground == group
+    }
+
+    /// Whether the foreground belongs to a group with no live process, as
+    /// after a child that took it failed its exec.
+    pub fn owned_by_gone_group() -> bool {
+        // SAFETY: tcgetpgrp and getpgrp only read state; kill with signal 0
+        // only checks that the group exists.
+        unsafe {
+            let foreground = libc::tcgetpgrp(libc::STDIN_FILENO);
+            foreground > 0
+                && foreground != libc::getpgrp()
+                && libc::kill(-foreground, 0) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        }
+    }
+
+    /// Make `group` the foreground. SIGTTOU is blocked for the call, so a
+    /// caller outside the foreground group is not stopped, and the previous
+    /// signal mask is restored. Async-signal-safe.
+    pub fn give(group: libc::pid_t) -> std::io::Result<()> {
+        // SAFETY: changes only this thread's signal mask, and restores it.
+        unsafe {
+            let mut ttou: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut ttou);
+            libc::sigaddset(&mut ttou, libc::SIGTTOU);
+            let mut saved: libc::sigset_t = std::mem::zeroed();
+            let blocked = libc::pthread_sigmask(libc::SIG_BLOCK, &ttou, &mut saved);
+            if blocked != 0 {
+                return Err(std::io::Error::from_raw_os_error(blocked));
+            }
+            let result = libc::tcsetpgrp(libc::STDIN_FILENO, group);
+            let error = std::io::Error::last_os_error();
+            libc::pthread_sigmask(libc::SIG_SETMASK, &saved, std::ptr::null_mut());
+            if result == -1 { Err(error) } else { Ok(()) }
+        }
+    }
+
+    /// Take the foreground back for claudectl. After a hangup the terminal is
+    /// gone; that changes nothing for the run's result or its cleanup.
+    pub fn reclaim() {
+        // SAFETY: getpgrp only reads process state.
+        let Err(error) = give(unsafe { libc::getpgrp() }) else {
+            return;
+        };
+        let hung_up = matches!(
+            error.raw_os_error(),
+            Some(libc::EIO | libc::ENOTTY | libc::ENXIO)
+        );
+        if !hung_up {
+            eprintln!("claudectl exec: cannot take the terminal back: {error}");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod foreground {
+    pub fn is_terminal() -> bool {
+        false
+    }
+    pub fn owned() -> bool {
+        false
+    }
+    pub fn owned_by(_group: i32) -> bool {
+        false
+    }
+    pub fn owned_by_gone_group() -> bool {
+        false
+    }
+    pub fn reclaim() {}
+}
 
 fn snapshot_executable(program: &Path, config_dir: &Path) -> Result<PathBuf, ExecError> {
     let dir = config_dir.join("bin");
@@ -1321,12 +1540,23 @@ pub mod signals {
             .map_or(0, |index| 1 << index)
     }
 
+    /// Send `signal` to the child's group. A stopped process acts on a
+    /// handled signal only after it is continued, so SIGCONT follows.
+    /// Async-signal-safe.
+    fn send(pid: i32, signal: libc::c_int) {
+        // SAFETY: kill is async-signal-safe. The child leads its own process
+        // group, so this reaches its descendants too.
+        unsafe {
+            libc::kill(-pid, signal);
+            libc::kill(-pid, libc::SIGCONT);
+        }
+    }
+
     /// Forward every signal whose bit is set in `bits`.
     fn forward_bits(pid: i32, bits: i32) {
         for signal in SIGNALS {
             if bits & bit(signal) != 0 {
-                // SAFETY: kill is async-signal-safe.
-                unsafe { libc::kill(-pid, signal) };
+                send(pid, signal);
             }
         }
     }
@@ -1335,9 +1565,7 @@ pub mod signals {
         IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
         let pid = CHILD.load(Ordering::SeqCst);
         if pid > 0 {
-            // SAFETY: kill is async-signal-safe. The child leads its own
-            // process group, so this reaches its descendants too.
-            unsafe { libc::kill(-pid, signal) };
+            send(pid, signal);
         } else {
             let mine = bit(signal);
             PENDING.fetch_or(mine, Ordering::SeqCst);
