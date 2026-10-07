@@ -883,7 +883,7 @@ fn run_in_dir(
         take_foreground(&mut command);
     }
 
-    let spawned = {
+    let (spawned, suspended_before_exec) = {
         // Hold the lock from the final ownership check through the spawn, so
         // no `use` can make this grant live in between.
         let lock = lock_with_retry(store);
@@ -913,7 +913,7 @@ fn run_in_dir(
             // window must still suspend the job.
             let watchdog = terminal.then(SpawnWatchdog::start);
             let spawned = command.spawn();
-            drop(watchdog);
+            let suspended = watchdog.is_some_and(SpawnWatchdog::finish);
             if spawned.is_err() {
                 signals::unblock();
                 if terminal && foreground::owned_by_gone_group() {
@@ -921,10 +921,10 @@ fn run_in_dir(
                     foreground::reclaim();
                 }
             }
-            Ok(spawned)
+            Ok((spawned, suspended))
         });
         match checked {
-            Ok(spawned) => spawned,
+            Ok(result) => result,
             Err(error) => {
                 receipt.write(&with(
                     base,
@@ -953,8 +953,10 @@ fn run_in_dir(
     };
     let pid = child.id();
     // Interactive only if the child really took the foreground: claudectl
-    // may have been stopped and resumed with `bg` before the spawn.
-    let interactive = terminal && i32::try_from(pid).is_ok_and(foreground::owned_by);
+    // may have been stopped and resumed with `bg` before the spawn. A child
+    // the watchdog suspended took it, even if `bg` resumed it since.
+    let interactive =
+        terminal && (suspended_before_exec || i32::try_from(pid).is_ok_and(foreground::owned_by));
     // Held signals are released here and forwarded once, with their own
     // numbers, now that the child is registered.
     signals::watch(pid);
@@ -1276,7 +1278,8 @@ fn suspend_with(leader: u32) {
 #[cfg(unix)]
 struct SpawnWatchdog {
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    /// Returns whether it suspended the job for the child.
+    thread: Option<std::thread::JoinHandle<bool>>,
 }
 
 #[cfg(unix)]
@@ -1290,12 +1293,15 @@ impl SpawnWatchdog {
         let thread = {
             let done = done.clone();
             std::thread::spawn(move || {
+                let mut suspended = false;
                 while !done.load(Ordering::SeqCst) {
                     if let Some(pid) = stopped_foreground_child() {
                         suspend_with(pid);
+                        suspended = true;
                     }
                     std::thread::sleep(Self::POLL);
                 }
+                suspended
             })
         };
         Self {
@@ -1303,15 +1309,25 @@ impl SpawnWatchdog {
             thread: Some(thread),
         }
     }
+
+    /// Stop watching once spawn has returned. Returns whether the watchdog
+    /// suspended the job for the child.
+    fn finish(mut self) -> bool {
+        self.stop()
+    }
+
+    fn stop(&mut self) -> bool {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.thread
+            .take()
+            .is_some_and(|thread| thread.join().unwrap_or(false))
+    }
 }
 
 #[cfg(unix)]
 impl Drop for SpawnWatchdog {
     fn drop(&mut self) {
-        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.stop();
     }
 }
 
@@ -1347,6 +1363,10 @@ struct SpawnWatchdog;
 impl SpawnWatchdog {
     fn start() -> Self {
         Self
+    }
+
+    fn finish(self) -> bool {
+        false
     }
 }
 

@@ -2581,28 +2581,7 @@ printf '%s' "$line" > "$out/line""#,
         "fg",
         &[("CLAUDECTL_TEST_PRE_EXEC_PAUSE_MS", "3000")],
     );
-    // The forked child owns the terminal and has not run its exec yet: the
-    // foreground left claudectl's group, and the child script did not start.
-    let started = std::time::Instant::now();
-    let in_window = || {
-        let helper = read_out(&out, "helper_pid");
-        let foreground = std::process::Command::new("ps")
-            .args(["-o", "pgid=,tpgid=", "-p", helper.trim()])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        let ids: Vec<&str> = foreground.split_whitespace().collect();
-        matches!(ids.as_slice(), [pgid, tpgid] if pgid != tpgid && *tpgid != "-1")
-            && !out.join("pid").exists()
-    };
-    while !in_window() && started.elapsed() < LIMIT {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        in_window(),
-        "the child never reached the window: {}",
-        job.transcript()
-    );
+    wait_for_pre_exec_window(&out, &job);
     job.type_text(b"\x1a");
     assert!(
         wait_for(&out.join("job_status"), LIMIT),
@@ -2629,6 +2608,83 @@ printf '%s' "$line" > "$out/line""#,
         [stopped.as_str(), "0"]
     );
     assert_eq!(read_out(&out, "line"), "after");
+}
+
+/// Poll until the forked child owns the terminal and has not run its exec:
+/// the foreground left claudectl's group, and the child script did not start.
+#[cfg(unix)]
+fn wait_for_pre_exec_window(out: &Path, job: &PtyJob) {
+    let in_window = || {
+        let helper = read_out(out, "helper_pid");
+        let ids = std::process::Command::new("ps")
+            .args(["-o", "pgid=,tpgid=", "-p", helper.trim()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let ids: Vec<&str> = ids.split_whitespace().collect();
+        matches!(ids.as_slice(), [pgid, tpgid] if pgid != tpgid && *tpgid != "-1")
+            && !out.join("pid").exists()
+    };
+    let started = std::time::Instant::now();
+    while !in_window() && started.elapsed() < LIMIT {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        in_window(),
+        "the child never reached the window: {}",
+        job.transcript()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_stopped_before_its_exec_and_resumed_with_bg_still_suspends_the_job() {
+    if !Path::new(STOP_SHELL).exists() {
+        eprintln!(
+            "skipped: {STOP_SHELL} is missing, and no other shell is known to see a job stop"
+        );
+        return;
+    }
+    let _guard = run_guard();
+    let (home, out) = tty_child_setup(
+        r#"echo ready > "$out/ready"
+IFS= read -r line"#,
+    );
+    let mut job = PtyJob::start_resuming(
+        home.path(),
+        "one",
+        &out,
+        "bg",
+        &[("CLAUDECTL_TEST_PRE_EXEC_PAUSE_MS", "3000")],
+    );
+    wait_for_pre_exec_window(&out, &job);
+    job.type_text(b"\x1a");
+    assert!(
+        wait_for(&out.join("in_background"), LIMIT),
+        "the job did not stop: {}",
+        job.transcript()
+    );
+    // In the background the child runs its exec, reads the terminal and
+    // stops on SIGTTIN; claudectl must stop its job again. dash's `wait` (no
+    // operand) returns, with status 0, only once no job runs.
+    let started = std::time::Instant::now();
+    while read_out(&out, "job_status").lines().count() < 2 && started.elapsed() < LIMIT {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let statuses = read_out(&out, "job_status");
+    let transcript = job.transcript();
+    for file in ["pid", "helper_pid"] {
+        if let Ok(pid) = read_out(&out, file).trim().parse::<i32>() {
+            // SAFETY: kill only sends a signal.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+    }
+    let stopped = (128 + libc::SIGTSTP).to_string();
+    assert_eq!(
+        statuses.lines().collect::<Vec<_>>(),
+        [stopped.as_str(), "0"],
+        "the job did not stop again on the background read: {transcript}"
+    );
 }
 
 #[cfg(unix)]
