@@ -20,7 +20,15 @@ const AMIR: &str = "amir@sawmills.ai";
 struct Running {
     origin: String,
     refreshes: Arc<AtomicUsize>,
-    _runtime: tokio::runtime::Runtime,
+    server: Arc<app::Server>,
+    runtime: tokio::runtime::Runtime,
+}
+impl Running {
+    fn register(&self, name: &str) -> (String, String) {
+        self.runtime
+            .block_on(app::register(self.server.store(), AMIR, name))
+            .unwrap()
+    }
 }
 
 fn start(state: &Path, key: &Path) -> Running {
@@ -31,7 +39,7 @@ fn start(state: &Path, key: &Path) -> Running {
         .unwrap();
     let refreshes = Arc::new(AtomicUsize::new(0));
     let counter = refreshes.clone();
-    let origin = runtime.block_on(async {
+    let (origin, server) = runtime.block_on(async {
         let provider = Router::new()
             .route(
                 "/api/oauth/profile",
@@ -50,7 +58,7 @@ fn start(state: &Path, key: &Path) -> Running {
         let api = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
         let server = app::Server::open(app::Config {
-            state: state.into(),
+            store: app::StoreConfig::File(state.into()),
             key: key.into(),
             allowed_users: vec![AMIR.into()],
             sso: None,
@@ -64,13 +72,15 @@ fn start(state: &Path, key: &Path) -> Running {
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app::router(server)).await.unwrap() });
-        origin
+        let router = app::router(server.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (origin, server)
     });
     Running {
         origin,
         refreshes,
-        _runtime: runtime,
+        server,
+        runtime,
     }
 }
 
@@ -127,9 +137,9 @@ fn a_machine_lists_refreshes_removes_and_revokes_through_the_server() {
     let state = root.path().join("state");
     let key = root.path().join("key");
     app::setup(&state, &key).unwrap();
-    let (_mac_id, mac) = app::register(&state, AMIR, "mac").unwrap();
-    let (devbox_id, devbox) = app::register(&state, AMIR, "devbox").unwrap();
     let server = start(&state, &key);
+    let (_mac_id, mac) = server.register("mac");
+    let (devbox_id, devbox) = server.register("devbox");
     let expires_at = chrono::Utc::now().timestamp_millis() + 3_600_000;
     let receipt: serde_json::Value = reqwest::blocking::Client::new()
         .post(format!("{}/v2/anthropic/migrations", server.origin))

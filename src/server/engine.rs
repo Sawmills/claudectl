@@ -197,7 +197,10 @@ macro_rules! marker_error {
 }
 marker_error!(Gone, "server account was deleted");
 marker_error!(NotFound, "server account not found");
-marker_error!(RefreshInProgress, "another replica is refreshing this account; retry");
+marker_error!(
+    RefreshInProgress,
+    "another replica is refreshing this account; retry"
+);
 
 pub struct Engine {
     store: Arc<Store>,
@@ -215,7 +218,7 @@ impl Engine {
             store::FileStore::create(state, key)?;
         }
         Self::with_store(
-            Arc::new(Store::File(store::FileStore::open(state, key)?)),
+            Arc::new(Store::File(Box::new(store::FileStore::open(state, key)?))),
             key,
             endpoints,
         )
@@ -269,16 +272,15 @@ impl Engine {
         }
     }
     /// Write `record` over `loaded` under the lease. False when the fence or revision moved.
-    async fn put(
-        &self,
-        loaded: &mut Loaded,
-        record: Record,
-        fence: Fence<'_>,
-    ) -> Result<()> {
+    async fn put(&self, loaded: &mut Loaded, record: Record, fence: Fence<'_>) -> Result<()> {
         let mut row = loaded.row.clone();
         row.revision = loaded.row.revision + 1;
         row.sealed = self.seal(&record)?;
-        if !self.store.put_account(&row, loaded.row.revision, fence).await? {
+        if !self
+            .store
+            .put_account(&row, loaded.row.revision, fence)
+            .await?
+        {
             bail!("the account changed or the refresh lease was lost; no token issued");
         }
         loaded.row = row;
@@ -457,7 +459,12 @@ impl Engine {
         admissions.push(migration.into());
         let generation = prior
             .as_ref()
-            .map(|p| p.record.generation.checked_add(1).context("generation overflow"))
+            .map(|p| {
+                p.record
+                    .generation
+                    .checked_add(1)
+                    .context("generation overflow")
+            })
             .transpose()?
             .unwrap_or(1);
         let record = Record {
@@ -621,8 +628,9 @@ impl Engine {
             .retained
             .clone()
             .context("refresh outcome uncertain; login renewal required")?;
-        let next: Response = serde_json::from_slice(&retained.body)
-            .map_err(|_| anyhow::anyhow!("refresh response invalid; retained for reconciliation"))?;
+        let next: Response = serde_json::from_slice(&retained.body).map_err(|_| {
+            anyhow::anyhow!("refresh response invalid; retained for reconciliation")
+        })?;
         let expiry = next
             .expires_in
             .checked_mul(1000)
@@ -630,10 +638,15 @@ impl Engine {
             .filter(|_| next.expires_in > 0)
             .context("refresh expiry invalid")?;
         let old = &loaded.record.grant;
-        let rotated = next.refresh_token.as_ref().is_some_and(|t| *t != old.refresh_token);
+        let rotated = next
+            .refresh_token
+            .as_ref()
+            .is_some_and(|t| *t != old.refresh_token);
         let grant = Grant {
             access_token: next.access_token,
-            refresh_token: next.refresh_token.unwrap_or_else(|| old.refresh_token.clone()),
+            refresh_token: next
+                .refresh_token
+                .unwrap_or_else(|| old.refresh_token.clone()),
             expires_at: expiry,
             scopes: next
                 .scope
@@ -644,7 +657,10 @@ impl Engine {
         let mut record = loaded.record.clone();
         record.grant = grant;
         record.revision = revision();
-        record.generation = record.generation.checked_add(1).context("generation overflow")?;
+        record.generation = record
+            .generation
+            .checked_add(1)
+            .context("generation overflow")?;
         record.phase = Phase::Unverified;
         self.put(loaded, record, Fence::Live(lease)).await?;
         Ok(rotated)
@@ -699,7 +715,10 @@ impl Engine {
             return Ok(loaded);
         }
         let outcome = match loaded.record.phase {
-            Phase::Unverified => self.verify_successor(lease, &mut loaded).await.map(|()| None),
+            Phase::Unverified => self
+                .verify_successor(lease, &mut loaded)
+                .await
+                .map(|()| None),
             Phase::Refreshing if loaded.record.retained.is_some() => {
                 match self.adopt(lease, &mut loaded).await {
                     Ok(rotated) => self

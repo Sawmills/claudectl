@@ -129,8 +129,7 @@ impl FileStore {
     pub fn admit(&self, admission: &Admission) -> Result<AdmitOutcome> {
         let a = &admission.account;
         self.transact(|t| {
-            if t
-                .tombstones
+            if t.tombstones
                 .get(&a.id)
                 .is_some_and(|(_, _, deleted_at)| *deleted_at >= admission.started_at)
             {
@@ -319,7 +318,11 @@ impl FileStore {
     pub fn set_user_enabled(&self, email: &str, enabled: bool) -> Result<bool> {
         self.transact(|t| {
             let mut found = false;
-            for user in t.users.iter_mut().filter(|u| u.email.eq_ignore_ascii_case(email)) {
+            for user in t
+                .users
+                .iter_mut()
+                .filter(|u| u.email.eq_ignore_ascii_case(email))
+            {
                 user.enabled = enabled;
                 found = true;
             }
@@ -377,7 +380,8 @@ impl FileStore {
                         && r.expires_at > now
                 })
                 .and_then(|(slot, r)| {
-                    slot.split_once('\u{1f}').map(|(_, key)| (key.to_owned(), r.clone()))
+                    slot.split_once('\u{1f}')
+                        .map(|(_, key)| (key.to_owned(), r.clone()))
                 })
         }))
     }

@@ -77,7 +77,7 @@ impl IntoResponse for HttpError {
 /// Open a store. A database must already have this binary's schema (run `migrate`).
 pub async fn open_store(config: &StoreConfig, key: &Path) -> Result<Arc<Store>> {
     Ok(Arc::new(match config {
-        StoreConfig::File(state) => Store::File(store::FileStore::open(state, key)?),
+        StoreConfig::File(state) => Store::File(Box::new(store::FileStore::open(state, key)?)),
         StoreConfig::Postgres(url) => {
             let store = store::PostgresStore::connect(url).await?;
             store.check_schema().await?;
@@ -336,15 +336,16 @@ async fn revoke_machine(
     {
         return Err(server.error(StatusCode::NOT_FOUND, "machine_not_found"));
     }
-    server.audit(&audit::Event {
-        operation: "revoke",
-        machine: &current.id,
-        account: "-",
-        result: "ok",
-        rotated: None,
-        target: Some(&input.id),
-    })
-    .await?;
+    server
+        .audit(&audit::Event {
+            operation: "revoke",
+            machine: &current.id,
+            account: "-",
+            result: "ok",
+            rotated: None,
+            target: Some(&input.id),
+        })
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -411,19 +412,20 @@ async fn token(
         .map_err(|e| server.engine_error(&e, "account_unavailable_or_login_required"))?;
     // A machine revoked while the refresh ran gets nothing.
     let authorized = server.authorize(&headers).await;
-    server.audit(&audit::Event {
-        operation: "issue",
-        machine: &machine.id,
-        account: &input.account_id,
-        result: if authorized.is_ok() {
-            "ok"
-        } else {
-            "refused_revoked"
-        },
-        rotated: None,
-        target: None,
-    })
-    .await?;
+    server
+        .audit(&audit::Event {
+            operation: "issue",
+            machine: &machine.id,
+            account: &input.account_id,
+            result: if authorized.is_ok() {
+                "ok"
+            } else {
+                "refused_revoked"
+            },
+            rotated: None,
+            target: None,
+        })
+        .await?;
     authorized?;
     Ok(private(access))
 }
@@ -614,7 +616,10 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/v2/anthropic/usage", get(usage))
         .route("/v2/anthropic/login/start", post(login_start))
         .route("/v2/anthropic/login/complete", post(login_complete))
-        .route("/v2/anthropic/migrations", post(migrate_account).get(receipt));
+        .route(
+            "/v2/anthropic/migrations",
+            post(migrate_account).get(receipt),
+        );
     enrollment::routes(routes).with_state(server)
 }
 

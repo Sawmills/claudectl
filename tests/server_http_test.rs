@@ -52,19 +52,35 @@ async fn provider(release: Option<Arc<Notify>>) -> (Endpoints, tokio::task::Join
 struct Fixture {
     _root: tempfile::TempDir,
     state: PathBuf,
+    server: Arc<app::Server>,
     origin: String,
     http: reqwest::Client,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 impl Fixture {
+    async fn register(&self, email: &str, name: &str) -> (String, String) {
+        app::register(self.server.store(), email, name)
+            .await
+            .unwrap()
+    }
+    fn file_store(&self) -> bool {
+        matches!(
+            self.server.store(),
+            claudectl::server::store::Store::File(_)
+        )
+    }
     async fn new(release: Option<Arc<Notify>>) -> Self {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
         let key = root.path().join("key");
         app::setup(&state, &key).unwrap();
+        let store = match claudectl::server::testing::fresh_database().await.unwrap() {
+            Some(url) => app::StoreConfig::Postgres(url),
+            None => app::StoreConfig::File(state.clone()),
+        };
         let (endpoints, provider) = provider(release).await;
         let server = app::Server::open(app::Config {
-            state: state.clone(),
+            store,
             key,
             allowed_users: vec![AMIR.into()],
             sso: None,
@@ -73,10 +89,11 @@ impl Fixture {
         })
         .await
         .unwrap();
-        let (origin, task) = serve(app::router(server)).await;
+        let (origin, task) = serve(app::router(server.clone())).await;
         Self {
             _root: root,
             state,
+            server,
             origin,
             http: reqwest::Client::new(),
             tasks: vec![provider, task],
@@ -125,8 +142,8 @@ impl Drop for Fixture {
 #[tokio::test]
 async fn only_an_enrolled_machine_of_an_allowed_user_gets_access() {
     let f = Fixture::new(None).await;
-    let (_mac, mac) = app::register(&f.state, AMIR, "mac").unwrap();
-    let (_other_id, other) = app::register(&f.state, "teammate@sawmills.ai", "laptop").unwrap();
+    let (_mac, mac) = f.register(AMIR, "mac").await;
+    let (_other_id, other) = f.register("teammate@sawmills.ai", "laptop").await;
     let get = reqwest::Method::GET;
 
     assert_eq!(
@@ -176,8 +193,8 @@ async fn only_an_enrolled_machine_of_an_allowed_user_gets_access() {
 #[tokio::test]
 async fn a_deleted_account_answers_gone_and_a_revoked_machine_is_refused() {
     let f = Fixture::new(None).await;
-    let (mac_id, mac) = app::register(&f.state, AMIR, "mac").unwrap();
-    let (_devbox_id, devbox) = app::register(&f.state, AMIR, "devbox").unwrap();
+    let (mac_id, mac) = f.register(AMIR, "mac").await;
+    let (_devbox_id, devbox) = f.register(AMIR, "devbox").await;
     let id = f.migrate(&mac).await;
     let (status, _) = f
         .call(
@@ -228,8 +245,8 @@ async fn a_deleted_account_answers_gone_and_a_revoked_machine_is_refused() {
 async fn a_machine_revoked_during_a_refresh_gets_no_token() {
     let release = Arc::new(Notify::new());
     let f = Fixture::new(Some(release.clone())).await;
-    let (mac_id, mac) = app::register(&f.state, AMIR, "mac").unwrap();
-    let (_devbox_id, devbox) = app::register(&f.state, AMIR, "devbox").unwrap();
+    let (mac_id, mac) = f.register(AMIR, "mac").await;
+    let (_devbox_id, devbox) = f.register(AMIR, "devbox").await;
     // The migration's forced refresh waits for one release.
     let migrate = {
         let release = release.clone();
@@ -286,7 +303,7 @@ async fn a_machine_revoked_during_a_refresh_gets_no_token() {
 #[tokio::test]
 async fn metrics_count_failures_by_reason_with_the_last_failure_time() {
     let f = Fixture::new(None).await;
-    let (_mac_id, mac) = app::register(&f.state, AMIR, "mac").unwrap();
+    let (_mac_id, mac) = f.register(AMIR, "mac").await;
     assert_eq!(
         f.call(reqwest::Method::GET, "/v1/me", Some("guess"), None)
             .await
@@ -324,32 +341,37 @@ async fn metrics_count_failures_by_reason_with_the_last_failure_time() {
 #[tokio::test]
 async fn a_delete_that_cannot_persist_answers_503_and_an_unknown_account_404() {
     let f = Fixture::new(None).await;
-    let (_mac_id, mac) = app::register(&f.state, AMIR, "mac").unwrap();
+    let (_mac_id, mac) = f.register(AMIR, "mac").await;
     let id = f.migrate(&mac).await;
-    let blocker = f.state.join("deleted.json");
-    std::fs::create_dir(&blocker).unwrap();
-    let (status, body) = f
-        .call(
-            reqwest::Method::DELETE,
-            &format!("/v2/anthropic/accounts/{id}"),
-            Some(&mac),
-            None,
-        )
-        .await;
-    assert_eq!(
-        (status, body["error"].as_str()),
-        (503, Some("persistence_failed"))
-    );
-    let (status, _) = f
-        .call(
-            reqwest::Method::POST,
-            "/v2/anthropic/token",
-            Some(&mac),
-            Some(json!({"account_id":id})),
-        )
-        .await;
-    assert_eq!(status, 200);
-    std::fs::remove_dir(&blocker).unwrap();
+    if f.file_store() {
+        // A directory where the state file goes makes every write fail.
+        let (file, saved) = (f.state.join("state.enc"), f.state.join("state.saved"));
+        std::fs::rename(&file, &saved).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let (status, body) = f
+            .call(
+                reqwest::Method::DELETE,
+                &format!("/v2/anthropic/accounts/{id}"),
+                Some(&mac),
+                None,
+            )
+            .await;
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::rename(&saved, &file).unwrap();
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (503, Some("persistence_failed"))
+        );
+        let (status, _) = f
+            .call(
+                reqwest::Method::POST,
+                "/v2/anthropic/token",
+                Some(&mac),
+                Some(json!({"account_id":id})),
+            )
+            .await;
+        assert_eq!(status, 200);
+    }
     let missing = "0".repeat(64);
     let (status, body) = f
         .call(
@@ -363,4 +385,93 @@ async fn a_delete_that_cannot_persist_answers_503_and_an_unknown_account_404() {
         (status, body["error"].as_str()),
         (404, Some("account_not_found"))
     );
+}
+
+#[tokio::test]
+async fn shutdown_lets_a_refresh_in_progress_finish_and_persist() {
+    let release = Arc::new(Notify::new());
+    let root = tempfile::tempdir().unwrap();
+    let (state, key) = (root.path().join("state"), root.path().join("key"));
+    app::setup(&state, &key).unwrap();
+    let store = match claudectl::server::testing::fresh_database().await.unwrap() {
+        Some(url) => app::StoreConfig::Postgres(url),
+        None => app::StoreConfig::File(state.clone()),
+    };
+    let (endpoints, _provider) = provider(Some(release.clone())).await;
+    let server = app::Server::open(app::Config {
+        store,
+        key,
+        allowed_users: vec![AMIR.into()],
+        sso: None,
+        metrics_token_hash: None,
+        endpoints,
+    })
+    .await
+    .unwrap();
+    let (_mac_id, mac) = app::register(server.store(), AMIR, "mac").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(app::serve_until(server.clone(), listener, async {
+        let _ = stopped.await;
+    }));
+    let http = reqwest::Client::new();
+    // The migration's forced refresh waits for one release.
+    release.notify_one();
+    let expires_at = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    let receipt: Value = http
+        .post(format!("{origin}/v2/anthropic/migrations"))
+        .bearer_auth(&mac)
+        .json(&json!({"alias":"work","migration_id":"m-1","exclusive_owner":true,
+            "grant":{"access_token":"migrated","refresh_token":"migrated-refresh","expires_at":expires_at,"scopes":["user:inference","user:profile"]}}))
+        .send().await.unwrap().json().await.unwrap();
+    let id = receipt["account_id"].as_str().unwrap().to_owned();
+    let access: Value = http
+        .post(format!("{origin}/v2/anthropic/token"))
+        .bearer_auth(&mac)
+        .json(&json!({"account_id":id}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pending = {
+        let (http, origin, mac, id) = (http.clone(), origin.clone(), mac.clone(), id.clone());
+        let previous = access["revision"].as_str().unwrap().to_owned();
+        tokio::spawn(async move {
+            http.post(format!("{origin}/v2/anthropic/token"))
+                .bearer_auth(mac)
+                .json(&json!({"account_id":id,"previous_revision":previous}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !serving.is_finished(),
+        "shutdown did not wait for the refresh"
+    );
+    release.notify_one();
+    assert_eq!(pending.await.unwrap(), 200);
+    tokio::time::timeout(Duration::from_secs(10), serving)
+        .await
+        .expect("drain finished")
+        .unwrap()
+        .unwrap();
+    let accounts = server
+        .store()
+        .accounts(&receipt_user(&server).await)
+        .await
+        .unwrap();
+    assert_eq!(accounts.len(), 1);
+}
+
+async fn receipt_user(server: &app::Server) -> String {
+    server.store().users().await.unwrap()[0].id.clone()
 }

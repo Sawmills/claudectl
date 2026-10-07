@@ -14,13 +14,18 @@ pub async fn fresh_database() -> Result<Option<String>> {
         .batch_execute(&format!("CREATE DATABASE {name}"))
         .await?;
     let url = database_url(&admin, &name);
-    super::store::PostgresStore::connect(&url).await?.migrate().await?;
+    super::store::PostgresStore::connect(&url)
+        .await?
+        .migrate()
+        .await?;
     Ok(Some(url))
 }
 
 /// Replace the database name in a `postgres://` URL.
 fn database_url(admin: &str, name: &str) -> String {
-    let (base, query) = admin.split_once('?').map_or((admin, None), |(b, q)| (b, Some(q)));
+    let (base, query) = admin
+        .split_once('?')
+        .map_or((admin, None), |(b, q)| (b, Some(q)));
     let base = base.rsplit_once('/').map_or(base, |(b, _)| b);
     match query {
         Some(q) => format!("{base}/{name}?{q}"),

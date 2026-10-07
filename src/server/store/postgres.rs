@@ -133,8 +133,7 @@ impl PostgresStore {
     /// Connect with a small pool. A URL without `sslmode=require` connects without TLS,
     /// which only a loopback test database may use.
     pub async fn connect(url: &str) -> Result<Self> {
-        let mut config: tokio_postgres::Config =
-            url.parse().context("invalid database URL")?;
+        let mut config: tokio_postgres::Config = url.parse().context("invalid database URL")?;
         config.connect_timeout(Duration::from_secs(5));
         config.keepalives_idle(Duration::from_secs(10));
         config.options(
@@ -190,7 +189,10 @@ impl PostgresStore {
     pub async fn check_schema(&self) -> Result<()> {
         let client = self.pool.get().await?;
         let row = client
-            .query_opt("SELECT version, min_reader FROM schema_info WHERE id = 1", &[])
+            .query_opt(
+                "SELECT version, min_reader FROM schema_info WHERE id = 1",
+                &[],
+            )
             .await
             .context("schema is not installed; run claudectl-server migrate")?
             .context("schema is not installed; run claudectl-server migrate")?;
@@ -511,7 +513,14 @@ impl PostgresStore {
             .execute(
                 "INSERT INTO login_flows (id, user_id, alias, sealed, exchanging, retained)
                  VALUES ($1, $2, $3, $4, $5, $6)",
-                &[&id, &row.user, &row.alias, &row.sealed, &row.exchanging, &row.retained],
+                &[
+                    &id,
+                    &row.user,
+                    &row.alias,
+                    &row.sealed,
+                    &row.exchanging,
+                    &row.retained,
+                ],
             )
             .await?;
         Ok(())
@@ -539,7 +548,10 @@ impl PostgresStore {
     pub async fn usage(&self, id: &str) -> Result<Option<Vec<u8>>> {
         let client = self.pool.get().await?;
         Ok(client
-            .query_opt("SELECT sealed FROM usage_cache WHERE account_id = $1", &[&id])
+            .query_opt(
+                "SELECT sealed FROM usage_cache WHERE account_id = $1",
+                &[&id],
+            )
             .await?
             .map(|r| r.get(0)))
     }
@@ -609,7 +621,10 @@ impl PostgresStore {
     pub async fn machines(&self) -> Result<Vec<Machine>> {
         let client = self.pool.get().await?;
         Ok(client
-            .query("SELECT id, user_id, token_hash, revoked FROM machines ORDER BY id", &[])
+            .query(
+                "SELECT id, user_id, token_hash, revoked FROM machines ORDER BY id",
+                &[],
+            )
             .await?
             .iter()
             .map(|r| Machine {
@@ -697,7 +712,12 @@ impl PostgresStore {
                 )
             }))
     }
-    pub async fn enrollment(&self, kind: &str, key: &str, now: i64) -> Result<Option<EnrollmentRow>> {
+    pub async fn enrollment(
+        &self,
+        kind: &str,
+        key: &str,
+        now: i64,
+    ) -> Result<Option<EnrollmentRow>> {
         let client = self.pool.get().await?;
         Ok(client
             .query_opt(

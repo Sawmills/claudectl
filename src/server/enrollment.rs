@@ -176,7 +176,10 @@ impl Sso {
             ClientId::new(self.config.client_id.clone()),
             Some(ClientSecret::new(self.client_secret.trim().into())),
         )
-        .set_redirect_uri(RedirectUrl::new(format!("{}/auth/callback", self.public_url))?))
+        .set_redirect_uri(RedirectUrl::new(format!(
+            "{}/auth/callback",
+            self.public_url
+        ))?))
     }
 }
 fn sso(server: &Server) -> Result<&Sso, HttpError> {
@@ -213,7 +216,11 @@ fn escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 impl Server {
-    fn seal_row<T: Serialize>(&self, value: &T, lookup: Option<String>) -> Result<EnrollmentRow, HttpError> {
+    fn seal_row<T: Serialize>(
+        &self,
+        value: &T,
+        lookup: Option<String>,
+    ) -> Result<EnrollmentRow, HttpError> {
         Ok(EnrollmentRow {
             lookup,
             sealed: self.seal(value).map_err(|_| self.unavailable())?,
@@ -300,7 +307,9 @@ async fn poll(State(server): Shared, Json(input): Json<Poll>) -> Result<Response
         .map_err(|_| server.unavailable())?
         .filter(|r| !r.consumed)
         .ok_or_else(|| server.error(StatusCode::GONE, "enrollment_expired"))?;
-    let mut device: Device = server.unseal(&row.sealed).map_err(|_| server.unavailable())?;
+    let mut device: Device = server
+        .unseal(&row.sealed)
+        .map_err(|_| server.unavailable())?;
     if device.last_poll.is_some_and(|t| now() - t < 3_000) {
         return Err(server.error(StatusCode::TOO_MANY_REQUESTS, "slow_down"));
     }
@@ -319,7 +328,9 @@ async fn poll(State(server): Shared, Json(input): Json<Poll>) -> Result<Response
         .await
         .map_err(|_| server.unavailable())?
         .ok_or_else(|| server.error(StatusCode::GONE, "enrollment_expired"))?;
-    let device: Device = server.unseal(&row.sealed).map_err(|_| server.unavailable())?;
+    let device: Device = server
+        .unseal(&row.sealed)
+        .map_err(|_| server.unavailable())?;
     let token = device
         .grant
         .ok_or_else(|| server.error(StatusCode::GONE, "enrollment_expired"))?;
@@ -343,7 +354,9 @@ async fn verify(State(server): Shared, Query(input): Query<Verify>) -> Result<Re
         .await
         .map_err(|_| server.unavailable())?
         .ok_or_else(|| server.error(StatusCode::GONE, "enrollment_expired"))?;
-    let pending: Device = server.unseal(&row.sealed).map_err(|_| server.unavailable())?;
+    let pending: Device = server
+        .unseal(&row.sealed)
+        .map_err(|_| server.unavailable())?;
     if pending.grant.is_some() {
         return Err(server.error(StatusCode::GONE, "enrollment_expired"));
     }
@@ -408,7 +421,9 @@ async fn callback(
         .await
         .map_err(|_| server.unavailable())?
         .ok_or_else(|| server.error(StatusCode::BAD_REQUEST, "invalid_sso_state"))?;
-    let login: SsoLogin = server.unseal(&row.sealed).map_err(|_| server.unavailable())?;
+    let login: SsoLogin = server
+        .unseal(&row.sealed)
+        .map_err(|_| server.unavailable())?;
     let code = input.code.ok_or_else(denied)?;
     let client = sso
         .client()
@@ -475,7 +490,9 @@ async fn callback(
         .filter(|r| !r.consumed)
         .ok_or_else(|| server.error(StatusCode::GONE, "enrollment_expired"))?;
     let lookup = device.lookup.clone().unwrap_or_default();
-    let pending: Device = server.unseal(&device.sealed).map_err(|_| server.unavailable())?;
+    let pending: Device = server
+        .unseal(&device.sealed)
+        .map_err(|_| server.unavailable())?;
     let approval = secret();
     let html = format!(
         include_str!("enrollment/approval.html"),
@@ -511,7 +528,9 @@ async fn approve(State(server): Shared, Form(input): Form<Approve>) -> Result<Re
         .await
         .map_err(|_| server.unavailable())?
         .ok_or_else(|| server.error(StatusCode::BAD_REQUEST, "invalid_approval"))?;
-    let approval: Approval = server.unseal(&row.sealed).map_err(|_| server.unavailable())?;
+    let approval: Approval = server
+        .unseal(&row.sealed)
+        .map_err(|_| server.unavailable())?;
     let device_row = store
         .enrollment("device", &approval.device, now())
         .await

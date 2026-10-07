@@ -133,7 +133,9 @@ impl Engine {
             }
             Err(_) => result.error = Some("usage_unavailable".into()),
         }
-        self.store.put_usage(THROTTLE, &self.seal(&throttle)?).await?;
+        self.store
+            .put_usage(THROTTLE, &self.seal(&throttle)?)
+            .await?;
         // A delete in the meantime removed the account; put_usage then stores nothing.
         self.store.put_usage(id, &self.seal(&result)?).await?;
         if result.error.is_some() {

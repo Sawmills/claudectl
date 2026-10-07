@@ -142,7 +142,10 @@ async fn run(cli: Cli) -> Result<()> {
                 .get(format!("http://{address}/ready"))
                 .send()
                 .await?;
-            ensure!(response.status().is_success(), "account server is not ready");
+            ensure!(
+                response.status().is_success(),
+                "account server is not ready"
+            );
         }
         Commands::Users {
             location,

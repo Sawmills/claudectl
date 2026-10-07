@@ -11,6 +11,27 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Run `f` against the file store at `state`, outside any server process.
+fn with_store<T>(
+    state: &std::path::Path,
+    key: &std::path::Path,
+    f: impl AsyncFnOnce(&claudectl::server::store::Store) -> T,
+) -> T {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let store = claudectl::server::app::open_store(
+            &claudectl::server::app::StoreConfig::File(state.into()),
+            key,
+        )
+        .await
+        .unwrap();
+        f(&store).await
+    })
+}
+
 fn server() -> Command {
     let mut command = Command::cargo_bin("claudectl-server").unwrap();
     command.env("PATH", "");
@@ -122,10 +143,14 @@ fn setup_if_absent_keeps_existing_state_for_a_restarted_pod() {
             .unwrap()
     };
     assert!(setup(&[]).status.success());
-    let (machine, _) = claudectl::server::app::register(&state, "amir@sawmills.ai", "mac").unwrap();
+    let (machine, _) = with_store(&state, &key, async |s| {
+        claudectl::server::app::register(s, "amir@sawmills.ai", "mac")
+            .await
+            .unwrap()
+    });
     assert!(!setup(&[]).status.success());
     assert!(setup(&["--if-absent"]).status.success());
-    let machines = claudectl::server::vault::machines(&state).unwrap();
+    let machines = with_store(&state, &key, async |s| s.machines().await.unwrap());
     assert_eq!(machines.len(), 1);
     assert_eq!(machines[0].id, machine);
 }
@@ -142,7 +167,11 @@ fn an_operator_revoke_writes_an_audit_line() {
         .arg(&key)
         .assert()
         .success();
-    let (machine, _) = claudectl::server::app::register(&state, "amir@sawmills.ai", "mac").unwrap();
+    let (machine, _) = with_store(&state, &key, async |s| {
+        claudectl::server::app::register(s, "amir@sawmills.ai", "mac")
+            .await
+            .unwrap()
+    });
     server()
         .args(["revoke", "--state"])
         .arg(&state)
@@ -151,10 +180,12 @@ fn an_operator_revoke_writes_an_audit_line() {
         .args(["--machine", &machine])
         .assert()
         .success();
-    let events = claudectl::server::audit::read(&state, &key).unwrap();
+    let events = with_store(&state, &key, async |s| {
+        claudectl::server::audit::read(s, &key).await.unwrap()
+    });
     let last = events.last().unwrap();
     assert_eq!(last["operation"], "revoke");
     assert_eq!(last["machine"], "operator");
     assert_eq!(last["target"], machine.as_str());
-    assert!(claudectl::server::vault::machines(&state).unwrap()[0].revoked);
+    assert!(with_store(&state, &key, async |s| s.machines().await.unwrap())[0].revoked);
 }

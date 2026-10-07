@@ -112,7 +112,7 @@ pub struct EnrollmentRow {
 }
 
 pub enum Store {
-    File(FileStore),
+    File(Box<FileStore>),
     Postgres(PostgresStore),
 }
 
@@ -243,7 +243,12 @@ impl Store {
     ) -> Result<Option<(String, EnrollmentRow)>> {
         dispatch!(self, find_enrollment(kind, lookup, now))
     }
-    pub async fn enrollment(&self, kind: &str, key: &str, now: i64) -> Result<Option<EnrollmentRow>> {
+    pub async fn enrollment(
+        &self,
+        kind: &str,
+        key: &str,
+        now: i64,
+    ) -> Result<Option<EnrollmentRow>> {
         dispatch!(self, enrollment(kind, key, now))
     }
     /// Replace an unconsumed row's payload. False when it is consumed or gone.
