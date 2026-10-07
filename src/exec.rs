@@ -1222,8 +1222,8 @@ fn wait_exit_no_reap(pid: u32, interactive: bool) -> std::io::Result<()> {
     }
 }
 
-/// The child stopped. Take the foreground back, stop claudectl as the
-/// terminal would, and when claudectl is continued, continue the
+/// The child stopped. Take the foreground back, stop claudectl's shell job
+/// as the terminal would, and when claudectl is continued, continue the
 /// child, in the foreground again if claudectl was resumed there (`fg`).
 #[cfg(unix)]
 fn suspend_with(leader: u32) {
@@ -1233,18 +1233,50 @@ fn suspend_with(leader: u32) {
     if foreground::owned_by(leader) {
         foreground::reclaim();
     }
-    // SAFETY: pthread_kill only sends a signal to this thread. A signal
-    // sent to this thread is handled before it runs on, so claudectl stops
-    // here until it is continued; a process-directed signal can go to
-    // another thread and leave this one running for a moment. The kernel
-    // discards it for an orphaned group, and then the child continues at
-    // once.
-    unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTSTP) };
+    stop_job();
     if foreground::owned() {
         let _ = foreground::give(leader);
     }
     // SAFETY: kill only sends a signal to the child's group.
     unsafe { libc::kill(-leader, libc::SIGCONT) };
+}
+
+/// Set by the SIGCONT handler while `stop_job` waits.
+#[cfg(unix)]
+static CONTINUED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn note_continued(_signal: libc::c_int) {
+    CONTINUED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Stop claudectl's shell job (a pipeline shares claudectl's group) as the
+/// terminal would, and return once claudectl is continued. The SIGTSTP can go
+/// to another thread of claudectl and leave this one running for a moment, so
+/// this thread waits for the SIGCONT. The kernel discards SIGTSTP for an
+/// orphaned group; then no SIGCONT comes, and the wait ends after a bound.
+#[cfg(unix)]
+fn stop_job() {
+    use std::sync::atomic::Ordering;
+    CONTINUED.store(false, Ordering::SeqCst);
+    // SAFETY: installs a handler that only stores an atomic, saves the
+    // previous action, and restores it below; kill only sends a signal.
+    let previous = unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = note_continued as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        let mut previous: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGCONT, &action, &mut previous);
+        libc::kill(0, libc::SIGTSTP);
+        previous
+    };
+    let started = std::time::Instant::now();
+    while !CONTINUED.load(Ordering::SeqCst) && started.elapsed() < Duration::from_millis(250) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // SAFETY: restores the SIGCONT action saved above.
+    unsafe { libc::sigaction(libc::SIGCONT, &previous, std::ptr::null_mut()) };
 }
 
 #[cfg(not(unix))]
