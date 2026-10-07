@@ -271,9 +271,13 @@ impl Env {
             .insert(alias.into(), script);
     }
     fn run(&self, args: &[&str], pids: &str) -> (bool, String) {
+        self.run_with(args, pids, &[])
+    }
+    fn run_with(&self, args: &[&str], pids: &str, env: &[(&str, &Path)]) -> (bool, String) {
         let path = format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap());
         let output = Command::cargo_bin("claudectl")
             .unwrap()
+            .envs(env.iter().map(|(k, v)| (*k, *v)))
             .env("HOME", self.home.path())
             .env("PATH", path)
             .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
@@ -595,4 +599,29 @@ fn migrate_all_without_the_exclusive_owner_statement_fences_nothing() {
     assert!(!env.fenced("a1"));
     assert!(env.has_credentials("a1"));
     assert_eq!(env.imports(), 0);
+}
+
+#[test]
+fn a_stale_live_credentials_file_refuses_only_the_live_account_and_fences_nothing() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, 3_600_000);
+    env.live("me", "u-me-0000", "stale");
+    // macOS: Claude Code refreshed only the Keychain; the file still holds the older grant.
+    let keychain = env.home.path().join("keychain-grant.json");
+    private_write(
+        &keychain,
+        &serde_json::to_string(&creds("newer", 3_600_000)).unwrap(),
+    );
+    let (ok, text) = env.run_with(
+        &["--all", "--exclusive-owner"],
+        "",
+        &[("CLAUDECTL_TEST_KEYCHAIN_GRANT", keychain.as_path())],
+    );
+    assert!(!ok, "{text}");
+    let row = Env::row(&text, "me");
+    assert!(row.contains("nothing was fenced"), "{text}");
+    assert!(row.contains("claudectl use me"), "{text}");
+    assert!(!env.fenced("me"));
+    assert!(env.paths.claude_credentials_file().exists());
+    assert!(Env::row(&text, "a1").contains("migrated"), "{text}");
 }

@@ -272,9 +272,17 @@ fn migrate_one(paths: &Paths, client: &Client, alias: &str, source: Source) -> R
                 (creds, expected)
             }
             Source::Live => {
-                let creds = store
-                    .read_refresh_owner()?
-                    .context("no live Claude login on this machine")?;
+                let creds =
+                    keychain_grant(&store)?.context("no live Claude login on this machine")?;
+                // Claude Code refreshes only the Keychain on macOS: an older file copy would
+                // block the post-receipt cleanup forever. Refuse before any fence.
+                if let Some(file) = live_file(paths)?
+                    && !same_digests(&digests(&file), &digests(&creds))
+                {
+                    bail!(
+                        "~/.claude/.credentials.json holds an older grant than the Keychain; nothing was fenced. Run `claudectl use {alias}` (rewrites both) or delete the stale file, then rerun"
+                    );
+                }
                 let expected = identity_of(
                     &store
                         .read_oauth_account()?
@@ -363,6 +371,17 @@ fn migrate_one(paths: &Paths, client: &Client, alias: &str, source: Source) -> R
     }
     cleanup(paths, &store, &journal, &dir, &profile_file)?;
     Ok(Done::Already)
+}
+/// The live login's authoritative grant (the Keychain on macOS, the file elsewhere). Debug
+/// builds let integration tests stand in a Keychain grant; release builds never read it.
+fn keychain_grant(store: &AuthStore) -> Result<Option<CredentialsFile>> {
+    #[cfg(debug_assertions)]
+    if let Ok(path) = std::env::var("CLAUDECTL_TEST_KEYCHAIN_GRANT") {
+        return Ok(Some(
+            serde_json::from_slice(&std::fs::read(path)?).context("invalid test Keychain grant")?,
+        ));
+    }
+    store.read_refresh_owner()
 }
 /// ~/.claude/.credentials.json: `Ok(None)` when absent, an error when unreadable.
 fn live_file(paths: &Paths) -> Result<Option<CredentialsFile>> {
