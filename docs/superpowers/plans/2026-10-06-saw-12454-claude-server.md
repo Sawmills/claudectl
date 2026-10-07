@@ -76,6 +76,18 @@ No account with capacity is inactive today: `amir7` is the Mac mini login, `amir
 
 **Residual risk.** Backups (Time Machine) may hold an old copy of the profile file. Claude rotates refresh tokens on use, so an older copy is stale once the server's forced refresh rotates the grant.
 
+### K3 gate on the devbox, 2026-10-07 19:2xZ
+
+Synthetic tokens only; isolated network namespace with a fake TLS provider. Claude 2.1.280 (`92f2b4fd…`), `claudectl` release build from main.
+
+| Check                                                                                                                               | Result                                                                                                                                        |
+| ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Settings lifecycle (`linux.py`): proactive, 401, expired, outage, missing, malformed, TUI                                           | 7 of 7 passed                                                                                                                                 |
+| Full launcher renewal during a tool call (`supervised.py`)                                                                          | passed                                                                                                                                        |
+| Published image `claudectl-server@sha256:5fe720ec…be19` (arm64): `migrate`, then two `serve` replicas on one PostgreSQL 16 database | migrate ok; both replicas `/health` 200 and `/ready` 200; `/metrics` 401 without the token and 200 with it; token route 401 without a machine |
+
+The image cannot point at a fake provider, so the end-to-end token issue with synthetic grants is covered by the engine tests (two-replica PostgreSQL) and not by the image run.
+
 ## Deploy access (superseded by the A14 section below)
 
 The single-PVC deploy table is replaced. See "A14 revision: infra PRs".
