@@ -28,7 +28,7 @@ _claudectl_profiles() {
 }
 "#;
 
-        // Complete profile aliases for use, remove, and status.
+        // Complete profile aliases for use, remove, status, and label.
         // `use`'s alias is optional, so clap emits a double-colon spec.
         script = script.replace(
             "'::alias -- Profile alias to switch to (auto-selects most available if omitted):_default'",
@@ -41,6 +41,10 @@ _claudectl_profiles() {
         script = script.replace(
             "'::alias -- Check only this saved profile:_default'",
             "'::alias -- Check only this saved profile:_claudectl_profiles'",
+        );
+        script = script.replace(
+            "':alias -- Profile alias to label:_default'",
+            "':alias -- Profile alias to label:_claudectl_profiles'",
         );
 
         print!("{profile_fn}{script}");
@@ -56,14 +60,29 @@ _claudectl_profiles() {
         );
         println!(r#"  fi"#);
         println!(r#"}}"#);
-        println!(r#"complete -F _claudectl_profiles claudectl use"#);
-        println!(r#"complete -F _claudectl_profiles claudectl remove"#);
-        println!(r#"complete -F _claudectl_profiles claudectl status"#);
+        // Saved aliases only for the first argument of these commands; clap's
+        // completion for every other position, such as the label text.
+        println!(r#"_claudectl_with_profiles() {{"#);
+        println!(
+            r#"  if [[ $COMP_CWORD -eq 2 && " use remove status label " == *" ${{COMP_WORDS[1]}} "* && "${{COMP_WORDS[2]}}" != -* ]]; then"#
+        );
+        println!(r#"    _claudectl_profiles"#);
+        println!(r#"    return"#);
+        println!(r#"  fi"#);
+        println!(r#"  _claudectl "$@""#);
+        println!(r#"}}"#);
+        println!(
+            r#"complete -F _claudectl_with_profiles -o nosort -o bashdefault -o default claudectl"#
+        );
     } else if shell == Shell::Fish {
         generate(shell, &mut cmd, name, &mut std::io::stdout());
         println!();
         println!(
             r#"complete -c claudectl -n '__fish_seen_subcommand_from use remove status' -xa '(ls ~/.claudectl/profiles/ 2>/dev/null)'"#
+        );
+        // Only the alias, the first argument of `label`; not the label text.
+        println!(
+            r#"complete -c claudectl -n '__fish_seen_subcommand_from label; and test (count (commandline -opc)) -eq 2' -xa '(ls ~/.claudectl/profiles/ 2>/dev/null)'"#
         );
     } else {
         generate(shell, &mut cmd, name, &mut std::io::stdout());
