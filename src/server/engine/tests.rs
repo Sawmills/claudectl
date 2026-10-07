@@ -2044,3 +2044,30 @@ async fn a_receipt_state_tells_no_admission_from_pending_and_complete() {
     assert!(receipt.is_some());
     assert_eq!(state, "complete");
 }
+
+/// An admission in flight (its grant kept, not yet committed) is not "none": a client must
+/// not restore its fenced grant while the server may still admit it.
+#[tokio::test]
+async fn a_receipt_state_is_pending_while_an_admission_is_in_flight() {
+    let app = Router::new()
+        .route("/token", counted_token(Arc::default()))
+        // The identity check fails once: the grant is kept, nothing is committed.
+        .route("/api/oauth/profile", flaky_profile(0));
+    let f = Fixture::new(app).await;
+    let engine = f.engine().await;
+    assert!(
+        engine
+            .migrate(
+                "person",
+                "mac",
+                "work",
+                "m-1",
+                grant_until("migrated", now() + 3_600_000)
+            )
+            .await
+            .is_err()
+    );
+    let (receipt, state) = engine.receipt_state("person", "m-1").await.unwrap();
+    assert!(receipt.is_none());
+    assert_eq!(state, "pending");
+}

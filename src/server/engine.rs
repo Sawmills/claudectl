@@ -670,7 +670,11 @@ impl Engine {
         admission: &str,
     ) -> Result<(Option<Receipt>, &'static str)> {
         match self.admitted(user, admission).await? {
-            None => Ok((None, "none")),
+            // A kept grant not yet committed may still be admitted: never "none".
+            None => match self.store.pending(user, admission).await? {
+                Some(row) if row.state == store::PendingState::Live => Ok((None, "pending")),
+                _ => Ok((None, "none")),
+            },
             Some((receipt, Rotation::Rotated | Rotation::NotMigrated, _)) => {
                 Ok((Some(receipt), "complete"))
             }

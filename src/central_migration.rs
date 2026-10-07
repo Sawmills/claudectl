@@ -422,14 +422,27 @@ fn cleanup(
     if journal.live {
         // Compare-and-delete: every present holder must be the exact migrated grant. A
         // holder that cannot be read stops the cleanup; nothing is deleted.
-        if verify_live_holders(
-            store
-                .read_live_grant()
-                .context("Keychain login unreadable; nothing deleted"),
-            live_file(paths).context("live credentials file unreadable; nothing deleted"),
-            &journal.grant_digests,
-        )? {
-            store.delete_live_login()?;
+        let verify = || {
+            verify_live_holders(
+                store
+                    .read_live_grant()
+                    .context("Keychain login unreadable; nothing deleted"),
+                live_file(paths).context("live credentials file unreadable; nothing deleted"),
+                &journal.grant_digests,
+            )
+        };
+        if verify()? {
+            // security(1) cannot delete conditionally. Narrow the window instead: no Claude
+            // process may run, and the holders must still match right before the delete.
+            let running = claude_processes()?;
+            if !running.is_empty() {
+                bail!(
+                    "a Claude process started during the migration; nothing deleted. Stop it, then rerun"
+                );
+            }
+            if verify()? {
+                store.delete_live_login()?;
+            }
         }
         if profile::get_active_from(paths)?
             .is_some_and(|a| crate::exec::same_profile(paths, &a, &journal.alias))
@@ -527,6 +540,21 @@ fn refresh_inactive(paths: &Paths, alias: &str) -> Result<()> {
             .is_some_and(|live| shared(&creds, live))
         {
             bail!("profile shares the live refresh grant; not refreshed");
+        }
+        // A rotation must reach every copy of the grant: an unreadable sibling might hold it.
+        for other in profile::list_profiles_from(paths)? {
+            if crate::exec::same_profile(paths, &other.meta.alias, alias)
+                || fenced_alias(paths, &other.meta.alias)
+                || !other.credentials_path().try_exists()?
+            {
+                continue;
+            }
+            other.read_credentials().with_context(|| {
+                format!(
+                    "cannot read profile {}; it may hold the same grant, so {alias} was not refreshed",
+                    other.meta.alias
+                )
+            })?;
         }
         Ok(Some((profile, creds)))
     };
@@ -759,6 +787,13 @@ pub fn abort(paths: &Paths, client: &Client, alias: &str) -> Result<()> {
     .context("invalid migration journal")?;
     if journal.receipt.is_some() {
         bail!("{alias} is migrated; use claudectl server remove to delete the server account");
+    }
+    // Only the server that holds the fence can say it never admitted it.
+    if journal.server != client.connection.server || journal.user_id != client.connection.user_id {
+        bail!(
+            "the fence of {alias} belongs to another server or user; reconnect to {} to abort",
+            journal.server
+        );
     }
     let restore = match client.receipt_state(&journal.migration_id) {
         Ok((None, state)) if state == "none" => true,

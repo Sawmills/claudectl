@@ -234,7 +234,8 @@ impl Client {
                 .map_err(|_| Unavailable)?,
         )?
         .json()
-        .map_err(|_| anyhow::anyhow!("invalid account-server response"))
+        // A broken reply is a broken server: callers stop instead of continuing blind.
+        .map_err(|_| anyhow::Error::from(Unavailable))
     }
     pub(super) fn post<T: serde::de::DeserializeOwned>(
         &self,

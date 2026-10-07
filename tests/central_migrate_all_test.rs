@@ -52,6 +52,9 @@ struct Fake {
     lock_held_during_refresh: Option<bool>,
     /// A profile file rewritten while the refresh is in flight.
     rewrite: Option<(PathBuf, String)>,
+    refreshes: usize,
+    /// Receipt lookups answer 200 with a body that is not JSON.
+    garbage_receipts: bool,
 }
 type Shared = Arc<Mutex<Fake>>;
 
@@ -67,6 +70,9 @@ async fn me(State(fake): State<Shared>) -> Response {
 }
 async fn receipt(State(fake): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
     let fake = fake.lock().unwrap();
+    if fake.garbage_receipts {
+        return (StatusCode::OK, "not json").into_response();
+    }
     let id = &q["migration_id"];
     match fake.receipts.get(id) {
         Some(r) => Json(json!({"receipt": r, "state": "complete"})).into_response(),
@@ -118,6 +124,7 @@ async fn import(State(fake): State<Shared>, Json(body): Json<Value>) -> Response
 }
 async fn token(State(fake): State<Shared>) -> Json<Value> {
     let mut fake = fake.lock().unwrap();
+    fake.refreshes += 1;
     if let Some(path) = fake.lock_path.clone() {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -624,4 +631,55 @@ fn a_stale_live_credentials_file_refuses_only_the_live_account_and_fences_nothin
     assert!(!env.fenced("me"));
     assert!(env.paths.claude_credentials_file().exists());
     assert!(Env::row(&text, "a1").contains("migrated"), "{text}");
+}
+
+#[test]
+fn abort_refuses_a_fence_of_another_server_or_user() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Down, 3_600_000);
+    let (_, text) = env.all();
+    assert!(env.fenced("a1"), "{text}");
+    // The machine is now connected as another company user; that server knows no admission.
+    let dir = env.paths.claudectl_dir().join("server");
+    private_write(
+        &dir.join("connection.json"),
+        &json!({"server":env.origin,"user_id":"someone-else","token_file":dir.join("machine.json")})
+            .to_string(),
+    );
+    let (ok, text) = env.run(&["--abort", "a1"], "");
+    assert!(!ok, "{text}");
+    assert!(text.contains("another server or user"), "{text}");
+    assert!(env.fenced("a1"));
+    assert!(!env.has_credentials("a1"));
+}
+
+#[test]
+fn an_unreadable_sibling_with_the_same_grant_blocks_the_refresh() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, -1_000);
+    env.profile("b2", "u-b2-0000", Script::Ok, 3_600_000);
+    // b2 cannot be read, so nobody can tell whether it shares a1's grant.
+    let b2 = env.paths.profiles_dir().join("b2").join("credentials.json");
+    std::fs::write(&b2, "not json").unwrap();
+    let (ok, text) = env.all();
+    assert!(!ok, "{text}");
+    assert!(Env::row(&text, "a1").contains("refused"), "{text}");
+    assert_eq!(
+        env.fake.lock().unwrap().refreshes,
+        0,
+        "the grant was rotated"
+    );
+    assert!(!env.fenced("a1"));
+}
+
+#[test]
+fn a_malformed_receipt_reply_halts_the_run() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, 3_600_000);
+    env.profile("b2", "u-b2-0000", Script::Ok, 3_600_000);
+    env.fake.lock().unwrap().garbage_receipts = true;
+    let (ok, text) = env.all();
+    assert!(!ok, "{text}");
+    assert!(Env::row(&text, "b2").contains("not-attempted"), "{text}");
+    assert!(!env.fenced("b2"));
 }
