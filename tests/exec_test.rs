@@ -601,6 +601,12 @@ fn helper_run_one_alias() {
         self_identity(),
     )
     .unwrap();
+    if let Some(ms) = std::env::var("CLAUDECTL_TEST_PRE_EXEC_PAUSE_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        claudectl::exec::test_hooks::set_pre_exec_pause(Duration::from_millis(ms));
+    }
     if std::env::var_os("CLAUDECTL_TEST_GATE_LOCK").is_some() {
         // Hold the auth lock until the test releases it, so `run` waits in
         // its lock retry after its own checks.
@@ -2421,6 +2427,13 @@ impl Drop for PtyJob {
     }
 }
 
+#[cfg(unix)]
+fn make_fifo(path: &Path) {
+    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: mkfifo only creates a file at the given path.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+}
+
 /// Wait until `path` exists.
 #[cfg(unix)]
 fn wait_for(path: &Path, limit: Duration) -> bool {
@@ -2548,6 +2561,134 @@ printf '%s' "$line" > "$out/line""#,
 
 #[cfg(unix)]
 #[test]
+fn ctrl_z_between_the_handoff_and_the_exec_suspends_the_job_and_fg_resumes_it() {
+    if !Path::new(STOP_SHELL).exists() {
+        eprintln!(
+            "skipped: {STOP_SHELL} is missing, and no other shell is known to see a job stop"
+        );
+        return;
+    }
+    let _guard = run_guard();
+    let (home, out) = tty_child_setup(
+        r#"echo ready > "$out/ready"
+IFS= read -r line
+printf '%s' "$line" > "$out/line""#,
+    );
+    let mut job = PtyJob::start_resuming(
+        home.path(),
+        "one",
+        &out,
+        "fg",
+        &[("CLAUDECTL_TEST_PRE_EXEC_PAUSE_MS", "3000")],
+    );
+    wait_for_pre_exec_window(&out, &job);
+    job.type_text(b"\x1a");
+    assert!(
+        wait_for(&out.join("job_status"), LIMIT),
+        "the job did not stop: {}",
+        job.transcript()
+    );
+    assert!(
+        !out.join("pid").exists(),
+        "the child ran its exec before the stop"
+    );
+    // After fg the child finishes its pause, runs its exec and reads this.
+    assert!(wait_for(&out.join("ready"), LIMIT), "{}", job.transcript());
+    job.type_text(b"after\n");
+    let status = job.wait(LIMIT);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the job did not finish after fg: {:?}\n{}",
+        status,
+        job.transcript()
+    );
+    let stopped = (128 + libc::SIGTSTP).to_string();
+    assert_eq!(
+        read_out(&out, "job_status").lines().collect::<Vec<_>>(),
+        [stopped.as_str(), "0"]
+    );
+    assert_eq!(read_out(&out, "line"), "after");
+}
+
+/// Poll until the forked child owns the terminal and has not run its exec:
+/// the foreground left claudectl's group, and the child script did not start.
+#[cfg(unix)]
+fn wait_for_pre_exec_window(out: &Path, job: &PtyJob) {
+    let in_window = || {
+        let helper = read_out(out, "helper_pid");
+        let ids = std::process::Command::new("ps")
+            .args(["-o", "pgid=,tpgid=", "-p", helper.trim()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let ids: Vec<&str> = ids.split_whitespace().collect();
+        matches!(ids.as_slice(), [pgid, tpgid] if pgid != tpgid && *tpgid != "-1")
+            && !out.join("pid").exists()
+    };
+    let started = std::time::Instant::now();
+    while !in_window() && started.elapsed() < LIMIT {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        in_window(),
+        "the child never reached the window: {}",
+        job.transcript()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_stopped_before_its_exec_and_resumed_with_bg_still_suspends_the_job() {
+    if !Path::new(STOP_SHELL).exists() {
+        eprintln!(
+            "skipped: {STOP_SHELL} is missing, and no other shell is known to see a job stop"
+        );
+        return;
+    }
+    let _guard = run_guard();
+    let (home, out) = tty_child_setup(
+        r#"echo ready > "$out/ready"
+IFS= read -r line"#,
+    );
+    let mut job = PtyJob::start_resuming(
+        home.path(),
+        "one",
+        &out,
+        "bg",
+        &[("CLAUDECTL_TEST_PRE_EXEC_PAUSE_MS", "3000")],
+    );
+    wait_for_pre_exec_window(&out, &job);
+    job.type_text(b"\x1a");
+    assert!(
+        wait_for(&out.join("in_background"), LIMIT),
+        "the job did not stop: {}",
+        job.transcript()
+    );
+    // In the background the child runs its exec, reads the terminal and
+    // stops on SIGTTIN; claudectl must stop its job again. dash's `wait` (no
+    // operand) returns, with status 0, only once no job runs.
+    let started = std::time::Instant::now();
+    while read_out(&out, "job_status").lines().count() < 2 && started.elapsed() < LIMIT {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let statuses = read_out(&out, "job_status");
+    let transcript = job.transcript();
+    for file in ["pid", "helper_pid"] {
+        if let Ok(pid) = read_out(&out, file).trim().parse::<i32>() {
+            // SAFETY: kill only sends a signal.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+    }
+    let stopped = (128 + libc::SIGTSTP).to_string();
+    assert_eq!(
+        statuses.lines().collect::<Vec<_>>(),
+        [stopped.as_str(), "0"],
+        "the job did not stop again on the background read: {transcript}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn claudectl_owns_the_terminal_again_after_an_interactive_child() {
     let _guard = run_guard();
     let (home, out) = tty_child_setup(r#"echo ready > "$out/ready""#);
@@ -2644,10 +2785,14 @@ fn a_child_that_exits_in_the_background_leaves_the_terminal_to_the_shell() {
         return;
     }
     let _guard = run_guard();
+    // The child waits on a FIFO, not on a `sleep` loop: dash forks `sleep`
+    // with vfork, and a Ctrl-Z before that exec stops the vfork child while
+    // the parent cannot stop, so the job never stops.
     let (home, out) = tty_child_setup(
         r#"echo ready > "$out/ready"
-while [ ! -e "$out/go" ]; do sleep 0.1; done"#,
+read go < "$out/go""#,
     );
+    make_fifo(&out.join("go"));
     let mut job = PtyJob::start_resuming(home.path(), "one", &out, "bg", &[]);
     assert!(wait_for(&out.join("ready"), LIMIT), "{}", job.transcript());
     job.type_text(b"\x1a");
@@ -2656,7 +2801,7 @@ while [ ! -e "$out/go" ]; do sleep 0.1; done"#,
         "the job did not stop: {}",
         job.transcript()
     );
-    std::fs::write(out.join("go"), "").unwrap();
+    std::fs::write(out.join("go"), "go\n").unwrap();
     let status = job.wait(LIMIT);
     assert!(
         status.is_some_and(|s| s.success()),
