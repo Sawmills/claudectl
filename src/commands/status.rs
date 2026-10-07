@@ -218,7 +218,30 @@ pub fn fetch_all_usages() -> Result<Vec<FetchedUsage>> {
 fn fetch_usages(alias: Option<&str>, mode: FetchMode) -> Result<Vec<FetchedUsage>> {
     let paths = config::default_paths()?;
     let store = AuthStore::real(paths.clone());
-    fetch_usages_from(&store, &paths, alias, mode)
+    let fetched = fetch_usages_from(&store, &paths, alias, mode)?;
+    record_statusline(&paths, &fetched, alias.is_none());
+    Ok(fetched)
+}
+
+/// Keep the statusline sample in step with the active account's latest
+/// usage. A failure only affects the statusline, so it is a warning.
+fn record_statusline(paths: &config::Paths, fetched: &[FetchedUsage], all_profiles: bool) {
+    let now = chrono::Utc::now().timestamp();
+    let active = fetched.iter().find(|f| f.is_active);
+    // A check of one other profile says nothing about the active one.
+    if active.is_none() && !all_profiles {
+        return;
+    }
+    let sample = active.map(|f| {
+        let usage = f
+            .usage
+            .as_ref()
+            .filter(|_| f.error.is_none() && f.snapshot.is_fresh_at(now));
+        (f.alias.as_str(), f.label.as_deref(), usage)
+    });
+    if let Err(error) = claudectl::statusline::record(paths, sample, now) {
+        eprintln!("warning: statusline sample not updated: {error:#}");
+    }
 }
 
 fn fetch_usages_from(

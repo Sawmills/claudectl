@@ -7,6 +7,7 @@ pub mod login;
 pub mod remove;
 pub mod save;
 pub mod status;
+pub mod statusline;
 pub mod switch;
 pub mod use_profile;
 pub mod whoami;

@@ -60,6 +60,8 @@ enum Commands {
     },
     /// Show current active account
     Whoami,
+    /// Print the active account's usage in one line for a prompt; silent on any doubt
+    Statusline,
     /// Set or clear a profile's display label
     Label {
         /// Profile alias to label
@@ -114,6 +116,12 @@ fn main() {
     // Parse first so --help and --version work without a writable home.
     let cli = Cli::parse();
 
+    // The prompt path reads one small file and never writes or waits.
+    if let Commands::Statusline = cli.command {
+        commands::statusline::run();
+        return;
+    }
+
     if let Err(e) = config::ensure_dirs() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
@@ -145,6 +153,7 @@ fn main() {
         Commands::List => commands::list::run(),
         Commands::Remove { ref alias } => commands::remove::run(alias),
         Commands::Whoami => commands::whoami::run(),
+        Commands::Statusline => unreachable!("handled before setup"),
         Commands::Label {
             ref alias,
             ref text,
