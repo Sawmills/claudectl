@@ -175,7 +175,10 @@ pub fn status_json(fetched: &[FetchedUsage], now: i64) -> serde_json::Value {
                         "used_credits": extra.used_credits,
                     })
                 }),
-                "token_expires_in_seconds": f.token_expiry_secs,
+                // `token_expiry_secs` is the absolute expiry (Unix seconds).
+                "token_expires_in_seconds": f
+                    .token_expiry_secs
+                    .map(|expires_at| expires_at.saturating_sub(now).max(0)),
                 "usage_age_seconds": f.snapshot.fetched_at.map(|at| now.saturating_sub(at).max(0)),
                 "usage_stale": !f.snapshot.is_fresh_at(now),
                 "error": f.error,
@@ -1553,13 +1556,14 @@ mod tests {
         );
         a.label = Some("Team seat".into());
         a.is_active = true;
-        a.token_expiry_secs = Some(600);
+        a.token_expiry_secs = Some(1_500 + 600);
         let mut failed = FetchedUsage {
             alias: "a-broken".into(),
             error: Some("credentials unavailable or invalid".into()),
             ..FetchedUsage::default()
         };
         failed.snapshot.fresh = false;
+        failed.token_expiry_secs = Some(1_000);
         let report = status_json(&[a, failed], 1_500);
         assert_eq!(report["version"], 1);
         let accounts = report["accounts"].as_array().unwrap();
@@ -1568,6 +1572,7 @@ mod tests {
         assert_eq!(accounts[0]["exhausted"], serde_json::Value::Null);
         assert_eq!(accounts[0]["usage_stale"], true);
         assert_eq!(accounts[0]["error"], "credentials unavailable or invalid");
+        assert_eq!(accounts[0]["token_expires_in_seconds"], 0, "expired");
         let b = &accounts[1];
         assert_eq!(b["label"], "Team seat");
         assert_eq!(b["active"], true);
