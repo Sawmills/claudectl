@@ -3,7 +3,7 @@
 //! sessions are counted; a turn outside every logged span is unattributed.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -177,44 +177,62 @@ struct Scan {
 /// `since` to `now`, the time open spans end at, so a record written during
 /// the scan is left out rather than counted outside a run. Claude Code
 /// writes one record per content block, so responses count once per API
-/// message id. Subagent transcripts sit deeper
-/// (`<project>/<session>/subagents/*.jsonl`) and run on the same account, so
-/// the whole tree is read.
+/// message id.
 fn turns(projects: &Path, since: DateTime<Utc>, now: DateTime<Utc>) -> Result<Scan> {
     let mut scan = Scan::default();
     let mut seen = HashSet::new();
-    let mut pending = vec![projects.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let Some(entries) = read_dir(&dir)? else {
+    for path in transcripts(projects)? {
+        let failed = || format!("failed to read {}", path.display());
+        // A file not written since `since` holds nothing newer.
+        let modified = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .with_context(failed)?;
+        if DateTime::<Utc>::from(modified) < since {
             continue;
-        };
-        for entry in entries {
-            let path = entry.path();
-            // Not followed: a link could leave the lane or loop.
-            let kind = entry
-                .file_type()
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            if kind.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            if !kind.is_file() || path.extension().is_none_or(|ext| ext != "jsonl") {
-                continue;
-            }
-            // A file not written since `since` holds nothing newer.
-            let modified = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            if DateTime::<Utc>::from(modified) < since {
-                continue;
-            }
-            let failed = || format!("failed to read {}", path.display());
-            let reader = std::io::BufReader::new(std::fs::File::open(&path).with_context(failed)?);
-            turns_in(reader, since, now, &mut seen, &mut scan).with_context(failed)?;
         }
+        let reader = std::io::BufReader::new(std::fs::File::open(&path).with_context(failed)?);
+        turns_in(reader, since, now, &mut seen, &mut scan).with_context(failed)?;
     }
     Ok(scan)
+}
+
+/// The transcript files Claude Code writes (checked in 2.1.292): sessions at
+/// `<project>/<session>.jsonl` and their subagents, which run on the same
+/// account, at `<project>/<session>/subagents/*.jsonl`. Nothing else is
+/// read, and links are not followed.
+fn transcripts(projects: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for project in dirs_in(projects)? {
+        found.extend(jsonl_in(&project)?);
+        for session in dirs_in(&project)? {
+            found.extend(jsonl_in(&session.join("subagents"))?);
+        }
+    }
+    Ok(found)
+}
+
+fn dirs_in(dir: &Path) -> Result<Vec<PathBuf>> {
+    entries_of(dir, |kind, _| kind.is_dir())
+}
+
+fn jsonl_in(dir: &Path) -> Result<Vec<PathBuf>> {
+    entries_of(dir, |kind, path| {
+        kind.is_file() && path.extension().is_some_and(|ext| ext == "jsonl")
+    })
+}
+
+fn entries_of(dir: &Path, keep: impl Fn(std::fs::FileType, &Path) -> bool) -> Result<Vec<PathBuf>> {
+    let mut kept = Vec::new();
+    for entry in read_dir(dir)?.unwrap_or_default() {
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if keep(kind, &path) {
+            kept.push(path);
+        }
+    }
+    Ok(kept)
 }
 
 /// The entries of `dir`, or `None` when it does not exist. Any other error
@@ -454,6 +472,14 @@ mod tests {
         std::fs::write(
             subagents.join("agent-1.jsonl"),
             assistant("2026-10-07T10:13:00Z", "m3") + "\n",
+        )
+        .unwrap();
+        // Other nested files are not transcripts.
+        let other = projects.join("s/tool-results");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            other.join("x.jsonl"),
+            assistant("2026-10-07T10:14:00Z", "not-a-turn") + "\n",
         )
         .unwrap();
         let rates = collect(
