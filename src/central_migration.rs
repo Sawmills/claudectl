@@ -84,7 +84,28 @@ pub fn ensure_login_unfenced(
         oauth_account: account.clone(),
         label: None,
     };
+    // Fail closed: with a fence present, a login whose Claude identity is unknown may be the
+    // migrated account under new tokens, which the digest check cannot see.
+    if identity(&meta).is_err() && fenced(root)? {
+        bail!(
+            "a server migration fence exists and this login's Claude identity is unknown; \
+             nothing was saved. Retry when the identity can be read"
+        );
+    }
     ensure_local_grant(root, &meta, creds)
+}
+/// True when any alias holds a migration fence.
+fn fenced(root: &Path) -> Result<bool> {
+    let migrations = root.join("server/migrations");
+    if !migrations.try_exists()? {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(migrations)? {
+        if entry?.path().join("journal.json").try_exists()? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 fn shared(a: &CredentialsFile, b: &CredentialsFile) -> bool {
     let a = &a.claude_ai_oauth;
@@ -330,6 +351,10 @@ mod tests {
         assert!(crate::central::retain_login(&paths, "other", &creds("migrated"), &None).is_err());
         // The fenced alias itself.
         assert!(crate::central::retain_login(&paths, "work", &creds("new"), &None).is_err());
+        // An unknown identity with new tokens: it may be the migrated account, so refuse.
+        assert!(crate::central::retain_login(&paths, "other", &creds("new"), &None).is_err());
+        let partial = Some(json!({"accountUuid":"a"}));
+        assert!(crate::central::retain_login(&paths, "other", &creds("new"), &partial).is_err());
         assert!(!paths.claudectl_dir().join("retained-logins").exists());
     }
 
@@ -340,6 +365,14 @@ mod tests {
         fence(&paths);
         let other = Some(json!({"accountUuid":"b","organizationUuid":"o"}));
         let kept = crate::central::retain_login(&paths, "other", &creds("new"), &other).unwrap();
+        assert!(kept.exists());
+    }
+
+    #[test]
+    fn without_any_fence_an_unknown_identity_is_still_recoverable() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().into());
+        let kept = crate::central::retain_login(&paths, "other", &creds("new"), &None).unwrap();
         assert!(kept.exists());
     }
 }
