@@ -318,3 +318,41 @@ fn label_shows_in_list_and_clears() {
     assert!(run(&["label", "work"]).contains("cleared the label of 'work'"));
     assert!(run(&["list"]).contains("  work (w@x.io)"));
 }
+
+#[test]
+fn bash_completions_offer_aliases_only_for_the_alias_argument() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".claudectl/profiles/work")).unwrap();
+    let output = Command::cargo_bin("claudectl")
+        .unwrap()
+        .args(["completions", "bash"])
+        .output()
+        .unwrap();
+    let script = home.path().join("claudectl.bash");
+    std::fs::write(&script, output.stdout).unwrap();
+    let complete = |words: &str, cword: usize| {
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "source '{}'; COMP_WORDS=({words}); COMP_CWORD={cword}; \
+                 _claudectl_with_profiles claudectl \"${{COMP_WORDS[COMP_CWORD]}}\"; \
+                 printf '%s\\n' \"${{COMPREPLY[@]}}\"",
+                script.display()
+            ))
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert!(
+        complete("claudectl label ''", 2)
+            .lines()
+            .any(|w| w == "work")
+    );
+    assert!(complete("claudectl use ''", 2).lines().any(|w| w == "work"));
+    assert!(
+        !complete("claudectl label work ''", 3)
+            .lines()
+            .any(|w| w == "work")
+    );
+}

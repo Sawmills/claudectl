@@ -60,9 +60,20 @@ _claudectl_profiles() {
         );
         println!(r#"  fi"#);
         println!(r#"}}"#);
-        println!(r#"complete -F _claudectl_profiles claudectl use"#);
-        println!(r#"complete -F _claudectl_profiles claudectl remove"#);
-        println!(r#"complete -F _claudectl_profiles claudectl status"#);
+        // Saved aliases only for the first argument of these commands; clap's
+        // completion for every other position, such as the label text.
+        println!(r#"_claudectl_with_profiles() {{"#);
+        println!(
+            r#"  if [[ $COMP_CWORD -eq 2 && " use remove status label " == *" ${{COMP_WORDS[1]}} "* && "${{COMP_WORDS[2]}}" != -* ]]; then"#
+        );
+        println!(r#"    _claudectl_profiles"#);
+        println!(r#"    return"#);
+        println!(r#"  fi"#);
+        println!(r#"  _claudectl "$@""#);
+        println!(r#"}}"#);
+        println!(
+            r#"complete -F _claudectl_with_profiles -o nosort -o bashdefault -o default claudectl"#
+        );
     } else if shell == Shell::Fish {
         generate(shell, &mut cmd, name, &mut std::io::stdout());
         println!();
