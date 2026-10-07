@@ -26,6 +26,8 @@ const MAX_RECOVERIES_PER_HOUR: usize = 3;
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 /// Wait before another usage read when one failed or came back old.
 const CONFIRM_RETRY: Duration = Duration::from_secs(30);
+/// Time Claude gets to save its session after SIGTERM before SIGKILL.
+const STOP_GRACE: Duration = Duration::from_secs(20);
 
 pub struct LaunchArgs {
     pub lane: String,
@@ -58,8 +60,12 @@ fn run_inner(launch: LaunchArgs) -> Result<i32> {
             confirm_explicit(alias, launch.allow_billing)?;
             alias.clone()
         }
-        None => choose(&status::fetch_all_usages()?, &tried)
-            .context("no rate-limited account with room; run claudectl status")?,
+        None => choose(
+            &status::fetch_all_usages()?,
+            &tried,
+            live_uuid(&store).as_deref(),
+        )
+        .context("no rate-limited account with room; run claudectl status")?,
     };
     let mut args = launch.args.clone();
     loop {
@@ -100,7 +106,11 @@ fn run_inner(launch: LaunchArgs) -> Result<i32> {
             );
         }
         tried.push(alias.clone());
-        let Some(next) = choose(&status::fetch_all_usages()?, &tried) else {
+        let Some(next) = choose(
+            &status::fetch_all_usages()?,
+            &tried,
+            live_uuid(&store).as_deref(),
+        ) else {
             bail!(
                 "{alias} reached its limit and no other rate-limited account has room; \
                  session {} is kept in lane {}",
@@ -187,7 +197,18 @@ fn watch(
     // Hits whose usage read showed room; a failed read is retried later.
     let mut handled: Vec<String> = Vec::new();
     let mut retry_at: Option<Instant> = None;
-    while !stop.load(Ordering::SeqCst) {
+    let mut final_scan_done = false;
+    loop {
+        let exited = stop.load(Ordering::SeqCst);
+        if exited {
+            // After the run ends: one last scan for a record written at exit,
+            // and keep a pending retry alive, so `claude -p` can recover too.
+            let pending = retry_at.is_some_and(|at| Instant::now() < at + WATCH_INTERVAL);
+            if final_scan_done && !pending {
+                return;
+            }
+            final_scan_done = true;
+        }
         std::thread::sleep(WATCH_INTERVAL);
         let Some(hit) = lane::find_rate_limit_in(config_dir, cwd, launched) else {
             continue;
@@ -198,16 +219,35 @@ fn watch(
         match limit_check(alias) {
             Limit::Reached => {
                 *limited.lock().unwrap_or_else(|e| e.into_inner()) = Some(hit);
-                // Signal the child's group directly, through exec's forwarder:
-                // a SIGTERM to this process would be lost if it was inherited
-                // as ignored.
-                exec::signals::forward(libc::SIGTERM);
+                if !stop.load(Ordering::SeqCst) {
+                    end_run(stop);
+                }
                 return;
             }
-            Limit::Room => handled.push(hit.uuid),
+            Limit::Room => {
+                handled.push(hit.uuid);
+                retry_at = None;
+            }
             Limit::Unknown => retry_at = Some(Instant::now() + CONFIRM_RETRY),
         }
     }
+}
+
+/// End the run through exec's child-group forwarder (a SIGTERM to this
+/// process could be inherited as ignored). If Claude has not exited after
+/// STOP_GRACE, for example because it inherited SIGTERM as ignored, kill its
+/// group: transcripts are append-only, so the session still resumes.
+fn end_run(stop: &AtomicBool) {
+    exec::signals::forward(libc::SIGTERM);
+    let started = Instant::now();
+    while started.elapsed() < STOP_GRACE {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("claudectl claude: Claude did not stop on SIGTERM; killing it");
+    exec::signals::forward(libc::SIGKILL);
 }
 
 enum Limit {
@@ -240,11 +280,14 @@ fn limit_check(alias: &str) -> Limit {
 /// The next account: rate-limited (never billed), with fresh usage below
 /// every limit, not the live login, and not tried in this launch, ranked as
 /// `use` ranks: lowest max(5h, 7d), a missing window counting as unavailable.
-fn choose(fetched: &[FetchedUsage], tried: &[String]) -> Option<String> {
+fn choose(fetched: &[FetchedUsage], tried: &[String], live_uuid: Option<&str>) -> Option<String> {
     let usable_until = chrono::Utc::now().timestamp() + MIN_VALID.as_secs() as i64;
     let candidates: Vec<use_profile::Candidate> = fetched
         .iter()
         .filter(|f| !f.is_active && !tried.contains(&f.alias))
+        // The live login's account, also when the active marker is stale:
+        // exec refuses it.
+        .filter(|f| live_uuid.is_none() || f.account_uuid.as_deref() != live_uuid)
         // exec refuses a profile without a known account or with a token that
         // expires within MIN_VALID; do not rank one.
         .filter(|f| f.account_uuid.is_some())
@@ -258,6 +301,17 @@ fn choose(fetched: &[FetchedUsage], tried: &[String]) -> Option<String> {
         .map(use_profile::candidate_from)
         .collect();
     use_profile::select_most_available(&candidates).map(str::to_string)
+}
+
+/// The live login's account UUID from `~/.claude.json`.
+fn live_uuid(store: &AuthStore) -> Option<String> {
+    store
+        .read_oauth_account()
+        .ok()
+        .flatten()?
+        .get("accountUuid")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// An explicitly chosen account that is not proven rate-limited may bill
@@ -300,7 +354,14 @@ fn relaunch_args(original: &[OsString], session_id: &str, prompt: &str) -> Vec<O
     while let Some(arg) = iter.next() {
         let text = arg.to_string_lossy();
         if text == "--resume" || text == "-r" {
-            iter.next();
+            // `--resume` alone opens a picker; skip a value only when present.
+            if iter
+                .clone()
+                .next()
+                .is_some_and(|next| !next.to_string_lossy().starts_with('-'))
+            {
+                iter.next();
+            }
             continue;
         }
         if text.starts_with("--resume=") || text == "--continue" || text == "-c" {
@@ -385,12 +446,15 @@ mod tests {
                 Some("max"),
             ),
         ];
-        assert_eq!(choose(&accounts, &[]).as_deref(), Some("roomy"));
+        assert_eq!(choose(&accounts, &[], None).as_deref(), Some("roomy"));
         assert_eq!(
-            choose(&accounts, &["roomy".into()]).as_deref(),
+            choose(&accounts, &["roomy".into()], None).as_deref(),
             Some("busy")
         );
-        assert_eq!(choose(&accounts, &["roomy".into(), "busy".into()]), None);
+        assert_eq!(
+            choose(&accounts, &["roomy".into(), "busy".into()], None),
+            None
+        );
     }
 
     #[test]
@@ -416,9 +480,12 @@ mod tests {
                 Some("max"),
             ),
         ];
-        assert_eq!(choose(&accounts, &[]).as_deref(), Some("calm"));
-        assert_eq!(choose(&accounts, &["calm".into()]).as_deref(), Some("hot"));
-        assert_eq!(choose(&accounts[2..], &[]), None, "missing 5h window");
+        assert_eq!(choose(&accounts, &[], None).as_deref(), Some("calm"));
+        assert_eq!(
+            choose(&accounts, &["calm".into()], None).as_deref(),
+            Some("hot")
+        );
+        assert_eq!(choose(&accounts[2..], &[], None), None, "missing 5h window");
     }
 
     #[test]
@@ -431,7 +498,18 @@ mod tests {
         expiring.token_expiry_secs = Some(chrono::Utc::now().timestamp() + 60);
         let mut no_expiry = fetched("no-expiry", &room, Some("max"));
         no_expiry.token_expiry_secs = None;
-        assert_eq!(choose(&[no_uuid, expiring, no_expiry], &[]), None);
+        assert_eq!(choose(&[no_uuid, expiring, no_expiry], &[], None), None);
+    }
+
+    #[test]
+    fn the_live_account_is_excluded_by_identity() {
+        let room =
+            format!(r#"{{"five_hour":{{"utilization":1}},"seven_day":{{"utilization":1}},{OFF}}}"#);
+        let accounts = [
+            fetched("a", &room, Some("max")),
+            fetched("b", &room, Some("max")),
+        ];
+        assert_eq!(choose(&accounts, &[], Some("uuid-a")).as_deref(), Some("b"));
     }
 
     #[test]
@@ -452,7 +530,19 @@ mod tests {
             Some("max"),
         );
         failed.error = Some("HTTP 500".into());
-        assert_eq!(choose(&[stale, failed], &[]), None);
+        assert_eq!(choose(&[stale, failed], &[], None), None);
+    }
+
+    #[test]
+    fn a_bare_resume_keeps_the_next_option() {
+        let original: Vec<OsString> = ["--resume", "--model", "opus"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(
+            relaunch_args(&original, "s2", "Go."),
+            ["--model", "opus", "--resume", "s2", "Go."].map(OsString::from)
+        );
     }
 
     #[test]
