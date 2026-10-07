@@ -8,8 +8,9 @@ use super::{
 use anyhow::{Result, bail};
 use axum::{
     Form, Json, Router,
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{Query, Request, State},
+    http::{StatusCode, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
@@ -232,6 +233,70 @@ fn page(html: String) -> Response {
         Html(document),
     )
         .into_response()
+}
+/// True when the Accept header lists `text/html` without rejecting it through `q=0`.
+fn accepts_html(accept: &str) -> bool {
+    accept.split(',').any(|range| {
+        let mut parts = range.split(';').map(str::trim);
+        parts
+            .next()
+            .is_some_and(|media| media.eq_ignore_ascii_case("text/html"))
+            && parts
+                .filter_map(|p| p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")))
+                .all(|q| q.parse::<f32>().is_ok_and(|q| q > 0.0))
+    })
+}
+/// Browser steps show a page for an error; API clients keep the JSON body and status.
+async fn browser_errors(request: Request, next: Next) -> Response {
+    let html = request
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(accepts_html);
+    let response = next.run(request).await;
+    if !html || !(response.status().is_client_error() || response.status().is_server_error()) {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let reason = axum::body::to_bytes(body, 4096)
+        .await
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["error"].as_str().map(String::from))
+        .unwrap_or_default();
+    let mut page = error_page(&reason);
+    *page.status_mut() = parts.status;
+    page.extensions_mut().extend(parts.extensions);
+    page
+}
+fn error_page(reason: &str) -> Response {
+    let (title, detail) = match reason {
+        "company_identity_required" => (
+            "Use your company account",
+            "This sign-in is not a verified company account. Run <code>claudectl server connect</code> again and pick your work account.",
+        ),
+        "user_not_allowed" | "user_unavailable" => (
+            "No access to this server",
+            "Your account is not on this server's allow list. Ask your admin for access.",
+        ),
+        "sso_denied" => (
+            "Sign-in did not finish",
+            "Your company sign-in did not confirm who you are. Run <code>claudectl server connect</code> again.",
+        ),
+        "enrollment_expired" | "invalid_sso_state" | "invalid_approval" => (
+            "This link has expired",
+            "Each link works once and only for five minutes. Run <code>claudectl server connect</code> again for a new link.",
+        ),
+        _ => (
+            "Something went wrong",
+            "The server could not finish this step. Wait a minute, then run <code>claudectl server connect</code> again.",
+        ),
+    };
+    page(format!(
+        include_str!("enrollment/error.html"),
+        title = title,
+        detail = detail
+    ))
 }
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -598,9 +663,13 @@ pub(super) fn routes(router: Router<Arc<Server>>) -> Router<Arc<Server>> {
     router
         .route("/v1/enrollment/start", post(start))
         .route("/v1/enrollment/poll", post(poll))
-        .route("/enroll", get(verify))
-        .route("/auth/callback", get(callback))
-        .route("/auth/approve", post(approve))
+        .merge(
+            Router::new()
+                .route("/enroll", get(verify))
+                .route("/auth/callback", get(callback))
+                .route("/auth/approve", post(approve))
+                .route_layer(middleware::from_fn(browser_errors)),
+        )
 }
 
 #[cfg(test)]
