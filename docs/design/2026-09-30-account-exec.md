@@ -78,6 +78,8 @@ Each run gets a new private directory, so the child neither reads nor writes the
 - Never copied: `oauthAccount` and any other identity, tokens, approved API keys, allowed tools, MCP servers, other projects, and settings files.
 - Without a readable `~/.claude.json`, nothing is copied and Claude shows its first-run screens.
 
+With `ExecRequest.state_dir`, the run uses that directory instead and keeps it afterwards (the `claude` launcher's lane, SAW-12468). It clears the executable snapshot first and rebuilds `.claude.json` from the allowlist above, plus the lane's own true start-up decisions (`hasTrustDialogAccepted` and the import approvals) from the previous seed; every other key of the old file, account state included, is dropped.
+
 ## Concurrency
 
 - Each run has its own config directory and pipe, so runs share no writable state, also on the same alias.

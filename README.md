@@ -265,6 +265,34 @@ pins the profile's account and the executable's SHA-256. It also keeps a private
 copy of claudectl in `<launcher>.claudectl/`, checks that copy's SHA-256 and runs
 it, so a later claudectl upgrade does not change what the launcher runs.
 
+### Lanes: one session across accounts
+
+```bash
+claudectl claude --lane review -- --dangerously-skip-permissions
+claudectl claude --lane review --account amir+2@example.com
+```
+
+`claudectl claude` runs Claude Code through `exec` on a saved account, with
+`CLAUDE_CONFIG_DIR` set to the lane's directory, `~/.claudectl/lanes/<lane>/config`.
+Only `projects/` (session transcripts) and the start-up decisions you made in
+the lane (folder trust, external CLAUDE.md imports) carry from one run to the
+next. Everything else, the `.claude.json` account state included, is rebuilt
+at every launch, so nothing moves from one account to another. One launcher at
+a time holds a lane.
+
+When Claude records a rate-limit error in the lane's transcript and one usage
+read confirms the account is at 100% of a window, claudectl ends the run
+(Claude gets `SIGTERM` and saves its session), picks the rate-limited account
+with the most room that this launch has not tried, and starts it with
+`--resume <session> "<recovery prompt>"`. It never picks an account that may
+bill credits (`usage_based` or `unknown` in `status --json`) and stops after 3
+recoveries in an hour, or when no account has room; the session stays in the
+lane. An explicit `--account` that may bill credits needs a yes on the terminal
+or `--allow-billing`. Without `--account`, it starts on the rate-limited
+account with the most room. `--lane` names the lane; `accounts.jsonl` in the
+lane records which account ran when, and `receipts.jsonl` holds the `exec`
+receipts.
+
 ### Statusline
 
 ```bash

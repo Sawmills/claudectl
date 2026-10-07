@@ -95,6 +95,27 @@ enum Commands {
         #[arg(last = true, required = true)]
         command: Vec<std::ffi::OsString>,
     },
+    /// Run Claude Code in a lane; on a usage limit, resume the session on another account
+    Claude {
+        /// Lane name: the session state kept between accounts
+        #[arg(long)]
+        lane: String,
+        /// Start on this saved profile (default: the rate-limited account with most room)
+        #[arg(long)]
+        account: Option<String>,
+        /// Allow starting on an account that may bill credits without asking
+        #[arg(long)]
+        allow_billing: bool,
+        /// Prompt sent when the session resumes on another account
+        #[arg(long, default_value = "Continue the previous request.")]
+        recovery_prompt: String,
+        /// Claude Code executable
+        #[arg(long, default_value = "claude")]
+        claude: std::ffi::OsString,
+        /// Arguments for Claude Code, after `--`
+        #[arg(last = true)]
+        args: Vec<std::ffi::OsString>,
+    },
     /// Write a launcher script pinned to one saved profile and one executable
     Launcher {
         /// Saved profile the launcher runs on
@@ -181,8 +202,24 @@ fn main() {
                 receipt,
                 program,
                 args: command,
+                state_dir: None,
             }))
         }
+        Commands::Claude {
+            lane,
+            account,
+            allow_billing,
+            recovery_prompt,
+            claude,
+            args,
+        } => std::process::exit(commands::claude::run(commands::claude::LaunchArgs {
+            lane,
+            account,
+            allow_billing,
+            recovery_prompt,
+            claude,
+            args,
+        })),
         Commands::Launcher {
             ref profile,
             ref claude,

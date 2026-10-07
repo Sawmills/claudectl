@@ -209,6 +209,7 @@ fn request(alias: &str, program: &Path) -> ExecRequest {
         receipt: None,
         program: program.as_os_str().to_owned(),
         args: vec!["-p".into(), "hello".into()],
+        state_dir: None,
     }
 }
 
@@ -591,6 +592,7 @@ fn helper_run_one_alias() {
     let child = out.join("fake-claude");
     let mut req = request(&alias, &child);
     req.receipt = Some(out.join("receipt.jsonl"));
+    req.state_dir = std::env::var_os("CLAUDECTL_TEST_STATE_DIR").map(Into::into);
     let prepared = prepare(
         &paths,
         &store,
@@ -2857,4 +2859,75 @@ fn trust_comes_from_the_closest_trusted_ancestor_under_its_own_key() {
     let seeded: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("claude_json")).unwrap()).unwrap();
     assert_eq!(seeded, serde_json::json!({"hasCompletedOnboarding": true}));
+}
+
+#[test]
+fn a_kept_state_dir_survives_the_run_with_fresh_seed_and_snapshot() {
+    let _guard = run_guard();
+    let (home, paths, _store) = setup();
+    save(
+        &paths,
+        "one",
+        "uuid-one",
+        &creds("a-one", "r-one", 2 * HOUR_MS),
+    );
+    std::fs::write(paths.claude_json(), r#"{"hasCompletedOnboarding":true}"#).unwrap();
+    let state = home.path().join("lane-config");
+    std::fs::create_dir_all(state.join("projects/p")).unwrap();
+    std::fs::write(state.join("projects/p/s.jsonl"), "{}").unwrap();
+    std::fs::create_dir_all(state.join("bin")).unwrap();
+    std::fs::write(state.join("bin/stale"), "").unwrap();
+    std::fs::write(
+        state.join(".claude.json"),
+        serde_json::json!({
+            "oauthAccount": {"accountUuid": "old"},
+            "fableOverageConsentV2": true,
+            "projects": {"/lane/dir": {
+                "hasTrustDialogAccepted": true,
+                "hasClaudeMdExternalIncludesApproved": true,
+                "hasClaudeMdExternalIncludesWarningShown": false,
+                "allowedTools": ["Bash"],
+                "mcpServers": {"x": {}}
+            }}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = home.path().join("out-state");
+    std::fs::create_dir(&out).unwrap();
+    fake_child(&out, &out, 0);
+    let status = run_helper(
+        home.path(),
+        "one",
+        &out,
+        &[("CLAUDECTL_TEST_STATE_DIR", state.to_str().unwrap())],
+        false,
+    );
+    assert!(status.success());
+    assert_eq!(
+        std::fs::read_to_string(out.join("config_dir")).unwrap(),
+        state.to_str().unwrap()
+    );
+    assert!(
+        state.join("projects/p/s.jsonl").exists(),
+        "transcripts are kept"
+    );
+    assert!(
+        !state.join("bin/stale").exists(),
+        "the old snapshot is replaced"
+    );
+    let seeded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("claude_json")).unwrap()).unwrap();
+    // Rebuilt: the lane's own start-up decisions carry over (true only); the
+    // old account, consent, tools and MCP servers do not.
+    assert_eq!(
+        seeded,
+        serde_json::json!({
+            "hasCompletedOnboarding": true,
+            "projects": {"/lane/dir": {
+                "hasTrustDialogAccepted": true,
+                "hasClaudeMdExternalIncludesApproved": true
+            }}
+        })
+    );
 }

@@ -213,6 +213,11 @@ pub fn print_focused(fetched: &[FetchedUsage], alias: &str) {
     print_summary(&accounts);
 }
 
+/// One saved profile's usage.
+pub fn fetch_alias(alias: &str, mode: FetchMode) -> Result<Option<FetchedUsage>> {
+    Ok(fetch_usages(Some(alias), mode)?.into_iter().next())
+}
+
 pub fn fetch_all_usages() -> Result<Vec<FetchedUsage>> {
     fetch_usages(None, FetchMode::Normal)
 }
