@@ -1,5 +1,6 @@
 pub mod completions;
 pub mod exec;
+pub mod label;
 pub mod launcher;
 pub mod list;
 pub mod login;

@@ -62,6 +62,13 @@ enum Commands {
     },
     /// Show current active account
     Whoami,
+    /// Set or clear a profile's display label
+    Label {
+        /// Profile alias to label
+        alias: String,
+        /// Label text (omit or leave blank to clear)
+        text: Option<String>,
+    },
     /// Run one command on a saved profile without switching the live login
     Exec {
         /// Saved profile to run on (never the active profile)
@@ -139,6 +146,10 @@ fn main() {
         Commands::List => commands::list::run(),
         Commands::Remove { ref alias } => commands::remove::run(alias),
         Commands::Whoami => commands::whoami::run(),
+        Commands::Label {
+            ref alias,
+            ref text,
+        } => commands::label::run(alias, text.as_deref()),
         Commands::Exec {
             profile,
             expect_account,

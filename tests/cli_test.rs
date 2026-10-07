@@ -89,6 +89,7 @@ fn help_shows_all_subcommands() {
         "list",
         "remove",
         "whoami",
+        "label",
         "completions",
     ] {
         assert!(stdout.contains(subcommand), "missing {subcommand}");
@@ -120,7 +121,25 @@ fn zsh_completions_wire_alias_args_to_profile_completer() {
     let mut cmd = Command::cargo_bin("claudectl").unwrap();
     let output = cmd.args(["completions", "zsh"]).output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(stdout.matches("_claudectl_profiles'").count(), 3);
+    assert_eq!(stdout.matches("_claudectl_profiles'").count(), 4);
+    assert!(stdout.contains("':alias -- Profile alias to label:_claudectl_profiles'"));
+}
+
+#[test]
+fn fish_completions_offer_aliases_for_the_label_alias_only() {
+    let output = |shell: &str| {
+        let output = Command::cargo_bin("claudectl")
+            .unwrap()
+            .args(["completions", shell])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert!(
+        output("fish").contains(
+            "__fish_seen_subcommand_from label; and test (count (commandline -opc)) -eq 2"
+        )
+    );
 }
 
 #[test]
@@ -263,4 +282,77 @@ fn exec_requires_a_command_after_the_separator() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn label_shows_in_list_and_clears() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join(".claudectl/profiles/work");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("account.json"),
+        r#"{"alias":"work","saved_at":"2026-01-01T00:00:00Z","oauth_account":{"emailAddress":"w@x.io"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"t"}}"#,
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let output = Command::cargo_bin("claudectl")
+            .unwrap()
+            .args(args)
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert!(run(&["label", "work", "Team seat"]).contains("labelled 'work' as 'Team seat'"));
+    assert!(run(&["list"]).contains("work [Team seat] (w@x.io)"));
+    assert!(run(&["label", "work"]).contains("cleared the label of 'work'"));
+    assert!(run(&["list"]).contains("  work (w@x.io)"));
+}
+
+#[test]
+fn bash_completions_offer_aliases_only_for_the_alias_argument() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".claudectl/profiles/work")).unwrap();
+    let output = Command::cargo_bin("claudectl")
+        .unwrap()
+        .args(["completions", "bash"])
+        .output()
+        .unwrap();
+    let script = home.path().join("claudectl.bash");
+    std::fs::write(&script, output.stdout).unwrap();
+    let complete = |words: &str, cword: usize| {
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "source '{}'; COMP_WORDS=({words}); COMP_CWORD={cword}; \
+                 _claudectl_with_profiles claudectl \"${{COMP_WORDS[COMP_CWORD]}}\"; \
+                 printf '%s\\n' \"${{COMPREPLY[@]}}\"",
+                script.display()
+            ))
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert!(
+        complete("claudectl label ''", 2)
+            .lines()
+            .any(|w| w == "work")
+    );
+    assert!(complete("claudectl use ''", 2).lines().any(|w| w == "work"));
+    assert!(
+        !complete("claudectl label work ''", 3)
+            .lines()
+            .any(|w| w == "work")
+    );
 }

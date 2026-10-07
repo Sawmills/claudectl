@@ -14,6 +14,9 @@ pub struct AccountMeta {
     /// `oauthAccount` blob from ~/.claude.json (None when login couldn't fetch identity).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oauth_account: Option<serde_json::Value>,
+    /// Display name for the account. Display only: it need not be unique.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl AccountMeta {
@@ -142,15 +145,51 @@ pub fn save_profile_to(
     let dir = paths.profiles_dir().join(alias);
     std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
 
+    // A re-save keeps the label the user gave the alias.
+    let label = read_account_meta(&dir).ok().and_then(|meta| meta.label);
     let meta = AccountMeta {
         alias: alias.to_string(),
         saved_at: chrono::Utc::now().to_rfc3339(),
         oauth_account,
+        label,
     };
     let profile = Profile { meta, dir };
     profile.write_credentials(creds)?;
     write_account_meta(&profile.dir, &profile.meta)?;
     Ok(profile)
+}
+
+/// Longest label accepted, in characters.
+pub const MAX_LABEL_CHARS: usize = 40;
+
+/// Set a profile's display label, or clear it when `label` is None or blank.
+/// Returns the stored label.
+pub fn set_label_from(
+    paths: &Paths,
+    store: &AuthStore,
+    alias: &str,
+    label: Option<&str>,
+) -> Result<Option<String>> {
+    let alias = validate_alias(alias)?;
+    let label = normalize_label(label)?;
+    let _auth_lock = store.lock_auth_state()?;
+    let mut profile = get_profile_from(paths, alias)?;
+    profile.meta.label = label.clone();
+    write_account_meta(&profile.dir, &profile.meta)?;
+    Ok(label)
+}
+
+fn normalize_label(label: Option<&str>) -> Result<Option<String>> {
+    let Some(label) = label.map(str::trim).filter(|label| !label.is_empty()) else {
+        return Ok(None);
+    };
+    if label.chars().count() > MAX_LABEL_CHARS {
+        bail!("label must be at most {MAX_LABEL_CHARS} characters");
+    }
+    if label.chars().any(char::is_control) {
+        bail!("label must not contain control characters");
+    }
+    Ok(Some(label.to_string()))
 }
 
 pub fn delete_profile_from(paths: &Paths, alias: &str) -> Result<()> {
@@ -308,9 +347,14 @@ fn read_account_meta(dir: &std::path::Path) -> Result<AccountMeta> {
     serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
 }
 
+/// Replace account.json atomically, so a reader never sees a partial file.
 fn write_account_meta(dir: &std::path::Path, meta: &AccountMeta) -> Result<()> {
     let json = serde_json::to_string_pretty(meta)?;
-    std::fs::write(dir.join("account.json"), json)?;
+    let tmp = dir.join(".account.json.tmp");
+    std::fs::write(&tmp, json).with_context(|| format!("failed to write {}", tmp.display()))?;
+    let path = dir.join("account.json");
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
     Ok(())
 }
 
@@ -327,6 +371,62 @@ pub fn get_active() -> Result<Option<String>> {
 mod tests {
     use super::*;
     use crate::api::OauthCreds;
+
+    #[test]
+    fn label_is_set_trimmed_kept_on_resave_and_cleared() {
+        let (_tmp, paths, store) = setup();
+        save_profile_to(&paths, "work", &creds("a"), Some(account("w@x", "u1"))).unwrap();
+        assert_eq!(
+            set_label_from(&paths, &store, "work", Some("  Team seat ")).unwrap(),
+            Some("Team seat".to_string())
+        );
+        assert_eq!(
+            get_profile_from(&paths, "work")
+                .unwrap()
+                .meta
+                .label
+                .as_deref(),
+            Some("Team seat")
+        );
+        save_profile_to(&paths, "work", &creds("b"), Some(account("w@x", "u1"))).unwrap();
+        assert_eq!(
+            get_profile_from(&paths, "work")
+                .unwrap()
+                .meta
+                .label
+                .as_deref(),
+            Some("Team seat")
+        );
+        assert_eq!(
+            set_label_from(&paths, &store, "work", Some("  ")).unwrap(),
+            None
+        );
+        assert_eq!(get_profile_from(&paths, "work").unwrap().meta.label, None);
+        let json = std::fs::read_to_string(paths.profiles_dir().join("work/account.json")).unwrap();
+        assert!(
+            !json.contains("label"),
+            "a cleared label is not written: {json}"
+        );
+    }
+
+    #[test]
+    fn label_rejects_long_or_control_text_and_unknown_profiles() {
+        let (_tmp, paths, store) = setup();
+        save_profile_to(&paths, "work", &creds("a"), None).unwrap();
+        let long = "x".repeat(MAX_LABEL_CHARS + 1);
+        assert!(set_label_from(&paths, &store, "work", Some(&long)).is_err());
+        assert!(set_label_from(&paths, &store, "work", Some("a\nb")).is_err());
+        assert!(set_label_from(&paths, &store, "missing", Some("x")).is_err());
+        assert!(set_label_from(&paths, &store, "../work", Some("x")).is_err());
+        assert_eq!(get_profile_from(&paths, "work").unwrap().meta.label, None);
+    }
+
+    #[test]
+    fn account_meta_without_a_label_still_loads() {
+        let meta: AccountMeta =
+            serde_json::from_str(r#"{"alias":"a","saved_at":"2026-01-01T00:00:00Z"}"#).unwrap();
+        assert_eq!(meta.label, None);
+    }
 
     fn creds(token: &str) -> CredentialsFile {
         CredentialsFile {

@@ -12,7 +12,9 @@ use claudectl::exec::*;
 
 const HOUR_MS: i64 = 3_600_000;
 
-/// Signal handlers are process-wide; tests that start children run one at a time.
+/// Signal handlers are process-wide, and on macOS a pipe is not close-on-exec
+/// until just after it is created, so a fork in another test thread can leak
+/// it. Tests that start processes run one at a time.
 static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
@@ -148,6 +150,7 @@ out='{out}'
 eval "cat <&$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" > "$out/token"
 printf '%s' "$CLAUDE_CONFIG_DIR" > "$out/config_dir"
 if [ -d "$CLAUDE_CONFIG_DIR" ]; then echo yes > "$out/config_exists"; fi
+if [ -f "$CLAUDE_CONFIG_DIR/.claude.json" ]; then cp "$CLAUDE_CONFIG_DIR/.claude.json" "$out/claude_json"; fi
 env | cut -d= -f1 | grep -E '^(CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_OAUTH_REFRESH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY|ANTHROPIC_AWS|ANTHROPIC_GOOGLE_CLOUD|GATEWAY|MANTLE)|ANTHROPIC_(BASE_URL|API_HOST|ASSETS_HOST|CUSTOM_HEADERS)|ANTHROPIC_(AWS|BEDROCK|BEDROCK_MANTLE|FOUNDRY|GOOGLE_CLOUD|VERTEX)_BASE_URL)$' > "$out/leaked_env" || true
 if [ -n "${{FAKE_SELF_HUP:-}}" ]; then kill -HUP $$; echo survived > "$out/self_hup"; fi
 printf '%s ' "$@" > "$out/args"
@@ -159,6 +162,10 @@ n=4; while [ $n -le 63 ]; do
   if [ -p "/dev/fd/$n" ]; then echo "$n" >> "$out/extra_fds"; fi
   n=$((n+1))
 done
+# Describe a leak for the failure message: this process and its parent.
+if [ -s "$out/extra_fds" ]; then
+  {{ lsof -p $$; ps -o pid,command -p $PPID; lsof -p $PPID; }} > "$out/fd_detail" 2>&1
+fi
 sleep "${{FAKE_SLEEP:-0}}"
 exit {code}
 "#,
@@ -171,6 +178,26 @@ exit {code}
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     script
+}
+
+/// Pipes the child reported in `extra_fds`, less the ones this test process
+/// itself inherited without close-on-exec (a CI runner can pass one on).
+/// Every child of this process inherits those, so they are not a leak from
+/// claudectl; the token pipe is close-on-exec here.
+fn leaked_fds(out: &Path) -> Vec<String> {
+    std::fs::read_to_string(out.join("extra_fds"))
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            let Ok(fd) = line.parse::<i32>() else {
+                return true;
+            };
+            // SAFETY: F_GETFD only reads this process's descriptor flags.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            flags == -1 || flags & libc::FD_CLOEXEC != 0
+        })
+        .map(str::to_owned)
+        .collect()
 }
 
 fn request(alias: &str, program: &Path) -> ExecRequest {
@@ -446,9 +473,10 @@ fn runs_the_child_on_the_saved_profile_and_leaves_global_state_alone() {
     assert!(out.join("config_exists").exists());
     assert_eq!(std::fs::read_to_string(out.join("fd_name")).unwrap(), "3");
     assert_eq!(
-        std::fs::read_to_string(out.join("extra_fds")).unwrap(),
-        "",
-        "the child must inherit no descriptor besides the token fd"
+        leaked_fds(&out),
+        Vec::<String>::new(),
+        "the child must inherit no descriptor besides the token fd\n{}",
+        std::fs::read_to_string(out.join("fd_detail")).unwrap_or_default()
     );
     let config_dir =
         std::path::PathBuf::from(std::fs::read_to_string(out.join("config_dir")).unwrap());
@@ -544,6 +572,7 @@ fn helper_run_one_alias() {
     let paths = Paths::from_home(home.into());
     let store = AuthStore::file_only(paths.clone());
     let out = std::path::PathBuf::from(out);
+    std::fs::write(out.join("helper_pid"), std::process::id().to_string()).unwrap();
     #[cfg(unix)]
     {
         // Record the inherited SIGCHLD disposition, so a test can prove its setup.
@@ -570,6 +599,18 @@ fn helper_run_one_alias() {
         self_identity(),
     )
     .unwrap();
+    if std::env::var_os("CLAUDECTL_TEST_GATE_LOCK").is_some() {
+        // Hold the auth lock until the test releases it, so `run` waits in
+        // its lock retry after its own checks.
+        let lock = store.lock_auth_state().unwrap();
+        let release = out.join("release_lock");
+        std::thread::spawn(move || {
+            while !release.exists() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            drop(lock);
+        });
+    }
     run(&paths, &store, prepared, &req).unwrap();
     #[cfg(unix)]
     {
@@ -583,6 +624,17 @@ fn helper_run_one_alias() {
         std::fs::write(
             out.join("sighup_after"),
             if ignored { "ignored" } else { "default" },
+        )
+        .unwrap();
+        // Record whether this process owns the terminal foreground again.
+        // SAFETY: tcgetpgrp and getpgrp only read process state.
+        let owned = unsafe {
+            let foreground = libc::tcgetpgrp(libc::STDIN_FILENO);
+            foreground != -1 && foreground == libc::getpgrp()
+        };
+        std::fs::write(
+            out.join("foreground_after"),
+            if owned { "owned" } else { "not_owned" },
         )
         .unwrap();
     }
@@ -635,6 +687,7 @@ fn run_helper_in(
 
 #[test]
 fn child_env_drops_credentials_provider_selectors_and_endpoint_overrides() {
+    let _guard = run_guard();
     let (home, paths, _store) = setup();
     save(
         &paths,
@@ -853,6 +906,7 @@ fn user_settings_in_home_are_skipped_below_home_but_checked_at_home() {
 
 #[test]
 fn exec_refuses_to_start_in_a_project_whose_settings_set_a_credential() {
+    let _guard = run_guard();
     let (home, paths, _store) = setup();
     save(
         &paths,
@@ -876,6 +930,7 @@ fn exec_refuses_to_start_in_a_project_whose_settings_set_a_credential() {
 
 #[test]
 fn inherited_ignored_sighup_stays_ignored_for_child_and_after_run() {
+    let _guard = run_guard();
     let (home, paths, _store) = setup();
     save(
         &paths,
@@ -901,6 +956,7 @@ fn inherited_ignored_sighup_stays_ignored_for_child_and_after_run() {
 
 #[test]
 fn concurrent_runs_in_two_processes_stay_isolated() {
+    let _guard = run_guard();
     let (home, paths, _store) = setup();
     for alias in ["one", "two"] {
         save(
@@ -939,8 +995,12 @@ fn concurrent_runs_in_two_processes_stay_isolated() {
             token == format!("a-{alias}").into_bytes(),
             "{alias} received another alias's token"
         );
-        let extra = std::fs::read_to_string(out.join("extra_fds")).unwrap();
-        assert_eq!(extra, "", "{alias} inherited another descriptor");
+        assert_eq!(
+            leaked_fds(&out),
+            Vec::<String>::new(),
+            "{alias} inherited another descriptor\n{}",
+            std::fs::read_to_string(out.join("fd_detail")).unwrap_or_default()
+        );
         dirs.push(std::fs::read_to_string(out.join("config_dir")).unwrap());
     }
     assert_ne!(dirs[0], dirs[1], "runs share a config dir");
@@ -2147,4 +2207,654 @@ fn a_live_login_change_after_prepare_is_refused() {
         !out.join("token").exists(),
         "no child after a live login change"
     );
+}
+
+/// A child that uses the terminal. It records its PID, its process group and
+/// the terminal's foreground group, then runs `body`.
+#[cfg(unix)]
+fn tty_child(out: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = out.join("fake-claude");
+    let text = format!(
+        r#"#!/bin/sh
+out='{out}'
+echo $$ > "$out/pid"
+ps -o pgid= -p $$ | tr -d ' ' > "$out/pgid"
+ps -o tpgid= -p $$ | tr -d ' ' > "$out/tpgid"
+{body}
+"#,
+        out = out.display()
+    );
+    std::fs::write(&script, text).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// `helper_run_one_alias` as a job of a job-control shell that leads a new
+/// session on a pty, as in a terminal pane. When the job stops on SIGTSTP the
+/// shell records that and resumes it with `fg`, or with `bg` when `resume`
+/// is "bg".
+#[cfg(unix)]
+struct PtyJob {
+    shell: std::process::Child,
+    master: std::fs::File,
+    output: std::sync::mpsc::Receiver<Vec<u8>>,
+    out: std::path::PathBuf,
+    tty: String,
+    done: bool,
+}
+
+/// A shell whose `set -m` sees a job stop. macOS /bin/sh (bash 3.2) does not
+/// see one; dash does, and it is /bin/sh on Ubuntu.
+#[cfg(unix)]
+const STOP_SHELL: &str = "/bin/dash";
+
+#[cfg(unix)]
+const JOB_SHELL: &str = r#"set -m
+"$@"
+s=$?
+echo "$s" >> "$CLAUDECTL_TEST_OUT/job_status"
+if [ "$s" = "$TSTP_STATUS" ] && [ "$JOB_RESUME" = bg ]; then
+  bg
+  : > "$CLAUDECTL_TEST_OUT/in_background"
+  wait
+  s=$?
+  echo "$s" >> "$CLAUDECTL_TEST_OUT/job_status"
+  # Who owns the terminal once the background job is done. Without job
+  # control, so the probe does not become a foreground job itself.
+  set +m
+  ps -o tpgid= -p $$ | tr -d ' ' > "$CLAUDECTL_TEST_OUT/shell_tpgid"
+  ps -o pgid= -p $$ | tr -d ' ' > "$CLAUDECTL_TEST_OUT/shell_pgid"
+elif [ "$s" = "$TSTP_STATUS" ]; then
+  fg
+  s=$?
+  echo "$s" >> "$CLAUDECTL_TEST_OUT/job_status"
+fi
+exit "$s"
+"#;
+
+#[cfg(unix)]
+impl PtyJob {
+    fn start(home: &Path, alias: &str, out: &Path) -> Self {
+        Self::start_resuming(home, alias, out, "fg", &[])
+    }
+
+    fn start_resuming(
+        home: &Path,
+        alias: &str,
+        out: &Path,
+        resume: &str,
+        env: &[(&str, &str)],
+    ) -> Self {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::process::CommandExt;
+        // SAFETY: plain pty calls; ptsname's static buffer is read at once,
+        // and the run guard keeps other tests from calling it meanwhile.
+        let (master, name) = unsafe {
+            let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(fd >= 0, "posix_openpt: {}", std::io::Error::last_os_error());
+            assert_eq!(libc::grantpt(fd), 0);
+            assert_eq!(libc::unlockpt(fd), 0);
+            let name = std::ffi::CStr::from_ptr(libc::ptsname(fd))
+                .to_str()
+                .unwrap()
+                .to_owned();
+            (std::fs::File::from_raw_fd(fd), name)
+        };
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(&name)
+            .unwrap();
+        let name = name.trim_start_matches("/dev/").to_owned();
+        // Only the Ctrl-Z test needs the shell to see a job stop, and it
+        // runs only with STOP_SHELL; the other tests accept any /bin/sh.
+        let job_shell = if Path::new(STOP_SHELL).exists() {
+            STOP_SHELL
+        } else {
+            "/bin/sh"
+        };
+        let mut shell = std::process::Command::new(job_shell);
+        shell
+            .args(["-c", JOB_SHELL, "sh"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "helper_run_one_alias", "--test-threads=1"])
+            .env("CLAUDECTL_TEST_HOME", home)
+            .env("CLAUDECTL_TEST_ALIAS", alias)
+            .env("CLAUDECTL_TEST_OUT", out)
+            .env("TSTP_STATUS", (128 + libc::SIGTSTP).to_string())
+            .env("JOB_RESUME", resume)
+            .envs(env.iter().copied())
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave);
+        // SAFETY: runs in the forked shell before exec; setsid and ioctl are
+        // async-signal-safe. The pty becomes the new session's terminal.
+        unsafe {
+            shell.pre_exec(|| {
+                if libc::setsid() == -1
+                    || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = shell.spawn().unwrap();
+        // Close the parent's slave copies, which the command holds, so the
+        // reader sees the end of the session.
+        drop(shell);
+        let mut reader = master.try_clone().unwrap();
+        let (sender, output) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buffer) {
+                if n == 0 || sender.send(buffer[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            shell: child,
+            master,
+            output,
+            out: out.to_path_buf(),
+            tty: name,
+            done: false,
+        }
+    }
+
+    fn type_text(&mut self, text: &[u8]) {
+        use std::io::Write;
+        self.master.write_all(text).unwrap();
+    }
+
+    /// The shell's exit status, or None after `limit`.
+    fn wait(&mut self, limit: Duration) -> Option<std::process::ExitStatus> {
+        let started = std::time::Instant::now();
+        while started.elapsed() < limit {
+            if let Some(status) = self.shell.try_wait().unwrap() {
+                self.done = true;
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    /// The terminal output so far and the session's processes, for a
+    /// failure message.
+    fn transcript(&self) -> String {
+        let bytes: Vec<u8> = self.output.try_iter().flatten().collect();
+        let processes = std::process::Command::new("ps")
+            .args(["-o", "pid,pgid,tpgid,stat,command", "-t", &self.tty])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        format!("{}\n{processes}", String::from_utf8_lossy(&bytes))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PtyJob {
+    /// A run that did not finish leaves no process behind: kill the child's
+    /// group, the job's group and the shell.
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        for file in ["pid", "helper_pid"] {
+            if let Some(pid) = std::fs::read_to_string(self.out.join(file))
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                // SAFETY: kill only sends a signal.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
+        }
+        let _ = self.shell.kill();
+        let _ = self.shell.wait();
+    }
+}
+
+/// Wait until `path` exists.
+#[cfg(unix)]
+fn wait_for(path: &Path, limit: Duration) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < limit {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+#[cfg(unix)]
+fn tty_child_setup(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let (home, paths, _store) = setup();
+    save(
+        &paths,
+        "one",
+        "uuid-one",
+        &creds("a-one", "r-one", 2 * HOUR_MS),
+    );
+    let out = home.path().join("out-tty");
+    std::fs::create_dir(&out).unwrap();
+    tty_child(&out, body);
+    (home, out)
+}
+
+#[cfg(unix)]
+fn read_out(out: &Path, name: &str) -> String {
+    std::fs::read_to_string(out.join(name)).unwrap_or_default()
+}
+
+#[cfg(unix)]
+const LIMIT: Duration = Duration::from_secs(15);
+
+#[cfg(unix)]
+#[test]
+fn an_interactive_child_owns_the_terminal_and_reads_it() {
+    let _guard = run_guard();
+    let (home, out) = tty_child_setup(
+        r#"echo ready > "$out/ready"
+IFS= read -r line
+printf '%s' "$line" > "$out/line""#,
+    );
+    let mut job = PtyJob::start(home.path(), "one", &out);
+    assert!(wait_for(&out.join("ready"), LIMIT), "{}", job.transcript());
+    job.type_text(b"hello\n");
+    let status = job.wait(LIMIT);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the child did not finish: {:?}\n{}",
+        status,
+        job.transcript()
+    );
+    assert_eq!(read_out(&out, "pgid"), read_out(&out, "tpgid"));
+    assert_eq!(read_out(&out, "line"), "hello");
+}
+
+#[cfg(unix)]
+#[test]
+fn ctrl_c_reaches_an_interactive_child_once_from_the_terminal() {
+    let _guard = run_guard();
+    let (home, out) = tty_child_setup(
+        r#"trap 'echo int >> "$out/int"; exit 0' INT
+echo ready > "$out/ready"
+while :; do sleep 1; done"#,
+    );
+    let mut job = PtyJob::start(home.path(), "one", &out);
+    assert!(wait_for(&out.join("ready"), LIMIT), "{}", job.transcript());
+    job.type_text(b"\x03");
+    let status = job.wait(LIMIT);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the child did not finish: {:?}\n{}",
+        status,
+        job.transcript()
+    );
+    // The terminal sends SIGINT to the child's group; claudectl is outside
+    // the foreground group and forwards no second copy.
+    assert_eq!(read_out(&out, "pgid"), read_out(&out, "tpgid"));
+    assert_eq!(read_out(&out, "int"), "int\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn ctrl_z_suspends_the_job_and_fg_resumes_the_child() {
+    if !Path::new(STOP_SHELL).exists() {
+        eprintln!(
+            "skipped: {STOP_SHELL} is missing, and no other shell is known to see a job stop"
+        );
+        return;
+    }
+    let _guard = run_guard();
+    let (home, out) = tty_child_setup(
+        r#"echo ready > "$out/ready"
+IFS= read -r line
+printf '%s' "$line" > "$out/line""#,
+    );
+    let mut job = PtyJob::start(home.path(), "one", &out);
+    assert!(wait_for(&out.join("ready"), LIMIT), "{}", job.transcript());
+    // Let the child reach its read before the suspend key.
+    std::thread::sleep(Duration::from_millis(300));
+    job.type_text(b"\x1a");
+    assert!(
+        wait_for(&out.join("job_status"), LIMIT),
+        "the job did not stop: {}",
+        job.transcript()
+    );
+    job.type_text(b"after\n");
+    let status = job.wait(LIMIT);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the job did not finish after fg: {:?}\n{}",
+        status,
+        job.transcript()
+    );
+    let stopped = (128 + libc::SIGTSTP).to_string();
+    assert_eq!(
+        read_out(&out, "job_status").lines().collect::<Vec<_>>(),
+        [stopped.as_str(), "0"]
+    );
+    assert_eq!(read_out(&out, "line"), "after");
+}
+
+#[cfg(unix)]
+#[test]
+fn claudectl_owns_the_terminal_again_after_an_interactive_child() {
+    let _guard = run_guard();
+    let (home, out) = tty_child_setup(r#"echo ready > "$out/ready""#);
+    let mut job = PtyJob::start(home.path(), "one", &out);
+    let status = job.wait(LIMIT);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "{:?}\n{}",
+        status,
+        job.transcript()
+    );
+    assert_eq!(read_out(&out, "foreground_after"), "owned");
+}
+
+/// A child that handles `signal` and stopped itself; claudectl receives
+/// `signal` and must still end the run.
+#[cfg(unix)]
+fn forwarded_signal_ends_a_stopped_child(signal: libc::c_int) {
+    let _guard = run_guard();
+    // Handlers like the Claude TUI's: macOS ends a stopped process on a
+    // default-action signal, but a handled one waits for SIGCONT.
+    let (home, out) = tty_child_setup(
+        r#"trap 'exit 130' INT
+trap 'exit 143' TERM
+echo ready > "$out/ready"
+kill -STOP $$"#,
+    );
+    let mut helper = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "helper_run_one_alias", "--test-threads=1"])
+        .env("CLAUDECTL_TEST_HOME", home.path())
+        .env("CLAUDECTL_TEST_ALIAS", "one")
+        .env("CLAUDECTL_TEST_OUT", &out)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(wait_for(&out.join("ready"), LIMIT));
+    let pid: i32 = read_out(&out, "pid").trim().parse().unwrap();
+    let started = std::time::Instant::now();
+    let mut stopped = false;
+    while started.elapsed() < LIMIT && !stopped {
+        let state = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        stopped = String::from_utf8_lossy(&state.stdout)
+            .trim_start()
+            .starts_with('T');
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(stopped, "test setup: the child stopped itself");
+    // SAFETY: kill only sends a signal to the helper.
+    unsafe { libc::kill(helper.id() as i32, signal) };
+    let started = std::time::Instant::now();
+    let mut status = None;
+    while started.elapsed() < LIMIT && status.is_none() {
+        status = helper.try_wait().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if status.is_none() {
+        // SAFETY: kill only sends signals; no process is left behind.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+            libc::kill(helper.id() as i32, libc::SIGKILL);
+        }
+    }
+    let _ = helper.wait();
+    assert!(
+        status.is_some(),
+        "claudectl did not end the stopped child on signal {signal}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_forwarded_sigterm_ends_a_stopped_child() {
+    forwarded_signal_ends_a_stopped_child(libc::SIGTERM);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_forwarded_sigint_ends_a_stopped_child() {
+    forwarded_signal_ends_a_stopped_child(libc::SIGINT);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_that_exits_in_the_background_leaves_the_terminal_to_the_shell() {
+    if !Path::new(STOP_SHELL).exists() {
+        eprintln!(
+            "skipped: {STOP_SHELL} is missing, and no other shell is known to see a job stop"
+        );
+        return;
+    }
+    let _guard = run_guard();
+    let (home, out) = tty_child_setup(
+        r#"echo ready > "$out/ready"
+while [ ! -e "$out/go" ]; do sleep 0.1; done"#,
+    );
+    let mut job = PtyJob::start_resuming(home.path(), "one", &out, "bg", &[]);
+    assert!(wait_for(&out.join("ready"), LIMIT), "{}", job.transcript());
+    job.type_text(b"\x1a");
+    assert!(
+        wait_for(&out.join("in_background"), LIMIT),
+        "the job did not stop: {}",
+        job.transcript()
+    );
+    std::fs::write(out.join("go"), "").unwrap();
+    let status = job.wait(LIMIT);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the background job did not finish: {:?}\n{}",
+        status,
+        job.transcript()
+    );
+    // claudectl ran in the background when its child exited; the shell
+    // keeps the terminal.
+    assert_eq!(read_out(&out, "shell_tpgid"), read_out(&out, "shell_pgid"));
+    assert_eq!(
+        read_out(&out, "foreground_after"),
+        "not_owned",
+        "job_status={:?} child pgid={:?} helper={:?}\n{}",
+        read_out(&out, "job_status"),
+        read_out(&out, "pgid"),
+        read_out(&out, "helper_pid"),
+        job.transcript()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_started_after_bg_leaves_the_terminal_to_the_shell() {
+    if !Path::new(STOP_SHELL).exists() {
+        eprintln!(
+            "skipped: {STOP_SHELL} is missing, and no other shell is known to see a job stop"
+        );
+        return;
+    }
+    let _guard = run_guard();
+    let (home, out) = tty_child_setup(r#"echo ready > "$out/ready""#);
+    let mut job = PtyJob::start_resuming(
+        home.path(),
+        "one",
+        &out,
+        "bg",
+        &[("CLAUDECTL_TEST_GATE_LOCK", "1")],
+    );
+    // claudectl owns the terminal and waits for the auth lock.
+    let receipt = out.join("receipt.jsonl");
+    let started = std::time::Instant::now();
+    while !read_out(&out, "receipt.jsonl").contains("\"prepared\"") && started.elapsed() < LIMIT {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(receipt.exists(), "{}", job.transcript());
+    std::thread::sleep(Duration::from_millis(200));
+    job.type_text(b"\x1a");
+    assert!(
+        wait_for(&out.join("in_background"), LIMIT),
+        "claudectl did not stop: {}",
+        job.transcript()
+    );
+    std::fs::write(out.join("release_lock"), "").unwrap();
+    let status = job.wait(LIMIT);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the background job did not finish: {:?}\n{}",
+        status,
+        job.transcript()
+    );
+    // The child started in the background: it must not take the terminal.
+    assert_ne!(read_out(&out, "tpgid"), read_out(&out, "pgid"));
+    assert_eq!(read_out(&out, "foreground_after"), "not_owned");
+}
+
+#[test]
+fn the_child_starts_with_onboarding_done_and_only_the_cwd_decisions() {
+    let _guard = run_guard();
+    let (home, paths, _store) = setup();
+    save(
+        &paths,
+        "one",
+        "uuid-one",
+        &creds("a-one", "r-one", 2 * HOUR_MS),
+    );
+    let project = home.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let project_key = std::fs::canonicalize(&project).unwrap();
+    let project_key = project_key.to_str().unwrap();
+    std::fs::write(
+        paths.claude_json(),
+        serde_json::json!({
+            "hasCompletedOnboarding": true,
+            "lastOnboardingVersion": "2.1.292",
+            "oauthAccount": {"accountUuid": "uuid-live-login"},
+            "customApiKeyResponses": {"approved": ["sk-secret"]},
+            "projects": {
+                project_key: {
+                    "hasTrustDialogAccepted": true,
+                    "hasClaudeMdExternalIncludesApproved": true,
+                    "hasClaudeMdExternalIncludesWarningShown": false,
+                    "allowedTools": ["Bash"],
+                    "mcpServers": {"x": {"env": {"TOKEN": "secret"}}}
+                },
+                "/elsewhere": {"hasTrustDialogAccepted": true}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = home.path().join("out-onboarding");
+    std::fs::create_dir(&out).unwrap();
+    fake_child(&out, &out, 0);
+    let status = run_helper_in(home.path(), "one", &out, &[], false, Some(&project));
+    assert!(status.success());
+    let seeded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("claude_json")).unwrap()).unwrap();
+    assert_eq!(
+        seeded,
+        serde_json::json!({
+            "hasCompletedOnboarding": true,
+            "lastOnboardingVersion": "2.1.292",
+            "projects": {project_key: {
+                "hasTrustDialogAccepted": true,
+                "hasClaudeMdExternalIncludesApproved": true
+            }}
+        })
+    );
+}
+
+#[test]
+fn without_a_claude_json_the_child_starts_without_a_seed() {
+    let _guard = run_guard();
+    let (home, paths, _store) = setup();
+    save(
+        &paths,
+        "one",
+        "uuid-one",
+        &creds("a-one", "r-one", 2 * HOUR_MS),
+    );
+    let out = home.path().join("out-no-seed");
+    std::fs::create_dir(&out).unwrap();
+    fake_child(&out, &out, 0);
+    let status = run_helper(home.path(), "one", &out, &[], false);
+    assert!(status.success());
+    assert!(!out.join("claude_json").exists());
+}
+
+#[test]
+fn trust_comes_from_the_closest_trusted_ancestor_under_its_own_key() {
+    let _guard = run_guard();
+    let (home, paths, _store) = setup();
+    save(
+        &paths,
+        "one",
+        "uuid-one",
+        &creds("a-one", "r-one", 2 * HOUR_MS),
+    );
+    let root = home.path().join("code");
+    let worktree = root.join("repo").join(".worktrees").join("lane");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let root_key = std::fs::canonicalize(&root).unwrap();
+    let repo_key = root_key.join("repo");
+    let worktree_key = std::fs::canonicalize(&worktree).unwrap();
+    // Claude writes `false` entries on its own for every directory it opens,
+    // and Claude Code 2.1.292 trusts a directory under any trusted ancestor
+    // even when a nearer entry is `false` (checked live, SAW-12468 PR 1).
+    std::fs::write(
+        paths.claude_json(),
+        serde_json::json!({
+            "hasCompletedOnboarding": true,
+            "projects": {
+                root_key.to_str().unwrap(): {"hasTrustDialogAccepted": true},
+                repo_key.to_str().unwrap(): {"hasTrustDialogAccepted": false},
+                worktree_key.to_str().unwrap(): {"hasTrustDialogAccepted": false}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = home.path().join("out-ancestor");
+    std::fs::create_dir(&out).unwrap();
+    fake_child(&out, &out, 0);
+    let status = run_helper_in(home.path(), "one", &out, &[], false, Some(&worktree));
+    assert!(status.success());
+    let seeded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("claude_json")).unwrap()).unwrap();
+    assert_eq!(
+        seeded,
+        serde_json::json!({
+            "hasCompletedOnboarding": true,
+            "projects": {root_key.to_str().unwrap(): {"hasTrustDialogAccepted": true}}
+        })
+    );
+
+    // With no trusted ancestor, nothing is trusted.
+    std::fs::write(
+        paths.claude_json(),
+        serde_json::json!({
+            "hasCompletedOnboarding": true,
+            "projects": {repo_key.to_str().unwrap(): {"hasTrustDialogAccepted": false}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::remove_file(out.join("claude_json")).unwrap();
+    let status = run_helper_in(home.path(), "one", &out, &[], false, Some(&worktree));
+    assert!(status.success());
+    let seeded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("claude_json")).unwrap()).unwrap();
+    assert_eq!(seeded, serde_json::json!({"hasCompletedOnboarding": true}));
 }

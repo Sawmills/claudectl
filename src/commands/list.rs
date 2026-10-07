@@ -14,11 +14,17 @@ pub fn run() -> Result<()> {
         } else {
             " "
         };
+        let label = p
+            .meta
+            .label
+            .as_deref()
+            .map(|label| format!(" [{label}]"))
+            .unwrap_or_default();
         match p.meta.email() {
             Some(email) if email != p.meta.alias => {
-                println!("{marker} {} ({email})", p.meta.alias)
+                println!("{marker} {}{label} ({email})", p.meta.alias)
             }
-            _ => println!("{marker} {}", p.meta.alias),
+            _ => println!("{marker} {}{label}", p.meta.alias),
         }
     }
     Ok(())
