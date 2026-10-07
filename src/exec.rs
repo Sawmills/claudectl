@@ -1336,6 +1336,12 @@ fn set_process_group(_command: &mut Command) {}
 /// claudectl's group owns the foreground at that moment. Rust runs this
 /// after the child's setpgid, and spawn returns only after the exec, so the
 /// child owns the foreground from its first instruction.
+///
+/// Known limit: a Ctrl-Z in the microseconds between this handoff and the
+/// exec stops the forked child while claudectl still waits inside spawn, so
+/// the shell cannot resume the job with `fg`. `kill -CONT <child pid>`
+/// recovers: the child execs and keeps the foreground. Ctrl-C does not,
+/// because the child still has claudectl's SIGINT handler until the exec.
 #[cfg(unix)]
 fn take_foreground(command: &mut Command) {
     use std::os::unix::process::CommandExt;

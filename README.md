@@ -187,7 +187,10 @@ claudectl owns the terminal foreground, the child's group takes it, as a shell
 job does: the terminal sends Ctrl-C and window size changes to the child
 directly. Ctrl-Z stops the child and claudectl together, and `fg` resumes both.
 claudectl takes the foreground back when the child exits, unless the shell
-owns it (after `bg`). If the terminal hangs
+owns it (after `bg`). Known limit: a Ctrl-Z in the few microseconds between
+the terminal handoff and the start of the child can leave the child stopped
+while `fg` cannot resume claudectl. Run `kill -CONT <child pid>` to recover;
+Ctrl-C does not help in that state. If the terminal hangs
 up (for example, the pane closes), the child gets `SIGHUP` from the terminal,
 and the private directory is still removed after it exits. `exec` runs a
 private copy of the executable, so use it for a single-file program such as the
