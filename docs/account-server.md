@@ -53,7 +53,9 @@ tool call. Only on a pass does it record the hash in
 `~/.claudectl/server/qualified-builds.json`. A damaged list refuses every build. It
 needs `python3` (and `unshare` on Linux, Homebrew OpenSSL on macOS). On 2026-10-06,
 Claude 2.1.292 on macOS ARM64 (`97a01e5bc74a199e67189435d0331ea3a24eac2e07db4b76d9148c5b0386138f`)
-passed.
+and Claude 2.1.280 on Linux ARM64 on the devbox
+(`92f2b4fd05d0bdcf7b9a0d4e0ecef4a1e4b368b290cd8fd07cff9a50013f45a2`) passed. The operator
+procedure is in [the runbook](account-server-runbook.md).
 
 ## Session behavior
 
