@@ -540,6 +540,13 @@ fn an_expired_inactive_profile_is_refreshed_before_its_fence() {
         "rotated-refresh",
         "the rotated grant was migrated"
     );
+    assert!(
+        !env.paths
+            .claudectl_dir()
+            .join("server/refresh-recovery/a1.json")
+            .exists(),
+        "a saved refresh keeps no recovery copy"
+    );
 }
 
 #[test]
@@ -594,6 +601,17 @@ fn a_profile_changed_during_its_refresh_is_not_overwritten() {
     let kept: CredentialsFile = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
     assert_eq!(kept.claude_ai_oauth.access_token, "relogin-access");
     assert!(!env.fenced("a1"));
+    // The provider rotated the old grant: its successor must stay recoverable.
+    let recovery = env
+        .paths
+        .claudectl_dir()
+        .join("server/refresh-recovery/a1.json");
+    let saved: CredentialsFile =
+        serde_json::from_slice(&std::fs::read(&recovery).unwrap()).unwrap();
+    assert_eq!(
+        saved.claude_ai_oauth.refresh_token.as_deref(),
+        Some("rotated-refresh")
+    );
 }
 
 #[test]

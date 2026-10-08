@@ -584,38 +584,44 @@ fn refresh_inactive(paths: &Paths, alias: &str) -> Result<()> {
                 .build()?,
             &before.claude_ai_oauth,
         ))?;
-    // Again under the lock: save only over the exact grant that was refreshed.
-    let _lock = store.lock_auth_state()?;
-    let Some((current_profile, mut current)) = owned(&store)? else {
-        bail!("{alias} became the live login during its refresh; not saved");
-    };
-    if current.claude_ai_oauth.refresh_token.as_deref() != Some(grant.as_str()) {
-        bail!("{alias} changed during its refresh (another login or refresh); not saved");
-    }
-    current.claude_ai_oauth = rotated;
-    let active = profile::get_active_from(paths)?;
-    if let Err(error) = profile::persist_rotated_grant(
-        paths,
-        active.as_deref(),
-        &current_profile,
-        &current,
-        &crate::usage_cache::UsageCache::key(&grant),
-    ) {
-        // The provider already rotated the grant: the successor must survive somewhere.
-        let kept = root(paths)
-            .join("refresh-recovery")
-            .join(format!("{alias}.json"));
-        atomic(&kept, &current).with_context(|| {
-            format!(
-                "refreshed {alias} but could neither save the profile nor keep the grant ({error})"
-            )
-        })?;
-        bail!(
-            "refreshed {alias} but could not save the profile ({error}); the new grant is kept privately at {}",
+    // The provider already rotated the grant: keep the successor before any re-check can
+    // fail, and drop this copy only after a successful save.
+    let kept = root(paths)
+        .join("refresh-recovery")
+        .join(format!("{alias}.json"));
+    let mut successor = before.clone();
+    successor.claude_ai_oauth = rotated;
+    atomic(&kept, &successor)
+        .with_context(|| format!("refreshed {alias} but could not keep the new grant"))?;
+    let saved = (|| -> Result<()> {
+        // Again under the lock: save only over the exact grant that was refreshed.
+        let _lock = store.lock_auth_state()?;
+        let Some((current_profile, mut current)) = owned(&store)? else {
+            bail!("{alias} became the live login during its refresh; not saved");
+        };
+        if current.claude_ai_oauth.refresh_token.as_deref() != Some(grant.as_str()) {
+            bail!("{alias} changed during its refresh (another login or refresh); not saved");
+        }
+        current.claude_ai_oauth = successor.claude_ai_oauth.clone();
+        let active = profile::get_active_from(paths)?;
+        profile::persist_rotated_grant(
+            paths,
+            active.as_deref(),
+            &current_profile,
+            &current,
+            &crate::usage_cache::UsageCache::key(&grant),
+        )
+    })();
+    match saved {
+        Ok(()) => {
+            std::fs::remove_file(&kept)?;
+            Ok(())
+        }
+        Err(error) => bail!(
+            "refreshed {alias} but did not save it ({error}); the new grant is kept privately at {}",
             kept.display()
-        );
+        ),
     }
-    Ok(())
 }
 fn fenced_alias(paths: &Paths, alias: &str) -> bool {
     directory(&paths.claudectl_dir(), alias)
@@ -958,5 +964,31 @@ mod tests {
         let paths = Paths::from_home(home.path().into());
         let builtin = "92f2b4fd05d0bdcf7b9a0d4e0ecef4a1e4b368b290cd8fd07cff9a50013f45a2";
         assert!(require_qualified(&paths, builtin).is_err());
+    }
+
+    #[test]
+    fn a_completed_migration_tells_the_user_to_run_from_the_server() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().into());
+        fence(&paths);
+        let root = paths.claudectl_dir();
+        let unfinished = ensure_local(&root, "work").unwrap_err().to_string();
+        assert!(
+            unfinished.contains("resume with claudectl server migrate"),
+            "{unfinished}"
+        );
+        let file = directory(&root, "work").join("journal.json");
+        let mut journal: Journal = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        journal.receipt = Some(Receipt {
+            account_id: "a".repeat(64),
+            identity: journal.identity.clone(),
+            migration_id: journal.migration_id.clone(),
+        });
+        std::fs::write(&file, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let done = ensure_local(&root, "work").unwrap_err().to_string();
+        assert_eq!(
+            done,
+            "work is migrated to the account server; use: claudectl server run work"
+        );
     }
 }
