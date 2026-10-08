@@ -230,16 +230,14 @@ pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Append one hook event to `<session dir>/events`. Only the event name, session id,
-/// notification type and time are kept; the hook input is never stored. The directory must
-/// be a session directory under this machine's sessions root.
-pub(super) fn record_hook(
+/// The most hook input read; a longer input counts as a failed event.
+pub(super) const HOOK_INPUT_LIMIT: usize = 1 << 20;
+
+/// The session directory, only when it is a `run-*` directory directly under `sessions`.
+fn session_dir(
     sessions: &std::path::Path,
     dir: &std::path::Path,
-    input: &str,
-    now: i64,
-) -> anyhow::Result<()> {
-    use std::io::Write;
+) -> anyhow::Result<std::path::PathBuf> {
     let sessions = sessions.canonicalize()?;
     let dir = dir.canonicalize()?;
     let is_session = dir.parent() == Some(sessions.as_path())
@@ -250,7 +248,53 @@ pub(super) fn record_hook(
     if !is_session {
         anyhow::bail!("not a server session directory");
     }
-    let v: serde_json::Value = serde_json::from_str(input)?;
+    Ok(dir)
+}
+
+/// Tell the monitor its event log is incomplete: it then stops renewing this session.
+fn mark_hook_error(dir: &std::path::Path) {
+    let _ = std::fs::File::create(dir.join("hook-error"));
+}
+
+/// The `server hook` entry point: read the hook input (at most `HOOK_INPUT_LIMIT`) and
+/// record it. Any read, size or parse failure leaves the error marker (fail closed).
+pub(super) fn hook_from(
+    sessions: &std::path::Path,
+    dir: &std::path::Path,
+    input: impl std::io::Read,
+    now: i64,
+) -> anyhow::Result<()> {
+    use std::io::Read;
+    let dir = session_dir(sessions, dir)?;
+    let mut text = String::new();
+    let read = input
+        .take(HOOK_INPUT_LIMIT as u64 + 1)
+        .read_to_string(&mut text);
+    if read.is_err() || text.len() > HOOK_INPUT_LIMIT {
+        mark_hook_error(&dir);
+        anyhow::bail!("hook input unreadable or too large");
+    }
+    record_hook(sessions, &dir, &text, now)
+}
+
+/// Append one hook event to `<session dir>/events`. Only the event name, session id,
+/// notification type and time are kept; the hook input is never stored. The directory must
+/// be a session directory under this machine's sessions root.
+pub(super) fn record_hook(
+    sessions: &std::path::Path,
+    dir: &std::path::Path,
+    input: &str,
+    now: i64,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let dir = session_dir(sessions, dir)?;
+    let v: serde_json::Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(error) => {
+            mark_hook_error(&dir);
+            return Err(error.into());
+        }
+    };
     let line = serde_json::json!({
         "at": now,
         "event": v["hook_event_name"],
@@ -269,8 +313,7 @@ pub(super) fn record_hook(
         .open(&path)
         .and_then(|mut file| writeln!(file, "{line}"));
     if let Err(error) = written {
-        // Tell the monitor its log is incomplete: it then stops renewing this session.
-        let _ = std::fs::File::create(dir.join("hook-error"));
+        mark_hook_error(&dir);
         return Err(error.into());
     }
     Ok(())
@@ -517,6 +560,32 @@ mod tests {
         let input = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#;
         assert!(record_hook(&sessions, &dir, input, 1).is_err());
         assert!(dir.join("hook-error").exists());
+    }
+
+    #[test]
+    fn oversized_or_malformed_hook_input_leaves_the_error_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        for (name, input) in [
+            ("run-big", vec![b'x'; HOOK_INPUT_LIMIT + 1]),
+            ("run-bad", b"not json".to_vec()),
+        ] {
+            let dir = sessions.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            assert!(hook_from(&sessions, &dir, std::io::Cursor::new(input), 1).is_err());
+            assert!(dir.join("hook-error").exists(), "{name}");
+        }
+        // A good event still records and leaves no marker.
+        let dir = sessions.join("run-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = br#"{"hook_event_name":"Stop","session_id":"s"}"#.to_vec();
+        hook_from(&sessions, &dir, std::io::Cursor::new(good), 1).unwrap();
+        assert!(!dir.join("hook-error").exists());
+        // Outside the sessions root nothing is written at all.
+        let outside = root.path().join("run-out");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(hook_from(&sessions, &outside, std::io::Cursor::new(b"x".to_vec()), 1).is_err());
+        assert!(!outside.join("hook-error").exists());
     }
 
     #[test]

@@ -693,11 +693,14 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Status { alias, cached } => status(&paths, &alias, cached),
         Command::Statusline { account_id } => statusline(&paths, &account_id),
         Command::Hook { dir } => {
-            // A hook never blocks or talks to Claude: no output, exit 0 whatever happens.
-            use std::io::Read;
-            let mut input = String::new();
-            let _ = std::io::stdin().take(1 << 20).read_to_string(&mut input);
-            let _ = renew::record_hook(&root(&paths).join("sessions"), &dir, &input, now());
+            // A hook never blocks or talks to Claude: no output, exit 0 whatever happens. A
+            // failure leaves the session's error marker, so renewal stops (fail closed).
+            let _ = renew::hook_from(
+                &root(&paths).join("sessions"),
+                &dir,
+                std::io::stdin(),
+                now(),
+            );
             Ok(())
         }
         Command::Qualify { claude } => qualify::qualify(&paths, &claude),
