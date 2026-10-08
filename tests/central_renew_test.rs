@@ -23,6 +23,9 @@ struct Fake {
     generation: u64,
     /// The server refreshes on the next token request (what a server-side refresh does).
     refresh_next: bool,
+    /// After that, it refreshes again on this many further requests (a second refresh,
+    /// for example `server refresh-access` on another machine).
+    extra_refreshes: u32,
 }
 type Shared = Arc<Mutex<Fake>>;
 
@@ -48,6 +51,9 @@ async fn token(State(fake): State<Shared>, Json(body): Json<Value>) -> Json<Valu
     fake.requests.push(body["previous_revision"].clone());
     if fake.refresh_next {
         fake.refresh_next = false;
+        fake.generation += 1;
+    } else if fake.generation > 1 && fake.extra_refreshes > 0 {
+        fake.extra_refreshes -= 1;
         fake.generation += 1;
     }
     let generation = fake.generation;
@@ -89,7 +95,12 @@ command = json.load(open(settings))["hooks"]["Stop"][0]["hooks"][0]["command"]
 for event in ({"hook_event_name": "SessionStart", "session_id": "sess-1"},
               {"hook_event_name": "Stop", "session_id": "sess-1"}):
     subprocess.run(["/bin/sh", "-c", command], input=json.dumps(event).encode(), check=True)
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+def term(*_):
+    status = json.load(open(os.path.join(os.path.dirname(settings), "session.json")))
+    with open(os.environ["FAKE_LOG"] + ".term", "w") as out:
+        out.write(status.get("renewal", ""))
+    sys.exit(143)
+signal.signal(signal.SIGTERM, term)
 with open(os.environ["FAKE_LOG"] + ".ready", "w") as ready:
     ready.write("idle")
 # A watchdog: a build that never restarts fails the test instead of hanging it.
@@ -191,10 +202,13 @@ impl Env {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
     }
-    fn assert_followed(&self, runs: &[Value]) {
+    fn assert_followed(&self, runs: &[Value], token: &str) {
         assert_eq!(runs.len(), 2, "{runs:?}");
         assert_eq!(runs[0]["token"], "token-1");
-        assert_eq!(runs[1]["token"], "token-2");
+        assert_eq!(runs[1]["token"], token);
+        // The supervisor-visible marker was set before Claude got SIGTERM.
+        let term = std::fs::read_to_string(self.log.with_extension("log.term")).unwrap();
+        assert_eq!(term, "renewing");
         let args: Vec<String> = serde_json::from_value(runs[1]["args"].clone()).unwrap();
         let settings = args.iter().position(|a| a == "--settings").unwrap();
         let mut user: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -228,7 +242,7 @@ fn a_revoked_token_restarts_an_idle_claude_with_resume_on_the_new_token() {
         stderr.contains("server token renewed; resuming session sess-1"),
         "{stderr}"
     );
-    env.assert_followed(&env.runs());
+    env.assert_followed(&env.runs(), "token-2");
 }
 
 /// Under a terminal, the relaunched Claude gets the terminal and its foreground again.
@@ -242,7 +256,7 @@ fn a_relaunch_under_a_terminal_owns_the_foreground() {
     let refresher = env.refresh_when_idle();
     let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
     let inner = format!(
-        "{} server run work --claude {} -- --model opus --resume old; echo exit=$?",
+        "{} server run work --claude {} -- --model opus --resume old; echo exit=$?; python3 -c 'import os; print(\"shell-foreground\", os.tcgetpgrp(0) == os.getpgrp())'",
         quote(
             &assert_cmd::cargo::cargo_bin("claudectl")
                 .display()
@@ -260,10 +274,39 @@ fn a_relaunch_under_a_terminal_owns_the_foreground() {
     refresher.join().unwrap();
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("exit=7"), "{text}");
+    // After the relaunched Claude exits, the terminal goes back to the shell.
+    assert!(text.contains("shell-foreground True"), "{text}");
     let runs = env.runs();
-    env.assert_followed(&runs);
+    env.assert_followed(&runs, "token-2");
     for run in &runs {
         assert_eq!(run["tty"], true, "{run}");
         assert_eq!(run["foreground"], true, "{run}");
     }
+}
+
+/// A second refresh after the successor was fetched: the relaunch uses the newest token,
+/// never a revoked one.
+#[test]
+fn a_restart_uses_the_newest_token_when_the_server_refreshed_again() {
+    let env = Env::new();
+    env.fake.lock().unwrap().extra_refreshes = 1;
+    let refresher = env.refresh_when_idle();
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+    env.env(&mut command);
+    command
+        .args(["server", "run", "work", "--claude"])
+        .arg(&env.claude)
+        .args(["--", "--model", "opus", "--resume", "old"]);
+    let output = Command::from_std(command)
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    refresher.join().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    env.assert_followed(&env.runs(), "token-3");
 }

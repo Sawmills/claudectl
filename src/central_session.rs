@@ -58,12 +58,12 @@ impl Session {
             &json!({"expires_at":self.current.expires_at}),
         )?;
         // No token here: the alias, account and expiry only.
-        atomic(
-            &self.directory.path().join("session.json"),
-            &json!({"alias":self.account.alias,"account_id":self.account.account_id,
-                "expires_at":self.current.expires_at,"pid":std::process::id(),
-                "renewal":self.renewal}),
-        )
+        atomic(&self.directory.path().join("session.json"), &self.status())
+    }
+    fn status(&self) -> serde_json::Value {
+        json!({"alias":self.account.alias,"account_id":self.account.account_id,
+            "expires_at":self.current.expires_at,"pid":std::process::id(),
+            "renewal":self.renewal})
     }
     /// Record the renewal state for supervisors.
     pub(super) fn set_renewal(&mut self, state: &str) -> Result<()> {
@@ -362,6 +362,8 @@ struct Monitor {
     renewable: bool,
     restarts: usize,
     tty: Option<PathBuf>,
+    /// The session.json content, to mark the session renewing before SIGTERM.
+    status: serde_json::Value,
 }
 #[cfg(unix)]
 impl Monitor {
@@ -471,8 +473,23 @@ impl Monitor {
                 restarts_last_hour: self.restarts,
             });
             if decision == renew::Decision::Restart
-                && let (Some(access), Some(session_id)) = (pending.take(), idle.session)
+                && let Some(session_id) = idle.session
             {
+                // The cached successor may itself be revoked by a later refresh: take the
+                // current token now, and restart only if it is still a newer revision.
+                pending = None;
+                let Ok(access) = self.client.acquire(&self.account_id, None) else {
+                    continue;
+                };
+                if access.revision == self.held_revision
+                    || access.expires_at <= self.held_expires_at
+                {
+                    continue;
+                }
+                // Supervisors see the handoff before Claude stops.
+                let mut status = self.status.clone();
+                status["renewal"] = "renewing".into();
+                let _ = atomic(&self.directory.join("session.json"), &status);
                 // SIGTERM the leader; teardown of the rest of the group follows its exit.
                 unsafe {
                     libc::kill(self.pid as i32, libc::SIGTERM);
@@ -532,6 +549,12 @@ pub fn run(
             command.arg("--settings").arg(hooks);
         }
         exec::set_process_group(&mut command);
+        // Whether claudectl holds the terminal foreground now (the group to give it back to).
+        // SAFETY: tcgetpgrp and getpgrp only read process state.
+        let own_group = unsafe {
+            let group = libc::getpgrp();
+            (terminal.is_some() && libc::tcgetpgrp(libc::STDIN_FILENO) == group).then_some(group)
+        };
         if !first {
             exec::take_foreground(&mut command);
         }
@@ -539,7 +562,15 @@ pub fn run(
         let mut child = command.spawn().context("could not start Claude")?;
         let pid = child.id();
         exec::signals::watch(pid);
-        let foreground = Foreground::take(pid);
+        // A relaunch got the foreground before exec; give it back to claudectl's own group.
+        let foreground = if first {
+            Foreground::take(pid)
+        } else {
+            Foreground(own_group)
+        };
+        if !first {
+            session.set_renewal("on")?;
+        }
         let (stop, stopped) = std::sync::mpsc::channel();
         let monitor = Monitor {
             client: client.clone(),
@@ -555,6 +586,7 @@ pub fn run(
                 .filter(|&&at| now() - at < 3_600_000)
                 .count(),
             tty: terminal.as_ref().and_then(|t| t.path.clone()),
+            status: session.status(),
         };
         let watcher = std::thread::spawn(move || monitor.watch(stopped));
         let waited = exec::wait_exit_no_reap(pid, terminal.is_some());
@@ -590,9 +622,9 @@ pub fn run(
         if let Some(terminal) = &terminal {
             terminal.restore();
         }
+        // Renewing until the next Claude runs.
         session.set_renewal("renewing")?;
         session.renew(access)?;
-        session.set_renewal("on")?;
         launch_args =
             super::renew::relaunch_args(args, &session_id).context("renewal of a one-shot run")?;
         restarts.push(now());
