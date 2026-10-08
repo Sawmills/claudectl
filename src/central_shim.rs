@@ -68,6 +68,12 @@ pub fn is_shim(path: &Path) -> bool {
         .any(|line| line == MARKER)
 }
 
+/// A regular file (through symlinks) with an execute bit.
+fn is_executable(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
@@ -106,8 +112,11 @@ fn check_real(real: &Path, target: &Path) -> Result<()> {
     if !real.is_absolute() {
         bail!("the real Claude path must be absolute: {}", real.display());
     }
-    if !real.is_file() {
-        bail!("the real Claude is not a file: {}", real.display());
+    if !is_executable(real) {
+        bail!(
+            "the real Claude is not an executable file: {}",
+            real.display()
+        );
     }
     let same = |a: &Path, b: &Path| matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b);
     if is_shim(real) || same(real, target) {
@@ -124,7 +133,7 @@ pub fn install(spec: &Spec, dir: &Path) -> Result<PathBuf> {
     crate::profile::validate_alias(&spec.alias)?;
     let target = dir.join("claude");
     check_real(&spec.real, &target)?;
-    if !spec.claudectl.is_absolute() || !spec.claudectl.is_file() {
+    if !spec.claudectl.is_absolute() || !is_executable(&spec.claudectl) {
         bail!("claudectl not found at {}", spec.claudectl.display());
     }
     if target.symlink_metadata().is_ok() && !is_shim(&target) {
@@ -135,11 +144,35 @@ pub fn install(spec: &Spec, dir: &Path) -> Result<PathBuf> {
     }
     let script = render(spec)?;
     std::fs::create_dir_all(dir)?;
-    // Write a sibling, then rename: a running `claude` never sees half a file.
-    let partial = dir.join(".claude.claudectl-shim.tmp");
-    std::fs::write(&partial, script)?;
-    std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))?;
-    std::fs::rename(&partial, &target)?;
+    // Write a new sibling, then rename: a running `claude` never sees half a file. The
+    // sibling is created exclusively (O_EXCL), so a planted file or symlink is refused,
+    // never written through.
+    let partial = dir.join(format!(
+        ".claude.claudectl-shim.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let written = (|| -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&partial)?;
+        file.write_all(script.as_bytes())?;
+        file.sync_all()?;
+        // The umask may have cleared bits from the mode above.
+        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::rename(&partial, &target)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    written?;
     Ok(target)
 }
 
@@ -164,14 +197,14 @@ pub fn uninstall(dir: &Path) -> Result<bool> {
 /// updates.
 pub fn find_real(explicit: Option<&Path>, path: &OsStr) -> Result<PathBuf> {
     if let Some(real) = explicit {
-        if !real.is_file() || is_shim(real) {
+        if !is_executable(real) || is_shim(real) {
             bail!("{} is not a Claude executable", real.display());
         }
         return Ok(real.to_path_buf());
     }
     std::env::split_paths(path)
         .map(|dir| dir.join("claude"))
-        .find(|candidate| candidate.is_file() && !is_shim(candidate))
+        .find(|candidate| is_executable(candidate) && !is_shim(candidate))
         .context("no Claude executable on PATH apart from a claudectl shim; pass --claude")
 }
 
@@ -179,11 +212,7 @@ pub fn find_real(explicit: Option<&Path>, path: &OsStr) -> Result<PathBuf> {
 fn on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path)
         .map(|dir| dir.join(name))
-        .find(|candidate| {
-            candidate
-                .metadata()
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
+        .find(|candidate| is_executable(candidate))
 }
 
 #[derive(Debug)]
@@ -203,7 +232,7 @@ pub fn status(dir: &Path, path: &OsStr) -> Result<Status> {
     let spec = installed.then(|| read_spec(&target)).flatten();
     let real_ok = spec
         .as_ref()
-        .is_some_and(|s| s.real.is_file() && !is_shim(&s.real));
+        .is_some_and(|s| is_executable(&s.real) && !is_shim(&s.real));
     let first_on_path = installed
         && on_path("claude", path).is_some_and(|found| {
             matches!((found.canonicalize(), target.canonicalize()), (Ok(a), Ok(b)) if a == b)

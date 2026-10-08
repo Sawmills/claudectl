@@ -258,3 +258,45 @@ fn an_absolute_path_call_bypasses_the_shim_and_its_directory_is_never_overwritte
 fn the_default_account_is_the_hook_for_a_later_picker() {
     assert_eq!(shim::default_account(), "amir@sawmills.ai");
 }
+
+#[test]
+fn install_never_writes_through_a_planted_symlink() {
+    let f = Fixture::new();
+    std::fs::create_dir_all(&f.dir).unwrap();
+    let victim = f.dir.parent().unwrap().join("victim");
+    std::fs::write(&victim, "keep me\n").unwrap();
+    // The old fixed temporary name, pointed at a file outside the shim directory.
+    std::os::unix::fs::symlink(&victim, f.dir.join(".claude.claudectl-shim.tmp")).unwrap();
+    shim::install(&f.spec("amir3"), &f.dir).unwrap();
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me\n");
+    assert!(shim::is_shim(&f.dir.join("claude")));
+    // No temporary file is left behind.
+    let left: Vec<_> = std::fs::read_dir(&f.dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".tmp") && n != ".claude.claudectl-shim.tmp")
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn a_non_executable_claude_is_never_the_real_claude() {
+    let f = Fixture::new();
+    let early = f.dir.parent().unwrap().join("early");
+    std::fs::create_dir_all(&early).unwrap();
+    std::fs::write(early.join("claude"), "not a program\n").unwrap();
+    std::fs::set_permissions(early.join("claude"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    let path =
+        std::env::join_paths([early.clone(), f.real.parent().unwrap().to_path_buf()]).unwrap();
+    // Discovery skips it; an explicit path or an install refuses it.
+    assert_eq!(shim::find_real(None, &path).unwrap(), f.real);
+    assert!(shim::find_real(Some(&early.join("claude")), &path).is_err());
+    let mut spec = f.spec("amir3");
+    spec.real = early.join("claude");
+    assert!(shim::install(&spec, &f.dir).is_err());
+    // Status reports a real Claude that lost its execute bit.
+    shim::install(&f.spec("amir3"), &f.dir).unwrap();
+    std::fs::set_permissions(&f.real, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let first = std::env::join_paths([f.dir.clone()]).unwrap();
+    assert!(!shim::status(&f.dir, &first).unwrap().real_ok);
+}
