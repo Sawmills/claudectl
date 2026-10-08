@@ -722,6 +722,28 @@ fn an_unreadable_sibling_with_the_same_grant_blocks_the_refresh() {
 }
 
 #[test]
+fn an_active_profile_with_the_same_grant_blocks_the_refresh() {
+    let env = Env::new();
+    // b2 is the selected profile; the live login has since moved to a newer grant.
+    env.live("b2", "u-b2-0000", "b2-live-newer");
+    env.profile("a1", "u-a1-0000", Script::Ok, -1_000);
+    // a1's saved copy holds b2's saved grant: rotating it would strand b2.
+    private_write(
+        &env.paths.profiles_dir().join("a1").join("credentials.json"),
+        &serde_json::to_string(&creds("b2", -1_000)).unwrap(),
+    );
+    let (ok, text) = env.all();
+    assert!(!ok, "{text}");
+    assert!(Env::row(&text, "a1").contains("refused"), "{text}");
+    assert_eq!(
+        env.fake.lock().unwrap().refreshes,
+        0,
+        "the grant was rotated"
+    );
+    assert!(!env.fenced("a1"));
+}
+
+#[test]
 fn a_malformed_receipt_reply_halts_the_run() {
     let env = Env::new();
     env.profile("a1", "u-a1-0000", Script::Ok, 3_600_000);

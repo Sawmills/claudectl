@@ -549,12 +549,19 @@ fn refresh_inactive(paths: &Paths, alias: &str) -> Result<()> {
             {
                 continue;
             }
-            other.read_credentials().with_context(|| {
+            let held = other.read_credentials().with_context(|| {
                 format!(
                     "cannot read profile {}; it may hold the same grant, so {alias} was not refreshed",
                     other.meta.alias
                 )
             })?;
+            // The rotated grant is never written to the selected profile, so it must not share it.
+            if active.as_deref() == Some(other.meta.alias.as_str()) && shared(&creds, &held) {
+                bail!(
+                    "profile shares the refresh grant of the selected profile {}; not refreshed",
+                    other.meta.alias
+                );
+            }
         }
         Ok(Some((profile, creds)))
     };
