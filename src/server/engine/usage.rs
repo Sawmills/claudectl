@@ -27,6 +27,17 @@ impl Engine {
             None => Ok(T::default()),
         }
     }
+    /// The stored observation of an account the caller already scoped to its user (from
+    /// `accounts(user)`). It takes no poll lock and loads no grant, so a slow provider poll
+    /// never delays it. For the dashboard.
+    pub async fn cached_usage(&self, id: &str) -> Result<Usage> {
+        let mut result: Usage = self.stored(id).await?;
+        result.stale = result.data.is_none()
+            || result.error.is_some()
+            || now() >= result.next_retry_at
+            || result.observed_at.is_some_and(|t| t > now() + USABLE);
+        Ok(result)
+    }
     /// A cached read never contacts the provider. A fresh read uses the current access token
     /// and never refreshes: without a usable token it reports `login_required`.
     pub async fn usage(&self, user: &str, id: &str, cached: bool) -> Result<Usage> {

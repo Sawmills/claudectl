@@ -307,6 +307,8 @@ async fn a_signed_company_hd_claim_reaches_approval_and_creates_the_user() {
         .unwrap();
     assert_eq!(approve.status().as_u16(), 200);
     assert_eq!(f.users().await, 1, "an approved sign-in creates the user");
+    // A machine enrollment never signs a browser in to the dashboard.
+    assert!(set_cookie(&approve, "claudectl-session").is_none());
 }
 
 /// A refused callback carries no approval token, so no user can be created from it.
@@ -495,6 +497,11 @@ impl Fixture {
         assert_eq!(response.status().as_u16(), 303, "{}", response.status());
         assert_eq!(response.headers()["location"], "/accounts");
         let cookie = set_cookie(&response, "claudectl-session").expect("session cookie");
+        assert_eq!(
+            set_cookie(&response, "claudectl-login").as_deref(),
+            Some("claudectl-login="),
+            "the login cookie is cleared"
+        );
         let header = response
             .headers()
             .get_all("set-cookie")
@@ -532,9 +539,22 @@ async fn the_home_page_offers_google_sign_in_and_accounts_needs_a_session() {
     let accounts = f.get("/accounts", None).await;
     assert!(accounts.status().is_redirection(), "{}", accounts.status());
     assert_eq!(accounts.headers()["location"], "/accounts/sign-in");
-    // An unknown session cookie is no session.
+    // An unknown session cookie is refused and cleared; the page offers sign-in.
     let forged = f.get("/accounts", Some("claudectl-session=forged")).await;
-    assert_eq!(forged.headers()["location"], "/accounts/sign-in");
+    assert_eq!(forged.status().as_u16(), 401);
+    assert!(
+        set_cookie(&forged, "claudectl-session").is_some_and(|c| c == "claudectl-session="),
+        "the stale cookie is expired"
+    );
+    assert!(forged.text().await.unwrap().contains("/accounts/sign-in"));
+    // The public page ignores it.
+    assert_eq!(
+        f.get("/", Some("claudectl-session=forged"))
+            .await
+            .status()
+            .as_u16(),
+        200
+    );
 }
 
 #[tokio::test]
@@ -564,6 +584,24 @@ async fn a_callback_from_another_browser_is_refused() {
         .await;
     assert_eq!(response.status().as_u16(), 401);
     assert!(set_cookie(&response, "claudectl-session").is_none());
+}
+
+#[tokio::test]
+async fn a_dashboard_sign_in_never_offers_a_machine_approval() {
+    let f = Fixture::new().await;
+    let response = f
+        .dashboard_callback(Token::new("amir@sawmills.ai", Some("sawmills.ai")), None)
+        .await;
+    assert_eq!(response.status().as_u16(), 303);
+    assert!(approval(&response.text().await.unwrap()).is_none());
+    assert!(
+        f.server
+            .store()
+            .machines(&f.user_id("amir@sawmills.ai"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -642,8 +680,17 @@ async fn sign_out_needs_the_same_origin_and_ends_the_session() {
     let response = sign_out(Some(f.origin.clone())).await.unwrap();
     assert_eq!(response.status().as_u16(), 303);
     assert_eq!(response.headers()["location"], "/");
+    let cleared = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_owned())
+        .find(|v| v.starts_with("claudectl-session="))
+        .expect("sign-out expires the cookie");
+    assert!(cleared.contains("Max-Age=0"), "{cleared}");
+    // The old cookie is dead on the server, not only in this browser.
     let after = f.get("/accounts", Some(&session)).await;
-    assert_eq!(after.headers()["location"], "/accounts/sign-in");
+    assert_eq!(after.status().as_u16(), 401);
 }
 
 #[tokio::test]

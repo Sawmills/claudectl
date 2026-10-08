@@ -55,6 +55,16 @@ async fn accounts(State(server): Shared, headers: HeaderMap) -> Response {
             Redirect::to("/accounts/sign-in"),
         )
             .into_response(),
+        Err(error) if error.status == StatusCode::UNAUTHORIZED => {
+            // A dead session cookie: expire it and offer sign-in.
+            let mut response = enrollment::dashboard_error(error);
+            if let Some(cookie) = enrollment::expired_session(&server) {
+                response
+                    .headers_mut()
+                    .append("set-cookie", cookie.parse().expect("generated cookie"));
+            }
+            response
+        }
         Err(error) if error.status == StatusCode::FORBIDDEN => enrollment::dashboard_error(error),
         Err(error) => {
             let mut response = document(include_str!("dashboard/error.html"), true);
@@ -73,8 +83,9 @@ async fn snapshot(server: &Server, headers: &HeaderMap) -> Result<Option<Snapsho
     let mut accounts = Vec::new();
     for account in engine.accounts(&user).await.map_err(unavailable)? {
         // Cached only: the page shows what the server last observed.
-        // A cache read failure shows as unknown usage and is counted, not hidden.
-        let usage = match engine.usage(&user, &account.account_id, true).await {
+        // The stored observation only: no poll lock, no account load. A read failure for
+        // one account shows as no data and is counted; it never fails the page.
+        let usage = match engine.cached_usage(&account.account_id).await {
             Ok(usage) => usage,
             Err(_) => {
                 server.error(StatusCode::SERVICE_UNAVAILABLE, "usage_unavailable");
@@ -210,6 +221,7 @@ mod preview {
         let mut pending = account("amir4", 0.0, 0.0, "pending");
         pending.five_hour.used_percent = None;
         pending.seven_day.used_percent = None;
+        pending.observed_at = None;
         pending.usage_stale = true;
         let full = Snapshot {
             email: "amir@sawmills.ai".into(),

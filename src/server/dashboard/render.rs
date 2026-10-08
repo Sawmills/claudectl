@@ -92,14 +92,14 @@ fn observed(a: &Account, now: i64) -> String {
         Some(at) => {
             let age = now.saturating_sub(at).max(0);
             if age < 60 {
-                format!("{age} s ago")
+                format!("Updated {age} s ago")
             } else if age < 7200 {
-                format!("{} min ago", age / 60)
+                format!("Updated {} min ago", age / 60)
             } else {
-                date(at)
+                format!("Updated {}", date(at))
             }
         }
-        None => "never".into(),
+        None => "No usage data yet".into(),
     }
 }
 fn window(w: &Window, label: &str, now: i64) -> String {
@@ -132,7 +132,7 @@ fn window(w: &Window, label: &str, now: i64) -> String {
 fn answer(accounts: &[Account]) -> String {
     if accounts.is_empty() {
         return format!(
-            r#"<h1 id="answer-title">No server accounts yet</h1><p>Move the Claude accounts saved on a connected machine to this server.</p>{}"#,
+            r#"<h1 id="answer-title">No server accounts yet</h1><p>Move the Claude accounts saved on a connected machine to this server. Run it on a machine you connected with this Google account.</p>{}<p class="hint">Machines an operator registered on the server host belong to a separate server user, so their accounts do not show here.</p>"#,
             command(
                 "cmd-migrate",
                 "claudectl server migrate --all --exclusive-owner"
@@ -170,7 +170,7 @@ fn ledger(accounts: &[Account], now: i64) -> String {
     for a in sorted {
         let (class, state) = a.state();
         rows += &format!(
-            r#"<tr role="row" class="{}"><td role="cell" class="cell-account"><div class="account-name"><strong translate="no">{}</strong><span class="note">{}</span></div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-state"><div class="status"><span class="state {class}">{state}</span><span class="status-detail">Last observed {}</span></div></td></tr>"#,
+            r#"<tr role="row" class="{}"><td role="cell" class="cell-account"><div class="account-name"><strong translate="no">{}</strong><span class="note">{}</span></div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-state"><div class="status"><span class="state {class}">{state}</span><span class="status-detail">{}</span></div></td></tr>"#,
             if a.usage_stale { "stale" } else { "" },
             escape(&a.alias),
             a.migration(),
@@ -273,6 +273,7 @@ mod tests {
     fn accounts_show_bars_reset_times_and_migration_state() {
         let mut pending = account("amir3", None, None);
         pending.migration = "pending".into();
+        pending.observed_at = None;
         pending.usage_stale = true;
         let html = overview(&snapshot(
             vec![account("amir5", Some(93.0), Some(40.0)), pending],
@@ -293,7 +294,8 @@ mod tests {
         assert!(html.contains("Nearly exhausted"));
         assert!(html.contains("Migration pending"));
         assert!(html.contains("Migrated</span>"));
-        assert!(html.contains("Last observed 30 s ago"));
+        assert!(html.contains("Updated 30 s ago"));
+        assert!(html.contains("No usage data yet"));
     }
 
     #[test]

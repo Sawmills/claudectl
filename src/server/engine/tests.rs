@@ -153,6 +153,47 @@ fn counted_token(count: Arc<AtomicUsize>) -> axum::routing::MethodRouter {
 }
 
 #[tokio::test]
+async fn dashboard_usage_reads_the_store_without_waiting_for_a_poll() {
+    let app = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/api/oauth/usage",
+            get(|| async {
+                Json(json!({"five_hour":{"utilization":42,"resets_at":"2099-01-01T00:00:00Z"}}))
+            }),
+        );
+    let f = Fixture::new(app).await;
+    let engine = f.engine().await;
+    let receipt = engine
+        .admit(
+            "person",
+            "work",
+            "first",
+            grant_until("a", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let empty = engine.cached_usage(&receipt.account_id).await.unwrap();
+    assert!(empty.data.is_none() && empty.observed_at.is_none() && empty.stale);
+    engine
+        .usage("person", &receipt.account_id, false)
+        .await
+        .unwrap();
+    // A poll in progress holds the poll lock; the dashboard read must not wait for it.
+    let _poll = engine.usage_poll.lock().await;
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        engine.cached_usage(&receipt.account_id),
+    )
+    .await
+    .expect("dashboard read waited for the poll lock")
+    .unwrap();
+    assert_eq!(read.data.unwrap()["five_hour"]["utilization"], 42);
+    assert!(read.observed_at.is_some());
+}
+
+#[tokio::test]
 async fn cached_usage_never_contacts_the_provider_and_reads_share_polling() {
     let count = Arc::new(AtomicUsize::new(0));
     let calls = count.clone();

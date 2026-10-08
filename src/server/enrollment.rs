@@ -121,16 +121,24 @@ struct Device {
     last_poll: Option<i64>,
     grant: Option<String>,
 }
-/// A browser sign-in in progress: for one device, or for the dashboard when `browser` is
-/// set. `browser` is the digest of the login cookie that binds the callback to the browser
-/// that started it.
+/// A browser sign-in in progress.
 #[derive(Serialize, Deserialize)]
 struct SsoLogin {
-    device: String,
+    #[serde(flatten)]
+    destination: Destination,
     nonce: String,
     verifier: String,
-    #[serde(default)]
-    browser: Option<String>,
+}
+/// Where a sign-in leads. Untagged, so a row written before the dashboard (`device` only)
+/// still parses as an enrollment, and a row naming neither is refused.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum Destination {
+    /// The dashboard. `browser` is the digest of the login cookie that binds the callback
+    /// to the browser that started it.
+    Accounts { browser: String },
+    /// Approval of one machine, keyed by its device-code digest.
+    Enrollment { device: String },
 }
 /// A signed-in dashboard browser. Sealed in the store, so every replica sees it.
 #[derive(Serialize, Deserialize)]
@@ -332,6 +340,10 @@ pub(super) fn dashboard_error(error: HttpError) -> Response {
             "No access to this server",
             "Your account is not on this server's allow list. Ask your admin for access.",
         ),
+        "session_expired" => (
+            "Your session ended",
+            "You signed out, or the session is older than one hour. Sign in again.",
+        ),
         "sso_denied" | "invalid_browser_login" | "invalid_sso_state" => (
             "Sign-in did not finish",
             "Google did not confirm who you are, or the link expired. Sign in again.",
@@ -349,6 +361,10 @@ pub(super) fn dashboard_error(error: HttpError) -> Response {
     ));
     *response.status_mut() = error.status;
     response
+}
+/// A `Set-Cookie` value that expires the dashboard session cookie.
+pub(super) fn expired_session(server: &Server) -> Option<String> {
+    server.sso.as_ref().map(|sso| sso.cookie("session", "", 0))
 }
 pub(super) fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -504,14 +520,10 @@ async fn verify(State(server): Shared, Query(input): Query<Verify>) -> Result<Re
     if pending.grant.is_some() {
         return Err(server.error(StatusCode::GONE, "enrollment_expired"));
     }
-    begin_login(&server, device, None).await
+    begin_login(&server, Destination::Enrollment { device }).await
 }
 /// Redirect to the company sign-in. The state, nonce, and PKCE verifier live in the store.
-async fn begin_login(
-    server: &Server,
-    device: String,
-    browser: Option<String>,
-) -> Result<Response, HttpError> {
+async fn begin_login(server: &Server, destination: Destination) -> Result<Response, HttpError> {
     let sso = sso(server)?;
     let client = sso
         .client()
@@ -537,10 +549,9 @@ async fn begin_login(
     }
     let (url, state, nonce) = authorization.url();
     let login = SsoLogin {
-        device,
+        destination,
         nonce: nonce.secret().clone(),
         verifier: verifier.secret().clone(),
-        browser,
     };
     let row = server.seal_row(&login, None)?;
     server
@@ -578,17 +589,22 @@ async fn callback(
     let login: SsoLogin = server
         .unseal(&row.sealed)
         .map_err(|_| server.unavailable())?;
-    if login.browser.is_some() {
-        // A dashboard sign-in: errors render the dashboard's page, never the CLI wording.
-        return dashboard_callback(&server, sso, login, input.code, &headers)
-            .await
-            .or_else(|e| Ok(dashboard_error(e)));
-    }
+    let device_key = match login.destination {
+        // A dashboard sign-in never reads a device row or writes an approval. Its errors
+        // render the dashboard's page, never the CLI wording.
+        Destination::Accounts { browser } => {
+            let proof = (login.verifier, login.nonce);
+            return dashboard_callback(&server, sso, &browser, proof, input.code, &headers)
+                .await
+                .or_else(|e| Ok(dashboard_error(e)));
+        }
+        Destination::Enrollment { device } => device,
+    };
     let (user, email) = identify(&server, sso, input.code, login.verifier, login.nonce).await?;
     let email = email.as_str();
     let device = server
         .store()
-        .enrollment("device", &login.device, now())
+        .enrollment("device", &device_key, now())
         .await
         .map_err(|_| server.unavailable())?
         .filter(|r| !r.consumed)
@@ -607,7 +623,7 @@ async fn callback(
     );
     let row = server.seal_row(
         &Approval {
-            device: login.device,
+            device: device_key,
             user,
             email: email.into(),
         },
@@ -679,15 +695,16 @@ async fn identify(
 async fn dashboard_callback(
     server: &Server,
     sso: &Sso,
-    login: SsoLogin,
+    browser: &str,
+    (verifier, nonce): (String, String),
     code: Option<String>,
     headers: &HeaderMap,
 ) -> Result<Response, HttpError> {
     let presented = cookie(headers, sso.cookie_name("login")).map(|v| vault::digest(v.as_bytes()));
-    if presented.is_none() || presented != login.browser {
+    if presented.as_deref() != Some(browser) {
         return Err(server.error(StatusCode::UNAUTHORIZED, "invalid_browser_login"));
     }
-    let (user, email) = identify(server, sso, code, login.verifier, login.nonce).await?;
+    let (user, email) = identify(server, sso, code, verifier, nonce).await?;
     if !server
         .store()
         .record_user(&user, &email)
@@ -834,8 +851,9 @@ fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
             (key == name).then_some(value)
         })
 }
-/// The signed-in dashboard user: (user ID, email). `None` without a live session. A user
-/// disabled or removed from the allow list since sign-in is refused.
+/// The signed-in dashboard user: (user ID, email). `None` without a session cookie. A cookie
+/// without a live session (signed out, expired, or forged) is 401. A user disabled or
+/// removed from the allow list since sign-in is 403, as for a machine token.
 pub(super) async fn browser_user(
     server: &Server,
     headers: &HeaderMap,
@@ -853,7 +871,7 @@ pub(super) async fn browser_user(
         .map_err(|_| server.unavailable())?
         .filter(|r| !r.consumed)
     else {
-        return Ok(None);
+        return Err(server.error(StatusCode::UNAUTHORIZED, "session_expired"));
     };
     let session: Session = server
         .unseal(&row.sealed)
@@ -872,12 +890,10 @@ pub(super) async fn browser_user(
 pub(super) async fn sign_in(State(server): Shared) -> Result<Response, HttpError> {
     let sso = sso(&server)?;
     let binding = secret();
-    let mut response = begin_login(
-        &server,
-        String::new(),
-        Some(vault::digest(binding.as_bytes())),
-    )
-    .await?;
+    let destination = Destination::Accounts {
+        browser: vault::digest(binding.as_bytes()),
+    };
+    let mut response = begin_login(&server, destination).await?;
     response.headers_mut().append(
         header::SET_COOKIE,
         sso.cookie("login", &binding, TTL_MS / 1000)
@@ -966,6 +982,40 @@ mod tests {
         assert_eq!(check(Some("amir@sawmills.ai"), Some(false)), None);
         assert_eq!(check(Some("amir@sawmills.ai"), None), None);
         assert_eq!(check(None, Some(true)), None);
+    }
+
+    #[test]
+    fn a_login_row_written_before_the_dashboard_parses_as_an_enrollment() {
+        let old: SsoLogin =
+            serde_json::from_value(json!({"device":"d1","nonce":"n","verifier":"v"})).unwrap();
+        assert!(
+            matches!(old.destination, Destination::Enrollment { ref device } if device == "d1")
+        );
+        let new = SsoLogin {
+            destination: Destination::Accounts {
+                browser: "b1".into(),
+            },
+            nonce: "n".into(),
+            verifier: "v".into(),
+        };
+        let row: SsoLogin = serde_json::from_value(serde_json::to_value(&new).unwrap()).unwrap();
+        assert!(
+            matches!(row.destination, Destination::Accounts { ref browser } if browser == "b1")
+        );
+        let enrollment = SsoLogin {
+            destination: Destination::Enrollment {
+                device: "d2".into(),
+            },
+            nonce: "n".into(),
+            verifier: "v".into(),
+        };
+        let row: SsoLogin =
+            serde_json::from_value(serde_json::to_value(&enrollment).unwrap()).unwrap();
+        assert!(
+            matches!(row.destination, Destination::Enrollment { ref device } if device == "d2")
+        );
+        // A row naming neither destination is refused, never guessed.
+        assert!(serde_json::from_value::<SsoLogin>(json!({"nonce":"n","verifier":"v"})).is_err());
     }
 
     #[test]
