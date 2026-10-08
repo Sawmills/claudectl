@@ -365,6 +365,34 @@ struct Monitor {
     /// The session.json content, to mark the session renewing before SIGTERM.
     status: serde_json::Value,
 }
+/// Fold the events appended to `path` since the last read into the activity. A missing log
+/// before the first event is no error; any other failure is returned and leaves the activity
+/// unchanged, and the caller then stops renewing (stale idle evidence must not authorize a
+/// restart).
+#[cfg(unix)]
+fn read_new_events(path: &Path, activity: &mut Activity) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !activity.seen_start => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut chunk = String::new();
+    file.seek(SeekFrom::Start(activity.offset))?;
+    file.read_to_string(&mut chunk)?;
+    if let Some(end) = chunk.rfind('\n') {
+        activity.offset += end as u64 + 1;
+        let events = super::renew::parse_events(&chunk[..end]);
+        activity.seen_start |= events
+            .iter()
+            .any(|(_, e)| matches!(e, super::renew::Event::SessionStart(_)));
+        super::renew::fold(&mut activity.idle, &events);
+    }
+    Ok(())
+}
+
 /// What the monitor knows about Claude's activity, read incrementally.
 #[cfg(unix)]
 #[derive(Default)]
@@ -377,23 +405,8 @@ struct Activity {
 #[cfg(unix)]
 impl Monitor {
     /// Fold the hook events appended since the last read into the activity.
-    fn read_events(&self, activity: &mut Activity) {
-        use std::io::{Read, Seek, SeekFrom};
-        let Ok(mut file) = File::open(self.directory.join("events")) else {
-            return;
-        };
-        let mut chunk = String::new();
-        if file.seek(SeekFrom::Start(activity.offset)).is_ok()
-            && file.read_to_string(&mut chunk).is_ok()
-            && let Some(end) = chunk.rfind('\n')
-        {
-            activity.offset += end as u64 + 1;
-            let events = super::renew::parse_events(&chunk[..end]);
-            activity.seen_start |= events
-                .iter()
-                .any(|(_, e)| matches!(e, super::renew::Event::SessionStart(_)));
-            super::renew::fold(&mut activity.idle, &events);
-        }
+    fn read_events(&self, activity: &mut Activity) -> std::io::Result<()> {
+        read_new_events(&self.directory.join("events"), activity)
     }
     /// The decision inputs from the current activity, terminal and process group. Without a
     /// server token, the server side equals the held one.
@@ -494,7 +507,11 @@ impl Monitor {
                 renewing = false;
                 continue;
             }
-            self.read_events(&mut activity);
+            if self.read_events(&mut activity).is_err() {
+                outcome.note = Some("off: event log unreadable".into());
+                renewing = false;
+                continue;
+            }
             if !activity.seen_start {
                 if now() - started > timing.hooks_wait_ms {
                     eprintln!(
@@ -536,7 +553,11 @@ impl Monitor {
             };
             // Activity may have changed while the request ran (a prompt, typing): sample it
             // again and decide on the fresh state only.
-            self.read_events(&mut activity);
+            if self.read_events(&mut activity).is_err() {
+                outcome.note = Some("off: event log unreadable".into());
+                renewing = false;
+                continue;
+            }
             let inputs = self.inputs(&mut activity, &timing, started, Some(&access));
             if renew::idle_gate(&inputs).is_err() {
                 // Claude became busy: restart at its next idle point, without the poll wait.
@@ -747,6 +768,30 @@ impl Drop for Foreground {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_event_log_is_an_error_and_keeps_no_new_idle_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events");
+        std::fs::write(
+            &log,
+            "{\"at\":1,\"event\":\"SessionStart\",\"session_id\":\"s\"}\n{\"at\":2,\"event\":\"Stop\",\"session_id\":\"s\"}\n",
+        )
+        .unwrap();
+        let mut activity = Activity::default();
+        read_new_events(&log, &mut activity).unwrap();
+        assert_eq!(activity.idle.since, Some(2));
+        // The log becomes unreadable (here: replaced by a directory) while a prompt runs.
+        std::fs::remove_file(&log).unwrap();
+        std::fs::create_dir(&log).unwrap();
+        assert!(read_new_events(&log, &mut activity).is_err());
+        // Missing after events were seen is an error too.
+        std::fs::remove_dir(&log).unwrap();
+        assert!(read_new_events(&log, &mut activity).is_err());
+        // Missing before any event is no error.
+        assert!(read_new_events(&log, &mut Activity::default()).is_ok());
+    }
 
     #[cfg(unix)]
     #[test]
