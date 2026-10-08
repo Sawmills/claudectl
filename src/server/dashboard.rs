@@ -28,7 +28,7 @@ async fn landing(State(server): Shared, headers: HeaderMap) -> Response {
     ) {
         return ([("cache-control", "no-store")], Redirect::to("/accounts")).into_response();
     }
-    let ready = server.store().ready().await.is_ok();
+    let ready = server.ready().await;
     // Operator configuration validated at startup, never a request header. Quote for the
     // shell, then escape for the HTML text node.
     let public_url = server.public_url().unwrap_or_default();
@@ -203,6 +203,40 @@ pub(super) fn routes(router: Router<Arc<Server>>) -> Router<Arc<Server>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_landing_badge_follows_readiness_and_goes_down_during_drain() {
+        let root = tempfile::tempdir().unwrap();
+        let (state, key) = (root.path().join("state"), root.path().join("key"));
+        crate::server::app::setup(&state, &key).unwrap();
+        let server = Server::open(crate::server::app::Config {
+            store: crate::server::app::StoreConfig::File(state),
+            key,
+            allowed_users: vec!["amir@sawmills.ai".into()],
+            sso: None,
+            metrics_token_hash: None,
+            endpoints: crate::server::engine::Endpoints {
+                api: "http://127.0.0.1:9".into(),
+                token: "http://127.0.0.1:9/token".into(),
+            },
+        })
+        .await
+        .unwrap();
+        let badge = |server: Arc<Server>| async move {
+            let response = landing(State(server), HeaderMap::new()).await;
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(body.to_vec()).unwrap()
+        };
+        assert!(badge(server.clone()).await.contains("Account server ready"));
+        // The same signal as /ready: a draining replica is not ready, even with a live store.
+        server.begin_drain();
+        assert!(!server.ready().await);
+        let body = badge(server.clone()).await;
+        assert!(body.contains("Account server not ready"), "{body}");
+        assert!(!body.contains(r#"<span class="state ok">"#), "{body}");
+    }
 
     #[test]
     fn a_cache_object_without_usage_figures_is_stale() {

@@ -192,6 +192,15 @@ impl Server {
     pub fn store(&self) -> &Store {
         self.engine.store()
     }
+    /// Ready for new work: not draining, and the store answers. `/ready` and the home page
+    /// badge both use this, so they never disagree.
+    pub(super) async fn ready(&self) -> bool {
+        !self.draining.load(Ordering::Acquire) && self.store().ready().await.is_ok()
+    }
+    #[cfg(test)]
+    pub(super) fn begin_drain(&self) {
+        self.draining.store(true, Ordering::Release);
+    }
     pub fn engine(&self) -> &Arc<Engine> {
         &self.engine
     }
@@ -615,7 +624,7 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 async fn ready(State(server): Shared) -> StatusCode {
-    if !server.draining.load(Ordering::Acquire) && server.store().ready().await.is_ok() {
+    if server.ready().await {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
