@@ -291,7 +291,9 @@ pub struct Engine {
     local: StdMutex<BTreeMap<String, Arc<Mutex<()>>>>,
     usage_poll: Mutex<()>,
     /// Refreshes run by this process, by reason: count and last time in seconds (for
-    /// `/metrics`).
+    /// `/metrics`). Process memory only: a rotation followed by a restart before the next
+    /// scrape (30 s) is not exported. The audit log (operation refresh, `reason`) is the
+    /// durable record; the alert is best-effort.
     rotations: StdMutex<BTreeMap<&'static str, (u64, i64)>>,
 }
 /// The receipt state when no committed admission was visible, from the pending row read
