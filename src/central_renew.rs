@@ -110,11 +110,11 @@ pub(super) fn relaunch_args(args: &[OsString], session: &str) -> Option<Vec<OsSt
         let text = arg.to_string_lossy();
         match text.as_ref() {
             "-p" | "--print" => return None,
-            "--resume" | "--session-id" => {
+            "--session-id" => {
                 rest.next();
             }
-            // `-r` takes an optional session id; only a value that is not a flag is one.
-            "-r" => {
+            // `--resume`/`-r` take an optional session id; only a value that is not a flag is one.
+            "--resume" | "-r" => {
                 if rest.peek().is_some_and(|next| !starts_with_dash(next)) {
                     rest.next();
                 }
@@ -342,6 +342,11 @@ mod tests {
         assert_eq!(
             relaunch_args(&os(&["-r", "--verbose"]), "s").unwrap(),
             os(&["--verbose", "--resume", "s"])
+        );
+        // A bare --resume (interactive picker) takes no value either.
+        assert_eq!(
+            relaunch_args(&os(&["--resume", "--model", "opus"]), "s").unwrap(),
+            os(&["--model", "opus", "--resume", "s"])
         );
         assert!(relaunch_args(&os(&["-p", "hi"]), "s").is_none());
         assert!(relaunch_args(&os(&["--print"]), "s").is_none());

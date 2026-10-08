@@ -489,10 +489,18 @@ impl Monitor {
                 // Supervisors see the handoff before Claude stops.
                 let mut status = self.status.clone();
                 status["renewal"] = "renewing".into();
-                let _ = atomic(&self.directory.join("session.json"), &status);
+                if atomic(&self.directory.join("session.json"), &status).is_err() {
+                    // Without the marker a supervisor could relaunch this session too.
+                    continue;
+                }
                 // SIGTERM the leader; teardown of the rest of the group follows its exit.
-                unsafe {
-                    libc::kill(self.pid as i32, libc::SIGTERM);
+                // Only a delivered signal makes the coming exit a renewal: if Claude already
+                // exited, `server run` ends with its code.
+                if unsafe { libc::kill(self.pid as i32, libc::SIGTERM) } != 0 {
+                    let mut status = self.status.clone();
+                    status["renewal"] = "on".into();
+                    let _ = atomic(&self.directory.join("session.json"), &status);
+                    break;
                 }
                 sent = Some((now(), Restart { access, session_id }));
             }
