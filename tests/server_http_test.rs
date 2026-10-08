@@ -477,6 +477,19 @@ async fn receipt_user(server: &app::Server) -> String {
 }
 
 #[tokio::test]
+async fn a_server_without_sso_offers_no_home_page_or_dashboard() {
+    let f = Fixture::new(None).await;
+    for path in ["/", "/accounts", "/accounts/sign-in"] {
+        let (status, _) = f.call(reqwest::Method::GET, path, None, None).await;
+        assert_eq!(status, 404, "{path}");
+    }
+    let (status, _) = f
+        .call(reqwest::Method::POST, "/accounts/sign-out", None, None)
+        .await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
 async fn the_receipt_route_reports_the_admission_state() {
     let f = Fixture::new(None).await;
     let (_mac, mac) = f.register(AMIR, "mac").await;

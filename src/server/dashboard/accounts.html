@@ -1,0 +1,31 @@
+<div id="overview" data-has-accounts="{has_accounts}">
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a
+        class="wordmark"
+        href="/accounts"
+        translate="no"
+        aria-label="claudectl accounts"
+        >claudectl<span class="caret" aria-hidden="true"></span
+      ></a>
+      <div class="identity" id="browser-identity">
+        <span class="email" translate="no" id="identity-email">{email}</span>
+        <form action="/accounts/sign-out" method="post">
+          <button class="link-button" type="submit">Sign out</button>
+        </form>
+      </div>
+    </div>
+  </header>
+  <main id="main" class="wrap">
+    <div class="lead">
+      <section class="answer" id="answer-current">{answer}</section>
+    </div>
+    <p
+      id="copy-status"
+      class="copy-status"
+      role="status"
+      aria-live="polite"
+    ></p>
+    {ledger} {machines}
+  </main>
+</div>

@@ -1,0 +1,76 @@
+<header class="topbar">
+  <div class="wrap topbar-inner">
+    <a class="wordmark" href="/" translate="no" aria-label="claudectl home"
+      >claudectl<span class="caret" aria-hidden="true"></span
+    ></a>
+    <a class="identity" href="/accounts/sign-in">Sign in</a>
+  </div>
+</header>
+
+<main id="main" class="wrap landing">
+  <section class="signin" aria-labelledby="title">
+    <h1 id="title">Your Claude accounts, in one place</h1>
+    <p class="lede">
+      See how much each of your Claude accounts has left and which machines are
+      connected.
+    </p>
+    <a class="button primary" href="/accounts/sign-in">Sign in with Google</a>
+    <p class="server-status" role="status" aria-live="polite">
+      <span class="state <!-- READY_STATE -->"><!-- READY_LABEL --></span>
+    </p>
+  </section>
+
+  <section aria-labelledby="connect-title">
+    <div class="steps-head">
+      <h2 id="connect-title">Connect a new machine</h2>
+      <p>One command, then one approval</p>
+    </div>
+    <ol class="steps">
+      <li class="step">
+        <div class="step-body">
+          <h3>Connect it to this account server</h3>
+          <div class="command">
+            <pre
+              tabindex="0"
+            ><code translate="no" id="connect-command">claudectl server connect \
+  <!-- SERVER --> \
+  <span class="flag">--name</span> "<span class="placeholder">&lt;machine&gt;</span>"</code></pre>
+            <button
+              class="button small copy"
+              type="button"
+              data-copy="connect-command"
+              aria-label="Copy machine connection command"
+            >
+              Copy
+            </button>
+          </div>
+          <p class="command-note">POSIX shell syntax.</p>
+          <p>
+            Replace <code translate="no">&lt;machine&gt;</code> with a name you
+            will recognize, such as “Studio MacBook”.
+          </p>
+        </div>
+      </li>
+      <li class="step">
+        <div class="step-body">
+          <h3>Approve it in your browser</h3>
+          <p>
+            The connect command opens a page. Sign in with Google, check that
+            the code matches your terminal, then approve.
+          </p>
+          <p class="hint">
+            No browser on that machine? Add
+            <code translate="no">--no-browser</code> and open the printed link
+            on another computer.
+          </p>
+        </div>
+      </li>
+    </ol>
+    <p
+      id="copy-status"
+      class="copy-status"
+      role="status"
+      aria-live="polite"
+    ></p>
+  </section>
+</main>

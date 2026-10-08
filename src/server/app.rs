@@ -1,6 +1,6 @@
 //! HTTP contract, machine authorization, and the company-user allow list.
 use super::{
-    audit,
+    audit, dashboard,
     engine::{self, Endpoints, Engine, Gone, NotFound, RefreshInProgress, Superseded, Unrotated},
     enrollment,
     store::{self, Machine, Store},
@@ -65,8 +65,8 @@ pub struct Server {
 }
 
 pub struct HttpError {
-    status: StatusCode,
-    reason: &'static str,
+    pub(super) status: StatusCode,
+    pub(super) reason: &'static str,
 }
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
@@ -191,6 +191,22 @@ impl Server {
     }
     pub fn store(&self) -> &Store {
         self.engine.store()
+    }
+    /// Ready for new work: not draining, and the store answers. `/ready` and the home page
+    /// badge both use this, so they never disagree.
+    pub(super) async fn ready(&self) -> bool {
+        !self.draining.load(Ordering::Acquire) && self.store().ready().await.is_ok()
+    }
+    #[cfg(test)]
+    pub(super) fn begin_drain(&self) {
+        self.draining.store(true, Ordering::Release);
+    }
+    pub fn engine(&self) -> &Arc<Engine> {
+        &self.engine
+    }
+    /// The public origin, when company SSO is configured.
+    pub(super) fn public_url(&self) -> Option<&str> {
+        self.sso.as_ref().map(enrollment::Sso::public_url)
     }
     pub(super) fn seal<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>> {
         vault::encrypt(&self.key, &serde_json::to_vec(value)?)
@@ -608,7 +624,7 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 async fn ready(State(server): Shared) -> StatusCode {
-    if !server.draining.load(Ordering::Acquire) && server.store().ready().await.is_ok() {
+    if server.ready().await {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -664,7 +680,14 @@ pub fn router(server: Arc<Server>) -> Router {
             post(migrate_account).get(receipt),
         )
         .route("/v2/anthropic/migrations/cancel", post(cancel_migration));
-    enrollment::routes(routes).with_state(server)
+    let routes = enrollment::routes(routes);
+    // The home page and dashboard sign in through company SSO; without it they do not exist.
+    let routes = if server.sso.is_some() {
+        dashboard::routes(routes)
+    } else {
+        routes
+    };
+    routes.with_state(server)
 }
 
 /// Serve until SIGTERM or Ctrl-C. A network listener needs an HTTPS public origin and

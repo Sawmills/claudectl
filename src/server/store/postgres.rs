@@ -811,6 +811,21 @@ impl PostgresStore {
             // A delete erases the cached usage in place.
             .filter(|sealed| !sealed.is_empty()))
     }
+    pub async fn user_usage(&self, user: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .query(
+                // A delete erases the cached usage in place, so empty rows are skipped.
+                "SELECT u.account_id, u.sealed FROM usage_cache u
+                 JOIN accounts a ON a.account_id = u.account_id
+                 WHERE a.user_id = $1 AND NOT a.deleted AND length(u.sealed) > 0",
+                &[&user],
+            )
+            .await?
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect())
+    }
     pub async fn put_usage(&self, id: &str, sealed: &[u8]) -> Result<()> {
         let client = self.pool.get().await?;
         client
