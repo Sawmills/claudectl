@@ -631,6 +631,43 @@ impl PostgresStore {
             .await?;
         Ok(())
     }
+    pub async fn cancel_admission(
+        &self,
+        user: &str,
+        admission_id: &str,
+        alias: &str,
+    ) -> Result<CancelOutcome> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        // The same lock as admit(): a commit and a cancel never interleave.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&alias_lock(user, alias)],
+        )
+        .await?;
+        if tx
+            .query_opt(
+                "SELECT 1 FROM admissions WHERE user_id = $1 AND admission_id = $2",
+                &[&user, &admission_id],
+            )
+            .await?
+            .is_some()
+        {
+            return Ok(CancelOutcome::Admitted);
+        }
+        // Cancel a kept grant (erasing it), or leave a tombstone that put_pending never
+        // replaces, so a delayed import finds a cancelled row.
+        tx.execute(
+            "INSERT INTO pending_admissions (user_id, admission_id, alias, state, sealed)
+             VALUES ($1, $2, $3, 'cancelled', ''::BYTEA)
+             ON CONFLICT (user_id, admission_id) DO UPDATE SET state = 'cancelled', sealed = ''::BYTEA
+             WHERE pending_admissions.state <> 'committed'",
+            &[&user, &admission_id, &alias],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(CancelOutcome::Cancelled)
+    }
     pub async fn pending(&self, user: &str, admission_id: &str) -> Result<Option<PendingRow>> {
         let client = self.pool.get().await?;
         Ok(client

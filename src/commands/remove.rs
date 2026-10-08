@@ -6,6 +6,7 @@ pub fn run(alias: &str) -> Result<()> {
     let paths = config::default_paths()?;
     let store = claudectl::auth_store::AuthStore::real(paths.clone());
     let _auth_lock = store.lock_auth_state()?;
+    claudectl::central::ensure_removable(&paths.claudectl_dir(), alias)?;
     let was_active = profile::get_active_from(&paths)?.as_deref() == Some(alias);
     profile::delete_profile_from(&paths, alias)?;
     if was_active {

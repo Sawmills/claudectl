@@ -333,6 +333,32 @@ impl FileStore {
     pub fn pending(&self, user: &str, admission_id: &str) -> Result<Option<PendingRow>> {
         Ok(self.read(|t| t.pending.get(&slot(user, admission_id)).cloned()))
     }
+    pub fn cancel_admission(
+        &self,
+        user: &str,
+        admission_id: &str,
+        alias: &str,
+    ) -> Result<CancelOutcome> {
+        let key = slot(user, admission_id);
+        self.transact(|t| {
+            if t.admissions.contains_key(&key) {
+                return (CancelOutcome::Admitted, false);
+            }
+            // Cancel a kept grant (erasing it), or leave a tombstone that put_pending never
+            // replaces, so a delayed import finds a cancelled row.
+            let row = t.pending.entry(key).or_insert_with(|| PendingRow {
+                user: user.into(),
+                alias: alias.into(),
+                state: PendingState::Cancelled,
+                sealed: Vec::new(),
+            });
+            if row.state != PendingState::Committed {
+                row.state = PendingState::Cancelled;
+                row.sealed.clear();
+            }
+            (CancelOutcome::Cancelled, true)
+        })
+    }
     pub fn put_pending(
         &self,
         admission_id: &str,

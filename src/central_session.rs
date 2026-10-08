@@ -167,25 +167,69 @@ pub(super) fn program(path: &Path) -> Result<PathBuf> {
         .canonicalize()
         .map_err(Into::into)
 }
-/// The built-in Linux hash passed the host-config launcher check in experiments/settings-renewal;
-/// other builds (every macOS build) need `claudectl server qualify` on this machine.
-fn supported(paths: &Paths, path: &Path) -> Result<()> {
-    let digest = exec::sha256_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let allowed = if cfg!(target_os = "macos") {
-        None
-    } else if cfg!(target_os = "linux") {
-        Some("92f2b4fd05d0bdcf7b9a0d4e0ecef4a1e4b368b290cd8fd07cff9a50013f45a2")
-    } else {
-        bail!("server-account sessions support Linux and macOS");
-    };
-    if allowed != Some(digest.as_str()) && !super::qualify::is_qualified(paths, &digest)? {
-        bail!(
-            "Claude build {digest} has not passed account-server compatibility checks; run `claudectl server qualify`"
-        );
+#[cfg(unix)]
+/// A private copy of the Claude build, made once before any server call. Its hash is what is
+/// checked, recorded and run, whatever happens to the source afterwards.
+struct Build {
+    _directory: tempfile::TempDir,
+    file: PathBuf,
+    digest: String,
+}
+#[cfg(unix)]
+fn snapshot_build(paths: &Paths, binary: &Path) -> Result<Build> {
+    let builds = root(paths).join("builds");
+    private_dir(&builds)?;
+    // A launch killed during its check (Ctrl-C, a closed tab) leaves its copy behind: remove
+    // copies whose launch is gone, keep those of launches still waiting or checking.
+    for entry in std::fs::read_dir(&builds)? {
+        let path = entry?.path();
+        let pid = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("build-"))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<i32>().ok());
+        if let Some(pid) = pid
+            && pid > 0
+            && unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            let _ = std::fs::remove_dir_all(&path);
+        }
     }
-    Ok(())
+    let directory = tempfile::Builder::new()
+        .prefix(&format!("build-{}-", std::process::id()))
+        .tempdir_in(&builds)?;
+    let file = directory.path().join("claude");
+    snapshot_binary(binary, &file)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o500))?;
+    }
+    let digest = exec::sha256_file(&file).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(Build {
+        _directory: directory,
+        file,
+        digest,
+    })
+}
+#[cfg(unix)]
+/// The build `server run` will execute, qualified on first use; nothing touches the server
+/// before it passes.
+fn qualified_build(
+    paths: &Paths,
+    binary: &Path,
+    harness: impl FnOnce(&Path, &str) -> Result<bool>,
+) -> Result<Build> {
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        bail!("server-account sessions support Linux and macOS");
+    }
+    let build = snapshot_build(paths, binary)?;
+    super::qualify::ensure(paths, &build.file, &build.digest, harness)?;
+    Ok(build)
 }
 
+#[cfg(unix)]
 fn snapshot_binary(source: &Path, destination: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -211,8 +255,7 @@ pub fn run(
 ) -> Result<i32> {
     let _slot = exec::RunSlot::take().map_err(|error| anyhow::anyhow!("{error}"))?;
     preflight(paths, &std::env::current_dir()?, args)?;
-    let binary = program(binary)?;
-    supported(paths, &binary)?;
+    let build = qualified_build(paths, &program(binary)?, super::qualify::harness)?;
     let account = client.account(alias)?;
     let mut access = client.acquire(&account.account_id, None)?;
     // The token is fixed for this process; start with a fresh one when less remains.
@@ -220,14 +263,9 @@ pub fn run(
         access = client.acquire(&account.account_id, Some(&access.revision))?;
     }
     let session = Session::new(paths, &account, access)?;
-    // Snapshot before spawn, then verify the exact copy that will execute.
+    // The checked copy itself runs (same filesystem, so the rename keeps the file).
     let snapshot = session.directory().join("claude");
-    snapshot_binary(&binary, &snapshot)?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o500))?;
-    }
-    supported(paths, &snapshot)?;
+    std::fs::rename(&build.file, &snapshot)?;
     let mut command = session.command(&snapshot, args)?;
     exec::set_process_group(&mut command);
     struct Signals;
@@ -344,6 +382,60 @@ impl Drop for Foreground {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_checked_copy_is_what_runs_when_the_source_is_swapped_mid_check() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().into());
+        let source = home.path().join("claude");
+        std::fs::write(&source, b"checked build").unwrap();
+        let original = exec::sha256_file(&source).unwrap();
+        let build = qualified_build(&paths, &source, |snapshot, digest| {
+            std::fs::write(&source, b"swapped build").unwrap();
+            assert_eq!(exec::sha256_file(snapshot).unwrap(), digest);
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(build.digest, original);
+        assert_eq!(std::fs::read(&build.file).unwrap(), b"checked build");
+        // The swapped source is not qualified by that check.
+        let swapped = exec::sha256_file(&source).unwrap();
+        assert!(!super::super::qualify::known(&paths, &swapped).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_removes_build_copies_of_dead_launches_and_keeps_live_ones() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().into());
+        let builds = root(&paths).join("builds");
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let stale = builds.join(format!("build-{dead_pid}-old"));
+        let live = builds.join(format!("build-{}-busy", std::process::id()));
+        for dir in [&stale, &live] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("claude"), b"copy").unwrap();
+        }
+        let source = home.path().join("claude");
+        std::fs::write(&source, b"build").unwrap();
+        let build = snapshot_build(&paths, &source).unwrap();
+        assert!(!stale.exists(), "a dead launch's copy stays");
+        assert!(live.exists(), "a live launch's copy was removed");
+        assert!(build.file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_build_that_fails_its_first_check_is_refused_before_any_server_call() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().into());
+        let source = home.path().join("claude");
+        std::fs::write(&source, b"bad build").unwrap();
+        assert!(qualified_build(&paths, &source, |_, _| Ok(false)).is_err());
+    }
 
     #[test]
     fn host_user_settings_cannot_override_the_server_token_or_endpoint() {

@@ -2083,3 +2083,183 @@ async fn an_oversized_usage_response_is_refused_and_never_stored() {
     assert!(usage.data.is_none());
     assert_eq!(usage.error.as_deref(), Some("invalid_usage"));
 }
+
+#[tokio::test]
+async fn a_receipt_state_tells_no_admission_from_pending_and_complete() {
+    let f = Fixture::new(failing_refresh()).await;
+    let engine = f.engine().await;
+    let grant = || grant_until("migrated", now() + 3_600_000);
+    let (receipt, state) = engine.receipt_state("person", "m-1").await.unwrap();
+    assert!(receipt.is_none());
+    assert_eq!(state, "none");
+    // The forced refresh fails: admitted, rotation not verified.
+    assert!(
+        engine
+            .migrate("person", "mac", "work", "m-1", grant())
+            .await
+            .is_err()
+    );
+    let (receipt, state) = engine.receipt_state("person", "m-1").await.unwrap();
+    assert!(receipt.is_none());
+    assert_eq!(state, "pending");
+    // A completed migration on a working provider.
+    let (_f2, ok, _refreshes) = synthetic(3600).await;
+    ok.migrate("person", "mac", "home", "m-2", grant())
+        .await
+        .unwrap();
+    let (receipt, state) = ok.receipt_state("person", "m-2").await.unwrap();
+    assert!(receipt.is_some());
+    assert_eq!(state, "complete");
+}
+
+/// An admission in flight (its grant kept, not yet committed) is not "none": a client must
+/// not restore its fenced grant while the server may still admit it.
+#[tokio::test]
+async fn a_receipt_state_is_pending_while_an_admission_is_in_flight() {
+    let app = Router::new()
+        .route("/token", counted_token(Arc::default()))
+        // The identity check fails once: the grant is kept, nothing is committed.
+        .route("/api/oauth/profile", flaky_profile(0));
+    let f = Fixture::new(app).await;
+    let engine = f.engine().await;
+    assert!(
+        engine
+            .migrate(
+                "person",
+                "mac",
+                "work",
+                "m-1",
+                grant_until("migrated", now() + 3_600_000)
+            )
+            .await
+            .is_err()
+    );
+    let (receipt, state) = engine.receipt_state("person", "m-1").await.unwrap();
+    assert!(receipt.is_none());
+    assert_eq!(state, "pending");
+}
+
+/// The admission and its pending row are separate reads; a commit between them leaves a
+/// committed pending row, which must not read as "none".
+#[tokio::test]
+async fn a_committed_pending_row_without_a_visible_admission_is_not_none() {
+    let (_f, engine, _refreshes) = synthetic(3600).await;
+    let row = store::PendingRow {
+        user: "person".into(),
+        alias: "work".into(),
+        state: store::PendingState::Live,
+        sealed: vec![1],
+    };
+    engine.store().put_pending("m-9", &row, None).await.unwrap();
+    // Model the reader that saw no admission, then a committed row.
+    assert_eq!(
+        engine.receipt_state("person", "m-9").await.unwrap().1,
+        "pending"
+    );
+    assert_eq!(
+        state_without_admission(Some(store::PendingState::Committed)),
+        "pending"
+    );
+    assert_eq!(
+        state_without_admission(Some(store::PendingState::Cancelled)),
+        "none"
+    );
+    assert_eq!(state_without_admission(None), "none");
+}
+
+#[tokio::test]
+async fn an_import_arriving_after_a_cancel_is_rejected() {
+    let (_f, engine, refreshes) = synthetic(3600).await;
+    assert_eq!(
+        engine
+            .cancel_migration("person", "work", "m-1")
+            .await
+            .unwrap(),
+        store::CancelOutcome::Cancelled
+    );
+    let late = engine
+        .migrate(
+            "person",
+            "mac",
+            "work",
+            "m-1",
+            grant_until("migrated", now() + 3_600_000),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        late.downcast_ref::<AdmissionCancelled>().is_some(),
+        "{late}"
+    );
+    assert!(engine.accounts("person").await.unwrap().is_empty());
+    assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+    // A second cancel is harmless.
+    assert_eq!(
+        engine
+            .cancel_migration("person", "work", "m-1")
+            .await
+            .unwrap(),
+        store::CancelOutcome::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_after_the_commit_is_refused() {
+    let (_f, engine, _refreshes) = synthetic(3600).await;
+    engine
+        .migrate(
+            "person",
+            "mac",
+            "work",
+            "m-1",
+            grant_until("migrated", now() + 3_600_000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        engine
+            .cancel_migration("person", "work", "m-1")
+            .await
+            .unwrap(),
+        store::CancelOutcome::Admitted
+    );
+    assert_eq!(
+        engine.receipt_state("person", "m-1").await.unwrap().1,
+        "complete"
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_beats_an_import_that_kept_its_grant_but_did_not_commit() {
+    let app = Router::new()
+        .route("/token", counted_token(Arc::default()))
+        // The first identity check fails: the grant is kept (live pending row), not admitted.
+        .route("/api/oauth/profile", flaky_profile(0));
+    let f = Fixture::new(app).await;
+    let engine = f.engine().await;
+    let grant = || grant_until("migrated", now() + 3_600_000);
+    assert!(
+        engine
+            .migrate("person", "mac", "work", "m-1", grant())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        engine
+            .cancel_migration("person", "work", "m-1")
+            .await
+            .unwrap(),
+        store::CancelOutcome::Cancelled
+    );
+    let retry = engine
+        .migrate("person", "mac", "work", "m-1", grant())
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        retry.downcast_ref::<AdmissionCancelled>().is_some(),
+        "{retry}"
+    );
+    assert!(engine.accounts("person").await.unwrap().is_empty());
+}

@@ -78,6 +78,8 @@ copy afterwards.
 1. **Qualify the Claude build** on every machine that will run sessions:
    `claudectl server qualify --claude claude`. The command resolves the name on `PATH` and
    follows symlinks to the real build. A build that does not pass is refused by `server run`.
+   `server run` also checks a new build on first use (for example after a Claude Code
+   update); a failed build is refused for one hour, then `server qualify` checks it again.
 2. **Inventory every holder** of the pilot grant: claudectl profiles and `~/.claudectl/run-*`
    directories on each machine, the Keychain on both Macs, every `~/.claude/.credentials.json`
    copy on the devbox, the claudectl usage cache, the Claude capacity guard list, headless
@@ -91,8 +93,14 @@ copy afterwards.
    The same holds for `migration_superseded`: a login renewal replaced the grant before it
    rotated.
 6. **Retire the other copies** by digest match on every other holder.
-7. **Verify** on the Mac and on the devbox: `claudectl server run <alias> -- -p "say ok"` across
-   one access-token renewal, then `claudectl server status <alias>`.
+
+After the pilot, `claudectl server migrate --all --exclusive-owner` moves every remaining
+account on a machine in one run (stop every Claude session there first; the command refuses
+while one runs). Read the summary table: rerun for `lost-reply` and `failed:fenced`, run
+`claudectl server migrate --abort <alias>` for `superseded` or `gone`, and stop and report
+for `unrotated`. A row `migrated (log out the live login)` means the live login on that
+machine holds a retired grant: run `claude auth logout` there; claudectl never deletes it. 7. **Verify** on the Mac and on the devbox: `claudectl server run <alias> -- -p "say ok"` across
+one access-token renewal, then `claudectl server status <alias>`.
 
 ## Alerts
 

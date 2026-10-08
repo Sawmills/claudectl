@@ -104,6 +104,15 @@ pub enum Admitted {
     Gone,
 }
 
+/// The result of cancelling an admission ID before it commits.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// Recorded: any later admission with this ID is rejected.
+    Cancelled,
+    /// The admission already committed; nothing changed.
+    Admitted,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum AdmitOutcome {
     Committed,
@@ -251,6 +260,16 @@ impl Store {
     }
     pub async fn release_lease(&self, lease: &Lease, id: &str) -> Result<()> {
         dispatch!(self, release_lease(lease, id))
+    }
+    /// Cancel an admission ID under the alias lock: mark its kept grant cancelled, or leave a
+    /// cancelled tombstone when none arrived yet. Refused once the admission committed.
+    pub async fn cancel_admission(
+        &self,
+        user: &str,
+        admission_id: &str,
+        alias: &str,
+    ) -> Result<CancelOutcome> {
+        dispatch!(self, cancel_admission(user, admission_id, alias))
     }
     pub async fn pending(&self, user: &str, admission_id: &str) -> Result<Option<PendingRow>> {
         dispatch!(self, pending(user, admission_id))

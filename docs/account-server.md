@@ -22,6 +22,8 @@ claudectl server status work
 claudectl server status work --cached
 claudectl server qualify --claude /absolute/path/to/claude
 claudectl server devices
+claudectl server migrate --all --exclusive-owner
+claudectl server migrate --abort work
 claudectl server revoke MACHINE_ID
 claudectl server remove work
 claudectl server disconnect
@@ -35,6 +37,35 @@ after token exchange, the server retains the acquired response. The failure show
 `complete-login ID --resume`, which retries verification without exchanging the
 code again. An uncertain exchange with no retained response requires a new login.
 
+`migrate --all --exclusive-owner` moves every saved account on this machine in one run;
+without `--exclusive-owner` it refuses and fences nothing. It first refuses
+the whole run while any Claude process runs (with or without `--exclusive-owner`),
+when the host's Claude build is not qualified, or when the server is unreachable;
+then nothing is fenced. Expired inactive profiles are refreshed locally before their
+fence. Inactive accounts migrate first. The host's live login migrates last, from its
+Keychain grant. claudectl never deletes the live login: `security(1)` cannot delete
+conditionally and Claude Code takes no lock, so a delete could erase a newer login.
+After the server verifies the rotation, the live login holds a retired grant; the row
+reads `migrated (log out the live login)` and the command prints the step to run:
+`claude auth logout`, then `claudectl server run <alias>`. If the live login changed
+since the fence, the row says so and nothing is touched. A server outage or 5xx stops the
+run; other accounts continue past a per-account refusal. The summary shows one row per
+account (`migrated`, `already`, `refused:…`, `unrotated`, `superseded`, `gone`,
+`lost-reply`, `failed:fenced`, `not-attempted`) with the next command; the exit code is
+1 unless every row is `migrated` or `already`. A rerun resumes fenced accounts through the
+receipt lookup.
+
+`migrate --abort ALIAS` first asks the server to cancel the migration ID. The server
+records the cancel under the alias lock (a cancelled tombstone when nothing arrived yet),
+so a delayed import with that ID is rejected (`409 migration_cancelled`). Only after the
+server confirms the cancel does abort restore the local grant, into the profile only. Abort
+never writes the live login, so a login made after any check is never replaced; for a live
+migration the profile gets the fenced live grant, and abort prints `claudectl use <alias>`
+to make it live again. `claudectl remove` refuses a profile with an open fence, so abort
+always has its profile directory. Once the admission committed, the cancel is refused
+(`409 migration_admitted`) and abort reports the state; for a superseded or deleted server
+account it drops the fence without keeping a copy.
+
 The company user, provider, account UUID, organization UUID, and monotonically
 increasing generation are checked before replacing the session credential. Only
 this Claude binary hash is built in, with synthetic evidence for the host-config launch model:
@@ -43,13 +74,20 @@ this Claude binary hash is built in, with synthetic evidence for the host-config
 | ----------- | -------------- | ------------------------------------------------------------------ |
 | Linux ARM64 | 2.1.280        | `92f2b4fd05d0bdcf7b9a0d4e0ecef4a1e4b368b290cd8fd07cff9a50013f45a2` |
 
-The launcher hashes a private executable snapshot before running it. Any other
-build is refused until `claudectl server qualify --claude PATH` passes on that
-machine. The command runs the full-launcher check `supervised_host_config` from
+`server run` copies the build once, before any server call, and hashes that copy; the
+same copy is checked, recorded and run. A build that is not built in or qualified is
+checked on first use: `server run` prints `qualifying Claude build <digest> (first use,
+about 15 s)`, and only on a pass does it ask the server for a token. One check runs at a
+time per machine (`~/.claudectl/server/qualify.lock`); another launch waits up to 90 s and
+prints `waiting for qualification (pid N)`. One check is limited to 75 s. A failed check
+is recorded in `qualify-failures.json` (same key as a pass; a damaged file refuses), and
+launches of that build are refused for one hour without a new check.
+`claudectl server qualify --claude PATH` always runs the check and clears a failure on a
+pass. The check runs the full-launcher check `supervised_host_config` from
 `experiments/settings-renewal/supervised.py` against a private snapshot of the build:
 a fake API and a host login in the HOME, one Bash tool call on server token A, then a
 `--resume` relaunch on server token B. The host token must never be sent and the host files
-must not change. Only on a pass does it record the hash, with the check name, in
+must not change. Only on a pass is the hash recorded, with the check name, in
 `~/.claudectl/server/qualified-host-config-builds.json`. Builds qualified by the earlier
 renewal check (in `qualified-builds.json`, before the host-config model) are not
 qualified for this client: run `server qualify` again after the upgrade. Older clients keep

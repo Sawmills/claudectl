@@ -488,3 +488,110 @@ async fn a_server_without_sso_offers_no_home_page_or_dashboard() {
         .await;
     assert_eq!(status, 404);
 }
+
+#[tokio::test]
+async fn the_receipt_route_reports_the_admission_state() {
+    let f = Fixture::new(None).await;
+    let (_mac, mac) = f.register(AMIR, "mac").await;
+    let get = reqwest::Method::GET;
+    let (status, body) = f
+        .call(
+            get.clone(),
+            "/v2/anthropic/migrations?migration_id=m-1",
+            Some(&mac),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "none");
+    assert!(body["receipt"].is_null());
+    f.migrate(&mac).await;
+    let (status, body) = f
+        .call(
+            get,
+            "/v2/anthropic/migrations?migration_id=m-1",
+            Some(&mac),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "complete");
+    assert_eq!(body["receipt"]["migration_id"], "m-1");
+}
+
+#[tokio::test]
+async fn a_migration_retried_after_its_account_was_deleted_answers_410() {
+    let f = Fixture::new(None).await;
+    let (_mac_id, mac) = f.register(AMIR, "mac").await;
+    let id = f.migrate(&mac).await;
+    let (status, _) = f
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/v2/anthropic/accounts/{id}"),
+            Some(&mac),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+    // A lost reply makes the client retry the same migration ID.
+    let expires_at = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    let (status, body) = f
+        .call(
+            reqwest::Method::POST,
+            "/v2/anthropic/migrations",
+            Some(&mac),
+            Some(json!({"alias":"work","migration_id":"m-1","exclusive_owner":true,
+                "grant":{"access_token":"migrated","refresh_token":"migrated-refresh","expires_at":expires_at,"scopes":["user:inference","user:profile"]}})),
+        )
+        .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (410, Some("account_deleted")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_cancel_route_blocks_later_imports_and_refuses_after_commit() {
+    let f = Fixture::new(None).await;
+    let (_mac_id, mac) = f.register(AMIR, "mac").await;
+    let post = reqwest::Method::POST;
+    let (status, body) = f
+        .call(
+            post.clone(),
+            "/v2/anthropic/migrations/cancel",
+            Some(&mac),
+            Some(json!({"alias":"work","migration_id":"m-9"})),
+        )
+        .await;
+    assert_eq!(
+        (status, body["state"].as_str()),
+        (200, Some("cancelled")),
+        "{body}"
+    );
+    let expires_at = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    let (status, body) = f
+        .call(post.clone(), "/v2/anthropic/migrations", Some(&mac),
+            Some(json!({"alias":"work","migration_id":"m-9","exclusive_owner":true,
+                "grant":{"access_token":"migrated","refresh_token":"migrated-refresh","expires_at":expires_at,"scopes":["user:inference","user:profile"]}})))
+        .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (409, Some("migration_cancelled")),
+        "{body}"
+    );
+    f.migrate(&mac).await;
+    let (status, body) = f
+        .call(
+            post,
+            "/v2/anthropic/migrations/cancel",
+            Some(&mac),
+            Some(json!({"alias":"work","migration_id":"m-1"})),
+        )
+        .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (409, Some("migration_admitted")),
+        "{body}"
+    );
+}

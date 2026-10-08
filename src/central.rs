@@ -16,7 +16,9 @@ mod migration;
 mod qualify;
 #[path = "central_session.rs"]
 pub mod session;
-pub use migration::{ensure_local, ensure_local_grant, ensure_login_unfenced, migrate};
+pub use migration::{
+    ensure_local, ensure_local_grant, ensure_login_unfenced, ensure_removable, migrate,
+};
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -163,12 +165,47 @@ fn http() -> Result<reqwest::blocking::Client> {
         .no_proxy()
         .build()?)
 }
+/// The account server answered with an error status; `reason` is its `error` field.
+#[derive(Debug)]
+pub struct ServerError {
+    pub status: u16,
+    pub reason: String,
+}
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "account server returned HTTP {} ({}); credentials were not changed",
+            self.status, self.reason
+        )
+    }
+}
+impl std::error::Error for ServerError {}
+/// The account server could not be reached, or its reply was lost.
+#[derive(Debug)]
+pub struct Unavailable;
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("account server unavailable; reconcile pending operations")
+    }
+}
+impl std::error::Error for Unavailable {}
+/// True when the server cannot serve now: unreachable, a lost reply, or HTTP 5xx.
+pub fn server_down(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Unavailable>().is_some()
+        || error
+            .downcast_ref::<ServerError>()
+            .is_some_and(|e| e.status >= 500)
+}
 fn checked(response: reqwest::blocking::Response) -> Result<reqwest::blocking::Response> {
     if !response.status().is_success() {
-        bail!(
-            "account server returned HTTP {}; credentials were not changed",
-            response.status().as_u16()
-        );
+        let status = response.status().as_u16();
+        let reason = response
+            .json::<Value>()
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".into());
+        return Err(ServerError { status, reason }.into());
     }
     Ok(response)
 }
@@ -196,10 +233,11 @@ impl Client {
                 .get(format!("{}{path}", self.connection.server))
                 .bearer_auth(&self.token)
                 .send()
-                .map_err(|_| anyhow::anyhow!("account server unavailable"))?,
+                .map_err(|_| Unavailable)?,
         )?
         .json()
-        .map_err(|_| anyhow::anyhow!("invalid account-server response"))
+        // A broken reply is a broken server: callers stop instead of continuing blind.
+        .map_err(|_| anyhow::Error::from(Unavailable))
     }
     pub(super) fn post<T: serde::de::DeserializeOwned>(
         &self,
@@ -212,12 +250,11 @@ impl Client {
                 .bearer_auth(&self.token)
                 .json(body)
                 .send()
-                .map_err(|_| {
-                    anyhow::anyhow!("account server unavailable; reconcile pending operations")
-                })?,
+                .map_err(|_| Unavailable)?,
         )?
         .json()
-        .map_err(|_| anyhow::anyhow!("invalid account-server response"))
+        // A reply that cannot be read is a lost reply: the server may have acted.
+        .map_err(|_| anyhow::Error::from(Unavailable))
     }
     pub fn accounts(&self) -> Result<Vec<Account>> {
         let accounts: Vec<Account> = self.get("/v2/anthropic/accounts")?;
@@ -261,17 +298,50 @@ impl Client {
             urlencoding::encode(id)
         ))
     }
+    /// The machine's company user; a preflight that the server is reachable and accepts us.
+    pub fn me(&self) -> Result<String> {
+        let me: Value = self.get("/v1/me")?;
+        let id = me["id"].as_str().context("invalid company-user identity")?;
+        if id != self.connection.user_id {
+            bail!("machine belongs to another company user");
+        }
+        Ok(id.into())
+    }
     pub(super) fn receipt(&self, id: &str) -> Result<Option<Receipt>> {
+        Ok(self.receipt_state(id)?.0)
+    }
+    /// Ask the server to cancel a migration ID that has not committed.
+    pub(super) fn cancel_migration(&self, alias: &str, id: &str) -> Result<()> {
+        let reply: Value = self.post(
+            "/v2/anthropic/migrations/cancel",
+            &json!({"alias": alias, "migration_id": id}),
+        )?;
+        if reply["state"] != "cancelled" {
+            bail!("the server did not confirm the cancel");
+        }
+        Ok(())
+    }
+    /// The receipt and the server's admission state: `none`, `pending` or `complete`.
+    pub(super) fn receipt_state(&self, id: &str) -> Result<(Option<Receipt>, String)> {
         #[derive(Deserialize)]
         struct Reply {
             receipt: Option<Receipt>,
+            /// Servers before the state field answer without it.
+            state: Option<String>,
         }
-        Ok(self
-            .get::<Reply>(&format!(
-                "/v2/anthropic/migrations?migration_id={}",
-                urlencoding::encode(id)
-            ))?
-            .receipt)
+        let reply: Reply = self.get(&format!(
+            "/v2/anthropic/migrations?migration_id={}",
+            urlencoding::encode(id)
+        ))?;
+        let state = reply.state.unwrap_or_else(|| {
+            if reply.receipt.is_some() {
+                "complete"
+            } else {
+                "unknown"
+            }
+            .into()
+        });
+        Ok((reply.receipt, state))
     }
 }
 pub fn connect(paths: &Paths, server: &str, name: &str, no_browser: bool) -> Result<()> {
@@ -580,12 +650,21 @@ pub enum Command {
     },
     /// Read the local session usage cache without network access
     Statusline { account_id: String },
-    /// Transfer an inactive profile after stopping every previous grant holder
+    /// Transfer a profile, or every saved account with --all, after stopping every previous
+    /// grant holder
     Migrate {
-        alias: String,
+        #[arg(required_unless_present_any = ["all", "abort"], conflicts_with_all = ["all", "abort"])]
+        alias: Option<String>,
+        /// Every saved account: inactive ones first, the live login last
+        #[arg(long, conflicts_with = "abort")]
+        all: bool,
         /// Declare all other copies and sessions retired, including backups and other machines
         #[arg(long)]
         exclusive_owner: bool,
+        /// Drop a fence the server never admitted (restores the grant), or whose server
+        /// account is gone
+        #[arg(long, value_name = "ALIAS")]
+        abort: Option<String>,
     },
     /// List enrolled machines for the current company user
     Devices,
@@ -643,8 +722,20 @@ pub fn dispatch(command: Command) -> Result<()> {
                 Command::Renew { alias, no_browser } => login(&client, &alias, true, no_browser),
                 Command::Migrate {
                     alias,
+                    all,
                     exclusive_owner,
-                } => migrate(&paths, &client, &alias, exclusive_owner),
+                    abort,
+                } => match (alias, all, abort) {
+                    (_, _, Some(alias)) => migration::abort(&paths, &client, &alias),
+                    (_, true, None) => {
+                        if !migration::migrate_all(&paths, &client, exclusive_owner)? {
+                            std::process::exit(1);
+                        }
+                        Ok(())
+                    }
+                    (Some(alias), false, None) => migrate(&paths, &client, &alias, exclusive_owner),
+                    (None, false, None) => unreachable!("clap requires an alias, --all or --abort"),
+                },
                 Command::Run {
                     alias,
                     claude,
@@ -665,7 +756,7 @@ pub fn dispatch(command: Command) -> Result<()> {
                             .bearer_auth(&client.token)
                             .json(&json!({"id":machine_id}))
                             .send()
-                            .map_err(|_| anyhow::anyhow!("account server unavailable"))?,
+                            .map_err(|_| Unavailable)?,
                     )?;
                     println!("Machine revoked.");
                     Ok(())
@@ -681,7 +772,7 @@ pub fn dispatch(command: Command) -> Result<()> {
                             ))
                             .bearer_auth(&client.token)
                             .send()
-                            .map_err(|_| anyhow::anyhow!("account server unavailable"))?,
+                            .map_err(|_| Unavailable)?,
                     )?;
                     println!(
                         "Server account removed. Access tokens already issued stay valid until they expire."

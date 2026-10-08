@@ -155,6 +155,27 @@ impl AuthStore {
         }
     }
 
+    /// The Keychain grant on macOS: `Ok(None)` only when the item does not exist. A locked
+    /// Keychain, a failed read or an unparsable item is an error, never "no Keychain".
+    /// Without a Keychain (Linux) this is `Ok(None)`; the credentials file is read separately.
+    pub fn read_live_grant(&self) -> Result<Option<CredentialsFile>> {
+        if !self.keychain {
+            return Ok(None);
+        }
+        let output = Command::new("security")
+            .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
+            .stdin(Stdio::null())
+            .output()
+            .context("failed to run security(1)")?;
+        let raw = keychain_read_outcome(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )?;
+        raw.map(|raw| serde_json::from_str(&raw).context("invalid Keychain credentials"))
+            .transpose()
+    }
+
     /// The `oauthAccount` blob from ~/.claude.json, if present.
     pub fn read_oauth_account(&self) -> Result<Option<serde_json::Value>> {
         let path = self.paths.claude_json();
@@ -418,6 +439,19 @@ fn parse_item_keychain(output: &SecurityCommandOutput) -> Option<String> {
         .find_map(|line| line.trim().strip_prefix("keychain:"))
         .map(parse_keychain_path)
         .filter(|path| !path.is_empty())
+}
+
+/// Map a `security find-generic-password -w` result: success = the item, only "not found"
+/// = absent, anything else (locked, interaction not allowed, a failed run) = error.
+fn keychain_read_outcome(code: Option<i32>, stdout: &str, stderr: &str) -> Result<Option<String>> {
+    if code == Some(0) {
+        return Ok(Some(stdout.trim().to_string()));
+    }
+    // 44 = errSecItemNotFound.
+    if code == Some(44) || keychain_item_not_found(stderr) {
+        return Ok(None);
+    }
+    bail!("could not read the Keychain login: {}", stderr.trim())
 }
 
 fn keychain_item_not_found(stderr: &str) -> bool {
@@ -1031,5 +1065,30 @@ mod tests {
     fn read_oauth_account_missing_file_is_none() {
         let (_tmp, store) = store();
         assert!(store.read_oauth_account().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_keychain_read_is_absent_only_for_item_not_found() {
+        // errSecItemNotFound: security(1) exits 44.
+        assert_eq!(keychain_read_outcome(Some(44), "", "").unwrap(), None);
+        assert_eq!(
+            keychain_read_outcome(
+                Some(44),
+                "",
+                "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain."
+            )
+            .unwrap(),
+            None
+        );
+        // 36: interaction not allowed (locked); 51: user canceled; anything else fails closed.
+        for code in [Some(36), Some(51), Some(1), None] {
+            assert!(keychain_read_outcome(code, "", "User interaction is not allowed.").is_err());
+        }
+        assert_eq!(
+            keychain_read_outcome(Some(0), "{\"a\":1}\n", "")
+                .unwrap()
+                .as_deref(),
+            Some("{\"a\":1}")
+        );
     }
 }
