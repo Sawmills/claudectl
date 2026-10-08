@@ -125,7 +125,10 @@ hooks (`--settings <session dir>/hooks.json`, run by a private copy of claudectl
 `SessionStart`, `UserPromptSubmit`, `Stop` and the `idle_prompt` notification, which record
 only the event, the session id and the time in `<session dir>/events`. It asks the server
 for the current token only while Claude passes every idle gate below, at most every 30 min
-(every 5 min in the token's last hour). When the
+(every 5 min in the token's last hour), retrying 30 s after a failed request, and never while
+the held token is valid but expires within 6 min: inside the server's 5 min refresh margin
+that request would refresh the grant and revoke the token a running turn may still use. After
+expiry the held token is dead for every session, so the request then is safe. When the
 revision changed (a refresh revoked the held token), it restarts Claude with
 `--resume <latest session>` on the new token, in the same folder and terminal, from the same
 checked build, and prints `claudectl: server token renewed; resuming session <id>`. It

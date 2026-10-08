@@ -19,6 +19,10 @@ const ACCOUNT: &str = "ababababababababababababababababababababababababababababa
 struct Fake {
     /// The `previous_revision` of every token request, in order.
     requests: Vec<Value>,
+    /// When each token request arrived (ms).
+    request_times: Vec<i64>,
+    /// The first token's lifetime (ms); later tokens live longer.
+    first_life_ms: Option<i64>,
     /// The token generation the server holds now.
     generation: u64,
     /// The server refreshes on the next token request (what a server-side refresh does).
@@ -57,11 +61,12 @@ async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Va
             fake.hold_ms
         }
     };
-    shared
-        .lock()
-        .unwrap()
-        .requests
-        .push(body["previous_revision"].clone());
+    {
+        let mut fake = shared.lock().unwrap();
+        fake.requests.push(body["previous_revision"].clone());
+        fake.request_times
+            .push(chrono::Utc::now().timestamp_millis());
+    }
     tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
     let mut fake = shared.lock().unwrap();
     if fake.refresh_next {
@@ -76,7 +81,10 @@ async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Va
         "identity": identity(),
         "access_token": format!("token-{generation}"),
         // Each newer generation lives longer, as a refresh gives a fresh 8 h token.
-        "expires_at": now + 1_800_000 * generation as i64,
+        "expires_at": match (generation, fake.first_life_ms) {
+            (1, Some(life)) => now + life,
+            _ => now + 1_800_000 * generation as i64,
+        },
         "scopes": ["user:inference", "user:profile"],
         "revision": format!("revision-{generation}"),
         "generation": generation,
@@ -424,4 +432,41 @@ fn a_prompt_during_the_token_request_cancels_the_restart() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(env.runs().len(), 1);
+}
+
+/// A held token inside the server's refresh window: the monitor asks nothing until it
+/// expires (a request then would refresh and revoke a token a turn may use), then follows.
+#[test]
+fn no_token_request_while_the_held_token_is_inside_the_refresh_window() {
+    let env = Env::new();
+    env.fake.lock().unwrap().first_life_ms = Some(3_000);
+    let refresher = env.refresh_when_idle();
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+    env.env(&mut command);
+    command
+        .args(["server", "run", "work", "--claude"])
+        .arg(&env.claude)
+        .args(["--", "--model", "opus"]);
+    let started = chrono::Utc::now().timestamp_millis();
+    let output = Command::from_std(command)
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    refresher.join().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let fake = env.fake.lock().unwrap();
+    // The launch, then nothing until the 3 s token expired.
+    assert!(fake.request_times.len() >= 2, "{:?}", fake.request_times);
+    for at in &fake.request_times[1..] {
+        assert!(
+            *at >= started + 3_000,
+            "a request {} ms after launch",
+            at - started
+        );
+    }
 }

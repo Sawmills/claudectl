@@ -9,6 +9,18 @@ pub(super) const IDLE_AFTER_STOP_MS: i64 = 60_000;
 pub(super) const TTY_IDLE_MS: i64 = 5 * 60_000;
 /// At most this many restarts in one hour.
 pub(super) const RESTARTS_PER_HOUR: usize = 3;
+/// The account server refreshes a grant inside `acquire` when its token expires within 5 min
+/// (src/server/engine.rs MARGIN), and a refresh revokes the token every session holds. While
+/// the held token is still valid and inside this window (the margin plus one minute), the
+/// monitor never asks, so its own request can never revoke a token a running turn still uses.
+pub(super) const NO_POLL_MS: i64 = 6 * 60_000;
+
+/// Whether the monitor may ask the server for the current token now: never while the held
+/// token is valid and inside the server's refresh window; after expiry the held token is dead
+/// for every session, so a refresh revokes nothing usable.
+pub(super) fn may_poll(now: i64, held_expires_at: i64, no_poll_ms: i64) -> bool {
+    held_expires_at <= now || held_expires_at - now > no_poll_ms
+}
 
 /// The monitor's clock. Debug builds honor `CLAUDECTL_TEST_RENEW_FAST=1` so the integration
 /// test does not wait minutes; release builds always use the real values.
@@ -20,6 +32,10 @@ pub(super) struct Timing {
     pub settle_ms: i64,
     pub poll_far_ms: i64,
     pub poll_near_ms: i64,
+    /// No token request while the held token is valid but expires within this window.
+    pub no_poll_ms: i64,
+    /// Wait after a failed token request.
+    pub retry_ms: i64,
 }
 pub(super) fn timing() -> Timing {
     let fast =
@@ -33,6 +49,8 @@ pub(super) fn timing() -> Timing {
             settle_ms: 0,
             poll_far_ms: 0,
             poll_near_ms: 0,
+            no_poll_ms: 5_000,
+            retry_ms: 0,
         }
     } else {
         Timing {
@@ -43,6 +61,8 @@ pub(super) fn timing() -> Timing {
             settle_ms: 30_000,
             poll_far_ms: 1_800_000,
             poll_near_ms: 300_000,
+            no_poll_ms: NO_POLL_MS,
+            retry_ms: 30_000,
         }
     }
 }
@@ -430,6 +450,16 @@ mod tests {
         let mut headless = inputs(&idle);
         headless.tty_idle_ms = None;
         assert_eq!(decide(&headless), Decision::Restart);
+    }
+
+    #[test]
+    fn no_token_request_inside_the_servers_refresh_window() {
+        let now = 1_000_000_000;
+        assert!(may_poll(now, now + NO_POLL_MS + 1, NO_POLL_MS));
+        assert!(!may_poll(now, now + NO_POLL_MS, NO_POLL_MS));
+        assert!(!may_poll(now, now + 1, NO_POLL_MS));
+        assert!(may_poll(now, now, NO_POLL_MS));
+        assert!(may_poll(now, now - 60_000, NO_POLL_MS));
     }
 
     #[test]

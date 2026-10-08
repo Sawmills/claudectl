@@ -518,10 +518,21 @@ impl Monitor {
             if !retry_now && now() - last_check < interval {
                 continue;
             }
+            // Inside the server's refresh window our request would refresh the grant and
+            // revoke the token a turn may still use: wait for expiry instead.
+            if !renew::may_poll(now(), self.held_expires_at, timing.no_poll_ms) {
+                continue;
+            }
             last_check = now();
             retry_now = false;
-            let Ok(access) = self.client.acquire(&self.account_id, None) else {
-                continue;
+            let access = match self.client.acquire(&self.account_id, None) {
+                Ok(access) => access,
+                Err(error) => {
+                    // Retry soon: one failure near expiry must not use up the token's life.
+                    eprintln!("claudectl: token check failed ({error:#}); retrying");
+                    last_check = now() - interval + timing.retry_ms;
+                    continue;
+                }
             };
             // Activity may have changed while the request ran (a prompt, typing): sample it
             // again and decide on the fresh state only.
