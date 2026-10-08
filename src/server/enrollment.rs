@@ -587,9 +587,12 @@ async fn callback(
         .map_err(|_| server.unavailable())?
     else {
         let error = server.error(StatusCode::BAD_REQUEST, "invalid_sso_state");
-        // Only a dashboard sign-in sets the login cookie: keep that browser on the
-        // dashboard path when its state expired or was replayed.
-        if cookie(&headers, sso.cookie_name("login")).is_some() {
+        // Only the dashboard sets these cookies: the login cookie before the callback, the
+        // session cookie after it. Keep that browser on the dashboard path when its state
+        // expired, or on a reload or Back after a finished sign-in.
+        if cookie(&headers, sso.cookie_name("login")).is_some()
+            || cookie(&headers, sso.cookie_name("session")).is_some()
+        {
             return Ok(dashboard_error(error));
         }
         return Err(error);

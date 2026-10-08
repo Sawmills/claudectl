@@ -594,22 +594,27 @@ async fn a_replayed_dashboard_callback_offers_dashboard_sign_in() {
         &query["nonce"],
         &Token::new("amir@sawmills.ai", Some("sawmills.ai")),
     );
-    let callback = || {
+    let callback = |cookie: String| {
         f.http
             .get(format!("{}/auth/callback", f.origin))
             .query(&[("state", query["state"].as_str()), ("code", "c")])
             .header("accept", BROWSER)
-            .header("cookie", login.clone())
+            .header("cookie", cookie)
             .send()
     };
-    assert_eq!(callback().await.unwrap().status().as_u16(), 303);
-    // The state works once. A replay (or an expired state) from the same browser stays on
-    // the dashboard path, not the machine-enrollment recovery text.
-    let replay = callback().await.unwrap();
-    assert_eq!(replay.status().as_u16(), 400);
-    let body = replay.text().await.unwrap();
-    assert!(body.contains(r#"href="/accounts/sign-in""#), "{body}");
-    assert!(!body.contains("server connect"), "{body}");
+    let first = callback(login.clone()).await.unwrap();
+    assert_eq!(first.status().as_u16(), 303);
+    // A browser now holds the session cookie only; the login cookie was cleared.
+    let session = set_cookie(&first, "claudectl-session").unwrap();
+    // The state works once. A reload or Back after sign-in, or an expired state before
+    // it, stays on the dashboard path, not the machine-enrollment recovery text.
+    for cookie in [session, login] {
+        let replay = callback(cookie).await.unwrap();
+        assert_eq!(replay.status().as_u16(), 400);
+        let body = replay.text().await.unwrap();
+        assert!(body.contains(r#"href="/accounts/sign-in""#), "{body}");
+        assert!(!body.contains("server connect"), "{body}");
+    }
 }
 
 #[tokio::test]

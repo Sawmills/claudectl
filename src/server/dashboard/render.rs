@@ -217,7 +217,7 @@ fn machines(snapshot: &Snapshot) -> String {
         )
     };
     let empty = if count == 0 {
-        r#"<p class="machines-note">No connected machines. Run <code translate="no">claudectl server connect</code> on a machine to add it.</p>"#
+        r#"<p class="machines-empty">No connected machines. Run <code translate="no">claudectl server connect</code> on a machine to add it.</p>"#
     } else {
         ""
     };
@@ -303,7 +303,8 @@ mod tests {
         let html = overview(&snapshot(vec![], vec![]));
         assert!(html.contains("No server accounts yet"));
         assert!(html.contains("claudectl server migrate --all --exclusive-owner"));
-        assert!(html.contains("No connected machines"));
+        // Its own class: the stylesheet hides `.machines-note` beside an empty table.
+        assert!(html.contains(r#"<p class="machines-empty">No connected machines"#));
     }
 
     #[test]

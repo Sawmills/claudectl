@@ -905,7 +905,8 @@ details > summary:hover {
 .machines tr.idle td:first-child {
   color: var(--ink-2);
 }
-.machines-note {
+.machines-note,
+.machines-empty {
   padding-top: var(--s3);
   border-top: 1px solid var(--line);
   color: var(--ink-3);
