@@ -38,8 +38,10 @@ impl Qualified {
     }
 }
 
+/// Older clients keep `qualified-builds.json` and reject unknown fields, so these records live
+/// in their own file; both client versions can run on one machine during an upgrade.
 fn path(paths: &Paths) -> PathBuf {
-    root(paths).join("qualified-builds.json")
+    root(paths).join("qualified-host-config-builds.json")
 }
 
 fn load(paths: &Paths) -> Result<Vec<Qualified>> {
@@ -196,6 +198,24 @@ mod tests {
         }]);
         atomic(&path(&paths), &old).unwrap();
         assert!(!is_qualified(&paths, &digest).unwrap());
+    }
+
+    #[test]
+    fn qualifying_leaves_the_list_of_older_clients_unchanged() {
+        // Older clients reject unknown fields, so they must never read a record with `check`.
+        let (_home, paths, binary) = fixture();
+        private_dir(&root(&paths)).unwrap();
+        let legacy = root(&paths).join("qualified-builds.json");
+        let old = serde_json::json!([{
+            "sha256": "1".repeat(64),
+            "platform": std::env::consts::OS,
+            "qualified_at": "2026-10-07T00:00:00Z",
+        }]);
+        atomic(&legacy, &old).unwrap();
+        let before = std::fs::read(&legacy).unwrap();
+        let digest = qualify_with(&paths, &binary, |_, _| Ok(true)).unwrap();
+        assert!(is_qualified(&paths, &digest).unwrap());
+        assert_eq!(std::fs::read(&legacy).unwrap(), before);
     }
 
     #[test]

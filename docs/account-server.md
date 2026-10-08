@@ -50,9 +50,10 @@ machine. The command runs the full-launcher check `supervised_host_config` from
 a fake API and a host login in the HOME, one Bash tool call on server token A, then a
 `--resume` relaunch on server token B. The host token must never be sent and the host files
 must not change. Only on a pass does it record the hash, with the check name, in
-`~/.claudectl/server/qualified-builds.json`. An entry recorded by another check (the
-earlier renewal check, before the host-config model) does not qualify a build: run
-`server qualify` again. A damaged list refuses every build. It needs `python3` (and
+`~/.claudectl/server/qualified-host-config-builds.json`. Builds qualified by the earlier
+renewal check (in `qualified-builds.json`, before the host-config model) are not
+qualified for this client: run `server qualify` again after the upgrade. Older clients keep
+reading the old file, so both versions work on one machine during the upgrade. A damaged list refuses every build. It needs `python3` (and
 `unshare` on Linux, Homebrew OpenSSL on macOS). Claude 2.1.280 on Linux ARM64 on the devbox
 passed on 2026-10-07. The operator procedure is in [the runbook](account-server-runbook.md).
 
