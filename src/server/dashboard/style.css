@@ -1280,7 +1280,7 @@ progress.meter.warn::-moz-progress-bar {
 }
 
 /* Empty state: the answer gives one line and one action; empty tables stay out. */
-.section:not(:has(tbody tr)):not(:has(details)) {
+.section:not(:has(tbody tr)):not(:has(details)):not(:has(.machines-empty)) {
   display: none;
 }
 table:has(> tbody:empty),

@@ -915,13 +915,26 @@ pub(super) async fn sign_in(State(server): Shared) -> Result<Response, HttpError
     );
     Ok(response)
 }
+/// True when `origin` is the serialized origin of `public_url`. Browsers drop a default
+/// port, so `https://host:443` and `https://host` are the same origin.
+fn same_origin(public_url: &str, origin: Option<&str>) -> bool {
+    let Some(origin) = origin else {
+        return false;
+    };
+    let expected = reqwest::Url::parse(public_url).map(|u| u.origin().ascii_serialization());
+    let actual = reqwest::Url::parse(origin).map(|u| u.origin().ascii_serialization());
+    matches!((expected, actual), (Ok(a), Ok(b)) if a == b && a != "null")
+}
 pub(super) async fn sign_out(
     State(server): Shared,
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
     let sso = sso(&server)?;
     // The only browser POST. A cross-site form carries another Origin, or none.
-    if headers.get(header::ORIGIN).and_then(|h| h.to_str().ok()) != Some(sso.public_url.as_str()) {
+    if !same_origin(
+        &sso.public_url,
+        headers.get(header::ORIGIN).and_then(|h| h.to_str().ok()),
+    ) {
         return Err(server.error(StatusCode::FORBIDDEN, "invalid_browser_origin"));
     }
     if let Some(token) = cookie(&headers, sso.cookie_name("session")) {
@@ -1029,6 +1042,25 @@ mod tests {
         );
         // A row naming neither destination is refused, never guessed.
         assert!(serde_json::from_value::<SsoLogin>(json!({"nonce":"n","verifier":"v"})).is_err());
+    }
+
+    #[test]
+    fn sign_out_compares_serialized_origins() {
+        let url = "https://claudectl.example:443";
+        assert!(same_origin(url, Some("https://claudectl.example")));
+        assert!(same_origin(
+            "https://claudectl.example",
+            Some("https://claudectl.example")
+        ));
+        assert!(same_origin(
+            "http://127.0.0.1:8080",
+            Some("http://127.0.0.1:8080")
+        ));
+        assert!(!same_origin(url, Some("https://evil.example")));
+        assert!(!same_origin(url, Some("http://claudectl.example")));
+        assert!(!same_origin(url, Some("https://claudectl.example:8443")));
+        assert!(!same_origin(url, Some("null")));
+        assert!(!same_origin(url, None));
     }
 
     #[test]
