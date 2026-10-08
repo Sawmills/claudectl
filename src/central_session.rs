@@ -122,6 +122,9 @@ impl Session {
         command.env_remove(exec::CONFIG_DIR_ENV);
         command.env("CLAUDE_CODE_OAUTH_TOKEN", &self.current.access_token);
         command.env("DISABLE_AUTOUPDATER", "1");
+        // Marks the token above as this session's own, so a nested `claude` shim may drop
+        // it before its own `server run` (whose preflight refuses inherited credentials).
+        command.env(SERVER_RUN_ENV, "1");
         Ok(command)
     }
 }
@@ -200,6 +203,9 @@ fn preflight(paths: &Paths, cwd: &Path, args: &[OsString]) -> Result<()> {
     // the same rules (no credential, endpoint or helper override of the server token).
     exec::check_user_settings(&paths.home).map_err(|e| anyhow::anyhow!("{e}"))
 }
+/// Set in a `server run` child: `CLAUDE_CODE_OAUTH_TOKEN` there is the session's own.
+pub const SERVER_RUN_ENV: &str = "CLAUDECTL_SERVER_RUN";
+
 pub(super) fn program(path: &Path) -> Result<PathBuf> {
     if path.components().count() > 1 {
         return Ok(path.canonicalize()?);
@@ -768,6 +774,45 @@ impl Drop for Foreground {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_child_is_marked_as_a_server_run_session() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().into());
+        let identity = super::super::Identity {
+            account_uuid: "a".into(),
+            organization_uuid: "o".into(),
+        };
+        let account = Account {
+            provider: "anthropic".into(),
+            account_id: "a".repeat(64),
+            alias: "work".into(),
+            identity: identity.clone(),
+            available: true,
+        };
+        let access = Access {
+            provider: "anthropic".into(),
+            account_id: account.account_id.clone(),
+            user_id: "u".into(),
+            identity,
+            access_token: "synthetic".into(),
+            expires_at: now() + 3_600_000,
+            scopes: vec!["user:inference".into()],
+            revision: "r".into(),
+            generation: 1,
+        };
+        let session = Session::new(&paths, &account, access).unwrap();
+        let command = session.command(Path::new("/bin/true"), &[]).unwrap();
+        let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        // A nested `claude` (the shim) uses this to drop the inherited server token.
+        assert_eq!(
+            env.get(std::ffi::OsStr::new(SERVER_RUN_ENV))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+    }
 
     #[cfg(unix)]
     #[test]

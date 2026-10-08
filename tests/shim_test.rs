@@ -353,3 +353,32 @@ fn the_printed_path_line_is_shell_safe() {
         "/tmp/$(touch x) \"q\" it's"
     );
 }
+
+#[test]
+fn a_nested_claude_drops_only_the_server_run_token() {
+    let f = Fixture::new();
+    // A claudectl that prints the token it would see.
+    std::fs::write(
+        &f.claudectl,
+        "#!/bin/sh\necho \"token=${CLAUDE_CODE_OAUTH_TOKEN-unset} marker=${CLAUDECTL_SERVER_RUN-unset}\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &f.real,
+        "#!/bin/sh\necho \"real token=${CLAUDE_CODE_OAUTH_TOKEN-unset}\"\n",
+    )
+    .unwrap();
+    shim::install(&f.spec("amir3"), &f.dir).unwrap();
+    let inside = [
+        ("CLAUDE_CODE_OAUTH_TOKEN", "session-token"),
+        ("CLAUDECTL_SERVER_RUN", "1"),
+    ];
+    // Inside a `server run` session: the session's token never reaches the nested run.
+    assert_eq!(f.run(&["-p", "x"], &inside), ["token=unset marker=unset"]);
+    assert_eq!(f.run(&["--version"], &inside), ["real token=unset"]);
+    // Outside one, a token the user set stays, so `server run` still refuses it.
+    assert_eq!(
+        f.run(&["-p", "x"], &[("CLAUDE_CODE_OAUTH_TOKEN", "mine")]),
+        ["token=mine marker=unset"]
+    );
+}
