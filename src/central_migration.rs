@@ -26,10 +26,15 @@ fn directory(root: &Path, alias: &str) -> PathBuf {
 }
 /// This fence lives outside the profile, so removing/recreating a profile cannot undo it.
 pub fn ensure_local(root: &Path, alias: &str) -> Result<()> {
-    if directory(root, profile::validate_alias(alias)?)
-        .join("journal.json")
-        .try_exists()?
-    {
+    let alias = profile::validate_alias(alias)?;
+    let file = directory(root, alias).join("journal.json");
+    if file.try_exists()? {
+        // A receipt means the migration finished: the account now runs from the server.
+        let completed = serde_json::from_slice::<Journal>(&private_read(&file)?)
+            .is_ok_and(|j| j.receipt.is_some());
+        if completed {
+            bail!("{alias} is migrated to the account server; use: claudectl server run {alias}");
+        }
         bail!("profile is fenced for server migration; resume with claudectl server migrate");
     }
     Ok(())
