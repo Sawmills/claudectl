@@ -14,6 +14,8 @@ use std::{
 mod migration;
 #[path = "central_qualify.rs"]
 mod qualify;
+#[path = "central_renew.rs"]
+mod renew;
 #[path = "central_session.rs"]
 pub mod session;
 pub use migration::{
