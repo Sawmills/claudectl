@@ -552,7 +552,8 @@ async fn an_observing_request_never_refreshes_a_usable_token() {
         .unwrap();
     assert_eq!(seen.access_token, "due");
     assert_eq!(refreshes.load(Ordering::SeqCst), 0);
-    // A token that is no longer usable is refreshed: it is dead for every holder anyway.
+    // In its last minute the token is too short for a new launch, but running sessions still
+    // use it until it expires: observing must not refresh it.
     let (_f, engine, refreshes) = synthetic(3600).await;
     let ending = engine
         .admit(
@@ -569,8 +570,41 @@ async fn an_observing_request_never_refreshes_a_usable_token() {
         .observe_for("person", "server", &ending.account_id)
         .await
         .unwrap();
-    assert_eq!(seen.access_token, "successor-0");
-    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(seen.access_token, "end");
+    assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_observing_request_refreshes_an_expired_token() {
+    // An expired token is dead for every holder, so observing may refresh it.
+    let (_f, engine, refreshes) = synthetic(1).await;
+    let receipt = engine
+        .admit(
+            "person",
+            "work",
+            "m",
+            grant_until("first", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let held = engine
+        .acquire("person", &receipt.account_id, None)
+        .await
+        .unwrap();
+    // Forced: the successor lives one second.
+    let short = engine
+        .acquire("person", &receipt.account_id, Some(&held.revision))
+        .await
+        .unwrap();
+    assert_eq!(short.access_token, "successor-0");
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    let seen = engine
+        .observe_for("person", "server", &receipt.account_id)
+        .await
+        .unwrap();
+    assert_eq!(seen.access_token, "successor-1");
+    assert_eq!(refreshes.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
