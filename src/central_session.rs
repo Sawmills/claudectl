@@ -365,6 +365,79 @@ struct Monitor {
     /// The session.json content, to mark the session renewing before SIGTERM.
     status: serde_json::Value,
 }
+/// What the monitor knows about Claude's activity, read incrementally.
+#[cfg(unix)]
+#[derive(Default)]
+struct Activity {
+    offset: u64,
+    idle: super::renew::Idle,
+    seen_start: bool,
+    baseline: Option<usize>,
+}
+#[cfg(unix)]
+impl Monitor {
+    /// Fold the hook events appended since the last read into the activity.
+    fn read_events(&self, activity: &mut Activity) {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut file) = File::open(self.directory.join("events")) else {
+            return;
+        };
+        let mut chunk = String::new();
+        if file.seek(SeekFrom::Start(activity.offset)).is_ok()
+            && file.read_to_string(&mut chunk).is_ok()
+            && let Some(end) = chunk.rfind('\n')
+        {
+            activity.offset += end as u64 + 1;
+            let events = super::renew::parse_events(&chunk[..end]);
+            activity.seen_start |= events
+                .iter()
+                .any(|(_, e)| matches!(e, super::renew::Event::SessionStart(_)));
+            super::renew::fold(&mut activity.idle, &events);
+        }
+    }
+    /// The decision inputs from the current activity, terminal and process group. Without a
+    /// server token, the server side equals the held one.
+    fn inputs<'a>(
+        &'a self,
+        activity: &'a mut Activity,
+        timing: &super::renew::Timing,
+        started: i64,
+        server: Option<&'a Access>,
+    ) -> super::renew::Inputs<'a> {
+        // Claude starts its MCP servers after SessionStart: take the baseline once it settled.
+        if activity.idle.since.is_some()
+            && activity.baseline.is_none()
+            && now() - started >= timing.settle_ms
+        {
+            activity.baseline = exec::group_size(self.pid);
+        }
+        // Unknown membership counts as grown: never restart over unknown processes.
+        let group_grew = match (activity.baseline, exec::group_size(self.pid)) {
+            (Some(before), Some(current)) => current > before,
+            _ => true,
+        };
+        let tty_idle_ms = self.tty.as_ref().map(|path| {
+            std::fs::metadata(path)
+                .and_then(|m| m.accessed())
+                .ok()
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |at| now() - at.as_millis() as i64)
+        });
+        super::renew::Inputs {
+            now: now(),
+            held_revision: &self.held_revision,
+            held_expires_at: self.held_expires_at,
+            server_revision: server.map_or(&self.held_revision, |a| &a.revision),
+            server_expires_at: server.map_or(self.held_expires_at, |a| a.expires_at),
+            idle: &activity.idle,
+            idle_after_ms: timing.idle_after_ms,
+            tty_gate_ms: timing.tty_idle_ms,
+            tty_idle_ms,
+            group_grew,
+            restarts_last_hour: self.restarts,
+        }
+    }
+}
 #[cfg(unix)]
 impl Monitor {
     fn watch(self, stopped: std::sync::mpsc::Receiver<()>) -> Outcome {
@@ -384,10 +457,8 @@ impl Monitor {
         let mut last_usage = 0;
         let mut last_check = 0;
         let mut renewing = self.renewable;
-        let mut baseline: Option<usize> = None;
-        let mut offset: u64 = 0;
-        let mut idle = renew::Idle::default();
-        let mut seen_start = false;
+        let mut activity = Activity::default();
+        let mut retry_now = false;
         let mut sent: Option<(i64, Restart)> = None;
         while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
             stopped.recv_timeout(Duration::from_millis(timing.tick_ms))
@@ -423,23 +494,8 @@ impl Monitor {
                 renewing = false;
                 continue;
             }
-            // Read only what the hooks appended since the last tick.
-            if let Ok(mut file) = File::open(self.directory.join("events")) {
-                use std::io::{Read, Seek, SeekFrom};
-                let mut chunk = String::new();
-                if file.seek(SeekFrom::Start(offset)).is_ok()
-                    && file.read_to_string(&mut chunk).is_ok()
-                    && let Some(end) = chunk.rfind('\n')
-                {
-                    offset += end as u64 + 1;
-                    let events = renew::parse_events(&chunk[..end]);
-                    seen_start |= events
-                        .iter()
-                        .any(|(_, e)| matches!(e, renew::Event::SessionStart(_)));
-                    renew::fold(&mut idle, &events);
-                }
-            }
-            if !seen_start {
+            self.read_events(&mut activity);
+            if !activity.seen_start {
                 if now() - started > timing.hooks_wait_ms {
                     eprintln!(
                         "claudectl: Claude sent no hook events; server token renewal is off for this session"
@@ -449,38 +505,9 @@ impl Monitor {
                 }
                 continue;
             }
-            // Claude starts its MCP servers after SessionStart: take the baseline once it settled.
-            if idle.since.is_some() && baseline.is_none() && now() - started >= timing.settle_ms {
-                baseline = exec::group_size(self.pid);
-            }
-            // Unknown membership counts as grown: never restart over unknown processes.
-            let group_grew = match (baseline, exec::group_size(self.pid)) {
-                (Some(before), Some(current)) => current > before,
-                _ => true,
-            };
-            let tty_idle_ms = self.tty.as_ref().map(|path| {
-                std::fs::metadata(path)
-                    .and_then(|m| m.accessed())
-                    .ok()
-                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |at| now() - at.as_millis() as i64)
-            });
-            let mut inputs = renew::Inputs {
-                now: now(),
-                held_revision: &self.held_revision,
-                held_expires_at: self.held_expires_at,
-                server_revision: &self.held_revision,
-                server_expires_at: self.held_expires_at,
-                idle: &idle,
-                idle_after_ms: timing.idle_after_ms,
-                tty_gate_ms: timing.tty_idle_ms,
-                tty_idle_ms,
-                group_grew,
-                restarts_last_hour: self.restarts,
-            };
             // Ask the server only while idle: near expiry the request refreshes the grant and
             // revokes the token a running turn would still use.
-            if renew::idle_gate(&inputs).is_err() {
+            if renew::idle_gate(&self.inputs(&mut activity, &timing, started, None)).is_err() {
                 continue;
             }
             let interval = if self.held_expires_at - now() < 3_600_000 {
@@ -488,17 +515,25 @@ impl Monitor {
             } else {
                 timing.poll_far_ms
             };
-            if now() - last_check < interval {
+            if !retry_now && now() - last_check < interval {
                 continue;
             }
             last_check = now();
+            retry_now = false;
             let Ok(access) = self.client.acquire(&self.account_id, None) else {
                 continue;
             };
-            inputs.server_revision = &access.revision;
-            inputs.server_expires_at = access.expires_at;
-            if renew::decide(&inputs) == renew::Decision::Restart
-                && let Some(session_id) = idle.session.clone()
+            // Activity may have changed while the request ran (a prompt, typing): sample it
+            // again and decide on the fresh state only.
+            self.read_events(&mut activity);
+            let inputs = self.inputs(&mut activity, &timing, started, Some(&access));
+            if renew::idle_gate(&inputs).is_err() {
+                // Claude became busy: restart at its next idle point, without the poll wait.
+                retry_now = true;
+            }
+            let decision = renew::decide(&inputs);
+            if decision == renew::Decision::Restart
+                && let Some(session_id) = activity.idle.session.clone()
             {
                 // Supervisors see the handoff before Claude stops.
                 let mut status = self.status.clone();

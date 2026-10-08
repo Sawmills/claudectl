@@ -26,6 +26,8 @@ struct Fake {
     /// Further refreshes that also happened before this request (a second refresh, for
     /// example `server refresh-access` on another machine).
     extra_refreshes: u32,
+    /// Hold every token response after the first this long (a slow server or refresh).
+    hold_ms: u64,
 }
 type Shared = Arc<Mutex<Fake>>;
 
@@ -46,9 +48,22 @@ async fn usage() -> Json<Value> {
     )
 }
 
-async fn token(State(fake): State<Shared>, Json(body): Json<Value>) -> Json<Value> {
-    let mut fake = fake.lock().unwrap();
-    fake.requests.push(body["previous_revision"].clone());
+async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Value> {
+    let hold = {
+        let fake = shared.lock().unwrap();
+        if fake.requests.is_empty() {
+            0
+        } else {
+            fake.hold_ms
+        }
+    };
+    shared
+        .lock()
+        .unwrap()
+        .requests
+        .push(body["previous_revision"].clone());
+    tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+    let mut fake = shared.lock().unwrap();
     if fake.refresh_next {
         fake.refresh_next = false;
         fake.generation += 1 + u64::from(fake.extra_refreshes);
@@ -352,4 +367,61 @@ fn a_busy_claude_never_triggers_a_token_request() {
     );
     // Only the launch asked for a token.
     assert_eq!(env.fake.lock().unwrap().requests.len(), 1);
+}
+
+/// A prompt that arrives while the token request is in flight: the monitor checks activity
+/// again after the request and does not stop the now-busy Claude.
+#[test]
+fn a_prompt_during_the_token_request_cancels_the_restart() {
+    let env = Env::new();
+    env.fake.lock().unwrap().hold_ms = 1_500;
+    let refresher = env.refresh_when_idle();
+    // When the monitor's request is in flight, the user submits a prompt.
+    let prompter = {
+        let fake = env.fake.clone();
+        let sessions = env.home.path().join(".claudectl/server/sessions");
+        std::thread::spawn(move || {
+            for _ in 0..400 {
+                if fake.lock().unwrap().requests.len() >= 2 {
+                    let dir = std::fs::read_dir(&sessions)
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    let line = json!({"at": chrono::Utc::now().timestamp_millis(),
+                        "event": "UserPromptSubmit", "session_id": "sess-1"});
+                    use std::io::Write;
+                    let mut events = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(dir.join("events"))
+                        .unwrap();
+                    writeln!(events, "{line}").unwrap();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        })
+    };
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+    env.env(&mut command);
+    command
+        .env("FAKE_WATCHDOG_S", "5")
+        .args(["server", "run", "work", "--claude"])
+        .arg(&env.claude)
+        .args(["--", "--model", "opus"]);
+    let output = Command::from_std(command)
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    refresher.join().unwrap();
+    prompter.join().unwrap();
+    // No restart: the busy Claude ran until its watchdog.
+    assert_eq!(
+        output.status.code(),
+        Some(99),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(env.runs().len(), 1);
 }
