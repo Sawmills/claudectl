@@ -19,7 +19,7 @@ mod renew;
 #[path = "central_session.rs"]
 pub mod session;
 pub use migration::{
-    ensure_local, ensure_local_grant, ensure_login_unfenced, ensure_removable, migrate,
+    ensure_local, ensure_local_grant, ensure_login_unfenced, ensure_removable, is_migrated, migrate,
 };
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -529,46 +529,178 @@ fn stale(usage: &Usage) -> bool {
             .observed_at
             .is_none_or(|at| at > now() || at.saturating_add(300_000) <= now())
 }
-pub fn status(paths: &Paths, alias: &str, cached: bool) -> Result<()> {
+/// The last usage this machine read for `alias` from its current server, if any.
+fn cached_usage(paths: &Paths, alias: &str) -> Option<Usage> {
+    let connection = cached_connection(paths)?;
+    let mut usage = private_read(&cache_path(paths, alias))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CachedUsage>(&bytes).ok())
+        .filter(|cache| {
+            cache.account.alias.eq_ignore_ascii_case(alias)
+                && connection.server == cache.server
+                && connection.user_id == cache.user_id
+        })
+        .map(|cache| cache.usage)?;
+    usage.stale = stale(&usage);
+    Some(usage)
+}
+fn save_usage(paths: &Paths, client: &Client, account: &Account, usage: &Usage) -> Result<()> {
+    atomic(
+        &cache_path(paths, &account.alias),
+        &CachedUsage {
+            server: client.connection.server.clone(),
+            user_id: client.connection.user_id.clone(),
+            account: account.clone(),
+            usage: usage.clone(),
+        },
+    )
+}
+fn read_usage(paths: &Paths, alias: &str, cached: bool) -> Result<Usage> {
     let alias = profile::validate_alias(alias)?;
-    let path = cache_path(paths, alias);
-    let usage = if cached {
-        let mut usage = private_read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<CachedUsage>(&bytes).ok())
-            .filter(|cache| {
-                cache.account.alias.eq_ignore_ascii_case(alias)
-                    && cached_connection(paths).is_some_and(|connection| {
-                        connection.server == cache.server && connection.user_id == cache.user_id
-                    })
-            })
-            .map(|cache| cache.usage)
-            .unwrap_or(Usage {
-                data: None,
-                observed_at: None,
-                next_retry_at: 0,
-                stale: true,
-                error: Some("no saved usage".into()),
-            });
-        usage.stale = stale(&usage);
-        usage
-    } else {
-        let client = Client::load(paths)?;
-        let account = client.account(alias)?;
-        let usage = client.usage(&account.account_id, false)?;
-        atomic(
-            &path,
-            &CachedUsage {
-                server: client.connection.server.clone(),
-                user_id: client.connection.user_id.clone(),
-                account,
-                usage: usage.clone(),
-            },
-        )?;
-        usage
-    };
-    println!("{}", serde_json::to_string(&usage)?);
+    if cached {
+        return Ok(cached_usage(paths, alias).unwrap_or(Usage {
+            data: None,
+            observed_at: None,
+            next_retry_at: 0,
+            stale: true,
+            error: Some("no saved usage".into()),
+        }));
+    }
+    let client = Client::load(paths)?;
+    let account = client.account(alias)?;
+    let usage = client.usage(&account.account_id, false)?;
+    save_usage(paths, &client, &account, &usage)?;
+    Ok(usage)
+}
+pub fn status(paths: &Paths, alias: &str, cached: bool, json: bool) -> Result<()> {
+    let usage = read_usage(paths, alias, cached)?;
+    if json {
+        println!("{}", serde_json::to_string(&usage)?);
+        return Ok(());
+    }
+    let windows: Option<crate::api::UsageResponse> = usage
+        .data
+        .clone()
+        .and_then(|data| serde_json::from_value(data).ok());
+    let mut table = table(&["Window", "Used", "Resets"]);
+    if let Some(windows) = &windows {
+        for (name, window) in [
+            ("5h", &windows.five_hour),
+            ("week", &windows.seven_day),
+            ("week Opus", &windows.seven_day_opus),
+            ("week Sonnet", &windows.seven_day_sonnet),
+        ] {
+            if let Some(window) = window {
+                table.add_row(vec![
+                    name.to_string(),
+                    window
+                        .utilization
+                        .map_or("-".into(), |used| format!("{used:.0}%")),
+                    window.resets_at.clone().unwrap_or_else(|| "-".into()),
+                ]);
+            }
+        }
+    }
+    println!("{alias} (account server)");
+    if table.row_count() > 0 {
+        println!("{table}");
+    }
+    match usage.observed_at {
+        Some(at) => println!(
+            "Observed {} ago{}.",
+            ago(now().saturating_sub(at)),
+            if usage.stale { "; stale" } else { "" }
+        ),
+        None => println!("No usage observed yet."),
+    }
+    if let Some(error) = &usage.error {
+        println!("Server reports: {error}");
+    }
     Ok(())
+}
+fn ago(ms: i64) -> String {
+    let seconds = (ms / 1000).max(0);
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m", seconds / 60),
+        _ => format!("{}h", seconds / 3600),
+    }
+}
+/// A plain table; colour is left to callers that give it meaning.
+fn table(header: &[&str]) -> comfy_table::Table {
+    let mut table = comfy_table::Table::new();
+    table.load_preset(comfy_table::presets::UTF8_FULL);
+    table.apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
+    table.set_header(header.to_vec());
+    table
+}
+/// One server account as `claudectl status` shows it.
+pub struct ServerRow {
+    pub alias: String,
+    pub available: bool,
+    pub usage: std::result::Result<Usage, String>,
+}
+/// What the account server reports for `claudectl status`.
+pub enum ServerView {
+    NotConnected,
+    Unreachable(String),
+    Rows(Vec<ServerRow>),
+}
+/// Every server account with its usage. The server answers usage from its cache and polls
+/// the provider at most once per 5 minutes, so the reads run in parallel. `cached` reads
+/// only this machine's saved copies of the `known` aliases and sends nothing.
+pub fn server_view(paths: &Paths, cached: bool, known: &[String]) -> ServerView {
+    if cached_connection(paths).is_none() {
+        return ServerView::NotConnected;
+    }
+    if cached {
+        return ServerView::Rows(
+            known
+                .iter()
+                .map(|alias| ServerRow {
+                    alias: alias.clone(),
+                    available: true,
+                    usage: cached_usage(paths, alias).ok_or_else(|| "no saved usage".into()),
+                })
+                .collect(),
+        );
+    }
+    let client = match Client::load(paths) {
+        Ok(client) => client,
+        Err(error) => return ServerView::Unreachable(format!("{error:#}")),
+    };
+    let accounts = match client.accounts() {
+        Ok(accounts) => accounts,
+        Err(error) => return ServerView::Unreachable(format!("{error:#}")),
+    };
+    let client = &client;
+    ServerView::Rows(std::thread::scope(|scope| {
+        let reads: Vec<_> = accounts
+            .into_iter()
+            .map(|account| {
+                scope.spawn(move || {
+                    let usage = client.usage(&account.account_id, false);
+                    if let Ok(usage) = &usage
+                        && let Err(error) = save_usage(paths, client, &account, usage)
+                    {
+                        eprintln!(
+                            "warning: server usage of {} not saved: {error:#}",
+                            account.alias
+                        );
+                    }
+                    ServerRow {
+                        alias: account.alias,
+                        available: account.available,
+                        usage: usage.map_err(|error| format!("{error:#}")),
+                    }
+                })
+            })
+            .collect();
+        reads
+            .into_iter()
+            .map(|read| read.join().expect("server usage read panicked"))
+            .collect()
+    }))
 }
 pub fn statusline(paths: &Paths, id: &str) -> Result<()> {
     if id.len() != 64 || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
@@ -610,7 +742,11 @@ pub enum Command {
         no_browser: bool,
     },
     /// List accounts belonging to the enrolled company user
-    Accounts,
+    Accounts {
+        /// Print the raw JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
     /// Sign in directly on the server; refresh credentials never reach this client
     Login {
         alias: String,
@@ -650,6 +786,9 @@ pub enum Command {
         alias: String,
         #[arg(long)]
         cached: bool,
+        /// Print the raw JSON instead of a table
+        #[arg(long)]
+        json: bool,
     },
     /// Read the local session usage cache without network access
     Statusline { account_id: String },
@@ -673,7 +812,11 @@ pub enum Command {
         abort: Option<String>,
     },
     /// List enrolled machines for the current company user
-    Devices,
+    Devices {
+        /// Print the raw JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop a machine from acquiring further access tokens
     Revoke { machine_id: String },
     /// Delete a server account and its refresh grant; tokens already issued expire on their own
@@ -690,7 +833,11 @@ pub fn dispatch(command: Command) -> Result<()> {
             no_browser,
         } => connect(&paths, &server, &name, no_browser),
         Command::Disconnect => disconnect(&paths),
-        Command::Status { alias, cached } => status(&paths, &alias, cached),
+        Command::Status {
+            alias,
+            cached,
+            json,
+        } => status(&paths, &alias, cached, json),
         Command::Statusline { account_id } => statusline(&paths, &account_id),
         Command::Hook { dir } => {
             // A hook never blocks or talks to Claude: no output, exit 0 whatever happens. A
@@ -731,8 +878,21 @@ pub fn dispatch(command: Command) -> Result<()> {
                     );
                     Ok(())
                 }
-                Command::Accounts => {
-                    println!("{}", serde_json::to_string(&client.accounts()?)?);
+                Command::Accounts { json } => {
+                    let accounts = client.accounts()?;
+                    if json {
+                        println!("{}", serde_json::to_string(&accounts)?);
+                        return Ok(());
+                    }
+                    let mut table = table(&["Account", "Available", "Claude account"]);
+                    for account in &accounts {
+                        table.add_row(vec![
+                            account.alias.clone(),
+                            if account.available { "yes" } else { "no" }.into(),
+                            account.identity.account_uuid.chars().take(8).collect(),
+                        ]);
+                    }
+                    println!("{table}");
                     Ok(())
                 }
                 Command::Login { alias, no_browser } => login(&client, &alias, false, no_browser),
@@ -761,8 +921,25 @@ pub fn dispatch(command: Command) -> Result<()> {
                     let code = session::run(&paths, &client, &alias, &claude, &args)?;
                     std::process::exit(code)
                 }
-                Command::Devices => {
-                    println!("{}", client.get::<Value>("/v1/devices")?);
+                Command::Devices { json } => {
+                    let devices: Value = client.get("/v1/devices")?;
+                    if json {
+                        println!("{devices}");
+                        return Ok(());
+                    }
+                    let mut table = table(&["Machine", "Revoked"]);
+                    for device in devices.as_array().into_iter().flatten() {
+                        table.add_row(vec![
+                            device["id"].as_str().unwrap_or("-").to_string(),
+                            if device["revoked"].as_bool() == Some(true) {
+                                "yes"
+                            } else {
+                                "no"
+                            }
+                            .into(),
+                        ]);
+                    }
+                    println!("{table}");
                     Ok(())
                 }
                 Command::Revoke { machine_id } => {

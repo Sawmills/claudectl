@@ -25,6 +25,8 @@ pub struct FetchedUsage {
     pub token_expiry_secs: Option<i64>,
     pub is_active: bool,
     pub error: Option<String>,
+    /// The account lives on the account server: a migrated profile, or a server row.
+    pub on_server: bool,
 }
 
 struct AccountStatus {
@@ -43,6 +45,7 @@ struct AccountStatus {
     is_active: bool,
     is_error: bool,
     error_msg: String,
+    on_server: bool,
 }
 
 impl AccountStatus {
@@ -67,18 +70,53 @@ impl AccountStatus {
 }
 
 pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> Result<()> {
-    let fetched = fetch_usages(alias, mode)?;
+    let paths = config::default_paths()?;
+    // An alias may exist only on the server.
+    let (local, local_error) = match fetch_usages(alias, mode) {
+        Ok(fetched) => (fetched, None),
+        Err(error) if alias.is_some() => (vec![], Some(error)),
+        Err(error) => return Err(error),
+    };
+    let known: Vec<String> = local
+        .iter()
+        .filter(|f| f.on_server)
+        .map(|f| f.alias.clone())
+        .chain(local_error.as_ref().and(alias).map(str::to_string))
+        .collect();
+    let view = claudectl::central::server_view(&paths, mode == FetchMode::Cached, &known);
+    let mut remote = server_rows(&view, &known);
+    if let Some(alias) = alias {
+        remote.retain(|f| f.alias.eq_ignore_ascii_case(alias));
+    }
+    if let Some(error) = local_error
+        && remote.is_empty()
+    {
+        return Err(error);
+    }
     if json {
-        let report = status_json(&fetched, chrono::Utc::now().timestamp());
+        let now = chrono::Utc::now().timestamp();
+        let mut report = status_json(&local, now);
+        report["server"] = server_json(&view, &remote, now);
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
+    // A migrated alias shows once: as its server row.
+    let fetched: Vec<&FetchedUsage> = local
+        .iter()
+        .filter(|f| {
+            !(f.on_server
+                && remote
+                    .iter()
+                    .any(|r| r.alias.eq_ignore_ascii_case(&f.alias)))
+        })
+        .chain(&remote)
+        .collect();
     if fetched.is_empty() {
         println!("no profiles saved. Use 'claudectl save' or 'claudectl login <alias>'.");
         return Ok(());
     }
 
-    let mut accounts: Vec<AccountStatus> = fetched.iter().map(to_account_status).collect();
+    let mut accounts: Vec<AccountStatus> = fetched.into_iter().map(to_account_status).collect();
     accounts.sort_by(|a, b| {
         a.availability_score()
             .partial_cmp(&b.availability_score())
@@ -92,6 +130,95 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
         print_summary(&accounts);
     }
     Ok(())
+}
+
+/// The status error of a profile whose account moved to the account server.
+const MIGRATED: &str = "migrated to the account server";
+/// The status error of a server account when the server did not answer.
+const UNREACHABLE: &str = "account server unreachable";
+
+/// Server accounts as status rows. When the server does not answer, the migrated aliases
+/// this machine knows stand in for them.
+fn server_rows(view: &claudectl::central::ServerView, known: &[String]) -> Vec<FetchedUsage> {
+    use claudectl::central::ServerView;
+    match view {
+        ServerView::NotConnected => vec![],
+        ServerView::Unreachable(error) => known
+            .iter()
+            .map(|alias| FetchedUsage {
+                alias: alias.clone(),
+                error: Some(format!("{UNREACHABLE}: {error}")),
+                on_server: true,
+                ..FetchedUsage::default()
+            })
+            .collect(),
+        ServerView::Rows(rows) => rows
+            .iter()
+            .map(|row| {
+                let mut fetched = FetchedUsage {
+                    alias: row.alias.clone(),
+                    on_server: true,
+                    ..FetchedUsage::default()
+                };
+                match &row.usage {
+                    Ok(usage) => {
+                        let parsed: Option<UsageResponse> = usage
+                            .data
+                            .clone()
+                            .and_then(|data| serde_json::from_value(data).ok());
+                        let observed = usage.observed_at.map(|ms| ms / 1000);
+                        fetched.snapshot = Snapshot {
+                            usage: parsed.clone(),
+                            fetched_at: observed,
+                            next_fetch_at: Some(usage.next_retry_at / 1000),
+                            source: "server",
+                            error: None,
+                            fresh: !usage.stale,
+                            // The server's own freshness window: 5 minutes.
+                            valid_until: observed.map(|at| at + 300),
+                        };
+                        fetched.usage = parsed;
+                        fetched.error = usage
+                            .error
+                            .as_ref()
+                            .map(|error| format!("account server: {error}"));
+                    }
+                    Err(error) => fetched.error = Some(format!("account server: {error}")),
+                }
+                if !row.available && fetched.error.is_none() {
+                    fetched.error = Some("unavailable on the account server".into());
+                }
+                fetched
+            })
+            .collect(),
+    }
+}
+
+/// The additive `server` key of `status --json`.
+fn server_json(
+    view: &claudectl::central::ServerView,
+    remote: &[FetchedUsage],
+    now: i64,
+) -> serde_json::Value {
+    use claudectl::central::ServerView;
+    let (state, error) = match view {
+        ServerView::NotConnected => ("not_connected", None),
+        ServerView::Unreachable(error) => ("unreachable", Some(error.clone())),
+        ServerView::Rows(_) => ("connected", None),
+    };
+    let available = |alias: &str| match view {
+        ServerView::Rows(rows) => rows
+            .iter()
+            .find(|r| r.alias.eq_ignore_ascii_case(alias))
+            .is_some_and(|r| r.available),
+        _ => false,
+    };
+    let mut accounts = status_json(remote, now)["accounts"].take();
+    for account in accounts.as_array_mut().into_iter().flatten() {
+        let alias = account["alias"].as_str().unwrap_or_default().to_string();
+        account["available"] = available(&alias).into();
+    }
+    serde_json::json!({ "state": state, "error": error, "accounts": accounts })
 }
 
 /// Version of the `status --json` shape.
@@ -339,6 +466,12 @@ fn fetch_usages_with_refresh(
             };
             let mut creds = match creds {
                 Ok(creds) => creds,
+                Err(_) if claudectl::central::is_migrated(paths, &profile.meta.alias) => {
+                    result.error = Some(MIGRATED.into());
+                    result.on_server = true;
+                    fetched.push(result);
+                    continue;
+                }
                 Err(_) => {
                     result.error = Some("credentials unavailable or invalid".into());
                     fetched.push(result);
@@ -484,6 +617,7 @@ fn to_account_status(f: &FetchedUsage) -> AccountStatus {
             is_active: f.is_active,
             is_error: f.error.is_some() || !f.snapshot.is_fresh_at(chrono::Utc::now().timestamp()),
             error_msg: f.error.clone().unwrap_or_default(),
+            on_server: f.on_server,
         },
         (None, err) => AccountStatus {
             alias: f.alias.clone(),
@@ -501,6 +635,7 @@ fn to_account_status(f: &FetchedUsage) -> AccountStatus {
             is_active: f.is_active,
             is_error: true,
             error_msg: err.clone().unwrap_or_else(|| "error".to_string()),
+            on_server: f.on_server,
         },
     }
 }
@@ -555,6 +690,56 @@ fn print_table(accounts: &[AccountStatus]) {
 /// Describe the next action without treating expired tokens or API throttling
 /// as proof that an account needs login or has exhausted its allowance.
 fn next_step(s: &AccountStatus) -> (String, String) {
+    let error = s.error_msg.as_str();
+    let run = || {
+        format!(
+            "claudectl server run {}",
+            claudectl::shell::quote_arg(&s.alias)
+        )
+    };
+    if error == MIGRATED {
+        return ("On server".into(), run());
+    }
+    if s.on_server {
+        let status = || {
+            format!(
+                "claudectl server status {}",
+                claudectl::shell::quote_arg(&s.alias)
+            )
+        };
+        if error.starts_with(UNREACHABLE) {
+            return (
+                "Server unreachable".into(),
+                "Check the server connection; run claudectl status again".into(),
+            );
+        }
+        if error.contains("login_required") {
+            return (
+                "Login needed".into(),
+                format!(
+                    "claudectl server renew {}",
+                    claudectl::shell::quote_arg(&s.alias)
+                ),
+            );
+        }
+        if error.contains("no saved usage") {
+            return ("Usage unknown".into(), "Run claudectl status".into());
+        }
+        if !error.is_empty() {
+            return ("Unavailable".into(), status());
+        }
+        let (label, action) = local_step(s);
+        let action = if label.ends_with("limit reached") {
+            action
+        } else {
+            run()
+        };
+        return (label, action);
+    }
+    local_step(s)
+}
+
+fn local_step(s: &AccountStatus) -> (String, String) {
     let error = s.error_msg.as_str();
     if error.contains("ownership unknown") {
         return (
@@ -664,6 +849,21 @@ fn reset_step(reset: &str) -> String {
     }
 }
 
+/// Where the account lives and whether it is in use.
+fn state(s: &AccountStatus) -> &'static str {
+    if s.on_server {
+        if s.error_msg.is_empty() || s.error_msg == MIGRATED {
+            "on server"
+        } else {
+            "unavailable"
+        }
+    } else if s.is_active {
+        "active"
+    } else {
+        "local"
+    }
+}
+
 fn summary_row(s: &AccountStatus) -> Vec<Cell> {
     let (status, action) = next_step(s);
     let alias = if s.is_active {
@@ -688,7 +888,9 @@ fn summary_row(s: &AccountStatus) -> Vec<Cell> {
         "Unknown".into()
     };
     let data = if s.snapshot.is_fresh_at(now) && !s.is_error {
-        if s.snapshot.source == "live" {
+        if s.snapshot.source == "server" {
+            "Account server".into()
+        } else if s.snapshot.source == "live" {
             "Live".into()
         } else {
             "Recent cache".into()
@@ -731,8 +933,15 @@ fn summary_row(s: &AccountStatus) -> Vec<Cell> {
     } else {
         Cell::new(alias)
     };
+    let state = state(s);
+    let state = if state == "unavailable" {
+        Cell::new(state).fg(Color::Yellow)
+    } else {
+        Cell::new(state)
+    };
     vec![
         alias,
+        state,
         Cell::new(status)
             .fg(status_color)
             .add_attribute(Attribute::Bold),
@@ -751,7 +960,14 @@ fn summary_table(accounts: &[AccountStatus], no_color: bool) -> Table {
         table.force_no_tty();
     }
     let show_label = show_label_column(accounts);
-    let mut header = vec!["Account", "Status", "Usage used", "Data", "Next step"];
+    let mut header = vec![
+        "Account",
+        "State",
+        "Status",
+        "Usage used",
+        "Data",
+        "Next step",
+    ];
     if show_label {
         header.insert(1, "Label");
     }
@@ -994,26 +1210,27 @@ mod tests {
                 .fg(Color::Cyan)
                 .add_attribute(Attribute::Bold)
         );
+        assert_eq!(row[1].content(), "active");
         assert_eq!(
-            row[1],
+            row[2],
             Cell::new("Within usage limits")
                 .fg(Color::Green)
                 .add_attribute(Attribute::Bold)
         );
-        assert_eq!(row[2], Cell::new("5h: 20%\nweek: 30%").fg(Color::Green));
+        assert_eq!(row[3], Cell::new("5h: 20%\nweek: 30%").fg(Color::Green));
         a.d7_pct = Some(100.0);
         assert_eq!(
-            summary_row(&a)[1],
+            summary_row(&a)[2],
             Cell::new("Weekly limit reached")
                 .fg(Color::Red)
                 .add_attribute(Attribute::Bold)
         );
         assert_eq!(
-            summary_row(&a)[2],
+            summary_row(&a)[3],
             Cell::new("5h: 20%\nweek: 100%").fg(Color::Red)
         );
         a.is_error = true;
-        assert_eq!(summary_row(&a)[2], Cell::new("Unknown").fg(Color::Yellow));
+        assert_eq!(summary_row(&a)[3], Cell::new("Unknown").fg(Color::Yellow));
     }
 
     #[test]
@@ -1039,7 +1256,7 @@ mod tests {
         assert_eq!(usage_color(80.0), Color::Red);
         let a = fresh_account(Some(99.6), Some(20.0), false);
         assert_eq!(next_step(&a).0, "Within usage limits");
-        assert!(summary_row(&a)[2].content().contains("5h: <100%"));
+        assert!(summary_row(&a)[3].content().contains("5h: <100%"));
     }
 
     #[test]
@@ -1139,8 +1356,8 @@ mod tests {
         a.snapshot.next_fetch_at = Some(now + 30);
         a.error_msg = "usage fetch failed (HTTP 429)".into();
         let row = summary_row(&a);
-        assert_eq!(row[3].content(), "Recent; check failed");
-        assert!(row[4].content().ends_with('s'));
+        assert_eq!(row[4].content(), "Recent; check failed");
+        assert!(row[5].content().ends_with('s'));
         a.error_msg = "token refresh fetch failed (HTTP 429)".into();
         assert_eq!(next_step(&a).0, "Refresh throttled");
         a.error_msg =
@@ -1187,7 +1404,7 @@ mod tests {
         ] {
             a.error_msg = error.into();
             assert_eq!(next_step(&a).0, label);
-            assert_eq!(summary_row(&a)[2].content(), "Unknown");
+            assert_eq!(summary_row(&a)[3].content(), "Unknown");
         }
         a.is_active = true;
         a.error_msg = "missing access token; log in again".into();
@@ -1198,6 +1415,18 @@ mod tests {
         a.is_active = false;
         assert_eq!(next_step(&a).0, "Cannot read saved login");
         assert!(next_step(&a).1.contains("saved file permissions"));
+        // A migrated profile has no local login by design.
+        a.error_msg = MIGRATED.into();
+        assert_eq!(
+            next_step(&a),
+            (
+                "On server".to_string(),
+                format!(
+                    "claudectl server run {}",
+                    claudectl::shell::quote_arg(&a.alias)
+                )
+            )
+        );
     }
 
     #[test]
@@ -1208,10 +1437,10 @@ mod tests {
         a.snapshot.valid_until = Some(now - 1);
         a.snapshot.next_fetch_at = Some(now + 600);
         let row = summary_row(&a);
-        assert_eq!(row[1].content(), "Usage unknown");
-        assert_eq!(row[2].content(), "Unknown");
-        assert!(row[3].content().starts_with("Old:"));
-        assert!(row[4].content().starts_with("Run status in"));
+        assert_eq!(row[2].content(), "Usage unknown");
+        assert_eq!(row[3].content(), "Unknown");
+        assert!(row[4].content().starts_with("Old:"));
+        assert!(row[5].content().starts_with("Run status in"));
     }
 
     #[test]
@@ -1223,9 +1452,9 @@ mod tests {
         a.token_expiry_secs = Some(1);
         a.h5_reset = "in 3h 20m (Wed Sep 30 18:00)".into();
         let row = summary_row(&a);
-        assert_eq!(row[1].content(), "5-hour limit reached");
-        assert!(row[2].content().contains("5h: 100%"));
-        assert_eq!(row[4].content(), "Resets in 3h 20m; or use another account");
+        assert_eq!(row[2].content(), "5-hour limit reached");
+        assert!(row[3].content().contains("5h: 100%"));
+        assert_eq!(row[5].content(), "Resets in 3h 20m; or use another account");
         a.h5_pct = Some(0.0);
         assert_eq!(next_step(&a).0, "Within usage limits");
         a.d7_pct = Some(100.0);
@@ -1546,6 +1775,7 @@ mod tests {
             is_active: false,
             is_error,
             error_msg: String::new(),
+            on_server: false,
         }
     }
 

@@ -56,6 +56,8 @@ struct Fake {
     /// Receipt lookups answer 200 with a body that is not JSON.
     garbage_receipts: bool,
     cancelled: HashSet<String>,
+    /// Account and usage reads answer 503.
+    down: bool,
 }
 type Shared = Arc<Mutex<Fake>>;
 
@@ -132,6 +134,48 @@ async fn cancel(State(fake): State<Shared>, Json(body): Json<Value>) -> Response
     fake.cancelled.insert(id);
     Json(json!({"state":"cancelled"})).into_response()
 }
+async fn accounts(State(fake): State<Shared>) -> Response {
+    let fake = fake.lock().unwrap();
+    if fake.down {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+    }
+    let mut aliases: Vec<&String> = fake.imported_refresh.keys().collect();
+    aliases.sort();
+    Json(json!(
+        aliases
+            .iter()
+            .map(|alias| json!({
+                "provider": "anthropic",
+                "account_id": "a".repeat(64),
+                "alias": alias,
+                "identity": {"account_uuid": fake.identities[*alias], "organization_uuid": "org"},
+                "available": true,
+            }))
+            .collect::<Vec<_>>()
+    ))
+    .into_response()
+}
+async fn usage(State(fake): State<Shared>) -> Response {
+    if fake.lock().unwrap().down {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    Json(json!({
+        "data": {
+            "five_hour": {"utilization": 42.0, "resets_at": "2099-01-01T00:00:00Z"},
+            "seven_day": {"utilization": 7.0, "resets_at": "2099-01-02T00:00:00Z"},
+        },
+        "observed_at": now - 60_000,
+        "next_retry_at": now + 240_000,
+        "stale": false,
+        "error": null,
+    }))
+    .into_response()
+}
+/// The provider usage endpoint, for local profiles.
+async fn provider_usage() -> Json<Value> {
+    Json(json!({"five_hour": {"utilization": 11.0, "resets_at": "2099-01-01T00:00:00Z"}}))
+}
 async fn token(State(fake): State<Shared>) -> Json<Value> {
     let mut fake = fake.lock().unwrap();
     fake.refreshes += 1;
@@ -196,6 +240,9 @@ impl Env {
             .route("/v2/anthropic/migrations", get(receipt).post(import))
             .route("/v2/anthropic/migrations/cancel", post(cancel))
             .route("/token", post(token))
+            .route("/v2/anthropic/accounts", get(accounts))
+            .route("/v2/anthropic/usage", get(usage))
+            .route("/api/oauth/usage", get(provider_usage))
             .with_state(fake.clone());
         let server = std::thread::spawn(move || {
             tokio::runtime::Runtime::new()
@@ -312,6 +359,27 @@ impl Env {
         );
         (output.status.success(), text)
     }
+    /// Any claudectl command in this environment.
+    fn cli(&self, args: &[&str]) -> (bool, String) {
+        let output = Command::cargo_bin("claudectl")
+            .unwrap()
+            .env("HOME", self.home.path())
+            .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env("CLAUDECTL_TEST_TOKEN_URL", format!("{}/token", self.origin))
+            .env(
+                "CLAUDECTL_TEST_USAGE_URL",
+                format!("{}/api/oauth/usage", self.origin),
+            )
+            .args(args)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (output.status.success(), text)
+    }
     fn all(&self) -> (bool, String) {
         self.run(&["--all", "--exclusive-owner"], "")
     }
@@ -369,6 +437,140 @@ fn all_saved_accounts_migrate_and_a_rerun_reports_already() {
         assert!(Env::row(&text, alias).contains("already"), "{text}");
     }
     assert_eq!(env.imports(), 3, "a rerun must not import again");
+}
+
+#[test]
+fn status_is_one_table_of_local_and_server_accounts() {
+    let env = Env::new();
+    for (alias, uuid) in [("a1", "u-a1-0000"), ("b2", "u-b2-0000")] {
+        env.profile(alias, uuid, Script::Ok, 3_600_000);
+    }
+    let (ok, text) = env.all();
+    assert!(ok, "{text}");
+    // A local profile that stays local.
+    env.profile("loc", "u-loc-000", Script::Ok, 3_600_000);
+    let report = |text: &str| -> Value {
+        let json = &text[text.find('{').unwrap()..=text.rfind('}').unwrap()];
+        serde_json::from_str(json).unwrap_or_else(|_| panic!("{text}"))
+    };
+
+    // --json: `accounts` keeps its v1 shape; server accounts come in the additive `server` key.
+    let (ok, text) = env.cli(&["status", "--json", "--cached"]);
+    assert!(ok, "{text}");
+    let doc = report(&text);
+    assert_eq!(doc["version"], 1, "{text}");
+    let local = doc["accounts"].as_array().unwrap();
+    assert_eq!(local.len(), 3, "{text}");
+    for account in local {
+        let keys: HashSet<&str> = account
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            HashSet::from([
+                "alias",
+                "label",
+                "active",
+                "plan",
+                "billing_class",
+                "exhausted",
+                "windows",
+                "extra_usage",
+                "token_expires_in_seconds",
+                "usage_age_seconds",
+                "usage_stale",
+                "error",
+            ]),
+            "{text}"
+        );
+        if account["alias"] != "loc" {
+            assert_eq!(account["error"], "migrated to the account server", "{text}");
+        }
+    }
+
+    let (ok, text) = env.cli(&["status", "--json"]);
+    assert!(ok, "{text}");
+    let doc = report(&text);
+    assert_eq!(doc["server"]["state"], "connected", "{text}");
+    let remote = doc["server"]["accounts"].as_array().unwrap();
+    assert_eq!(remote.len(), 2, "{text}");
+    for account in remote {
+        assert_eq!(account["available"], true, "{text}");
+        assert_eq!(account["error"], Value::Null, "{text}");
+        assert_eq!(
+            account["windows"]["five_hour"]["used_percent"], 42.0,
+            "{text}"
+        );
+        assert_eq!(
+            account["windows"]["seven_day"]["used_percent"], 7.0,
+            "{text}"
+        );
+        assert_eq!(account["usage_stale"], false, "{text}");
+    }
+
+    // The default output is a table, never JSON: local and server rows together.
+    let (ok, text) = env.cli(&["status"]);
+    assert!(ok, "{text}");
+    assert!(!text.trim_start().starts_with('{'), "{text}");
+    for word in [
+        "State",
+        "loc",
+        "local",
+        "a1",
+        "b2",
+        "on server",
+        "42",
+        "claudectl server run 'a1'",
+    ] {
+        assert!(text.contains(word), "{word} missing:\n{text}");
+    }
+    assert!(!text.contains("Cannot read saved login"), "{text}");
+    assert_eq!(
+        text.lines().filter(|l| l.contains("│ a1 ")).count(),
+        1,
+        "a migrated alias shows once:\n{text}"
+    );
+
+    // Server down: local rows still print, server rows say so, exit 0.
+    env.fake.lock().unwrap().down = true;
+    let (ok, text) = env.cli(&["status"]);
+    assert!(ok, "{text}");
+    assert!(text.contains("loc"), "{text}");
+    assert!(text.contains("Server unreachable"), "{text}");
+    assert!(!text.contains("Cannot read saved login"), "{text}");
+    let (ok, text) = env.cli(&["status", "--json"]);
+    assert!(ok, "{text}");
+    let doc = report(&text);
+    assert_eq!(doc["server"]["state"], "unreachable", "{text}");
+    assert_eq!(doc["accounts"].as_array().unwrap().len(), 3, "{text}");
+}
+
+#[test]
+fn server_status_and_accounts_print_tables_unless_json_is_asked() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, 3_600_000);
+    let (ok, text) = env.all();
+    assert!(ok, "{text}");
+    let (ok, text) = env.cli(&["server", "accounts"]);
+    assert!(ok, "{text}");
+    assert!(!text.trim_start().starts_with('['), "{text}");
+    assert!(text.contains("a1") && text.contains("Account"), "{text}");
+    let (ok, text) = env.cli(&["server", "accounts", "--json"]);
+    assert!(ok, "{text}");
+    let accounts: Value = serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("{text}"));
+    assert_eq!(accounts[0]["alias"], "a1", "{text}");
+
+    let (ok, text) = env.cli(&["server", "status", "a1"]);
+    assert!(ok, "{text}");
+    assert!(!text.trim_start().starts_with('{'), "{text}");
+    assert!(text.contains("42") && text.contains("5h"), "{text}");
+    let (ok, text) = env.cli(&["server", "status", "a1", "--json"]);
+    assert!(ok, "{text}");
+    let usage: Value = serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("{text}"));
+    assert_eq!(usage["data"]["five_hour"]["utilization"], 42.0, "{text}");
 }
 
 #[test]
