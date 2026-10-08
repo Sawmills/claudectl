@@ -20,56 +20,65 @@ fn grant(token: &str, generation: u64) -> Access {
         generation,
     }
 }
-#[test]
-fn published_tokens_stay_on_one_account_and_child_receives_no_refresh_authority() {
-    let root = tempfile::tempdir().unwrap();
-    let paths = Paths::from_home(root.path().into());
-    let a = grant("synthetic-a", 1);
-    let account = Account {
-        provider: "anthropic".into(),
-        account_id: a.account_id.clone(),
-        alias: "work".into(),
-        identity: a.identity.clone(),
-        available: true,
-    };
-    let mut session = Session::new(&paths, &account, a.clone()).unwrap();
-    let mut wrong = grant("synthetic-foreign", 2);
-    wrong.identity.account_uuid = "another-account".into();
-    assert!(session.publish(wrong).is_err());
-    session.publish(grant("synthetic-b", 2)).unwrap();
-    assert!(session.publish(a).is_err());
-    let mut command=session.command(std::path::Path::new("/bin/sh"),&["-c".into(),"cat \"$CLAUDE_CONFIG_DIR/settings.json\"; test -z \"${CLAUDE_CODE_OAUTH_REFRESH_TOKEN:-}\"".into()]).unwrap();
-    let output = command.output().unwrap();
-    assert!(output.status.success());
-    let settings: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(settings["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "synthetic-b");
-    assert!(
-        !String::from_utf8(output.stdout)
-            .unwrap()
-            .contains("refresh")
-    );
-    let private = session.directory().to_path_buf();
-    drop(session);
-    assert!(!private.exists());
-}
-
-#[test]
-fn conversation_storage_cannot_be_reused_for_a_different_verified_identity() {
-    let root = tempfile::tempdir().unwrap();
-    let paths = Paths::from_home(root.path().into());
-    let access = grant("first", 1);
-    let mut account = Account {
+fn account_for(access: &Access) -> Account {
+    Account {
         provider: "anthropic".into(),
         account_id: access.account_id.clone(),
         alias: "work".into(),
         identity: access.identity.clone(),
         available: true,
-    };
-    drop(Session::new(&paths, &account, access).unwrap());
-    let mut other = grant("different-account", 1);
-    other.identity.account_uuid = "foreign-account".into();
-    account.identity = other.identity.clone();
-    assert!(Session::new(&paths, &account, other).is_err());
+    }
+}
+
+/// SAW-12555: the child keeps the host Claude config (no CLAUDE_CONFIG_DIR), so --resume,
+/// skills, hooks and trust work; only the server access token is swapped in, and no refresh
+/// authority reaches it.
+#[test]
+fn the_child_keeps_the_host_config_and_gets_only_the_server_access_token() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::from_home(root.path().into());
+    let access = grant("synthetic-a", 1);
+    let session = Session::new(&paths, &account_for(&access), access).unwrap();
+    let mut command = session
+        .command(
+            std::path::Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                "printf '%s|%s|%s' \"${CLAUDE_CONFIG_DIR-unset}\" \"$CLAUDE_CODE_OAUTH_TOKEN\" \"${CLAUDE_CODE_OAUTH_REFRESH_TOKEN-unset}\"".into(),
+            ],
+        )
+        .unwrap();
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "unset|synthetic-a|unset"
+    );
+    let private = session.directory().to_path_buf();
+    assert!(!private.join("settings.json").exists());
+    assert!(!private.join("projects").exists());
+    drop(session);
+    assert!(!private.exists());
+}
+
+/// The guard reads when a server tab's token ends, to relaunch it with --resume first.
+#[test]
+fn a_session_records_its_alias_account_and_token_expiry() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::from_home(root.path().into());
+    let access = grant("synthetic-a", 1);
+    let session = Session::new(&paths, &account_for(&access), access.clone()).unwrap();
+    let status: Value =
+        serde_json::from_slice(&std::fs::read(session.directory().join("session.json")).unwrap())
+            .unwrap();
+    assert_eq!(status["alias"], "work");
+    assert_eq!(status["account_id"], access.account_id.as_str());
+    assert_eq!(status["expires_at"], access.expires_at);
+    assert!(
+        !String::from_utf8(std::fs::read(session.directory().join("session.json")).unwrap())
+            .unwrap()
+            .contains("synthetic-a")
+    );
 }
 
 #[test]
