@@ -38,3 +38,12 @@ On the Mac, with the guide: pick one idle tab, `handoff` to `amir@`, relaunch, t
 1. Copy, not move, of the transcript (the original stays for a rollback). Recommendation: copy.
 2. Three commands vs one `capacity --json` that also emits relaunch argv. Recommendation: three; `handoff` has a side effect (the copy) and should be explicit.
 3. Server usage freshness: live call with the server's cache vs local cache only. Recommendation: live (the guard polls every 5 min; the server rate-limits provider calls).
+
+## HQ rule 57 changes (17:4x PDT), binding for the build
+
+- M1: find the transcript as `*/<id>.jsonl` under a `--projects-root` (host `~/.claude/projects`, lane `~/.claudectl/lanes/<lane>/config/projects`, or `CLAUDE_CONFIG_DIR`); exactly one match or refuse; reuse that slug directory name in `conversations/<account_id>/<slug>/<id>.jsonl` (never recompute it from `--cwd`); refuse a lane tab while its lane lock is held.
+- M2: one stateless prefix rule in both directions: overwrite only when the destination is a byte prefix of the source, else refuse; temp file and rename under the server lock.
+- M3: `env_clear` is a fixed list of known names (always `CLAUDE_CONFIG_DIR`, `ANTHROPIC_API_KEY` and the other names `server run` refuses), not computed from the guard's environment. Contract: any `server run` refusal means the guard relaunches the local `claude --resume <id>` (fail closed).
+- M4: seed the onboarding and trust keys in server sessions (as `exec::seed_claude_json` does), or prove in the drill that no theme or trust prompt appears.
+- M5: server rows take `billing_class` from `data.extra_usage` through the `status.rs` billing function; stale, errored or login-required rows have `auto_select: false`; a test proves a stale server row is never auto-selected.
+- M6: document the order (idle, exit Claude, handoff, relaunch); check size and mtime before and after the copy; strip `--resume=X`, `-r [X]`, `--continue`, `--session-id`, `--fork-session` and refuse unknown forms; the drill proves the session id is unchanged after the server `--resume`; document that file history and todos do not move.
