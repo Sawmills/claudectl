@@ -425,6 +425,16 @@ async fn successor_verification_recovers_after_restart_without_another_refresh()
             .await
             .is_err()
     );
+    // The exchange revoked the old token before verification failed: still a rotation.
+    assert_eq!(
+        engine.rotations(),
+        vec![
+            ("expired", 0),
+            ("forced", 1),
+            ("margin", 0),
+            ("migration", 0)
+        ]
+    );
     drop(engine);
     let engine = f.engine().await;
     let successor = engine

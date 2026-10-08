@@ -839,7 +839,14 @@ impl Engine {
         Ok(rotated)
     }
     /// One refresh token exchange. Returns whether the provider rotated the refresh token.
-    async fn refresh(&self, lease: &mut Lease, loaded: &mut Loaded) -> Result<bool> {
+    /// Exchange the refresh token. `reason` is counted once the provider accepts the
+    /// exchange: that revokes the old access token even if a later step fails.
+    async fn refresh(
+        &self,
+        lease: &mut Lease,
+        loaded: &mut Loaded,
+        reason: &'static str,
+    ) -> Result<bool> {
         let attempt = revision();
         let mut record = loaded.record.clone();
         record.phase = Phase::Refreshing;
@@ -857,6 +864,12 @@ impl Engine {
         if !response.status().is_success() {
             bail!("refresh rejected; login renewal required");
         }
+        *self
+            .rotations
+            .lock()
+            .expect("rotations lock")
+            .entry(reason)
+            .or_default() += 1;
         let bytes = match capped_body(response).await {
             Ok(bytes) => bytes,
             Err(Body::TooLarge) => {
@@ -909,24 +922,17 @@ impl Engine {
                 bail!("refresh outcome uncertain; login renewal or reconciliation required")
             }
             Phase::Ready => {
-                reason = Some(rotation_reason(
+                let why = rotation_reason(
                     previous,
                     &loaded.record.revision,
                     matches!(loaded.record.rotation, Rotation::Pending { .. }),
                     loaded.record.grant.expires_at,
                     now(),
-                ));
-                self.refresh(lease, &mut loaded).await.map(Some)
+                );
+                reason = Some(why);
+                self.refresh(lease, &mut loaded, why).await.map(Some)
             }
         };
-        if let (Ok(_), Some(reason)) = (&outcome, reason) {
-            *self
-                .rotations
-                .lock()
-                .expect("rotations lock")
-                .entry(reason)
-                .or_default() += 1;
-        }
         self.audit(&audit::Event {
             operation: "refresh",
             machine,
