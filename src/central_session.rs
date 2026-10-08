@@ -177,8 +177,26 @@ struct Build {
 fn snapshot_build(paths: &Paths, binary: &Path) -> Result<Build> {
     let builds = root(paths).join("builds");
     private_dir(&builds)?;
+    // A launch killed during its check (Ctrl-C, a closed tab) leaves its copy behind: remove
+    // copies whose launch is gone, keep those of launches still waiting or checking.
+    for entry in std::fs::read_dir(&builds)? {
+        let path = entry?.path();
+        let pid = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("build-"))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<i32>().ok());
+        if let Some(pid) = pid
+            && pid > 0
+            && unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
     let directory = tempfile::Builder::new()
-        .prefix("build-")
+        .prefix(&format!("build-{}-", std::process::id()))
         .tempdir_in(&builds)?;
     let file = directory.path().join("claude");
     snapshot_binary(binary, &file)?;
@@ -379,6 +397,28 @@ mod tests {
         // The swapped source is not qualified by that check.
         let swapped = exec::sha256_file(&source).unwrap();
         assert!(!super::super::qualify::known(&paths, &swapped).unwrap());
+    }
+
+    #[test]
+    fn a_launch_removes_build_copies_of_dead_launches_and_keeps_live_ones() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().into());
+        let builds = root(&paths).join("builds");
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let stale = builds.join(format!("build-{dead_pid}-old"));
+        let live = builds.join(format!("build-{}-busy", std::process::id()));
+        for dir in [&stale, &live] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("claude"), b"copy").unwrap();
+        }
+        let source = home.path().join("claude");
+        std::fs::write(&source, b"build").unwrap();
+        let build = snapshot_build(&paths, &source).unwrap();
+        assert!(!stale.exists(), "a dead launch's copy stays");
+        assert!(live.exists(), "a live launch's copy was removed");
+        assert!(build.file.exists());
     }
 
     #[test]
