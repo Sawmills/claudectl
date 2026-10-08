@@ -59,22 +59,31 @@ procedure is in [the runbook](account-server-runbook.md).
 
 ## Session behavior
 
-The credential writer atomically replaces a private `settings.json` containing
-`env.CLAUDE_CODE_OAUTH_TOKEN`. The child starts with an invalid fallback token.
-The tested builds reload the settings token, including with conflicting synthetic
-Keychain responses. Missing/malformed settings retain the last selected token;
-they do not immediately stop network requests. The client has no refresh token.
+`claudectl server run <alias> -- <claude args>` keeps the host Claude config: the same
+`~/.claude` (or the inherited default) with its conversations, skills, hooks, memory and
+folder trust, so `--resume <session>` finds a conversation started on the host login. The
+child receives only the server access token, in `CLAUDE_CODE_OAUTH_TOKEN`; credential and
+routing overrides (`ANTHROPIC_API_KEY` and the like) are removed from its environment, and
+the client never holds a refresh token. Existing project and managed credential overrides
+are refused at startup, and user-supplied `--settings`, `--setting-sources` and `--bare` are
+refused.
 
-Each session gets a private config directory. A per-session lock protects live
-sessions from cleanup. A later launch removes abandoned directories only after
-their recorded access expiry; ordinary exit removes them immediately. Its `projects` directory points at
-persistent conversation storage for the server account. The launcher forces
-`--setting-sources user`, so project/local settings do not override its credential
-while the process runs. Existing project and managed credential overrides are
-refused at startup. User-supplied `--settings`, `--setting-sources`, and `--bare`
-are refused. Normal project instructions and tool operation still need separate
-compatibility checks; settings-based permissions and hooks are not copied from the
-user's ordinary Claude config.
+The synthetic check `experiments/settings-renewal/host-config.py` (Claude 2.1.280, Linux)
+shows, with a host login present in the config dir: the server token is used, the host token
+is never sent, nothing calls a refresh or other POST endpoint, and the host credentials file
+and the host identity in `.claude.json` stay byte-identical. It also shows that Claude does
+not reload a changed token inside a running process (a `--settings` file, a host-managed
+credentials file and the process environment all behave the same), while a new process with
+`--resume <session>` continues the same session.
+
+Token lifetime is therefore the session limit. At launch the client asks the server for a
+fresh token when less than two hours remain (a server refresh gives about eight hours). The
+private session directory records `session.json` (alias, account, `expires_at`, pid; no
+token) so a supervisor such as the capacity guard can relaunch an idle tab with `--resume`
+before the expiry. A tab still running at expiry gets an authentication error on its next
+request; relaunching it with `--resume <session>` continues the conversation. A per-session
+lock protects live session directories; a later launch removes abandoned ones after their
+recorded expiry.
 
 This is not an OS sandbox. Tools inherit the access token environment and can
 access files available to the same OS user. The Mac experiment's fake `security`

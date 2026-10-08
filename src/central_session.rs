@@ -1,4 +1,8 @@
-//! One account per session; atomic settings publication outranks stored credentials.
+//! One server account per Claude process. The process keeps the host Claude config (its
+//! conversations, skills, hooks and trust) and receives only a server access token in
+//! CLAUDE_CODE_OAUTH_TOKEN. The token cannot change inside a running Claude (see
+//! experiments/settings-renewal/host-config.py), so a session lasts until that token expires;
+//! `session.json` records the expiry so a supervisor can relaunch with `--resume` first.
 use super::*;
 use crate::exec;
 use std::{ffi::OsString, process::Command};
@@ -32,34 +36,6 @@ impl Session {
         }
         let lease = options.open(directory.path().join("owner.lock"))?;
         lease.try_lock()?;
-        let conversations = root(paths).join("conversations").join(&account.account_id);
-        private_dir(&conversations)?;
-        let binding = conversations.join("account.json");
-        let expected = json!({"provider":account.provider,"user_id":access.user_id,"identity":account.identity});
-        if binding.try_exists()? {
-            let stored: Value = serde_json::from_slice(&private_read(&binding)?)
-                .context("invalid conversation account binding")?;
-            if stored != expected {
-                bail!("conversation storage belongs to another verified account");
-            }
-        } else {
-            // Creating this binding is serialized with connection and migration changes.
-            let _lock = lock(paths)?;
-            if binding.try_exists()? {
-                let stored: Value = serde_json::from_slice(&private_read(&binding)?)?;
-                if stored != expected {
-                    bail!("conversation storage belongs to another verified account");
-                }
-            } else {
-                atomic(&binding, &expected)?;
-            }
-        }
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&conversations, directory.path().join("projects"))?;
-        atomic(
-            &directory.path().join(".claude.json"),
-            &json!({"oauthAccount":{"accountUuid":account.identity.account_uuid,"organizationUuid":account.identity.organization_uuid}}),
-        )?;
         let session = Self {
             directory,
             _lease: lease,
@@ -77,38 +53,15 @@ impl Session {
             &self.directory.path().join("lease.json"),
             &json!({"expires_at":self.current.expires_at}),
         )?;
+        // No token here: the alias, account and expiry only.
         atomic(
-            &self.directory.path().join("settings.json"),
-            &json!({"env":{"CLAUDE_CODE_OAUTH_TOKEN":self.current.access_token}}),
+            &self.directory.path().join("session.json"),
+            &json!({"alias":self.account.alias,"account_id":self.account.account_id,
+                "expires_at":self.current.expires_at,"pid":std::process::id()}),
         )
     }
-    pub fn publish(&mut self, access: Access) -> Result<()> {
-        validate(&self.account, &access)?;
-        if access.user_id != self.current.user_id || access.generation < self.current.generation {
-            bail!("access grant changed company user or went backwards");
-        }
-        if access.generation == self.current.generation {
-            if access.revision != self.current.revision
-                || access.access_token != self.current.access_token
-                || access.expires_at != self.current.expires_at
-            {
-                bail!("same revision contains different credentials");
-            }
-            return Ok(());
-        }
-        if access.revision == self.current.revision {
-            bail!("new generation reused an old revision");
-        }
-        atomic(
-            &self.directory.path().join("lease.json"),
-            &json!({"expires_at":access.expires_at.max(self.current.expires_at)}),
-        )?;
-        atomic(
-            &self.directory.path().join("settings.json"),
-            &json!({"env":{"CLAUDE_CODE_OAUTH_TOKEN":access.access_token}}),
-        )?;
-        self.current = access;
-        Ok(())
+    pub fn expires_at(&self) -> i64 {
+        self.current.expires_at
     }
     pub fn command(&self, program: &Path, args: &[OsString]) -> Result<Command> {
         let mut command = Command::new(program);
@@ -118,16 +71,17 @@ impl Session {
                 command.env_remove(name);
             }
         }
-        command.env(exec::CONFIG_DIR_ENV, self.directory.path());
-        // If settings disappear, a fixed invalid fallback cannot select a local login.
-        command.env(
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "claudectl-unavailable-access-token",
-        );
+        // The host config stays; the server token outranks the host login for this process
+        // only, and Claude never stores or refreshes it.
+        command.env_remove(exec::CONFIG_DIR_ENV);
+        command.env("CLAUDE_CODE_OAUTH_TOKEN", &self.current.access_token);
         command.env("DISABLE_AUTOUPDATER", "1");
         Ok(command)
     }
 }
+/// Request a fresh server token at launch when less than this remains (milliseconds).
+const FRESH_TOKEN_MS: i64 = 2 * 3_600_000;
+
 fn retire_expired_sessions(sessions: &Path) -> Result<()> {
     for entry in std::fs::read_dir(sessions)? {
         let entry = entry?;
@@ -261,8 +215,12 @@ pub fn run(
     let binary = program(binary)?;
     supported(paths, &binary)?;
     let account = client.account(alias)?;
-    let access = client.acquire(&account.account_id, None)?;
-    let mut session = Session::new(paths, &account, access)?;
+    let mut access = client.acquire(&account.account_id, None)?;
+    // The token is fixed for this process; start with a fresh one when less remains.
+    if access.expires_at - now() < FRESH_TOKEN_MS {
+        access = client.acquire(&account.account_id, Some(&access.revision))?;
+    }
+    let session = Session::new(paths, &account, access)?;
     // Snapshot before spawn, then verify the exact copy that will execute.
     let snapshot = session.directory().join("claude");
     snapshot_binary(&binary, &snapshot)?;
@@ -271,9 +229,7 @@ pub fn run(
         std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o500))?;
     }
     supported(paths, &snapshot)?;
-    let mut launch_args = vec![OsString::from("--setting-sources"), OsString::from("user")];
-    launch_args.extend_from_slice(args);
-    let mut command = session.command(&snapshot, &launch_args)?;
+    let mut command = session.command(&snapshot, args)?;
     exec::set_process_group(&mut command);
     struct Signals;
     impl Drop for Signals {
@@ -301,36 +257,9 @@ pub fn run(
         }
         let _stop_child = StopChild(pid);
         let mut last_usage = 0;
-        let mut outage = false;
         while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
             stopped.recv_timeout(Duration::from_secs(5))
         {
-            match writer_client.acquire(&account.account_id, None) {
-                Ok(access) => {
-                    if let Err(_error) = session.publish(access) {
-                        eprintln!(
-                            "Server grant or credential publication failed; stopping the pinned session."
-                        );
-                        // Leader remains unreaped until this thread joins, preventing PID reuse.
-                        unsafe {
-                            libc::kill(-(pid as i32), libc::SIGTERM);
-                        }
-                        break;
-                    }
-                    if outage {
-                        eprintln!("Account server recovered; retry any failed prompt.");
-                        outage = false;
-                    }
-                }
-                Err(_) => {
-                    if !outage {
-                        eprintln!(
-                            "Account server unavailable; keeping the current access token. Retry after recovery."
-                        );
-                        outage = true;
-                    }
-                }
-            }
             if now() - last_usage >= 300_000 {
                 if let Ok(usage) = writer_client.usage(&account.account_id, false) {
                     let _ = atomic(
