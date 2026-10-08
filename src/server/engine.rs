@@ -41,7 +41,10 @@ impl std::fmt::Display for LoginRefused {
 }
 impl std::error::Error for LoginRefused {}
 /// `error` tagged with `reason`, keeping its message.
-pub(crate) fn refused(reason: &'static str, message: &'static str) -> anyhow::Error {
+pub(crate) fn refused(
+    reason: &'static str,
+    message: impl std::fmt::Display + Send + Sync + 'static,
+) -> anyhow::Error {
     anyhow::Error::new(LoginRefused(reason)).context(message)
 }
 /// The reason for a failed login completion; untagged errors keep the generic one.
@@ -212,7 +215,8 @@ impl Default for Endpoints {
     fn default() -> Self {
         Self {
             api: "https://api.anthropic.com".into(),
-            token: "https://console.anthropic.com/v1/oauth/token".into(),
+            // Claude Code 2.1.295's token endpoint, for code exchange and refresh.
+            token: "https://platform.claude.com/v1/oauth/token".into(),
         }
     }
 }

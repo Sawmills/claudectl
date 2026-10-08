@@ -437,6 +437,92 @@ async fn successor_verification_recovers_after_restart_without_another_refresh()
 }
 
 #[tokio::test]
+async fn a_login_uses_the_claude_code_oauth_flow() {
+    // Claude Code 2.1.295: claude.com authorize, platform.claude.com redirect, full scopes.
+    let seen = Arc::new(std::sync::Mutex::new(None::<Value>));
+    let body = seen.clone();
+    let app = Router::new()
+        .route(
+            "/token",
+            post(move |Json(request): Json<Value>| {
+                let body = body.clone();
+                async move {
+                    *body.lock().unwrap() = Some(request);
+                    Json(json!({"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600,"scope":"user:inference user:profile"}))
+                }
+            }),
+        )
+        .route("/api/oauth/profile", get(|| async { profile() }));
+    let f = Fixture::new(app).await;
+    let engine = f.engine().await;
+    let login = engine
+        .start_login("person", "machine", "work", false)
+        .await
+        .unwrap();
+    let url = reqwest::Url::parse(&login.authorize_url).unwrap();
+    assert_eq!(
+        (url.scheme(), url.host_str(), url.path()),
+        ("https", Some("claude.com"), "/cai/oauth/authorize")
+    );
+    let query: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(
+        query["redirect_uri"],
+        "https://platform.claude.com/oauth/code/callback"
+    );
+    assert_eq!(
+        query["scope"],
+        "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins"
+    );
+    assert_eq!(query["code"], "true");
+    engine
+        .finish_login("person", "machine", &login.id, &pasted(&login))
+        .await
+        .unwrap();
+    let request = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        request["redirect_uri"],
+        "https://platform.claude.com/oauth/code/callback"
+    );
+    assert_eq!(request["grant_type"], "authorization_code");
+}
+
+#[test]
+fn the_default_token_endpoint_is_claude_codes() {
+    assert_eq!(
+        Endpoints::default().token,
+        "https://platform.claude.com/v1/oauth/token"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_exchange_and_a_wrong_state_have_their_own_reasons() {
+    let app = Router::new().route(
+        "/token",
+        post(|| async { axum::http::StatusCode::BAD_REQUEST.into_response() }),
+    );
+    let f = Fixture::new(app).await;
+    let engine = f.engine().await;
+    let login = engine
+        .start_login("person", "machine", "work", false)
+        .await
+        .unwrap();
+    let wrong = engine
+        .finish_login("person", "machine", &login.id, "fake-code#wrong")
+        .await
+        .err()
+        .expect("wrong state");
+    assert_eq!(super::login_reason(&wrong), "login_state_mismatch");
+    let rejected = engine
+        .finish_login("person", "machine", &login.id, &pasted(&login))
+        .await
+        .err()
+        .expect("rejected exchange");
+    assert_eq!(super::login_reason(&rejected), "login_exchange_rejected");
+    // The provider status is in the message (logged), never in the bounded reason.
+    assert!(format!("{rejected:#}").contains("400"), "{rejected:#}");
+}
+
+#[tokio::test]
 async fn login_retries_a_kept_response_without_reusing_the_authorization_code() {
     let exchanges = Arc::new(AtomicUsize::new(0));
     let tokens = exchanges.clone();

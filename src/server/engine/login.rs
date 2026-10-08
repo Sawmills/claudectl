@@ -3,7 +3,10 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 use store::FlowRow;
 
-const REDIRECT: &str = "https://console.anthropic.com/oauth/code/callback";
+/// Claude Code 2.1.295's sign-in for Claude subscriptions (read from its binary).
+const AUTHORIZE: &str = "https://claude.com/cai/oauth/authorize";
+const REDIRECT: &str = "https://platform.claude.com/oauth/code/callback";
+const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins";
 #[derive(Serialize, Deserialize)]
 struct Flow {
     machine: String,
@@ -66,13 +69,13 @@ impl Engine {
         if !self.store.put_flow(&id, &row, target).await? {
             bail!("the alias changed while the login started; start the login again");
         }
-        let mut url = reqwest::Url::parse("https://claude.ai/oauth/authorize")?;
+        let mut url = reqwest::Url::parse(AUTHORIZE)?;
         url.query_pairs_mut().extend_pairs([
             ("code", "true"),
             ("client_id", CLIENT_ID),
             ("response_type", "code"),
             ("redirect_uri", REDIRECT),
-            ("scope", "org:create_api_key user:profile user:inference"),
+            ("scope", SCOPES),
             (
                 "code_challenge",
                 &URL_SAFE_NO_PAD.encode(Sha256::digest(flow.verifier.as_bytes())),
@@ -125,7 +128,10 @@ impl Engine {
                     .split_once('#')
                     .context("paste code#state from the Claude sign-in page")?;
                 if code.is_empty() || state != flow.state {
-                    bail!("login state mismatch");
+                    return Err(super::refused(
+                        "login_state_mismatch",
+                        "login state mismatch: paste the code#state of this login",
+                    ));
                 }
                 // Exactly one exchange per flow, across replicas.
                 if !self.store.start_exchange(user, id).await? {
@@ -144,7 +150,10 @@ impl Engine {
                 if !response.status().is_success() {
                     return Err(super::refused(
                         "login_exchange_rejected",
-                        "Claude rejected the login exchange",
+                        format!(
+                            "Claude rejected the login exchange (HTTP {})",
+                            response.status().as_u16()
+                        ),
                     ));
                 }
                 let bytes = match capped_body(response).await {
