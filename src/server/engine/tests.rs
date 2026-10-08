@@ -493,14 +493,14 @@ async fn login_retries_a_kept_response_without_reusing_the_authorization_code() 
 }
 
 #[tokio::test]
-async fn the_server_refreshes_inside_five_minutes_of_expiry_and_not_before() {
+async fn the_server_refreshes_inside_45_minutes_of_expiry_and_not_before() {
     let (_f, engine, refreshes) = synthetic(3600).await;
     let early = engine
         .admit(
             "person",
             "early",
             "m-early",
-            grant_until("early", now() + 360_000),
+            grant_until("early", now() + 50 * 60_000),
             None,
         )
         .await
@@ -518,7 +518,7 @@ async fn the_server_refreshes_inside_five_minutes_of_expiry_and_not_before() {
             "person",
             "due",
             "m-due",
-            grant_until("due", now() + 240_000),
+            grant_until("due", now() + 40 * 60_000),
             None,
         )
         .await
@@ -529,6 +529,49 @@ async fn the_server_refreshes_inside_five_minutes_of_expiry_and_not_before() {
         .unwrap();
     assert_eq!(access.access_token, "successor-0");
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(engine.rotations(), vec![("margin", 1)]);
+}
+
+#[test]
+fn a_rotation_reason_tells_forced_from_margin_and_expired() {
+    use super::rotation_reason;
+    let now = 1_000_000_000;
+    assert_eq!(
+        rotation_reason(Some("r1"), "r1", now + 7_200_000, now),
+        "forced"
+    );
+    assert_eq!(rotation_reason(None, "r1", now + 60_000, now), "margin");
+    assert_eq!(
+        rotation_reason(Some("old"), "r1", now + 60_000, now),
+        "margin"
+    );
+    assert_eq!(rotation_reason(None, "r1", now - 1, now), "expired");
+    // A forced refresh of an expired token is still the client's doing.
+    assert_eq!(rotation_reason(Some("r1"), "r1", now - 1, now), "forced");
+}
+
+#[tokio::test]
+async fn a_client_forced_refresh_is_counted_as_forced() {
+    let (_f, engine, _refreshes) = synthetic(3600).await;
+    let receipt = engine
+        .admit(
+            "person",
+            "work",
+            "m-forced",
+            grant_until("a", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let current = engine
+        .acquire("person", &receipt.account_id, None)
+        .await
+        .unwrap();
+    engine
+        .acquire("person", &receipt.account_id, Some(&current.revision))
+        .await
+        .unwrap();
+    assert_eq!(engine.rotations(), vec![("forced", 1)]);
 }
 
 #[tokio::test]

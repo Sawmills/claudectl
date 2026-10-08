@@ -32,6 +32,17 @@ spec:
             summary: Claudectl account operation failed
             description: Read the reason in the structured logs and the audit log. A refresh that failed needs login renewal; never replay a lost refresh response.
             runbook_url: https://github.com/Sawmills/claudectl/blob/main/docs/account-server.md
+        - alert: ClaudectlForcedTokenRotation
+          expr: sum(increase(claudectl_token_rotations_total{reason="forced"}[10m])) > 0
+          for: 0m
+          labels:
+            severity: warning
+            service: claudectl
+            environment: staging
+          annotations:
+            summary: A client forced a Claude token refresh
+            description: A forced refresh revokes the access token that every running server run of the account holds; those sessions restart on the new token at their next idle point (claudectl 0.1.17 and later) or fail. Find the machine in the audit log (operation refresh, reason forced).
+            runbook_url: https://github.com/Sawmills/claudectl/blob/main/docs/account-server.md
 ---
 # The staging ServiceMonitor schema lacks authentication. ScrapeConfig supports credentials.
 apiVersion: monitoring.coreos.com/v1alpha1

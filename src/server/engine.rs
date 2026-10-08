@@ -28,8 +28,27 @@ pub use login::Login;
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const BETA: &str = "oauth-2025-04-20";
 const PROVIDER: &str = "anthropic";
-/// Refresh when less than this remains, so machines always hold a token with room to work.
-const MARGIN: i64 = 300_000;
+/// Refresh when less than this remains. Every `server run` of an account shares one access
+/// token and follows a new revision at its next idle point, so the margin leaves room for
+/// that (SAW-12610).
+const MARGIN: i64 = 45 * 60_000;
+
+/// Why a refresh ran: a client that sent the current revision forced it; otherwise the held
+/// token was inside the margin or already expired.
+pub(crate) fn rotation_reason(
+    previous: Option<&str>,
+    revision: &str,
+    expires_at: i64,
+    now: i64,
+) -> &'static str {
+    if previous == Some(revision) {
+        "forced"
+    } else if expires_at <= now {
+        "expired"
+    } else {
+        "margin"
+    }
+}
 /// A grant must stay valid this long for admission and identity verification.
 const USABLE: i64 = 60_000;
 /// Refresh lease length. Each provider call needs `CALL_BUDGET` of it left.
@@ -264,6 +283,8 @@ pub struct Engine {
     /// One task per account in this process; the lease covers other replicas.
     local: StdMutex<BTreeMap<String, Arc<Mutex<()>>>>,
     usage_poll: Mutex<()>,
+    /// Refreshes run by this process, by reason (for `/metrics`).
+    rotations: StdMutex<BTreeMap<&'static str, u64>>,
 }
 /// The receipt state when no committed admission was visible, from the pending row read
 /// after it.
@@ -301,6 +322,7 @@ impl Engine {
                 .build()?,
             local: StdMutex::new(BTreeMap::new()),
             usage_poll: Mutex::new(()),
+            rotations: StdMutex::new(BTreeMap::new()),
         })
     }
     pub fn store(&self) -> &Arc<Store> {
@@ -605,6 +627,7 @@ impl Engine {
                         result: "refused",
                         rotated: None,
                         target: None,
+                        reason: None,
                     })
                     .await?;
                     return Err(error);
@@ -647,6 +670,7 @@ impl Engine {
             result,
             rotated: None,
             target: None,
+            reason: None,
         })
         .await?;
         refreshed?;
@@ -859,6 +883,7 @@ impl Engine {
         if !loaded.needs_refresh(previous) {
             return Ok(loaded);
         }
+        let mut reason = None;
         let outcome = match loaded.record.phase {
             Phase::Unverified => self
                 .verify_successor(lease, &mut loaded)
@@ -876,8 +901,24 @@ impl Engine {
             Phase::Refreshing => {
                 bail!("refresh outcome uncertain; login renewal or reconciliation required")
             }
-            Phase::Ready => self.refresh(lease, &mut loaded).await.map(Some),
+            Phase::Ready => {
+                reason = Some(rotation_reason(
+                    previous,
+                    &loaded.record.revision,
+                    loaded.record.grant.expires_at,
+                    now(),
+                ));
+                self.refresh(lease, &mut loaded).await.map(Some)
+            }
         };
+        if let (Ok(_), Some(reason)) = (&outcome, reason) {
+            *self
+                .rotations
+                .lock()
+                .expect("rotations lock")
+                .entry(reason)
+                .or_default() += 1;
+        }
         self.audit(&audit::Event {
             operation: "refresh",
             machine,
@@ -885,6 +926,7 @@ impl Engine {
             result: if outcome.is_ok() { "ok" } else { "failed" },
             rotated: outcome.as_ref().ok().copied().flatten(),
             target: None,
+            reason,
         })
         .await?;
         outcome?;
@@ -956,8 +998,18 @@ impl Engine {
             result: "ok",
             rotated: None,
             target: None,
+            reason: None,
         })
         .await
+    }
+    /// Refreshes run by this process, by reason.
+    pub fn rotations(&self) -> Vec<(&'static str, u64)> {
+        self.rotations
+            .lock()
+            .expect("rotations lock")
+            .iter()
+            .map(|(reason, count)| (*reason, *count))
+            .collect()
     }
     pub async fn audit(&self, event: &audit::Event<'_>) -> Result<()> {
         audit::record(&self.store, &self.key, event).await
