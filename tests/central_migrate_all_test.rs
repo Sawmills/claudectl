@@ -60,6 +60,8 @@ struct Fake {
     down: bool,
     /// Server accounts the server marks unavailable.
     unavailable: HashSet<String>,
+    /// Usage reads served.
+    usage_reads: usize,
 }
 type Shared = Arc<Mutex<Fake>>;
 
@@ -158,8 +160,12 @@ async fn accounts(State(fake): State<Shared>) -> Response {
     .into_response()
 }
 async fn usage(State(fake): State<Shared>) -> Response {
-    if fake.lock().unwrap().down {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+    {
+        let mut fake = fake.lock().unwrap();
+        if fake.down {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+        }
+        fake.usage_reads += 1;
     }
     let now = chrono::Utc::now().timestamp_millis();
     Json(json!({
@@ -534,6 +540,20 @@ fn status_is_one_table_of_local_and_server_accounts() {
         text.lines().filter(|l| l.contains("│ a1 ")).count(),
         1,
         "a migrated alias shows once:\n{text}"
+    );
+
+    // One account asks the server about that account only.
+    let before = env.fake.lock().unwrap().usage_reads;
+    let (ok, text) = env.cli(&["status", "a1", "--json"]);
+    assert!(ok, "{text}");
+    assert_eq!(env.fake.lock().unwrap().usage_reads - before, 1, "{text}");
+    assert_eq!(
+        report(&text)["server"]["accounts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{text}"
     );
 
     // A server-only account (signed in on the server) and an unavailable one, saved by a

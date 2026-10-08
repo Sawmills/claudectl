@@ -83,7 +83,7 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
         .map(|f| f.alias.clone())
         .chain(local_error.as_ref().and(alias).map(str::to_string))
         .collect();
-    let view = claudectl::central::server_view(&paths, mode == FetchMode::Cached, &known);
+    let view = claudectl::central::server_view(&paths, mode == FetchMode::Cached, &known, alias);
     let mut remote = server_rows(&view, &known);
     if let Some(alias) = alias {
         remote.retain(|f| f.alias.eq_ignore_ascii_case(alias));

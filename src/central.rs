@@ -652,8 +652,15 @@ pub enum ServerView {
 }
 /// Every server account with its usage. The server answers usage from its cache and polls
 /// the provider at most once per 5 minutes, so the reads run in parallel. `cached` reads
-/// only this machine's saved copies of the `known` aliases and sends nothing.
-pub fn server_view(paths: &Paths, cached: bool, known: &[String]) -> ServerView {
+/// only this machine's saved copies of the `known` aliases and sends nothing. `only` limits
+/// every read to one alias.
+pub fn server_view(
+    paths: &Paths,
+    cached: bool,
+    known: &[String],
+    only: Option<&str>,
+) -> ServerView {
+    let wanted = |alias: &str| only.is_none_or(|only| only.eq_ignore_ascii_case(alias));
     let Some(connection) = cached_connection(paths) else {
         return ServerView::NotConnected;
     };
@@ -664,13 +671,14 @@ pub fn server_view(paths: &Paths, cached: bool, known: &[String]) -> ServerView 
             .flatten()
             .flatten()
             .filter_map(|entry| cached_entry(paths, &connection, &entry.path()))
+            .filter(|cache| wanted(&cache.account.alias))
             .map(|cache| ServerRow {
                 alias: cache.account.alias,
                 available: cache.account.available,
                 usage: Ok(cache.usage),
             })
             .collect();
-        for alias in known {
+        for alias in known.iter().filter(|alias| wanted(alias)) {
             if !rows.iter().any(|r| r.alias.eq_ignore_ascii_case(alias)) {
                 rows.push(ServerRow {
                     alias: alias.clone(),
@@ -686,8 +694,8 @@ pub fn server_view(paths: &Paths, cached: bool, known: &[String]) -> ServerView 
         Ok(client) => client,
         Err(error) => return ServerView::Unreachable(format!("{error:#}")),
     };
-    let accounts = match client.accounts() {
-        Ok(accounts) => accounts,
+    let accounts: Vec<Account> = match client.accounts() {
+        Ok(accounts) => accounts.into_iter().filter(|a| wanted(&a.alias)).collect(),
         Err(error) => return ServerView::Unreachable(format!("{error:#}")),
     };
     let client = &client;
