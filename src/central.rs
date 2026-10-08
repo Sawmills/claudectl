@@ -621,7 +621,8 @@ pub enum Command {
         #[arg(long)]
         resume: bool,
     },
-    /// Request a new access token after Claude rejects the current token
+    /// Force a new access token; every running server session of this account loses its
+    /// token (a refresh revokes the previous one) and must be relaunched with --resume
     RefreshAccess { alias: String },
     /// Repair an existing server grant through identity-pinned sign-in
     Renew {
@@ -710,7 +711,7 @@ pub fn dispatch(command: Command) -> Result<()> {
                     let current = client.acquire(&account.account_id, None)?;
                     client.acquire(&account.account_id, Some(&current.revision))?;
                     println!(
-                        "Access token refreshed; running sessions will pick it up. Retry the failed prompt."
+                        "Access token refreshed. The previous token is revoked: relaunch every running `server run` of {alias} with --resume."
                     );
                     Ok(())
                 }
