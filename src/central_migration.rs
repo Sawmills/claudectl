@@ -861,7 +861,12 @@ pub fn abort(paths: &Paths, client: &Client, alias: &str) -> Result<()> {
         if !present {
             let creds: CredentialsFile = serde_json::from_slice(&private_read(&retained)?)
                 .map_err(|_| anyhow::anyhow!("invalid retained migration grant"))?;
-            store.write_credentials_after_live_commit(&creds, || {})?;
+            // Conditional create: a login that appeared since the check is never replaced.
+            if !store.create_live_login_if_absent(&creds)? {
+                bail!(
+                    "a new live login appeared during the abort; nothing restored. The fence and its grant stay; rerun --abort"
+                );
+            }
         }
     }
     let copy = if journal.live { &aside } else { &retained };

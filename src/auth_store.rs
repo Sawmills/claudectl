@@ -176,6 +176,60 @@ impl AuthStore {
             .transpose()
     }
 
+    /// Restore a live login only where none exists. Never replaces a login another process
+    /// created: Ok(false) when one is there. On macOS the Keychain item is the authority and
+    /// is added without `-U` (fails if it exists); the file is created only if absent.
+    pub(crate) fn create_live_login_if_absent(&self, creds: &CredentialsFile) -> Result<bool> {
+        let json = serde_json::to_string(creds)?;
+        if self.keychain {
+            let user =
+                std::env::var("USER").context("USER not set; cannot address Keychain entry")?;
+            let output = Command::new("security")
+                .args([
+                    "add-generic-password",
+                    "-a",
+                    &user,
+                    "-s",
+                    KEYCHAIN_SERVICE,
+                    "-w",
+                    &json,
+                ])
+                .stdin(Stdio::null())
+                .output()
+                .context("failed to run security(1)")?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // 45 = errSecDuplicateItem: another login exists; leave it.
+                if output.status.code() == Some(45) || stderr.contains("already exists") {
+                    return Ok(false);
+                }
+                bail!("{}", keychain_write_error(stderr.trim()));
+            }
+        }
+        let path = self.paths.claude_credentials_file();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(json.as_bytes())?;
+                file.sync_all()?;
+                Ok(true)
+            }
+            // Without a Keychain the file is the login: someone else created it.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(self.keychain),
+            Err(e) => Err(e).context("could not restore the live credentials file"),
+        }
+    }
+
     /// The `oauthAccount` blob from ~/.claude.json, if present.
     pub fn read_oauth_account(&self) -> Result<Option<serde_json::Value>> {
         let path = self.paths.claude_json();
@@ -1090,5 +1144,40 @@ mod tests {
                 .as_deref(),
             Some("{\"a\":1}")
         );
+    }
+
+    #[test]
+    fn a_restored_live_login_never_replaces_one_that_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().to_path_buf());
+        let store = AuthStore::file_only(paths.clone());
+        let file = paths.claude_credentials_file();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, serde_json::to_string(&test_creds("newer")).unwrap()).unwrap();
+        assert!(
+            !store
+                .create_live_login_if_absent(&test_creds("restored"))
+                .unwrap()
+        );
+        let kept: CredentialsFile =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(kept.claude_ai_oauth.access_token, "newer");
+        std::fs::remove_file(&file).unwrap();
+        assert!(
+            store
+                .create_live_login_if_absent(&test_creds("restored"))
+                .unwrap()
+        );
+        let made: CredentialsFile =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(made.claude_ai_oauth.access_token, "restored");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 }
