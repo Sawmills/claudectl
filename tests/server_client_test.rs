@@ -158,8 +158,17 @@ fn a_machine_lists_refreshes_removes_and_revokes_through_the_server() {
     connect(mac_home.path(), &server.origin, &mac);
     connect(devbox_home.path(), &server.origin, &devbox);
 
-    let accounts = ok(&claudectl(devbox_home.path(), &["server", "accounts"]));
+    let accounts = ok(&claudectl(
+        devbox_home.path(),
+        &["server", "accounts", "--json"],
+    ));
     assert!(accounts.contains("\"alias\":\"work\""), "{accounts}");
+    // Without --json: a table.
+    let table = ok(&claudectl(devbox_home.path(), &["server", "accounts"]));
+    assert!(
+        table.contains("work") && table.contains("Account"),
+        "{table}"
+    );
     ok(&claudectl(
         mac_home.path(),
         &["server", "refresh-access", "work"],
@@ -177,7 +186,10 @@ fn a_machine_lists_refreshes_removes_and_revokes_through_the_server() {
     );
 
     ok(&claudectl(mac_home.path(), &["server", "remove", "work"]));
-    let accounts = ok(&claudectl(mac_home.path(), &["server", "accounts"]));
+    let accounts = ok(&claudectl(
+        mac_home.path(),
+        &["server", "accounts", "--json"],
+    ));
     assert_eq!(accounts.trim(), "[]");
     assert!(
         !claudectl(mac_home.path(), &["server", "refresh-access", "work"])

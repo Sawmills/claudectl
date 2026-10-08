@@ -56,6 +56,14 @@ struct Fake {
     /// Receipt lookups answer 200 with a body that is not JSON.
     garbage_receipts: bool,
     cancelled: HashSet<String>,
+    /// Account and usage reads answer 503.
+    down: bool,
+    /// Account reads answer 401 (a revoked machine).
+    rejected: bool,
+    /// Server accounts the server marks unavailable.
+    unavailable: HashSet<String>,
+    /// Usage reads served.
+    usage_reads: usize,
 }
 type Shared = Arc<Mutex<Fake>>;
 
@@ -132,6 +140,55 @@ async fn cancel(State(fake): State<Shared>, Json(body): Json<Value>) -> Response
     fake.cancelled.insert(id);
     Json(json!({"state":"cancelled"})).into_response()
 }
+async fn accounts(State(fake): State<Shared>) -> Response {
+    let fake = fake.lock().unwrap();
+    if fake.down {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+    }
+    if fake.rejected {
+        return error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let mut aliases: Vec<&String> = fake.imported_refresh.keys().collect();
+    aliases.sort();
+    Json(json!(
+        aliases
+            .iter()
+            .map(|alias| json!({
+                "provider": "anthropic",
+                "account_id": "a".repeat(64),
+                "alias": alias,
+                "identity": {"account_uuid": fake.identities[*alias], "organization_uuid": "org"},
+                "available": !fake.unavailable.contains(*alias),
+            }))
+            .collect::<Vec<_>>()
+    ))
+    .into_response()
+}
+async fn usage(State(fake): State<Shared>) -> Response {
+    {
+        let mut fake = fake.lock().unwrap();
+        if fake.down {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+        }
+        fake.usage_reads += 1;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    Json(json!({
+        "data": {
+            "five_hour": {"utilization": 42.0, "resets_at": "2099-01-01T00:00:00Z"},
+            "seven_day": {"utilization": 7.0, "resets_at": "2099-01-02T00:00:00Z"},
+        },
+        "observed_at": now - 60_000,
+        "next_retry_at": now + 240_000,
+        "stale": false,
+        "error": null,
+    }))
+    .into_response()
+}
+/// The provider usage endpoint, for local profiles.
+async fn provider_usage() -> Json<Value> {
+    Json(json!({"five_hour": {"utilization": 11.0, "resets_at": "2099-01-01T00:00:00Z"}}))
+}
 async fn token(State(fake): State<Shared>) -> Json<Value> {
     let mut fake = fake.lock().unwrap();
     fake.refreshes += 1;
@@ -196,6 +253,9 @@ impl Env {
             .route("/v2/anthropic/migrations", get(receipt).post(import))
             .route("/v2/anthropic/migrations/cancel", post(cancel))
             .route("/token", post(token))
+            .route("/v2/anthropic/accounts", get(accounts))
+            .route("/v2/anthropic/usage", get(usage))
+            .route("/api/oauth/usage", get(provider_usage))
             .with_state(fake.clone());
         let server = std::thread::spawn(move || {
             tokio::runtime::Runtime::new()
@@ -312,6 +372,27 @@ impl Env {
         );
         (output.status.success(), text)
     }
+    /// Any claudectl command in this environment.
+    fn cli(&self, args: &[&str]) -> (bool, String) {
+        let output = Command::cargo_bin("claudectl")
+            .unwrap()
+            .env("HOME", self.home.path())
+            .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env("CLAUDECTL_TEST_TOKEN_URL", format!("{}/token", self.origin))
+            .env(
+                "CLAUDECTL_TEST_USAGE_URL",
+                format!("{}/api/oauth/usage", self.origin),
+            )
+            .args(args)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (output.status.success(), text)
+    }
     fn all(&self) -> (bool, String) {
         self.run(&["--all", "--exclusive-owner"], "")
     }
@@ -369,6 +450,284 @@ fn all_saved_accounts_migrate_and_a_rerun_reports_already() {
         assert!(Env::row(&text, alias).contains("already"), "{text}");
     }
     assert_eq!(env.imports(), 3, "a rerun must not import again");
+}
+
+#[test]
+fn status_is_one_table_of_local_and_server_accounts() {
+    let env = Env::new();
+    for (alias, uuid) in [("a1", "u-a1-0000"), ("b2", "u-b2-0000")] {
+        env.profile(alias, uuid, Script::Ok, 3_600_000);
+    }
+    let (ok, text) = env.all();
+    assert!(ok, "{text}");
+    // A local profile that stays local.
+    env.profile("loc", "u-loc-000", Script::Ok, 3_600_000);
+    let report = |text: &str| -> Value {
+        let json = &text[text.find('{').unwrap()..=text.rfind('}').unwrap()];
+        serde_json::from_str(json).unwrap_or_else(|_| panic!("{text}"))
+    };
+
+    // --json: `accounts` keeps its v1 shape; server accounts come in the additive `server` key.
+    let (ok, text) = env.cli(&["status", "--json", "--cached"]);
+    assert!(ok, "{text}");
+    let doc = report(&text);
+    assert_eq!(doc["version"], 1, "{text}");
+    let local = doc["accounts"].as_array().unwrap();
+    assert_eq!(local.len(), 3, "{text}");
+    for account in local {
+        let keys: HashSet<&str> = account
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            HashSet::from([
+                "alias",
+                "label",
+                "active",
+                "plan",
+                "billing_class",
+                "exhausted",
+                "windows",
+                "extra_usage",
+                "token_expires_in_seconds",
+                "usage_age_seconds",
+                "usage_stale",
+                "error",
+            ]),
+            "{text}"
+        );
+        if account["alias"] != "loc" {
+            assert_eq!(account["error"], "migrated to the account server", "{text}");
+        }
+    }
+
+    let (ok, text) = env.cli(&["status", "--json"]);
+    assert!(ok, "{text}");
+    let doc = report(&text);
+    assert_eq!(doc["server"]["state"], "connected", "{text}");
+    let remote = doc["server"]["accounts"].as_array().unwrap();
+    assert_eq!(remote.len(), 2, "{text}");
+    for account in remote {
+        assert_eq!(account["available"], true, "{text}");
+        assert_eq!(account["error"], Value::Null, "{text}");
+        assert_eq!(
+            account["windows"]["five_hour"]["used_percent"], 42.0,
+            "{text}"
+        );
+        assert_eq!(
+            account["windows"]["seven_day"]["used_percent"], 7.0,
+            "{text}"
+        );
+        assert_eq!(account["usage_stale"], false, "{text}");
+    }
+
+    // The default output is a table, never JSON: local and server rows together.
+    let (ok, text) = env.cli(&["status"]);
+    assert!(ok, "{text}");
+    assert!(!text.trim_start().starts_with('{'), "{text}");
+    for word in [
+        "State",
+        "loc",
+        "local",
+        "a1",
+        "b2",
+        "on server",
+        "42",
+        "claudectl server run 'a1'",
+    ] {
+        assert!(text.contains(word), "{word} missing:\n{text}");
+    }
+    assert!(!text.contains("Cannot read saved login"), "{text}");
+    assert_eq!(
+        text.lines().filter(|l| l.contains("│ a1 ")).count(),
+        1,
+        "a migrated alias shows once:\n{text}"
+    );
+
+    // One account asks the server about that account only.
+    let before = env.fake.lock().unwrap().usage_reads;
+    let (ok, text) = env.cli(&["status", "a1", "--json"]);
+    assert!(ok, "{text}");
+    assert_eq!(env.fake.lock().unwrap().usage_reads - before, 1, "{text}");
+    assert_eq!(
+        report(&text)["server"]["accounts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{text}"
+    );
+
+    // A server-only account (signed in on the server) and an unavailable one, saved by a
+    // normal run, still show offline with --cached.
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.identities.insert("srv".into(), "u-srv-000".into());
+        fake.imported_refresh
+            .insert("srv".into(), "server-login".into());
+        fake.unavailable.insert("b2".into());
+    }
+    let (ok, text) = env.cli(&["status", "--json"]);
+    assert!(ok, "{text}");
+    let (ok, text) = env.cli(&["status", "--json", "--cached"]);
+    assert!(ok, "{text}");
+    let doc = report(&text);
+    let remote = doc["server"]["accounts"].as_array().unwrap();
+    let find = |alias: &str| {
+        remote
+            .iter()
+            .find(|a| a["alias"] == alias)
+            .unwrap_or_else(|| panic!("{alias} missing: {text}"))
+    };
+    assert_eq!(find("srv")["available"], true, "{text}");
+    assert_eq!(find("b2")["available"], false, "{text}");
+    assert_eq!(find("a1")["available"], true, "{text}");
+    let (ok, text) = env.cli(&["status", "--cached"]);
+    assert!(ok, "{text}");
+    assert!(text.contains("srv"), "{text}");
+
+    // Server down: local rows still print, server rows say so, exit 0.
+    env.fake.lock().unwrap().down = true;
+    let (ok, text) = env.cli(&["status"]);
+    assert!(ok, "{text}");
+    assert!(text.contains("loc"), "{text}");
+    assert!(text.contains("Server unreachable"), "{text}");
+    assert!(!text.contains("Cannot read saved login"), "{text}");
+    let (ok, text) = env.cli(&["status", "--json"]);
+    assert!(ok, "{text}");
+    let doc = report(&text);
+    assert_eq!(doc["server"]["state"], "unreachable", "{text}");
+    assert_eq!(doc["accounts"].as_array().unwrap().len(), 3, "{text}");
+    // Every server account this machine read before stays listed, server-only ones too.
+    let remote: Vec<&str> = doc["server"]["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["alias"].as_str().unwrap())
+        .collect();
+    assert_eq!(remote, ["a1", "b2", "srv"], "{text}");
+    for account in doc["server"]["accounts"].as_array().unwrap() {
+        assert_eq!(account["available"], false, "{text}");
+        assert!(
+            account["error"].as_str().unwrap().contains("unreachable"),
+            "{text}"
+        );
+    }
+    let (_, text) = env.cli(&["status"]);
+    assert!(text.lines().any(|l| l.contains("│ srv ")), "{text}");
+}
+
+#[test]
+fn status_handles_pending_removed_unknown_and_refused_accounts() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, 3_600_000);
+    env.profile("b2", "u-b2-0000", Script::Ok, 3_600_000);
+    // b2's import commits but the reply is lost: a fence without a receipt.
+    env.script("b2", Script::Lost);
+    let (_, text) = env.all();
+    assert!(Env::row(&text, "b2").contains("lost-reply"), "{text}");
+    let report = |text: &str| -> Value {
+        let json = &text[text.find('{').unwrap()..=text.rfind('}').unwrap()];
+        serde_json::from_str(json).unwrap_or_else(|_| panic!("{text}"))
+    };
+    let local = |doc: &Value, alias: &str| -> Value {
+        doc["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["alias"] == alias)
+            .unwrap_or_else(|| panic!("{alias} missing: {doc}"))
+            .clone()
+    };
+    // A pending fence is not a local account: no credential read, a clear next step.
+    let (ok, text) = env.cli(&["status", "--json", "--cached"]);
+    assert!(ok, "{text}");
+    assert_eq!(
+        local(&report(&text), "b2")["error"],
+        "server migration pending",
+        "{text}"
+    );
+    let (_, text) = env.cli(&["status", "--cached"]);
+    assert!(text.contains("Migration pending"), "{text}");
+
+    // An alias removed from the server is not "on server".
+    env.fake.lock().unwrap().imported_refresh.remove("a1");
+    let (ok, text) = env.cli(&["status"]);
+    assert!(ok, "{text}");
+    let row = text
+        .lines()
+        .find(|l| l.contains("│ a1 "))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(row.contains("Not on server"), "{text}");
+    assert!(!row.contains("server run"), "{text}");
+
+    // A typo is not an available server account, even offline.
+    let (ok, text) = env.cli(&["status", "nosuch", "--cached", "--json"]);
+    assert!(!ok, "{text}");
+
+    // A machine the server refuses is told so, not "unreachable".
+    env.fake.lock().unwrap().rejected = true;
+    let (ok, text) = env.cli(&["status", "--json"]);
+    assert!(ok, "{text}");
+    assert_eq!(report(&text)["server"]["state"], "rejected", "{text}");
+    let (_, text) = env.cli(&["status"]);
+    assert!(text.contains("Server refused"), "{text}");
+    assert!(!text.contains("Server unreachable"), "{text}");
+}
+
+#[test]
+fn status_shows_a_migrated_live_login_once_as_a_server_row() {
+    let env = Env::new();
+    env.live("me", "u-me-0000", "live");
+    let (ok, text) = env.all();
+    assert!(ok, "{text}");
+    // The live login still holds the retired grant until the user logs out.
+    assert!(env.paths.claude_credentials_file().exists());
+    let (ok, text) = env.cli(&["status", "--json"]);
+    assert!(ok, "{text}");
+    let json = &text[text.find('{').unwrap()..=text.rfind('}').unwrap()];
+    let doc: Value = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        doc["accounts"][0]["error"], "migrated to the account server",
+        "{text}"
+    );
+    assert_eq!(doc["server"]["accounts"][0]["alias"], "me", "{text}");
+    let (ok, text) = env.cli(&["status"]);
+    assert!(ok, "{text}");
+    assert_eq!(
+        text.lines().filter(|l| l.contains(" me ")).count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("on server"), "{text}");
+}
+
+#[test]
+fn server_status_and_accounts_print_tables_unless_json_is_asked() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, 3_600_000);
+    let (ok, text) = env.all();
+    assert!(ok, "{text}");
+    let (ok, text) = env.cli(&["server", "accounts"]);
+    assert!(ok, "{text}");
+    assert!(!text.trim_start().starts_with('['), "{text}");
+    assert!(text.contains("a1") && text.contains("Account"), "{text}");
+    let (ok, text) = env.cli(&["server", "accounts", "--json"]);
+    assert!(ok, "{text}");
+    let accounts: Value = serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("{text}"));
+    assert_eq!(accounts[0]["alias"], "a1", "{text}");
+
+    let (ok, text) = env.cli(&["server", "status", "a1"]);
+    assert!(ok, "{text}");
+    assert!(!text.trim_start().starts_with('{'), "{text}");
+    assert!(text.contains("42") && text.contains("5h"), "{text}");
+    let (ok, text) = env.cli(&["server", "status", "a1", "--json"]);
+    assert!(ok, "{text}");
+    let usage: Value = serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("{text}"));
+    assert_eq!(usage["data"]["five_hour"]["utilization"], 42.0, "{text}");
 }
 
 #[test]

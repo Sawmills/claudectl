@@ -14,6 +14,14 @@ pub fn token_url() -> String {
     TOKEN_URL.into()
 }
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// The usage endpoint, overridable in debug builds like `token_url`.
+pub fn usage_url() -> String {
+    #[cfg(debug_assertions)]
+    if let Ok(url) = std::env::var("CLAUDECTL_TEST_USAGE_URL") {
+        return url;
+    }
+    USAGE_URL.into()
+}
 pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 pub const OAUTH_BETA_HEADER: (&str, &str) = ("anthropic-beta", "oauth-2025-04-20");
 
@@ -132,7 +140,7 @@ pub async fn fetch_usage_async(
     client: &reqwest::Client,
     access_token: &str,
 ) -> Result<UsageResponse> {
-    fetch_usage_at(client, access_token, USAGE_URL).await
+    fetch_usage_at(client, access_token, &usage_url()).await
 }
 
 pub(crate) async fn fetch_usage_at(

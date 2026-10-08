@@ -39,6 +39,21 @@ pub fn ensure_local(root: &Path, alias: &str) -> Result<()> {
     }
     Ok(())
 }
+/// True once the migration of `alias` reached a server receipt: the account runs from the
+/// server and has no local login by design.
+/// True while a migration fence of `alias` exists, finished or not. A fence without a
+/// receipt may already be admitted on the server (a lost reply): the local grant is retired.
+pub fn is_fenced(paths: &Paths, alias: &str) -> bool {
+    profile::validate_alias(alias).is_ok_and(|alias| fenced_alias(paths, alias))
+}
+pub fn is_migrated(paths: &Paths, alias: &str) -> bool {
+    profile::validate_alias(alias).is_ok_and(|alias| {
+        private_read(&directory(&paths.claudectl_dir(), alias).join("journal.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Journal>(&raw).ok())
+            .is_some_and(|j| j.receipt.is_some())
+    })
+}
 fn digests(creds: &CredentialsFile) -> Vec<String> {
     [
         Some(creds.claude_ai_oauth.access_token.as_str()),

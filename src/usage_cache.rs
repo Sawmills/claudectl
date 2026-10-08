@@ -103,7 +103,7 @@ impl UsageCache {
             _lock: lock,
             dir,
             state,
-            endpoint: api::USAGE_URL.into(),
+            endpoint: api::usage_url(),
             request_spacing: Duration::from_secs(1),
             checked: HashSet::new(),
         })

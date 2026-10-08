@@ -6,7 +6,7 @@ fn cached_server_status_works_offline_without_machine_credentials() {
     let output = Command::cargo_bin("claudectl")
         .unwrap()
         .env("HOME", home.path())
-        .args(["server", "status", "work", "--cached"])
+        .args(["server", "status", "work", "--cached", "--json"])
         .output()
         .unwrap();
     assert!(
@@ -17,6 +17,17 @@ fn cached_server_status_works_offline_without_machine_credentials() {
     let usage: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(usage["stale"], true);
     assert!(usage["data"].is_null());
+    // Without --json: a human summary, not JSON.
+    let output = Command::cargo_bin("claudectl")
+        .unwrap()
+        .env("HOME", home.path())
+        .args(["server", "status", "work", "--cached"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("No usage observed yet."), "{text}");
+    assert!(text.contains("no saved usage"), "{text}");
 }
 
 #[cfg(target_os = "linux")] // CLI uses authoritative Keychain on macOS; no real Keychain in tests.

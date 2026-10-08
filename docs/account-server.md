@@ -29,6 +29,9 @@ claudectl server remove work
 claudectl server disconnect
 ```
 
+`accounts`, `status` and `devices` print tables; add `--json` for the raw JSON.
+`claudectl status` (without `server`) shows local and server accounts in one table.
+
 `connect` opens company SSO; `--no-browser` prints the URL for another browser.
 `login` opens Claude sign-in, but the server exchanges the authorization code and
 retains the refresh grant. `renew` performs sign-in again for an existing alias and

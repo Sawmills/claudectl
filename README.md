@@ -82,6 +82,17 @@ a plan window bills credits), `rate_limited` for a subscription plan with usage
 windows and extra usage reported off, and `unknown` otherwise (missing or null
 extra-usage data counts as unknown). `exhausted` is true when any window, including
 Opus, Sonnet and Fable, is at 100%. It combines with `--cached` and `--refresh`.
+A migrated profile stays in `accounts` with `error` set to
+`migrated to the account server`, so scripts never pick it for local use. The
+`server` key lists the account server's accounts: `state` (`connected`,
+`unreachable` or `not_connected`), `error`, and `accounts`, each with the same
+fields as above plus `available`.
+
+On a machine connected to an account server, the default table has one row per
+account, local and server together. The `State` column says `active`, `local`,
+`on server`, or `unavailable`. A migrated alias shows once, as its server row, with
+the server's usage and the next step `claudectl server run <alias>`. If the server
+does not answer, local rows still print and server rows say `Server unreachable`.
 
 The default table shows each account's status and next step:
 
