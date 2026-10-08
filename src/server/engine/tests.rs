@@ -532,6 +532,48 @@ async fn the_server_refreshes_inside_five_minutes_of_expiry_and_not_before() {
 }
 
 #[tokio::test]
+async fn an_observing_request_never_refreshes_a_usable_token() {
+    // Inside the refresh margin a normal request refreshes; an observing one returns the
+    // held token, so it can never revoke the token a running session uses (SAW-12610).
+    let (_f, engine, refreshes) = synthetic(3600).await;
+    let due = engine
+        .admit(
+            "person",
+            "due",
+            "m-due",
+            grant_until("due", now() + 240_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let seen = engine
+        .observe_for("person", "server", &due.account_id)
+        .await
+        .unwrap();
+    assert_eq!(seen.access_token, "due");
+    assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+    // A token that is no longer usable is refreshed: it is dead for every holder anyway.
+    let (_f, engine, refreshes) = synthetic(3600).await;
+    let ending = engine
+        .admit(
+            "person",
+            "end",
+            "m-end",
+            grant_until("end", now() + 61_000),
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    let seen = engine
+        .observe_for("person", "server", &ending.account_id)
+        .await
+        .unwrap();
+    assert_eq!(seen.access_token, "successor-0");
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn a_refresh_reads_expires_in_as_seconds() {
     let (_f, engine, _refreshes) = synthetic(3600).await;
     let receipt = engine

@@ -404,6 +404,9 @@ struct Token {
     account_id: String,
     #[serde(default)]
     previous_revision: Option<String>,
+    /// Watch for a new revision without refreshing a usable token (SAW-12610).
+    #[serde(default)]
+    observe: bool,
 }
 async fn token(
     State(server): Shared,
@@ -417,14 +420,18 @@ async fn token(
     let account = input.account_id.clone();
     let access = server
         .run(async move {
-            engine
-                .acquire_for(
-                    &user,
-                    &machine_id,
-                    &account,
-                    input.previous_revision.as_deref(),
-                )
-                .await
+            if input.observe {
+                engine.observe_for(&user, &machine_id, &account).await
+            } else {
+                engine
+                    .acquire_for(
+                        &user,
+                        &machine_id,
+                        &account,
+                        input.previous_revision.as_deref(),
+                    )
+                    .await
+            }
         })
         .await?
         .map_err(|e| server.engine_error(&e, "account_unavailable_or_login_required"))?;

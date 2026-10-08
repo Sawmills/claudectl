@@ -909,6 +909,17 @@ impl Engine {
     pub async fn acquire(&self, user: &str, id: &str, previous: Option<&str>) -> Result<Access> {
         self.acquire_for(user, "server", id, previous).await
     }
+    /// The current token without refreshing a usable one: a refresh revokes the token every
+    /// session of the account holds, so a session that only watches for a new revision must
+    /// never cause one (SAW-12610). A token that is no longer usable is refreshed as usual;
+    /// it is dead for every holder anyway.
+    pub async fn observe_for(&self, user: &str, machine: &str, id: &str) -> Result<Access> {
+        let loaded = self.selected(user, id).await?;
+        if loaded.record.phase == Phase::Ready && loaded.record.grant.expires_at > now() + USABLE {
+            return Ok(loaded.access());
+        }
+        self.acquire_for(user, machine, id, None).await
+    }
     pub async fn acquire_for(
         &self,
         user: &str,
