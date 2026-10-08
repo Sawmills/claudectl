@@ -28,10 +28,10 @@ pub use login::Login;
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const BETA: &str = "oauth-2025-04-20";
 const PROVIDER: &str = "anthropic";
-/// Refresh when less than this remains. Every `server run` of an account shares one access
-/// token and follows a new revision at its next idle point, so the margin leaves room for
-/// that (SAW-12610).
-const MARGIN: i64 = 45 * 60_000;
+/// Refresh when less than this remains, so machines always hold a token with room to work.
+/// Keep it short: a refresh revokes the token every `server run` of the account holds, and
+/// the client avoids asking inside this window (claudectl renew::NO_POLL_MS, SAW-12610).
+const MARGIN: i64 = 300_000;
 
 /// Why a refresh ran: a client that sent the current revision forced it; otherwise the held
 /// token was inside the margin or already expired.

@@ -493,14 +493,14 @@ async fn login_retries_a_kept_response_without_reusing_the_authorization_code() 
 }
 
 #[tokio::test]
-async fn the_server_refreshes_inside_45_minutes_of_expiry_and_not_before() {
+async fn the_server_refreshes_inside_five_minutes_of_expiry_and_not_before() {
     let (_f, engine, refreshes) = synthetic(3600).await;
     let early = engine
         .admit(
             "person",
             "early",
             "m-early",
-            grant_until("early", now() + 50 * 60_000),
+            grant_until("early", now() + 360_000),
             None,
         )
         .await
@@ -518,7 +518,7 @@ async fn the_server_refreshes_inside_45_minutes_of_expiry_and_not_before() {
             "person",
             "due",
             "m-due",
-            grant_until("due", now() + 40 * 60_000),
+            grant_until("due", now() + 240_000),
             None,
         )
         .await
