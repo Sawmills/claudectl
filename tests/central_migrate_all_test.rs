@@ -58,6 +58,8 @@ struct Fake {
     cancelled: HashSet<String>,
     /// Account and usage reads answer 503.
     down: bool,
+    /// Account reads answer 401 (a revoked machine).
+    rejected: bool,
     /// Server accounts the server marks unavailable.
     unavailable: HashSet<String>,
     /// Usage reads served.
@@ -142,6 +144,9 @@ async fn accounts(State(fake): State<Shared>) -> Response {
     let fake = fake.lock().unwrap();
     if fake.down {
         return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+    }
+    if fake.rejected {
+        return error(StatusCode::UNAUTHORIZED, "unauthorized");
     }
     let mut aliases: Vec<&String> = fake.imported_refresh.keys().collect();
     aliases.sort();
@@ -613,6 +618,64 @@ fn status_is_one_table_of_local_and_server_accounts() {
     }
     let (_, text) = env.cli(&["status"]);
     assert!(text.lines().any(|l| l.contains("│ srv ")), "{text}");
+}
+
+#[test]
+fn status_handles_pending_removed_unknown_and_refused_accounts() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Ok, 3_600_000);
+    env.profile("b2", "u-b2-0000", Script::Ok, 3_600_000);
+    // b2's import commits but the reply is lost: a fence without a receipt.
+    env.script("b2", Script::Lost);
+    let (_, text) = env.all();
+    assert!(Env::row(&text, "b2").contains("lost-reply"), "{text}");
+    let report = |text: &str| -> Value {
+        let json = &text[text.find('{').unwrap()..=text.rfind('}').unwrap()];
+        serde_json::from_str(json).unwrap_or_else(|_| panic!("{text}"))
+    };
+    let local = |doc: &Value, alias: &str| -> Value {
+        doc["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["alias"] == alias)
+            .unwrap_or_else(|| panic!("{alias} missing: {doc}"))
+            .clone()
+    };
+    // A pending fence is not a local account: no credential read, a clear next step.
+    let (ok, text) = env.cli(&["status", "--json", "--cached"]);
+    assert!(ok, "{text}");
+    assert_eq!(
+        local(&report(&text), "b2")["error"],
+        "server migration pending",
+        "{text}"
+    );
+    let (_, text) = env.cli(&["status", "--cached"]);
+    assert!(text.contains("Migration pending"), "{text}");
+
+    // An alias removed from the server is not "on server".
+    env.fake.lock().unwrap().imported_refresh.remove("a1");
+    let (ok, text) = env.cli(&["status"]);
+    assert!(ok, "{text}");
+    let row = text
+        .lines()
+        .find(|l| l.contains("│ a1 "))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(row.contains("Not on server"), "{text}");
+    assert!(!row.contains("server run"), "{text}");
+
+    // A typo is not an available server account, even offline.
+    let (ok, text) = env.cli(&["status", "nosuch", "--cached", "--json"]);
+    assert!(!ok, "{text}");
+
+    // A machine the server refuses is told so, not "unreachable".
+    env.fake.lock().unwrap().rejected = true;
+    let (ok, text) = env.cli(&["status", "--json"]);
+    assert!(ok, "{text}");
+    assert_eq!(report(&text)["server"]["state"], "rejected", "{text}");
+    let (_, text) = env.cli(&["status"]);
+    assert!(text.contains("Server refused"), "{text}");
+    assert!(!text.contains("Server unreachable"), "{text}");
 }
 
 #[test]

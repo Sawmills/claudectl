@@ -72,7 +72,7 @@ impl AccountStatus {
 pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> Result<()> {
     let paths = config::default_paths()?;
     // An alias may exist only on the server.
-    let (local, local_error) = match fetch_usages(alias, mode) {
+    let (mut local, local_error) = match fetch_usages(alias, mode) {
         Ok(fetched) => (fetched, None),
         Err(error) if alias.is_some() => (vec![], Some(error)),
         Err(error) => return Err(error),
@@ -81,7 +81,6 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
         .iter()
         .filter(|f| f.on_server)
         .map(|f| f.alias.clone())
-        .chain(local_error.as_ref().and(alias).map(str::to_string))
         .collect();
     let view = claudectl::central::server_view(&paths, mode == FetchMode::Cached, &known, alias);
     let mut remote = server_rows(&view);
@@ -92,6 +91,18 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
         && remote.is_empty()
     {
         return Err(error);
+    }
+    // The server's account list is authoritative: a migrated alias it no longer has was
+    // removed there.
+    if let claudectl::central::ServerView::Rows(_) = &view {
+        for f in local.iter_mut().filter(|f| f.on_server) {
+            if !remote
+                .iter()
+                .any(|r| r.alias.eq_ignore_ascii_case(&f.alias))
+            {
+                f.error = Some(NOT_ON_SERVER.into());
+            }
+        }
     }
     if json {
         let now = chrono::Utc::now().timestamp();
@@ -136,6 +147,12 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
 const MIGRATED: &str = "migrated to the account server";
 /// The status error of a server account when the server did not answer.
 const UNREACHABLE: &str = "account server unreachable";
+/// The status error of a server account when the server refused this machine.
+const REFUSED: &str = "account server refused this machine";
+/// The status error of a migrated alias the server no longer has.
+const NOT_ON_SERVER: &str = "not on the account server";
+/// The status error of a profile fenced for a migration that has no receipt yet.
+const PENDING: &str = "server migration pending";
 
 /// Server accounts as status rows. When the server does not answer, the accounts this
 /// machine knows stand in for them.
@@ -143,11 +160,18 @@ fn server_rows(view: &claudectl::central::ServerView) -> Vec<FetchedUsage> {
     use claudectl::central::ServerView;
     match view {
         ServerView::NotConnected => vec![],
-        ServerView::Unreachable { error, aliases } => aliases
+        ServerView::Unreachable {
+            error,
+            rejected,
+            aliases,
+        } => aliases
             .iter()
             .map(|alias| FetchedUsage {
                 alias: alias.clone(),
-                error: Some(format!("{UNREACHABLE}: {error}")),
+                error: Some(format!(
+                    "{}: {error}",
+                    if *rejected { REFUSED } else { UNREACHABLE }
+                )),
                 on_server: true,
                 ..FetchedUsage::default()
             })
@@ -203,7 +227,12 @@ fn server_json(
     use claudectl::central::ServerView;
     let (state, error) = match view {
         ServerView::NotConnected => ("not_connected", None),
-        ServerView::Unreachable { error, .. } => ("unreachable", Some(error.clone())),
+        ServerView::Unreachable {
+            error, rejected, ..
+        } => (
+            if *rejected { "rejected" } else { "unreachable" },
+            Some(error.clone()),
+        ),
         ServerView::Rows(_) => ("connected", None),
     };
     let available = |alias: &str| match view {
@@ -430,13 +459,16 @@ fn fetch_usages_with_refresh(
             let active = profile::get_active_from(paths)?;
             // A migrated account runs from the server. The live login may still hold its
             // retired grant until the user logs out: read no live or saved credential for it.
-            if claudectl::central::is_migrated(paths, &profile.meta.alias) {
+            // A fence without a receipt may already be admitted (a lost reply): treat its
+            // grant as retired too.
+            let migrated = claudectl::central::is_migrated(paths, &profile.meta.alias);
+            if migrated || claudectl::central::is_fenced(paths, &profile.meta.alias) {
                 fetched.push(FetchedUsage {
                     alias: profile.meta.alias.clone(),
                     label: profile.meta.label.clone(),
                     is_active: active.as_deref() == Some(profile.meta.alias.as_str()),
-                    error: Some(MIGRATED.into()),
-                    on_server: true,
+                    error: Some(if migrated { MIGRATED } else { PENDING }.into()),
+                    on_server: migrated,
                     ..FetchedUsage::default()
                 });
                 continue;
@@ -707,6 +739,24 @@ fn next_step(s: &AccountStatus) -> (String, String) {
     if error == MIGRATED {
         return ("On server".into(), run());
     }
+    if error == PENDING {
+        return (
+            "Migration pending".into(),
+            format!(
+                "claudectl server migrate --all --exclusive-owner (or --abort {})",
+                claudectl::shell::quote_arg(&s.alias)
+            ),
+        );
+    }
+    if error == NOT_ON_SERVER {
+        return (
+            "Not on server".into(),
+            format!(
+                "claudectl server login {}",
+                claudectl::shell::quote_arg(&s.alias)
+            ),
+        );
+    }
     if s.on_server {
         let status = || {
             format!(
@@ -714,6 +764,12 @@ fn next_step(s: &AccountStatus) -> (String, String) {
                 claudectl::shell::quote_arg(&s.alias)
             )
         };
+        if error.starts_with(REFUSED) {
+            return (
+                "Server refused".into(),
+                "Check claudectl server devices; reconnect with claudectl server connect".into(),
+            );
+        }
         if error.starts_with(UNREACHABLE) {
             return (
                 "Server unreachable".into(),
@@ -858,7 +914,9 @@ fn reset_step(reset: &str) -> String {
 
 /// Where the account lives and whether it is in use.
 fn state(s: &AccountStatus) -> &'static str {
-    if s.on_server {
+    if s.error_msg == PENDING {
+        "migrating"
+    } else if s.on_server {
         if s.error_msg.is_empty() || s.error_msg == MIGRATED {
             "on server"
         } else {

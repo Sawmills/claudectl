@@ -19,7 +19,8 @@ mod renew;
 #[path = "central_session.rs"]
 pub mod session;
 pub use migration::{
-    ensure_local, ensure_local_grant, ensure_login_unfenced, ensure_removable, is_migrated, migrate,
+    ensure_local, ensure_local_grant, ensure_login_unfenced, ensure_removable, is_fenced,
+    is_migrated, migrate,
 };
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -647,10 +648,12 @@ pub struct ServerRow {
 /// What the account server reports for `claudectl status`.
 pub enum ServerView {
     NotConnected,
-    /// The server did not answer. `aliases`: every account this machine read from it
-    /// before, and the `known` aliases.
+    /// The server did not answer, or (`rejected`) answered with a 4xx refusal such as a
+    /// revoked machine. `aliases`: every account this machine read from it before, and the
+    /// `known` aliases.
     Unreachable {
         error: String,
+        rejected: bool,
         aliases: Vec<String>,
     },
     Rows(Vec<ServerRow>),
@@ -679,7 +682,8 @@ fn cached_rows(
         if !rows.iter().any(|r| r.alias.eq_ignore_ascii_case(alias)) {
             rows.push(ServerRow {
                 alias: alias.clone(),
-                available: true,
+                // Never read from the server: its availability is unknown.
+                available: false,
                 usage: Err("no saved usage".into()),
             });
         }
@@ -705,6 +709,9 @@ pub fn server_view(
         return ServerView::Rows(cached_rows(paths, &connection, known, &wanted));
     }
     let unreachable = |error: anyhow::Error| ServerView::Unreachable {
+        rejected: error
+            .downcast_ref::<ServerError>()
+            .is_some_and(|e| (400..500).contains(&e.status)),
         error: format!("{error:#}"),
         aliases: cached_rows(paths, &connection, known, &wanted)
             .into_iter()
