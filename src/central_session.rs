@@ -57,6 +57,12 @@ impl Session {
             &self.directory.path().join("lease.json"),
             &json!({"expires_at":self.current.expires_at}),
         )?;
+        // Only the token's digest: a nested run proves an inherited token is this
+        // session's own (`own_session_token`) without the token on disk.
+        atomic(
+            &self.directory.path().join("token.sha256"),
+            &sha256_hex(self.current.access_token.as_bytes()),
+        )?;
         // No token here: the alias, account and expiry only.
         atomic(&self.directory.path().join("session.json"), &self.status())
     }
@@ -122,9 +128,9 @@ impl Session {
         command.env_remove(exec::CONFIG_DIR_ENV);
         command.env("CLAUDE_CODE_OAUTH_TOKEN", &self.current.access_token);
         command.env("DISABLE_AUTOUPDATER", "1");
-        // Marks the token above as this session's own, so a nested `claude` shim may drop
-        // it before its own `server run` (whose preflight refuses inherited credentials).
-        command.env(SERVER_RUN_ENV, "1");
+        // Names this session, so a nested `server run` can prove the token above is this
+        // live session's own and not one a user set (`own_session_token`).
+        command.env(SERVER_RUN_ENV, self.directory());
         Ok(command)
     }
 }
@@ -179,8 +185,58 @@ fn validate(account: &Account, access: &Access) -> Result<()> {
     }
     Ok(())
 }
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// True when `token` is the token a live `server run` session gave its Claude: `marker`
+/// names a session directory under this user's private sessions root, that session still
+/// holds its lease, and the token's digest matches the one it recorded. A marker alone
+/// proves nothing: anyone can set an environment variable.
+pub(super) fn own_session_token(
+    paths: &Paths,
+    marker: Option<&std::ffi::OsStr>,
+    token: Option<&std::ffi::OsStr>,
+) -> bool {
+    let (Some(marker), Some(token)) = (marker, token) else {
+        return false;
+    };
+    let Ok(sessions) = root(paths).join("sessions").canonicalize() else {
+        return false;
+    };
+    let Ok(dir) = Path::new(marker).canonicalize() else {
+        return false;
+    };
+    if dir.parent() != Some(sessions.as_path()) {
+        return false;
+    }
+    // The owner holds this lock for the session's whole life: a free lock is no session.
+    let live = std::fs::File::open(dir.join("owner.lock"))
+        .is_ok_and(|lock| matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+    let recorded = std::fs::read(dir.join("token.sha256"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<String>(&b).ok());
+    live && token
+        .to_str()
+        .is_some_and(|t| recorded == Some(sha256_hex(t.as_bytes())))
+}
+
 fn preflight(paths: &Paths, cwd: &Path, args: &[OsString]) -> Result<()> {
+    // A nested run inside a live session inherits that session's token; it may pass. Any
+    // other inherited credential is refused.
+    let own = own_session_token(
+        paths,
+        std::env::var_os(SERVER_RUN_ENV).as_deref(),
+        std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN").as_deref(),
+    );
     for (name, _) in std::env::vars_os() {
+        if own && name == "CLAUDE_CODE_OAUTH_TOKEN" {
+            continue;
+        }
         if name == exec::CONFIG_DIR_ENV || name.to_str().is_some_and(exec::is_scrubbed_env) {
             bail!(
                 "inherited credential or routing override: {}",
@@ -203,7 +259,7 @@ fn preflight(paths: &Paths, cwd: &Path, args: &[OsString]) -> Result<()> {
     // the same rules (no credential, endpoint or helper override of the server token).
     exec::check_user_settings(&paths.home).map_err(|e| anyhow::anyhow!("{e}"))
 }
-/// Set in a `server run` child: `CLAUDE_CODE_OAUTH_TOKEN` there is the session's own.
+/// Set in a `server run` child to its session directory (see `own_session_token`).
 pub const SERVER_RUN_ENV: &str = "CLAUDECTL_SERVER_RUN";
 
 pub(super) fn program(path: &Path) -> Result<PathBuf> {
@@ -805,13 +861,57 @@ mod tests {
         let session = Session::new(&paths, &account, access).unwrap();
         let command = session.command(Path::new("/bin/true"), &[]).unwrap();
         let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
-        // A nested `claude` (the shim) uses this to drop the inherited server token.
+        // The marker names this session's directory; a nested run checks it (preflight).
         assert_eq!(
             env.get(std::ffi::OsStr::new(SERVER_RUN_ENV))
                 .copied()
                 .flatten(),
-            Some(std::ffi::OsStr::new("1"))
+            Some(session.directory().as_os_str())
         );
+        let marker = session.directory().as_os_str();
+        let token = std::ffi::OsStr::new("synthetic");
+        // A live session's own token is accepted.
+        assert!(own_session_token(&paths, Some(marker), Some(token)));
+        // Another token, a missing marker, or a marker outside the sessions root is not.
+        assert!(!own_session_token(
+            &paths,
+            Some(marker),
+            Some("other".as_ref())
+        ));
+        assert!(!own_session_token(&paths, None, Some(token)));
+        let forged = home.path().join("forged");
+        std::fs::create_dir_all(&forged).unwrap();
+        std::fs::write(
+            forged.join("token.sha256"),
+            serde_json::to_vec(&sha256_hex(b"synthetic")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(forged.join("owner.lock"), "").unwrap();
+        assert!(!own_session_token(
+            &paths,
+            Some(forged.as_os_str()),
+            Some(token)
+        ));
+        // A session that ended (its lease released) no longer vouches for the token, even
+        // when its files are still on disk.
+        let kept = session.directory().with_extension("kept");
+        std::fs::create_dir_all(&kept).unwrap();
+        for file in ["token.sha256", "owner.lock"] {
+            std::fs::copy(session.directory().join(file), kept.join(file)).unwrap();
+        }
+        assert!(!own_session_token(
+            &paths,
+            Some(kept.as_os_str()),
+            Some(token)
+        ));
+        drop(command);
+        let directory = session.directory().to_path_buf();
+        drop(session);
+        assert!(!own_session_token(
+            &paths,
+            Some(directory.as_os_str()),
+            Some(token)
+        ));
     }
 
     #[cfg(unix)]

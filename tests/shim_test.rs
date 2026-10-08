@@ -355,32 +355,21 @@ fn the_printed_path_line_is_shell_safe() {
 }
 
 #[test]
-fn a_nested_claude_drops_only_the_server_run_token() {
+fn the_shim_passes_the_environment_through_unchanged() {
+    // `server run` decides whether an inherited token is its own session's (preflight);
+    // the shim never strips one, so a forged marker cannot launder a hand-set token.
     let f = Fixture::new();
-    // A claudectl that prints the token it would see.
     std::fs::write(
         &f.claudectl,
         "#!/bin/sh\necho \"token=${CLAUDE_CODE_OAUTH_TOKEN-unset} marker=${CLAUDECTL_SERVER_RUN-unset}\"\n",
     )
     .unwrap();
-    std::fs::write(
-        &f.real,
-        "#!/bin/sh\necho \"real token=${CLAUDE_CODE_OAUTH_TOKEN-unset}\"\n",
-    )
-    .unwrap();
     shim::install(&f.spec("amir3"), &f.dir).unwrap();
-    let inside = [
-        ("CLAUDE_CODE_OAUTH_TOKEN", "session-token"),
-        ("CLAUDECTL_SERVER_RUN", "1"),
+    let env = [
+        ("CLAUDE_CODE_OAUTH_TOKEN", "mine"),
+        ("CLAUDECTL_SERVER_RUN", "/forged"),
     ];
-    // Inside a `server run` session: the session's token never reaches the nested run.
-    assert_eq!(f.run(&["-p", "x"], &inside), ["token=unset marker=unset"]);
-    assert_eq!(f.run(&["--version"], &inside), ["real token=unset"]);
-    // Outside one, a token the user set stays, so `server run` still refuses it.
-    assert_eq!(
-        f.run(&["-p", "x"], &[("CLAUDE_CODE_OAUTH_TOKEN", "mine")]),
-        ["token=mine marker=unset"]
-    );
+    assert_eq!(f.run(&["-p", "x"], &env), ["token=mine marker=/forged"]);
 }
 
 #[test]
@@ -421,4 +410,34 @@ fn relative_paths_become_absolute_without_resolving_symlinks() {
         shim::absolute(Path::new("/x/shim"), Path::new("/home/a")),
         Path::new("/x/shim")
     );
+}
+
+#[test]
+fn a_directory_with_a_colon_is_refused() {
+    // PATH splits on ':', so the printed line could never name this directory.
+    let f = Fixture::new();
+    let dir = f.dir.parent().unwrap().join("shim:.:bin");
+    assert!(shim::install(&f.spec("amir3"), &dir).is_err());
+    assert!(!dir.join("claude").exists());
+}
+
+#[test]
+fn the_recorded_claudectl_is_absolute_from_a_relative_path_entry() {
+    let f = Fixture::new();
+    let bin = f.claudectl.parent().unwrap();
+    let base = bin.parent().unwrap();
+    let found = shim::claudectl_path_from(std::ffi::OsStr::new("real bin"), base, &f.claudectl);
+    assert_eq!(found, f.claudectl);
+    assert!(found.is_absolute());
+}
+
+#[test]
+fn execute_permission_is_checked_for_this_user_not_any_class() {
+    let f = Fixture::new();
+    // Executable for group and others, not for the owner (this user).
+    std::fs::set_permissions(&f.real, std::fs::Permissions::from_mode(0o611)).unwrap();
+    let mut spec = f.spec("amir3");
+    spec.real = f.real.clone();
+    assert!(shim::install(&spec, &f.dir).is_err());
+    assert!(shim::find_real(Some(&f.real), std::ffi::OsStr::new("")).is_err());
 }

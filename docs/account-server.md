@@ -118,10 +118,13 @@ claudectl shim status
 - `CLAUDECTL_SHIM=off claude ...` runs the real Claude. `-v`, `--version`, `-h`,
   `--help`, `update`, `doctor`, and `install` as the first argument also run it directly,
   without a server token.
-- `server run` marks its Claude with `CLAUDECTL_SERVER_RUN=1`. A `claude` started
-  inside that session (a nested run) drops the session's `CLAUDE_CODE_OAUTH_TOKEN`
-  first, so it starts its own `server run`. Outside a session the shim keeps every
-  variable, and `server run` still refuses a credential set by hand.
+- `server run` sets `CLAUDECTL_SERVER_RUN` in its Claude to its session directory and
+  records the SHA-256 of the token it hands out there. A nested `server run` (a `claude`
+  started inside that session) accepts the inherited `CLAUDE_CODE_OAUTH_TOKEN` only when
+  the marker names a session under `~/.claudectl/server/sessions`, that session still
+  holds its lease, and the digest matches. Any other inherited credential is refused, so
+  a hand-set marker cannot pass a hand-set token. The shim passes the environment
+  through unchanged.
 - Install refuses an account that is not on the server, a real Claude that is a shim,
   and an existing `claude` file in the directory that it did not write. `claudectl shim
   uninstall` removes only its own file.
