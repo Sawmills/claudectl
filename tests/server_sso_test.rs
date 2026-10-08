@@ -151,6 +151,14 @@ async fn issuer() -> (Issuer, tokio::task::JoinHandle<()>) {
                 Json(json!({"access_token":"at","token_type":"Bearer","expires_in":3600,"id_token":id_token}))
             }),
         )
+        // The synthetic Claude profile: one identity per access token, for seeded accounts.
+        .route(
+            "/api/oauth/profile",
+            get(|headers: axum::http::HeaderMap| async move {
+                let token = headers["authorization"].to_str().unwrap().trim_start_matches("Bearer ");
+                Json(json!({"account":{"uuid":format!("acct-{token}")},"organization":{"uuid":"org"}}))
+            }),
+        )
         .with_state(issuer.clone());
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (issuer, task)
@@ -206,7 +214,7 @@ impl Fixture {
             }),
             metrics_token_hash: None,
             endpoints: Endpoints {
-                api: "http://127.0.0.1:9".into(),
+                api: issuer.origin.clone(),
                 token: "http://127.0.0.1:9/token".into(),
             },
         })
@@ -406,4 +414,245 @@ async fn a_token_the_issuer_did_not_sign_or_for_another_login_is_denied() {
     let (status, body) = f.callback(token).await;
     assert_refused(status, &body, 401, "sso_denied");
     assert_eq!(f.users().await, 0);
+}
+
+// ---------- Browser dashboard (SAW-12585) ----------
+
+const BROWSER: &str = "text/html,application/xhtml+xml,*/*;q=0.8";
+
+/// The `name=value` pair a response sets for this cookie name, if any.
+fn set_cookie(response: &reqwest::Response, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|v| v.starts_with(&format!("{name}=")))
+        .map(|v| v.split(';').next().unwrap().to_owned())
+}
+
+impl Fixture {
+    fn user_id(&self, email: &str) -> String {
+        claudectl::server::vault::digest(format!("{}\0sub-{email}", self.issuer.origin).as_bytes())
+    }
+    /// Admit one synthetic account for `user`; the access token names its Claude identity.
+    async fn seed(&self, user: &str, alias: &str) {
+        let grant = claudectl::server::engine::Grant {
+            access_token: format!("token-{alias}"),
+            refresh_token: format!("refresh-{alias}"),
+            expires_at: chrono::Utc::now().timestamp_millis() + 3_600_000,
+            scopes: vec!["user:inference".into(), "user:profile".into()],
+        };
+        self.server
+            .engine()
+            .admit(user, alias, &format!("seed-{alias}"), grant, None)
+            .await
+            .unwrap();
+    }
+    /// Start a browser sign-in: (login cookie, authorization query).
+    async fn dashboard_sign_in(&self) -> (String, std::collections::HashMap<String, String>) {
+        let response = self
+            .http
+            .get(format!("{}/accounts/sign-in", self.origin))
+            .header("accept", BROWSER)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection(), "{}", response.status());
+        let cookie = set_cookie(&response, "claudectl-login").expect("login cookie");
+        let location = response.headers()["location"].to_str().unwrap();
+        assert!(location.starts_with(&format!("{}/auth", self.issuer.origin)));
+        let query = reqwest::Url::parse(location)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        (cookie, query)
+    }
+    /// Finish a browser sign-in with this ID token and login cookie.
+    async fn dashboard_callback(
+        &self,
+        token: Token<'_>,
+        cookie: Option<&str>,
+    ) -> reqwest::Response {
+        let (login, query) = self.dashboard_sign_in().await;
+        assert_eq!(query.get("hd").map(String::as_str), Some("sawmills.ai"));
+        self.issuer.prepare(&query["nonce"], &token);
+        self.http
+            .get(format!("{}/auth/callback", self.origin))
+            .query(&[("state", query["state"].as_str()), ("code", "c")])
+            .header("accept", BROWSER)
+            .header("cookie", cookie.unwrap_or(&login))
+            .send()
+            .await
+            .unwrap()
+    }
+    /// A signed-in session cookie for this company account.
+    async fn session(&self, email: &str) -> String {
+        let response = self
+            .dashboard_callback(Token::new(email, Some("sawmills.ai")), None)
+            .await;
+        assert_eq!(response.status().as_u16(), 303, "{}", response.status());
+        assert_eq!(response.headers()["location"], "/accounts");
+        let cookie = set_cookie(&response, "claudectl-session").expect("session cookie");
+        let header = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_owned())
+            .find(|v| v.starts_with("claudectl-session="))
+            .unwrap();
+        for attribute in ["HttpOnly", "SameSite=Lax", "Path=/"] {
+            assert!(header.contains(attribute), "{header}");
+        }
+        cookie
+    }
+    async fn get(&self, path: &str, cookie: Option<&str>) -> reqwest::Response {
+        let mut request = self
+            .http
+            .get(format!("{}{path}", self.origin))
+            .header("accept", BROWSER);
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        request.send().await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn the_home_page_offers_google_sign_in_and_accounts_needs_a_session() {
+    let f = Fixture::new().await;
+    let home = f.get("/", None).await;
+    assert_eq!(home.status().as_u16(), 200);
+    assert!(home.headers().contains_key("content-security-policy"));
+    let body = home.text().await.unwrap();
+    assert!(body.contains("claudectl"), "{body}");
+    assert!(body.contains(r#"href="/accounts/sign-in""#), "{body}");
+    assert!(body.contains("Sign in with Google"), "{body}");
+    let accounts = f.get("/accounts", None).await;
+    assert!(accounts.status().is_redirection(), "{}", accounts.status());
+    assert_eq!(accounts.headers()["location"], "/accounts/sign-in");
+    // An unknown session cookie is no session.
+    let forged = f.get("/accounts", Some("claudectl-session=forged")).await;
+    assert_eq!(forged.headers()["location"], "/accounts/sign-in");
+}
+
+#[tokio::test]
+async fn a_personal_google_account_cannot_open_the_dashboard() {
+    let f = Fixture::new().await;
+    for token in [
+        Token::new("someone@gmail.com", None),
+        Token::new("amir@sawmills.ai", None),
+    ] {
+        let response = f.dashboard_callback(token, None).await;
+        assert_eq!(response.status().as_u16(), 403);
+        assert!(set_cookie(&response, "claudectl-session").is_none());
+        let body = response.text().await.unwrap();
+        assert!(body.contains("Use your company account"), "{body}");
+    }
+    assert_eq!(f.users().await, 0);
+}
+
+#[tokio::test]
+async fn a_callback_from_another_browser_is_refused() {
+    let f = Fixture::new().await;
+    let response = f
+        .dashboard_callback(
+            Token::new("amir@sawmills.ai", Some("sawmills.ai")),
+            Some("claudectl-login=another-browser"),
+        )
+        .await;
+    assert_eq!(response.status().as_u16(), 401);
+    assert!(set_cookie(&response, "claudectl-session").is_none());
+}
+
+#[tokio::test]
+async fn a_signed_in_user_sees_only_own_accounts_and_machines() {
+    let f = Fixture::new().await;
+    let amir = f.user_id("amir@sawmills.ai");
+    f.seed(&amir, "amir-pilot").await;
+    f.seed("someone-else", "not-yours").await;
+    let store = f.server.store();
+    store
+        .record_user("someone-else", "other@sawmills.ai")
+        .await
+        .unwrap();
+    claudectl::server::app::register(store, "other@sawmills.ai", "foreign-box")
+        .await
+        .unwrap();
+    let session = f.session("amir@sawmills.ai").await;
+    let page = f.get("/accounts", Some(&session)).await;
+    assert_eq!(page.status().as_u16(), 200);
+    let headers = page.headers().clone();
+    assert_eq!(headers["cache-control"], "no-store");
+    assert!(headers.contains_key("content-security-policy"));
+    let body = page.text().await.unwrap();
+    assert!(body.contains("amir@sawmills.ai"), "{body}");
+    assert!(body.contains("amir-pilot"), "{body}");
+    assert!(!body.contains("not-yours"), "{body}");
+    assert!(!body.contains("foreign-box"), "{body}");
+    // No credential material reaches the page.
+    for secret in ["token-amir-pilot", "refresh-amir-pilot", "acct-token"] {
+        assert!(!body.contains(secret), "{secret} leaked");
+    }
+    // A signed-in visitor to the home page goes straight to the dashboard.
+    let home = f.get("/", Some(&session)).await;
+    assert_eq!(home.headers()["location"], "/accounts");
+}
+
+#[tokio::test]
+async fn an_empty_dashboard_shows_the_migrate_command() {
+    let f = Fixture::new().await;
+    let session = f.session("amir@sawmills.ai").await;
+    let body = f
+        .get("/accounts", Some(&session))
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("claudectl server migrate --all --exclusive-owner"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn sign_out_needs_the_same_origin_and_ends_the_session() {
+    let f = Fixture::new().await;
+    let session = f.session("amir@sawmills.ai").await;
+    let sign_out = |origin: Option<String>| {
+        let mut request = f
+            .http
+            .post(format!("{}/accounts/sign-out", f.origin))
+            .header("accept", BROWSER)
+            .header("cookie", session.clone());
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        request.send()
+    };
+    for origin in [None, Some("https://evil.example".to_owned())] {
+        let response = sign_out(origin).await.unwrap();
+        assert_eq!(response.status().as_u16(), 403);
+    }
+    assert_eq!(
+        f.get("/accounts", Some(&session)).await.status().as_u16(),
+        200
+    );
+    let response = sign_out(Some(f.origin.clone())).await.unwrap();
+    assert_eq!(response.status().as_u16(), 303);
+    assert_eq!(response.headers()["location"], "/");
+    let after = f.get("/accounts", Some(&session)).await;
+    assert_eq!(after.headers()["location"], "/accounts/sign-in");
+}
+
+#[tokio::test]
+async fn a_user_removed_from_the_allow_list_loses_the_dashboard() {
+    let f = Fixture::new().await;
+    let session = f.session("amir@sawmills.ai").await;
+    claudectl::server::app::set_user(f.server.store(), "amir@sawmills.ai", false)
+        .await
+        .unwrap();
+    let page = f.get("/accounts", Some(&session)).await;
+    assert_eq!(page.status().as_u16(), 403);
 }

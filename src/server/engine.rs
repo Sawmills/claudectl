@@ -178,6 +178,10 @@ pub struct Account {
     pub alias: String,
     pub identity: Identity,
     pub available: bool,
+    /// `not_migrated` (admitted by login), `pending`, `unrotated`, or `rotated`. For the
+    /// dashboard only; the machine API does not carry it.
+    #[serde(skip)]
+    pub migration: &'static str,
 }
 /// Anthropic API origins. Tests point them at a synthetic provider.
 pub struct Endpoints {
@@ -375,6 +379,12 @@ impl Engine {
                 alias: loaded.row.alias.clone(),
                 identity: loaded.identity(),
                 available: loaded.record.phase == Phase::Ready,
+                migration: match loaded.record.rotation {
+                    Rotation::NotMigrated => "not_migrated",
+                    Rotation::Pending { .. } => "pending",
+                    Rotation::Unrotated => "unrotated",
+                    Rotation::Rotated => "rotated",
+                },
             });
         }
         Ok(out)

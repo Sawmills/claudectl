@@ -1,6 +1,6 @@
 //! HTTP contract, machine authorization, and the company-user allow list.
 use super::{
-    audit,
+    audit, dashboard,
     engine::{self, Endpoints, Engine, Gone, NotFound, RefreshInProgress, Superseded, Unrotated},
     enrollment,
     store::{self, Machine, Store},
@@ -65,8 +65,8 @@ pub struct Server {
 }
 
 pub struct HttpError {
-    status: StatusCode,
-    reason: &'static str,
+    pub(super) status: StatusCode,
+    pub(super) reason: &'static str,
 }
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
@@ -191,6 +191,13 @@ impl Server {
     }
     pub fn store(&self) -> &Store {
         self.engine.store()
+    }
+    pub fn engine(&self) -> &Arc<Engine> {
+        &self.engine
+    }
+    /// The public origin, when company SSO is configured.
+    pub(super) fn public_url(&self) -> Option<&str> {
+        self.sso.as_ref().map(enrollment::Sso::public_url)
     }
     pub(super) fn seal<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>> {
         vault::encrypt(&self.key, &serde_json::to_vec(value)?)
@@ -630,7 +637,7 @@ pub fn router(server: Arc<Server>) -> Router {
             "/v2/anthropic/migrations",
             post(migrate_account).get(receipt),
         );
-    enrollment::routes(routes).with_state(server)
+    dashboard::routes(enrollment::routes(routes)).with_state(server)
 }
 
 /// Serve until SIGTERM or Ctrl-C. A network listener needs an HTTPS public origin and

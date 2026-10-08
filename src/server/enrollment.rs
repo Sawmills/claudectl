@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 use axum::{
     Form, Json, Router,
     extract::{Query, Request, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -121,13 +121,24 @@ struct Device {
     last_poll: Option<i64>,
     grant: Option<String>,
 }
-/// A browser sign-in in progress for one device.
+/// A browser sign-in in progress: for one device, or for the dashboard when `browser` is
+/// set. `browser` is the digest of the login cookie that binds the callback to the browser
+/// that started it.
 #[derive(Serialize, Deserialize)]
 struct SsoLogin {
     device: String,
     nonce: String,
     verifier: String,
+    #[serde(default)]
+    browser: Option<String>,
 }
+/// A signed-in dashboard browser. Sealed in the store, so every replica sees it.
+#[derive(Serialize, Deserialize)]
+struct Session {
+    user: String,
+    email: String,
+}
+const SESSION_TTL_MS: i64 = 3_600_000;
 /// A signed-in person who may approve one device.
 #[derive(Serialize, Deserialize)]
 struct Approval {
@@ -254,7 +265,15 @@ async fn browser_errors(request: Request, next: Next) -> Response {
         .and_then(|v| v.to_str().ok())
         .is_some_and(accepts_html);
     let response = next.run(request).await;
-    if !html || !(response.status().is_client_error() || response.status().is_server_error()) {
+    // A handler that already rendered a page (the dashboard sign-in) keeps it.
+    let rendered = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"text/html"));
+    if !html
+        || rendered
+        || !(response.status().is_client_error() || response.status().is_server_error())
+    {
         return response;
     }
     let (parts, body) = response.into_parts();
@@ -274,6 +293,10 @@ fn error_page(reason: &str) -> Response {
         "company_identity_required" => (
             "Use your company account",
             "This sign-in is not a verified company account. Run <code>claudectl server connect</code> again and pick your work account.",
+        ),
+        "invalid_browser_login" => (
+            "Sign-in did not finish",
+            "Start the sign-in again from this browser.",
         ),
         "user_not_allowed" | "user_unavailable" => (
             "No access to this server",
@@ -298,7 +321,36 @@ fn error_page(reason: &str) -> Response {
         detail = detail
     ))
 }
-fn escape(s: &str) -> String {
+/// The dashboard's error page: same reasons, wording for a browser sign-in.
+pub(super) fn dashboard_error(error: HttpError) -> Response {
+    let (title, detail) = match error.reason {
+        "company_identity_required" => (
+            "Use your company account",
+            "This Google account is not a verified company account. Sign in again with your work account.",
+        ),
+        "user_not_allowed" | "user_unavailable" | "user_disabled" => (
+            "No access to this server",
+            "Your account is not on this server's allow list. Ask your admin for access.",
+        ),
+        "sso_denied" | "invalid_browser_login" | "invalid_sso_state" => (
+            "Sign-in did not finish",
+            "Google did not confirm who you are, or the link expired. Sign in again.",
+        ),
+        _ => (
+            "Something went wrong",
+            "The server could not finish this step. Wait a minute, then sign in again.",
+        ),
+    };
+    let detail = format!(r#"{detail}</p><p><a href="/accounts/sign-in">Sign in with Google</a>"#);
+    let mut response = page(format!(
+        include_str!("enrollment/error.html"),
+        title = title,
+        detail = detail
+    ));
+    *response.status_mut() = error.status;
+    response
+}
+pub(super) fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -439,7 +491,7 @@ struct Verify {
     code: String,
 }
 async fn verify(State(server): Shared, Query(input): Query<Verify>) -> Result<Response, HttpError> {
-    let sso = sso(&server)?;
+    sso(&server)?;
     let (device, row) = server
         .store()
         .find_enrollment("device", &input.code, now())
@@ -452,6 +504,15 @@ async fn verify(State(server): Shared, Query(input): Query<Verify>) -> Result<Re
     if pending.grant.is_some() {
         return Err(server.error(StatusCode::GONE, "enrollment_expired"));
     }
+    begin_login(&server, device, None).await
+}
+/// Redirect to the company sign-in. The state, nonce, and PKCE verifier live in the store.
+async fn begin_login(
+    server: &Server,
+    device: String,
+    browser: Option<String>,
+) -> Result<Response, HttpError> {
+    let sso = sso(server)?;
     let client = sso
         .client()
         .await
@@ -479,6 +540,7 @@ async fn verify(State(server): Shared, Query(input): Query<Verify>) -> Result<Re
         device,
         nonce: nonce.secret().clone(),
         verifier: verifier.secret().clone(),
+        browser,
     };
     let row = server.seal_row(&login, None)?;
     server
@@ -503,9 +565,9 @@ struct Callback {
 async fn callback(
     State(server): Shared,
     Query(input): Query<Callback>,
+    headers: HeaderMap,
 ) -> Result<Response, HttpError> {
     let sso = sso(&server)?;
-    let denied = || server.error(StatusCode::UNAUTHORIZED, "sso_denied");
     // The SSO state works once, on any replica.
     let row = server
         .store()
@@ -516,50 +578,14 @@ async fn callback(
     let login: SsoLogin = server
         .unseal(&row.sealed)
         .map_err(|_| server.unavailable())?;
-    let code = input.code.ok_or_else(denied)?;
-    let client = sso
-        .client()
-        .await
-        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?;
-    let tokens = client
-        .exchange_code(AuthorizationCode::new(code))
-        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?
-        .set_pkce_verifier(PkceCodeVerifier::new(login.verifier))
-        .request_async(&sso.http)
-        .await
-        .map_err(|_| denied())?;
-    // The verifier checks signature, issuer, audience, expiry, and nonce.
-    let verifier = client.id_token_verifier();
-    let id = tokens.extra_fields().id_token().ok_or_else(denied)?;
-    let claims = id
-        .claims(&verifier, &Nonce::new(login.nonce))
-        .map_err(|_| denied())?;
-    if let Some(expected) = claims.access_token_hash() {
-        let actual = AccessTokenHash::from_token(
-            tokens.access_token(),
-            id.signing_alg().map_err(|_| denied())?,
-            id.signing_key(&verifier).map_err(|_| denied())?,
-        )
-        .map_err(|_| denied())?;
-        if actual != *expected {
-            return Err(denied());
-        }
+    if login.browser.is_some() {
+        // A dashboard sign-in: errors render the dashboard's page, never the CLI wording.
+        return dashboard_callback(&server, sso, login, input.code, &headers)
+            .await
+            .or_else(|e| Ok(dashboard_error(e)));
     }
-    let refused = || server.error(StatusCode::FORBIDDEN, "company_identity_required");
-    let email = sso
-        .config
-        .company_email(
-            claims.email().map(|e| e.as_str()),
-            claims.email_verified(),
-            claims.additional_claims().hd.as_deref(),
-        )
-        .ok_or_else(refused)?;
-    if !server.allowed(email) {
-        return Err(server.error(StatusCode::FORBIDDEN, "user_not_allowed"));
-    }
-    // Users key on (issuer, subject); an email change keeps the same user.
-    let user =
-        vault::digest(format!("{}\0{}", sso.config.issuer, claims.subject().as_str()).as_bytes());
+    let (user, email) = identify(&server, sso, input.code, login.verifier, login.nonce).await?;
+    let email = email.as_str();
     let device = server
         .store()
         .enrollment("device", &login.device, now())
@@ -593,6 +619,119 @@ async fn callback(
         .await
         .map_err(|_| server.unavailable())?;
     Ok(page(html))
+}
+/// Exchange the code and check the signed ID token: company account, allow list. Returns
+/// the user ID and email. Users key on (issuer, subject); an email change keeps the user.
+async fn identify(
+    server: &Server,
+    sso: &Sso,
+    code: Option<String>,
+    verifier: String,
+    nonce: String,
+) -> Result<(String, String), HttpError> {
+    let denied = || server.error(StatusCode::UNAUTHORIZED, "sso_denied");
+    let code = code.ok_or_else(denied)?;
+    let client = sso
+        .client()
+        .await
+        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?;
+    let tokens = client
+        .exchange_code(AuthorizationCode::new(code))
+        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?
+        .set_pkce_verifier(PkceCodeVerifier::new(verifier))
+        .request_async(&sso.http)
+        .await
+        .map_err(|_| denied())?;
+    // The verifier checks signature, issuer, audience, expiry, and nonce.
+    let verifier = client.id_token_verifier();
+    let id = tokens.extra_fields().id_token().ok_or_else(denied)?;
+    let claims = id
+        .claims(&verifier, &Nonce::new(nonce))
+        .map_err(|_| denied())?;
+    if let Some(expected) = claims.access_token_hash() {
+        let actual = AccessTokenHash::from_token(
+            tokens.access_token(),
+            id.signing_alg().map_err(|_| denied())?,
+            id.signing_key(&verifier).map_err(|_| denied())?,
+        )
+        .map_err(|_| denied())?;
+        if actual != *expected {
+            return Err(denied());
+        }
+    }
+    let refused = || server.error(StatusCode::FORBIDDEN, "company_identity_required");
+    let email = sso
+        .config
+        .company_email(
+            claims.email().map(|e| e.as_str()),
+            claims.email_verified(),
+            claims.additional_claims().hd.as_deref(),
+        )
+        .ok_or_else(refused)?;
+    if !server.allowed(email) {
+        return Err(server.error(StatusCode::FORBIDDEN, "user_not_allowed"));
+    }
+    let user =
+        vault::digest(format!("{}\0{}", sso.config.issuer, claims.subject().as_str()).as_bytes());
+    Ok((user, email.to_owned()))
+}
+/// Finish a dashboard sign-in: the browser that started it gets a session cookie.
+async fn dashboard_callback(
+    server: &Server,
+    sso: &Sso,
+    login: SsoLogin,
+    code: Option<String>,
+    headers: &HeaderMap,
+) -> Result<Response, HttpError> {
+    let presented = cookie(headers, sso.cookie_name("login")).map(|v| vault::digest(v.as_bytes()));
+    if presented.is_none() || presented != login.browser {
+        return Err(server.error(StatusCode::UNAUTHORIZED, "invalid_browser_login"));
+    }
+    let (user, email) = identify(server, sso, code, login.verifier, login.nonce).await?;
+    if !server
+        .store()
+        .record_user(&user, &email)
+        .await
+        .map_err(|_| server.unavailable())?
+    {
+        return Err(server.error(StatusCode::FORBIDDEN, "user_unavailable"));
+    }
+    let token = secret();
+    let row = EnrollmentRow {
+        lookup: None,
+        sealed: server
+            .seal(&Session { user, email })
+            .map_err(|_| server.unavailable())?,
+        expires_at: now() + SESSION_TTL_MS,
+        consumed: false,
+    };
+    server
+        .store()
+        .put_enrollment("session", &vault::digest(token.as_bytes()), &row)
+        .await
+        .map_err(|_| server.unavailable())?;
+    let mut response = (
+        [
+            ("cache-control", "no-store"),
+            ("referrer-policy", "no-referrer"),
+        ],
+        Redirect::to("/accounts"),
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.append(
+        header::SET_COOKIE,
+        sso.cookie("session", &token, SESSION_TTL_MS / 1000)
+            .parse()
+            .expect("generated cookie"),
+    );
+    headers.append(
+        header::SET_COOKIE,
+        sso.cookie("login", "", 0)
+            .parse()
+            .expect("generated cookie"),
+    );
+    Ok(response)
 }
 #[derive(Deserialize)]
 struct Approve {
@@ -658,6 +797,126 @@ async fn approve(State(server): Shared, Form(input): Form<Approve>) -> Result<Re
         current = fresh.sealed;
     }
     Err(server.error(StatusCode::SERVICE_UNAVAILABLE, "registry_busy"))
+}
+impl Sso {
+    pub(super) fn public_url(&self) -> &str {
+        &self.public_url
+    }
+    /// `__Host-` cookies on HTTPS: Secure, host-only, and Path=/.
+    fn cookie_name(&self, kind: &str) -> &'static str {
+        match (self.public_url.starts_with("https:"), kind) {
+            (true, "login") => "__Host-claudectl-login",
+            (true, _) => "__Host-claudectl-session",
+            (false, "login") => "claudectl-login",
+            (false, _) => "claudectl-session",
+        }
+    }
+    fn cookie(&self, kind: &str, value: &str, age: i64) -> String {
+        let secure = if self.public_url.starts_with("https:") {
+            "; Secure"
+        } else {
+            ""
+        };
+        format!(
+            "{}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={age}{secure}",
+            self.cookie_name(kind)
+        )
+    }
+}
+fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .find_map(|part| {
+            let (key, value) = part.trim().split_once('=')?;
+            (key == name).then_some(value)
+        })
+}
+/// The signed-in dashboard user: (user ID, email). `None` without a live session. A user
+/// disabled or removed from the allow list since sign-in is refused.
+pub(super) async fn browser_user(
+    server: &Server,
+    headers: &HeaderMap,
+) -> Result<Option<(String, String)>, HttpError> {
+    let Some(sso) = server.sso.as_ref() else {
+        return Ok(None);
+    };
+    let Some(token) = cookie(headers, sso.cookie_name("session")) else {
+        return Ok(None);
+    };
+    let Some(row) = server
+        .store()
+        .enrollment("session", &vault::digest(token.as_bytes()), now())
+        .await
+        .map_err(|_| server.unavailable())?
+        .filter(|r| !r.consumed)
+    else {
+        return Ok(None);
+    };
+    let session: Session = server
+        .unseal(&row.sealed)
+        .map_err(|_| server.unavailable())?;
+    let enabled = server
+        .store()
+        .user(&session.user)
+        .await
+        .map_err(|_| server.unavailable())?
+        .is_some_and(|u| u.enabled);
+    if !enabled || !server.allowed(&session.email) {
+        return Err(server.error(StatusCode::FORBIDDEN, "user_disabled"));
+    }
+    Ok(Some((session.user, session.email)))
+}
+pub(super) async fn sign_in(State(server): Shared) -> Result<Response, HttpError> {
+    let sso = sso(&server)?;
+    let binding = secret();
+    let mut response = begin_login(
+        &server,
+        String::new(),
+        Some(vault::digest(binding.as_bytes())),
+    )
+    .await?;
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        sso.cookie("login", &binding, TTL_MS / 1000)
+            .parse()
+            .expect("generated cookie"),
+    );
+    Ok(response)
+}
+pub(super) async fn sign_out(
+    State(server): Shared,
+    headers: HeaderMap,
+) -> Result<Response, HttpError> {
+    let sso = sso(&server)?;
+    // The only browser POST. A cross-site form carries another Origin, or none.
+    if headers.get(header::ORIGIN).and_then(|h| h.to_str().ok()) != Some(sso.public_url.as_str()) {
+        return Err(server.error(StatusCode::FORBIDDEN, "invalid_browser_origin"));
+    }
+    if let Some(token) = cookie(&headers, sso.cookie_name("session")) {
+        server
+            .store()
+            .consume_enrollment("session", &vault::digest(token.as_bytes()), now())
+            .await
+            .map_err(|_| server.unavailable())?;
+    }
+    let mut response = (
+        [
+            ("cache-control", "no-store"),
+            ("referrer-policy", "no-referrer"),
+        ],
+        Redirect::to("/"),
+    )
+        .into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        sso.cookie("session", "", 0)
+            .parse()
+            .expect("generated cookie"),
+    );
+    Ok(response)
 }
 pub(super) fn routes(router: Router<Arc<Server>>) -> Router<Arc<Server>> {
     router
