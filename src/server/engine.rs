@@ -33,6 +33,9 @@ const PROVIDER: &str = "anthropic";
 /// the client avoids asking inside this window (claudectl renew::NO_POLL_MS, SAW-12610).
 const MARGIN: i64 = 300_000;
 
+/// Every value `rotation_reason` returns. `/metrics` exports each from startup, so the first
+/// refresh of a reason shows as an increase.
+pub(crate) const ROTATION_REASONS: [&str; 3] = ["expired", "forced", "margin"];
 /// Why a refresh ran: a client that sent the current revision forced it; otherwise the held
 /// token was inside the margin or already expired.
 pub(crate) fn rotation_reason(
@@ -322,7 +325,7 @@ impl Engine {
                 .build()?,
             local: StdMutex::new(BTreeMap::new()),
             usage_poll: Mutex::new(()),
-            rotations: StdMutex::new(BTreeMap::new()),
+            rotations: StdMutex::new(ROTATION_REASONS.iter().map(|r| (*r, 0)).collect()),
         })
     }
     pub fn store(&self) -> &Arc<Store> {

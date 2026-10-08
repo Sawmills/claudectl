@@ -529,7 +529,10 @@ async fn the_server_refreshes_inside_five_minutes_of_expiry_and_not_before() {
         .unwrap();
     assert_eq!(access.access_token, "successor-0");
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
-    assert_eq!(engine.rotations(), vec![("margin", 1)]);
+    assert_eq!(
+        engine.rotations(),
+        vec![("expired", 0), ("forced", 0), ("margin", 1)]
+    );
 }
 
 #[test]
@@ -553,6 +556,11 @@ fn a_rotation_reason_tells_forced_from_margin_and_expired() {
 #[tokio::test]
 async fn a_client_forced_refresh_is_counted_as_forced() {
     let (_f, engine, _refreshes) = synthetic(3600).await;
+    // Every reason is exported from startup, so the first event shows as an increase.
+    assert_eq!(
+        engine.rotations(),
+        vec![("expired", 0), ("forced", 0), ("margin", 0)]
+    );
     let receipt = engine
         .admit(
             "person",
@@ -571,7 +579,10 @@ async fn a_client_forced_refresh_is_counted_as_forced() {
         .acquire("person", &receipt.account_id, Some(&current.revision))
         .await
         .unwrap();
-    assert_eq!(engine.rotations(), vec![("forced", 1)]);
+    assert_eq!(
+        engine.rotations(),
+        vec![("expired", 0), ("forced", 1), ("margin", 0)]
+    );
 }
 
 #[tokio::test]
