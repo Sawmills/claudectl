@@ -637,7 +637,14 @@ pub fn router(server: Arc<Server>) -> Router {
             "/v2/anthropic/migrations",
             post(migrate_account).get(receipt),
         );
-    dashboard::routes(enrollment::routes(routes)).with_state(server)
+    let routes = enrollment::routes(routes);
+    // The home page and dashboard sign in through company SSO; without it they do not exist.
+    let routes = if server.sso.is_some() {
+        dashboard::routes(routes)
+    } else {
+        routes
+    };
+    routes.with_state(server)
 }
 
 /// Serve until SIGTERM or Ctrl-C. A network listener needs an HTTPS public origin and

@@ -580,12 +580,20 @@ async fn callback(
 ) -> Result<Response, HttpError> {
     let sso = sso(&server)?;
     // The SSO state works once, on any replica.
-    let row = server
+    let Some(row) = server
         .store()
         .consume_enrollment("sso", &vault::digest(input.state.as_bytes()), now())
         .await
         .map_err(|_| server.unavailable())?
-        .ok_or_else(|| server.error(StatusCode::BAD_REQUEST, "invalid_sso_state"))?;
+    else {
+        let error = server.error(StatusCode::BAD_REQUEST, "invalid_sso_state");
+        // Only a dashboard sign-in sets the login cookie: keep that browser on the
+        // dashboard path when its state expired or was replayed.
+        if cookie(&headers, sso.cookie_name("login")).is_some() {
+            return Ok(dashboard_error(error));
+        }
+        return Err(error);
+    };
     let login: SsoLogin = server
         .unseal(&row.sealed)
         .map_err(|_| server.unavailable())?;
@@ -896,7 +904,9 @@ pub(super) async fn sign_in(State(server): Shared) -> Result<Response, HttpError
     let mut response = begin_login(&server, destination).await?;
     response.headers_mut().append(
         header::SET_COOKIE,
-        sso.cookie("login", &binding, TTL_MS / 1000)
+        // Longer than the state, so an expired state still finds the dashboard path. The
+        // callback checks the cookie against the state row, so it grants nothing alone.
+        sso.cookie("login", &binding, SESSION_TTL_MS / 1000)
             .parse()
             .expect("generated cookie"),
     );

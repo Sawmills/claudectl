@@ -587,6 +587,32 @@ async fn a_callback_from_another_browser_is_refused() {
 }
 
 #[tokio::test]
+async fn a_replayed_dashboard_callback_offers_dashboard_sign_in() {
+    let f = Fixture::new().await;
+    let (login, query) = f.dashboard_sign_in().await;
+    f.issuer.prepare(
+        &query["nonce"],
+        &Token::new("amir@sawmills.ai", Some("sawmills.ai")),
+    );
+    let callback = || {
+        f.http
+            .get(format!("{}/auth/callback", f.origin))
+            .query(&[("state", query["state"].as_str()), ("code", "c")])
+            .header("accept", BROWSER)
+            .header("cookie", login.clone())
+            .send()
+    };
+    assert_eq!(callback().await.unwrap().status().as_u16(), 303);
+    // The state works once. A replay (or an expired state) from the same browser stays on
+    // the dashboard path, not the machine-enrollment recovery text.
+    let replay = callback().await.unwrap();
+    assert_eq!(replay.status().as_u16(), 400);
+    let body = replay.text().await.unwrap();
+    assert!(body.contains(r#"href="/accounts/sign-in""#), "{body}");
+    assert!(!body.contains("server connect"), "{body}");
+}
+
+#[tokio::test]
 async fn a_dashboard_sign_in_never_offers_a_machine_approval() {
     let f = Fixture::new().await;
     let response = f
