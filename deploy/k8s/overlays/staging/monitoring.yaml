@@ -43,7 +43,7 @@ spec:
             environment: staging
           annotations:
             summary: A client or a migration forced a Claude token refresh
-            description: A forced refresh (reason forced or migration) revokes the access token that every running server run of the account holds; those sessions restart on the new token at their next idle point (claudectl 0.1.17 and later) or fail. Find the machine in the audit log (operation refresh, reason forced or migration). Best-effort: a rotation followed by a pod restart before the next scrape is not exported; the audit log always has it.
+            description: "A forced refresh (reason forced or migration) revokes the access token that every running server run of the account holds; those sessions restart on the new token at their next idle point (claudectl 0.1.17 and later) or fail. Find the machine in the audit log (operation refresh, reason forced or migration). Best effort only: a rotation is missed when the pod restarts before the next scrape, or crashes between the provider exchange and the audit append; the audit log holds every refresh whose append succeeded."
             runbook_url: https://github.com/Sawmills/claudectl/blob/main/docs/account-server.md
 ---
 # The staging ServiceMonitor schema lacks authentication. ScrapeConfig supports credentials.
