@@ -551,6 +551,8 @@ details > summary:hover {
 /* Job 1: the answer */
 .answer {
   display: grid;
+  /* A long command scrolls inside its box instead of widening the page at 360px. */
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--s5);
 }
 .answer h1 {
