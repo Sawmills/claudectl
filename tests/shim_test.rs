@@ -300,3 +300,56 @@ fn a_non_executable_claude_is_never_the_real_claude() {
     let first = std::env::join_paths([f.dir.clone()]).unwrap();
     assert!(!shim::status(&f.dir, &first).unwrap().real_ok);
 }
+
+#[test]
+fn server_qualify_refuses_the_shim_as_its_claude() {
+    let f = Fixture::new();
+    shim::install(&f.spec("amir3"), &f.dir).unwrap();
+    let home = f.dir.parent().unwrap().join("home-q");
+    std::fs::create_dir_all(&home).unwrap();
+    // The default `claude` resolves through PATH, where the shim comes first.
+    let path =
+        std::env::join_paths([f.dir.clone(), f.real.parent().unwrap().to_path_buf()]).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_claudectl"))
+        .args(["server", "qualify"])
+        .env("HOME", &home)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("claudectl shim"), "{stderr}");
+}
+
+#[test]
+fn status_is_broken_when_the_recorded_claudectl_is_gone() {
+    let f = Fixture::new();
+    shim::install(&f.spec("amir3"), &f.dir).unwrap();
+    let first = std::env::join_paths([f.dir.clone()]).unwrap();
+    assert!(shim::status(&f.dir, &first).unwrap().claudectl_ok);
+    std::fs::remove_file(&f.claudectl).unwrap();
+    assert!(!shim::status(&f.dir, &first).unwrap().claudectl_ok);
+}
+
+#[test]
+fn the_printed_path_line_is_shell_safe() {
+    assert_eq!(
+        shim::path_line(Path::new("/home/a/.local/claudectl/bin")),
+        r#"export PATH="/home/a/.local/claudectl/bin:$PATH""#
+    );
+    let hostile = shim::path_line(Path::new("/tmp/$(touch x) \"q\" it's"));
+    assert_eq!(
+        hostile,
+        r#"export PATH='/tmp/$(touch x) "q" it'\''s':"$PATH""#
+    );
+    // The shell reads it back as the literal directory.
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{hostile}; printf %s \"${{PATH%%:*}}\""))
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "/tmp/$(touch x) \"q\" it's"
+    );
+}

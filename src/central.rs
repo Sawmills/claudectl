@@ -688,7 +688,7 @@ pub fn dispatch(command: Command) -> Result<()> {
     let paths = crate::config::default_paths()?;
     // Before any connection is loaded: a shim passed as Claude would run itself.
     #[cfg(unix)]
-    if let Command::Run { claude, .. } = &command {
+    if let Command::Run { claude, .. } | Command::Qualify { claude } = &command {
         shim::refuse_shim_program(claude)?;
     }
     match command {

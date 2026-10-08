@@ -163,9 +163,9 @@ pub fn install(spec: &Spec, dir: &Path) -> Result<PathBuf> {
             .mode(0o755)
             .open(&partial)?;
         file.write_all(script.as_bytes())?;
+        // On the open handle (fchmod), not by path: the umask may have cleared bits.
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
         file.sync_all()?;
-        // The umask may have cleared bits from the mode above.
-        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))?;
         std::fs::rename(&partial, &target)?;
         Ok(())
     })();
@@ -222,6 +222,8 @@ pub struct Status {
     pub real: Option<PathBuf>,
     pub real_ok: bool,
     pub claudectl: Option<PathBuf>,
+    /// The recorded claudectl is still an executable file.
+    pub claudectl_ok: bool,
     /// `claude` on this PATH resolves to the launcher.
     pub first_on_path: bool,
 }
@@ -233,6 +235,7 @@ pub fn status(dir: &Path, path: &OsStr) -> Result<Status> {
     let real_ok = spec
         .as_ref()
         .is_some_and(|s| is_executable(&s.real) && !is_shim(&s.real));
+    let claudectl_ok = spec.as_ref().is_some_and(|s| is_executable(&s.claudectl));
     let first_on_path = installed
         && on_path("claude", path).is_some_and(|found| {
             matches!((found.canonicalize(), target.canonicalize()), (Ok(a), Ok(b)) if a == b)
@@ -243,6 +246,7 @@ pub fn status(dir: &Path, path: &OsStr) -> Result<Status> {
         real: spec.as_ref().map(|s| s.real.clone()),
         real_ok,
         claudectl: spec.map(|s| s.claudectl),
+        claudectl_ok,
         first_on_path,
     })
 }
@@ -267,6 +271,20 @@ fn claudectl_path(path: &OsStr) -> Result<PathBuf> {
     Ok(on_path("claudectl", path)
         .filter(|found| found.canonicalize().is_ok_and(|c| c == me))
         .unwrap_or(me))
+}
+
+/// The shell line that puts `dir` first on PATH. A directory with characters the shell
+/// would expand is single-quoted, so pasting the line runs nothing.
+pub fn path_line(dir: &Path) -> String {
+    let dir = dir.to_string_lossy();
+    if dir
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+@".contains(c))
+    {
+        format!("export PATH=\"{dir}:$PATH\"")
+    } else {
+        format!("export PATH={}:\"$PATH\"", quote(&dir))
+    }
 }
 
 fn default_dir(paths: &crate::config::Paths) -> PathBuf {
@@ -300,7 +318,7 @@ pub fn dispatch(command: Command) -> Result<()> {
                 println!("`claude` on this PATH already runs the shim.");
             } else {
                 println!("Put this line in your shell profile, then open a new terminal:");
-                println!("  export PATH=\"{}:$PATH\"", dir.display());
+                println!("  {}", path_line(&dir));
             }
             println!("Escape hatch: CLAUDECTL_SHIM=off claude ...");
             Ok(())
@@ -328,8 +346,10 @@ pub fn dispatch(command: Command) -> Result<()> {
                 Some(real) => println!("claude    {} (missing: run install again)", real.display()),
                 None => println!("claude    unknown"),
             }
-            if let Some(c) = &s.claudectl {
-                println!("claudectl {}", c.display());
+            match &s.claudectl {
+                Some(c) if s.claudectl_ok => println!("claudectl {}", c.display()),
+                Some(c) => println!("claudectl {} (missing: run install again)", c.display()),
+                None => println!("claudectl unknown"),
             }
             println!(
                 "PATH      {}",
@@ -339,7 +359,7 @@ pub fn dispatch(command: Command) -> Result<()> {
                     "`claude` does not run the shim; put the shim directory first on PATH"
                 }
             );
-            if !(s.real_ok && s.first_on_path) {
+            if !(s.real_ok && s.claudectl_ok && s.first_on_path) {
                 std::process::exit(1);
             }
             Ok(())
