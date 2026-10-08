@@ -527,9 +527,9 @@ impl Monitor {
             retry_now = false;
             let access = match self.client.acquire(&self.account_id, None) {
                 Ok(access) => access,
-                Err(error) => {
+                Err(_) => {
                     // Retry soon: one failure near expiry must not use up the token's life.
-                    eprintln!("claudectl: token check failed ({error:#}); retrying");
+                    // Nothing is printed: stderr is Claude's terminal.
                     last_check = now() - interval + timing.retry_ms;
                     continue;
                 }
