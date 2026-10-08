@@ -18,7 +18,7 @@ pub struct Event<'a> {
     /// The revoked machine, for a machine revoke.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<&'a str>,
-    /// Why a refresh ran: forced, margin or expired.
+    /// Why a refresh ran: forced, expired, migration or margin.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
 }

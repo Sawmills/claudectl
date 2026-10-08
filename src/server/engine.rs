@@ -35,12 +35,14 @@ const MARGIN: i64 = 300_000;
 
 /// Every value `rotation_reason` returns. `/metrics` exports each from startup, so the first
 /// refresh of a reason shows as an increase.
-pub(crate) const ROTATION_REASONS: [&str; 3] = ["expired", "forced", "margin"];
-/// Why a refresh ran: a client that sent the current revision forced it; otherwise the held
-/// token was inside the margin or already expired.
+pub(crate) const ROTATION_REASONS: [&str; 4] = ["expired", "forced", "margin", "migration"];
+/// Why a refresh ran: a client that sent the current revision forced it; a token that had
+/// already expired revoked nothing; a pending migration rotates a token that may have hours
+/// left; otherwise the held token was inside the margin.
 pub(crate) fn rotation_reason(
     previous: Option<&str>,
     revision: &str,
+    pending_migration: bool,
     expires_at: i64,
     now: i64,
 ) -> &'static str {
@@ -48,6 +50,8 @@ pub(crate) fn rotation_reason(
         "forced"
     } else if expires_at <= now {
         "expired"
+    } else if pending_migration {
+        "migration"
     } else {
         "margin"
     }
@@ -908,6 +912,7 @@ impl Engine {
                 reason = Some(rotation_reason(
                     previous,
                     &loaded.record.revision,
+                    matches!(loaded.record.rotation, Rotation::Pending { .. }),
                     loaded.record.grant.expires_at,
                     now(),
                 ));

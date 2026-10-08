@@ -531,7 +531,12 @@ async fn the_server_refreshes_inside_five_minutes_of_expiry_and_not_before() {
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
     assert_eq!(
         engine.rotations(),
-        vec![("expired", 0), ("forced", 0), ("margin", 1)]
+        vec![
+            ("expired", 0),
+            ("forced", 0),
+            ("margin", 1),
+            ("migration", 0)
+        ]
     );
 }
 
@@ -540,17 +545,29 @@ fn a_rotation_reason_tells_forced_from_margin_and_expired() {
     use super::rotation_reason;
     let now = 1_000_000_000;
     assert_eq!(
-        rotation_reason(Some("r1"), "r1", now + 7_200_000, now),
+        rotation_reason(Some("r1"), "r1", false, now + 7_200_000, now),
         "forced"
     );
-    assert_eq!(rotation_reason(None, "r1", now + 60_000, now), "margin");
     assert_eq!(
-        rotation_reason(Some("old"), "r1", now + 60_000, now),
+        rotation_reason(None, "r1", false, now + 60_000, now),
         "margin"
     );
-    assert_eq!(rotation_reason(None, "r1", now - 1, now), "expired");
+    assert_eq!(
+        rotation_reason(Some("old"), "r1", false, now + 60_000, now),
+        "margin"
+    );
+    assert_eq!(rotation_reason(None, "r1", false, now - 1, now), "expired");
     // A forced refresh of an expired token is still the client's doing.
-    assert_eq!(rotation_reason(Some("r1"), "r1", now - 1, now), "forced");
+    assert_eq!(
+        rotation_reason(Some("r1"), "r1", false, now - 1, now),
+        "forced"
+    );
+    // A pending migration refreshes a token that has hours left.
+    assert_eq!(
+        rotation_reason(None, "r1", true, now + 7_200_000, now),
+        "migration"
+    );
+    assert_eq!(rotation_reason(None, "r1", true, now - 1, now), "expired");
 }
 
 #[tokio::test]
@@ -559,7 +576,12 @@ async fn a_client_forced_refresh_is_counted_as_forced() {
     // Every reason is exported from startup, so the first event shows as an increase.
     assert_eq!(
         engine.rotations(),
-        vec![("expired", 0), ("forced", 0), ("margin", 0)]
+        vec![
+            ("expired", 0),
+            ("forced", 0),
+            ("margin", 0),
+            ("migration", 0)
+        ]
     );
     let receipt = engine
         .admit(
@@ -581,7 +603,12 @@ async fn a_client_forced_refresh_is_counted_as_forced() {
         .unwrap();
     assert_eq!(
         engine.rotations(),
-        vec![("expired", 0), ("forced", 1), ("margin", 0)]
+        vec![
+            ("expired", 0),
+            ("forced", 1),
+            ("margin", 0),
+            ("migration", 0)
+        ]
     );
 }
 
@@ -621,6 +648,16 @@ async fn a_migration_refreshes_once_so_copies_of_the_old_grant_go_stale() {
         .await
         .unwrap();
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    // The token had an hour left: the migration revoked it on purpose.
+    assert_eq!(
+        engine.rotations(),
+        vec![
+            ("expired", 0),
+            ("forced", 0),
+            ("margin", 0),
+            ("migration", 1)
+        ]
+    );
     let access = engine
         .acquire("person", &receipt.account_id, None)
         .await
