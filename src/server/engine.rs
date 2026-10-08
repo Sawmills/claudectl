@@ -29,6 +29,8 @@ const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const BETA: &str = "oauth-2025-04-20";
 const PROVIDER: &str = "anthropic";
 /// Refresh when less than this remains, so machines always hold a token with room to work.
+/// Keep it short: a refresh revokes the token every `server run` of the account holds, and
+/// the client avoids asking inside this window (claudectl renew::NO_POLL_MS, SAW-12610).
 const MARGIN: i64 = 300_000;
 /// Why a login could not finish, as a bounded reason the machine is told. The response
 /// stays retained either way.
@@ -52,6 +54,29 @@ pub fn login_reason(error: &anyhow::Error) -> &'static str {
     error
         .downcast_ref::<LoginRefused>()
         .map_or("login_incomplete_grant_retained", |refused| refused.0)
+}
+/// Every value `rotation_reason` returns. `/metrics` exports each from startup, so the first
+/// refresh of a reason shows as an increase.
+pub(crate) const ROTATION_REASONS: [&str; 4] = ["expired", "forced", "margin", "migration"];
+/// Why a refresh ran: a client that sent the current revision forced it; a token that had
+/// already expired revoked nothing; a pending migration rotates a token that may have hours
+/// left; otherwise the held token was inside the margin.
+pub(crate) fn rotation_reason(
+    previous: Option<&str>,
+    revision: &str,
+    pending_migration: bool,
+    expires_at: i64,
+    now: i64,
+) -> &'static str {
+    if previous == Some(revision) {
+        "forced"
+    } else if expires_at <= now {
+        "expired"
+    } else if pending_migration {
+        "migration"
+    } else {
+        "margin"
+    }
 }
 /// A grant must stay valid this long for admission and identity verification.
 const USABLE: i64 = 60_000;
@@ -288,6 +313,12 @@ pub struct Engine {
     /// One task per account in this process; the lease covers other replicas.
     local: StdMutex<BTreeMap<String, Arc<Mutex<()>>>>,
     usage_poll: Mutex<()>,
+    /// Refreshes run by this process, by reason: count and last time in seconds (for
+    /// `/metrics`). Process memory only: a rotation followed by a restart before the next
+    /// scrape (30 s) is not exported. The audit log (operation refresh, `reason`) is the
+    /// durable record of every refresh whose append succeeded; a crash between the provider
+    /// exchange and the append leaves neither. The alert is best effort.
+    rotations: StdMutex<BTreeMap<&'static str, (u64, i64)>>,
 }
 /// The receipt state when no committed admission was visible, from the pending row read
 /// after it.
@@ -325,6 +356,7 @@ impl Engine {
                 .build()?,
             local: StdMutex::new(BTreeMap::new()),
             usage_poll: Mutex::new(()),
+            rotations: StdMutex::new(ROTATION_REASONS.iter().map(|r| (*r, (0, 0))).collect()),
         })
     }
     pub fn store(&self) -> &Arc<Store> {
@@ -635,6 +667,7 @@ impl Engine {
                         result: "refused",
                         rotated: None,
                         target: None,
+                        reason: None,
                     })
                     .await?;
                     return Err(error);
@@ -677,6 +710,7 @@ impl Engine {
             result,
             rotated: None,
             target: None,
+            reason: None,
         })
         .await?;
         refreshed?;
@@ -838,7 +872,14 @@ impl Engine {
         Ok(rotated)
     }
     /// One refresh token exchange. Returns whether the provider rotated the refresh token.
-    async fn refresh(&self, lease: &mut Lease, loaded: &mut Loaded) -> Result<bool> {
+    /// Exchange the refresh token. `reason` is counted once the provider accepts the
+    /// exchange: that revokes the old access token even if a later step fails.
+    async fn refresh(
+        &self,
+        lease: &mut Lease,
+        loaded: &mut Loaded,
+        reason: &'static str,
+    ) -> Result<bool> {
         let attempt = revision();
         let mut record = loaded.record.clone();
         record.phase = Phase::Refreshing;
@@ -855,6 +896,12 @@ impl Engine {
             .map_err(|_| anyhow::anyhow!("refresh outcome uncertain; login renewal required"))?;
         if !response.status().is_success() {
             bail!("refresh rejected; login renewal required");
+        }
+        {
+            let mut rotations = self.rotations.lock().expect("rotations lock");
+            let rotation = rotations.entry(reason).or_default();
+            rotation.0 += 1;
+            rotation.1 = now() / 1000;
         }
         let bytes = match capped_body(response).await {
             Ok(bytes) => bytes,
@@ -889,6 +936,7 @@ impl Engine {
         if !loaded.needs_refresh(previous) {
             return Ok(loaded);
         }
+        let mut reason = None;
         let outcome = match loaded.record.phase {
             Phase::Unverified => self
                 .verify_successor(lease, &mut loaded)
@@ -906,7 +954,17 @@ impl Engine {
             Phase::Refreshing => {
                 bail!("refresh outcome uncertain; login renewal or reconciliation required")
             }
-            Phase::Ready => self.refresh(lease, &mut loaded).await.map(Some),
+            Phase::Ready => {
+                let why = rotation_reason(
+                    previous,
+                    &loaded.record.revision,
+                    matches!(loaded.record.rotation, Rotation::Pending { .. }),
+                    loaded.record.grant.expires_at,
+                    now(),
+                );
+                reason = Some(why);
+                self.refresh(lease, &mut loaded, why).await.map(Some)
+            }
         };
         self.audit(&audit::Event {
             operation: "refresh",
@@ -915,6 +973,7 @@ impl Engine {
             result: if outcome.is_ok() { "ok" } else { "failed" },
             rotated: outcome.as_ref().ok().copied().flatten(),
             target: None,
+            reason,
         })
         .await?;
         outcome?;
@@ -1001,8 +1060,28 @@ impl Engine {
             result: "ok",
             rotated: None,
             target: None,
+            reason: None,
         })
         .await
+    }
+    /// Refreshes run by this process, by reason.
+    pub fn rotations(&self) -> Vec<(&'static str, u64)> {
+        self.rotations
+            .lock()
+            .expect("rotations lock")
+            .iter()
+            .map(|(reason, (count, _))| (*reason, *count))
+            .collect()
+    }
+    /// The last refresh run by this process, by reason, in seconds; 0 if none. The alert
+    /// reads this: a rotation before the first scrape never shows as a counter increase.
+    pub fn last_rotations(&self) -> Vec<(&'static str, i64)> {
+        self.rotations
+            .lock()
+            .expect("rotations lock")
+            .iter()
+            .map(|(reason, (_, last))| (*reason, *last))
+            .collect()
     }
     pub async fn audit(&self, event: &audit::Event<'_>) -> Result<()> {
         audit::record(&self.store, &self.key, event).await

@@ -146,6 +146,7 @@ pub async fn revoke(store: &Store, key: &Path, machine: &str) -> Result<()> {
             result: "ok",
             rotated: None,
             target: Some(machine),
+            reason: None,
         },
     )
     .await
@@ -362,6 +363,7 @@ async fn revoke_machine(
             result: "ok",
             rotated: None,
             target: Some(&input.id),
+            reason: None,
         })
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -449,6 +451,7 @@ async fn token(
             },
             rotated: None,
             target: None,
+            reason: None,
         })
         .await?;
     authorized?;
@@ -669,6 +672,18 @@ async fn metrics(State(server): Shared, headers: HeaderMap) -> Result<Response, 
             )
         })
         .collect();
+    let rotations: String = server
+        .engine
+        .rotations()
+        .iter()
+        .zip(server.engine.last_rotations())
+        .map(|((reason, count), (_, last))| {
+            format!(
+                "claudectl_token_rotations_total{{reason=\"{reason}\"}} {count}\nclaudectl_token_last_rotation_timestamp_seconds{{reason=\"{reason}\"}} {last}\n"
+            )
+        })
+        .collect();
+    let output = output + &rotations;
     Ok((
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         output,
