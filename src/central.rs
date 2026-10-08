@@ -308,6 +308,17 @@ impl Client {
     pub(super) fn receipt(&self, id: &str) -> Result<Option<Receipt>> {
         Ok(self.receipt_state(id)?.0)
     }
+    /// Ask the server to cancel a migration ID that has not committed.
+    pub(super) fn cancel_migration(&self, alias: &str, id: &str) -> Result<()> {
+        let reply: Value = self.post(
+            "/v2/anthropic/migrations/cancel",
+            &json!({"alias": alias, "migration_id": id}),
+        )?;
+        if reply["state"] != "cancelled" {
+            bail!("the server did not confirm the cancel");
+        }
+        Ok(())
+    }
     /// The receipt and the server's admission state: `none`, `pending` or `complete`.
     pub(super) fn receipt_state(&self, id: &str) -> Result<(Option<Receipt>, String)> {
         #[derive(Deserialize)]

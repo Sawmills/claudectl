@@ -42,16 +42,26 @@ without `--exclusive-owner` it refuses and fences nothing. It first refuses
 the whole run while any Claude process runs (with or without `--exclusive-owner`),
 when the host's Claude build is not qualified, or when the server is unreachable;
 then nothing is fenced. Expired inactive profiles are refreshed locally before their
-fence. Inactive accounts migrate first. The host's live login migrates last, from its Keychain grant; after the server verifies the rotation,
-the live login is deleted only while it is still that exact grant (digest compare),
-and the active marker is cleared. A server outage or 5xx stops the run; other accounts
-continue past a per-account refusal. The summary shows one row per account (`migrated`,
-`already`, `refused:…`, `unrotated`, `superseded`, `gone`, `lost-reply`, `failed:fenced`,
-`not-attempted`) with the next command; the exit code is 1 unless every row is
-`migrated` or `already`. A rerun resumes fenced accounts through the receipt lookup.
-`migrate --abort ALIAS` drops a fence the server never admitted and restores the local
-grant; for a superseded or deleted server account it drops the fence without keeping
-a copy.
+fence. Inactive accounts migrate first. The host's live login migrates last, from its
+Keychain grant. claudectl never deletes the live login: `security(1)` cannot delete
+conditionally and Claude Code takes no lock, so a delete could erase a newer login.
+After the server verifies the rotation, the live login holds a retired grant; the row
+reads `migrated (log out the live login)` and the command prints the step to run:
+`claude auth logout`, then `claudectl server run <alias>`. If the live login changed
+since the fence, the row says so and nothing is touched. A server outage or 5xx stops the
+run; other accounts continue past a per-account refusal. The summary shows one row per
+account (`migrated`, `already`, `refused:…`, `unrotated`, `superseded`, `gone`,
+`lost-reply`, `failed:fenced`, `not-attempted`) with the next command; the exit code is
+1 unless every row is `migrated` or `already`. A rerun resumes fenced accounts through the
+receipt lookup.
+
+`migrate --abort ALIAS` first asks the server to cancel the migration ID. The server
+records the cancel under the alias lock (a cancelled tombstone when nothing arrived yet),
+so a delayed import with that ID is rejected (`409 migration_cancelled`). Only after the
+server confirms the cancel does abort restore the local grant (and, for the live login,
+the Keychain login if it is gone). Once the admission committed, the cancel is refused
+(`409 migration_admitted`) and abort reports the state; for a superseded or deleted server
+account it drops the fence without keeping a copy.
 
 The company user, provider, account UUID, organization UUID, and monotonically
 increasing generation are checked before replacing the session credential. Only

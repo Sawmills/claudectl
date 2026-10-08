@@ -55,6 +55,7 @@ struct Fake {
     refreshes: usize,
     /// Receipt lookups answer 200 with a body that is not JSON.
     garbage_receipts: bool,
+    cancelled: HashSet<String>,
 }
 type Shared = Arc<Mutex<Fake>>;
 
@@ -122,6 +123,15 @@ async fn import(State(fake): State<Shared>, Json(body): Json<Value>) -> Response
         }
     }
 }
+async fn cancel(State(fake): State<Shared>, Json(body): Json<Value>) -> Response {
+    let mut fake = fake.lock().unwrap();
+    let id = body["migration_id"].as_str().unwrap().to_string();
+    if fake.receipts.contains_key(&id) || fake.pending.contains(&id) {
+        return error(StatusCode::CONFLICT, "migration_admitted");
+    }
+    fake.cancelled.insert(id);
+    Json(json!({"state":"cancelled"})).into_response()
+}
 async fn token(State(fake): State<Shared>) -> Json<Value> {
     let mut fake = fake.lock().unwrap();
     fake.refreshes += 1;
@@ -184,6 +194,7 @@ impl Env {
         let app = Router::new()
             .route("/v1/me", get(me))
             .route("/v2/anthropic/migrations", get(receipt).post(import))
+            .route("/v2/anthropic/migrations/cancel", post(cancel))
             .route("/token", post(token))
             .with_state(fake.clone());
         let server = std::thread::spawn(move || {
@@ -445,6 +456,11 @@ fn abort_restores_only_when_the_server_never_admitted() {
     assert!(ok, "{text}");
     assert!(!env.fenced("a1"));
     assert!(env.has_credentials("a1"), "the grant is restored");
+    assert_eq!(
+        env.fake.lock().unwrap().cancelled.len(),
+        1,
+        "the server confirmed a cancel before the restore"
+    );
 
     env.profile("b2", "u-b2-0000", Script::Pending, 3_600_000);
     env.script("a1", Script::Ok);
@@ -458,7 +474,7 @@ fn abort_restores_only_when_the_server_never_admitted() {
 }
 
 #[test]
-fn the_live_login_migrates_last_and_is_deleted_only_while_it_is_the_migrated_grant() {
+fn the_live_login_migrates_last_and_is_never_deleted_automatically() {
     let env = Env::new();
     env.profile("a1", "u-a1-0000", Script::Ok, 3_600_000);
     env.live("me", "u-me-0000", "live");
@@ -483,18 +499,22 @@ fn the_live_login_migrates_last_and_is_deleted_only_while_it_is_the_migrated_gra
         &env.paths.claude_credentials_file(),
         &serde_json::to_string(&creds("changed", 3_600_000)).unwrap(),
     );
+    // The receipt is found: migrated. The changed live login is reported, never touched.
     let (ok, text) = env.run(&["--all", "--exclusive-owner"], "");
-    assert!(!ok, "{text}");
-    assert!(
-        Env::row(&text, "me").contains("live login changed"),
-        "{text}"
-    );
-    assert!(
-        env.paths.claude_credentials_file().exists(),
+    assert!(ok, "{text}");
+    let row = Env::row(&text, "me");
+    assert!(row.contains("migrated"), "{text}");
+    assert!(row.contains("live login changed"), "{text}");
+    let kept: CredentialsFile =
+        serde_json::from_slice(&std::fs::read(env.paths.claude_credentials_file()).unwrap())
+            .unwrap();
+    assert_eq!(
+        kept.claude_ai_oauth.access_token, "changed-access",
         "nothing deleted"
     );
 
-    // Back to the migrated grant: the cleanup deletes it and clears the active marker.
+    // Back to the migrated grant: the migration completes, and the live login is never
+    // deleted automatically (HQ decision): the user is told to log it out.
     private_write(
         &env.paths.claude_credentials_file(),
         &serde_json::to_string(&creds("live", 3_600_000)).unwrap(),
@@ -502,8 +522,19 @@ fn the_live_login_migrates_last_and_is_deleted_only_while_it_is_the_migrated_gra
     let (ok, text) = env.run(&["--all", "--exclusive-owner"], "");
     assert!(ok, "{text}");
     assert!(Env::row(&text, "me").contains("already"), "{text}");
-    assert!(!env.paths.claude_credentials_file().exists());
-    assert!(profile::get_active_from(&env.paths).unwrap().is_none());
+    assert!(
+        Env::row(&text, "me").contains("log out the live login"),
+        "{text}"
+    );
+    assert!(text.contains("claude auth logout"), "{text}");
+    assert!(
+        env.paths.claude_credentials_file().exists(),
+        "nothing deleted"
+    );
+    assert_eq!(
+        profile::get_active_from(&env.paths).unwrap().as_deref(),
+        Some("me")
+    );
     assert!(!env.has_credentials("me"));
 }
 

@@ -253,7 +253,12 @@ pub fn migrate(paths: &Paths, client: &Client, alias: &str, exclusive_owner: boo
     Ok(())
 }
 /// One account through fence -> server receipt -> local cleanup. Rerunnable at every step.
-fn migrate_one(paths: &Paths, client: &Client, alias: &str, source: Source) -> Result<Done> {
+fn migrate_one(
+    paths: &Paths,
+    client: &Client,
+    alias: &str,
+    source: Source,
+) -> Result<(Done, Option<&'static str>)> {
     let _server_lock = lock(paths)?;
     let store = AuthStore::real(paths.clone());
     let _auth_lock = store.lock_auth_state()?;
@@ -371,11 +376,11 @@ fn migrate_one(paths: &Paths, client: &Client, alias: &str, source: Source) -> R
         }
         journal.receipt = Some(receipt);
         atomic(&journal_path, &journal)?;
-        cleanup(paths, &store, &journal, &dir, &profile_file)?;
-        return Ok(Done::Migrated);
+        let note = cleanup(paths, &store, &journal, &dir, &profile_file)?;
+        return Ok((Done::Migrated, note));
     }
-    cleanup(paths, &store, &journal, &dir, &profile_file)?;
-    Ok(Done::Already)
+    let note = cleanup(paths, &store, &journal, &dir, &profile_file)?;
+    Ok((Done::Already, note))
 }
 /// The live login's authoritative grant (the Keychain on macOS, the file elsewhere). Debug
 /// builds let integration tests stand in a Keychain grant; release builds never read it.
@@ -408,52 +413,42 @@ fn verify_live_holders(
     let (keychain, file) = (keychain?, file?);
     for creds in keychain.iter().chain(file.iter()) {
         if !same_digests(&digests(creds), migrated) {
-            bail!("live login changed; nothing deleted. Reconcile the current login, then rerun");
+            bail!("live login changed since the migration");
         }
     }
     Ok(keychain.is_some() || file.is_some())
 }
-/// After a receipt (the server verified a rotation): retire every local copy. Idempotent.
+/// What the user must do after the live login migrated.
+const LIVE_LOG_OUT: &str = "log out the live login";
+/// After a receipt (the server verified a rotation): retire the fenced copies. Idempotent.
+/// Returns a note for a live migration.
 fn cleanup(
     paths: &Paths,
     store: &AuthStore,
     journal: &Journal,
     dir: &Path,
     profile_file: &Path,
-) -> Result<()> {
+) -> Result<Option<&'static str>> {
     if profile_file.try_exists()? {
         bail!("credentials reappeared in migrated profile; reconcile the competing owner");
     }
+    let mut note = None;
     if journal.live {
-        // Compare-and-delete: every present holder must be the exact migrated grant. A
-        // holder that cannot be read stops the cleanup; nothing is deleted.
-        let verify = || {
-            verify_live_holders(
-                store
-                    .read_live_grant()
-                    .context("Keychain login unreadable; nothing deleted"),
-                live_file(paths).context("live credentials file unreadable; nothing deleted"),
+        // HQ decision: the live login is never deleted automatically. security(1) cannot
+        // delete conditionally and Claude Code takes no lock, so a delete could erase a newer
+        // login. The digest check only decides what to tell the user.
+        note = Some(
+            match verify_live_holders(
+                store.read_live_grant(),
+                live_file(paths),
                 &journal.grant_digests,
-            )
-        };
-        if verify()? {
-            // security(1) cannot delete conditionally. Narrow the window instead: no Claude
-            // process may run, and the holders must still match right before the delete.
-            let running = claude_processes()?;
-            if !running.is_empty() {
-                bail!(
-                    "a Claude process started during the migration; nothing deleted. Stop it, then rerun"
-                );
-            }
-            if verify()? {
-                store.delete_live_login()?;
-            }
-        }
-        if profile::get_active_from(paths)?
-            .is_some_and(|a| crate::exec::same_profile(paths, &a, &journal.alias))
-        {
-            profile::clear_active_from(paths)?;
-        }
+            ) {
+                // Still the migrated grant, now retired on the server side.
+                Ok(true) => LIVE_LOG_OUT,
+                Ok(false) => "live login already gone",
+                Err(_) => "live login changed since; not touched",
+            },
+        );
         let aside = dir.join("profile-credentials.json");
         if aside.try_exists()? {
             std::fs::remove_file(aside)?;
@@ -464,7 +459,7 @@ fn cleanup(
         std::fs::remove_file(&retained)?;
         File::open(dir)?.sync_all()?;
     }
-    Ok(())
+    Ok(note)
 }
 
 /// One summary row of `migrate --all`.
@@ -476,7 +471,7 @@ pub(super) struct Row {
 }
 impl Row {
     fn ok(&self) -> bool {
-        matches!(self.result.as_str(), "migrated" | "already")
+        self.result.starts_with("migrated") || self.result.starts_with("already")
     }
 }
 /// Running Claude processes as (PID, start time). claudectl itself is not one.
@@ -687,6 +682,11 @@ pub fn migrate_all(paths: &Paths, client: &Client, exclusive_owner: bool) -> Res
             row.next.replace("<alias>", &row.alias)
         );
     }
+    if rows.iter().any(|r| r.result.contains(LIVE_LOG_OUT)) {
+        println!(
+            "The live login on this machine still holds the migrated grant, which the server has retired. Log it out now: claude auth logout. Then start sessions with claudectl server run <alias>."
+        );
+    }
     Ok(rows.iter().all(Row::ok))
 }
 pub(super) fn migrate_all_with(
@@ -771,18 +771,23 @@ pub(super) fn migrate_all_with(
             continue;
         }
         let row = match migrate_one(paths, client, &alias, source) {
-            Ok(Done::Migrated) => Row {
-                alias,
-                identity,
-                result: "migrated".into(),
-                next: "-",
-            },
-            Ok(Done::Already) => Row {
-                alias,
-                identity,
-                result: "already".into(),
-                next: "-",
-            },
+            Ok((done, note)) => {
+                let status = if done == Done::Migrated {
+                    "migrated"
+                } else {
+                    "already"
+                };
+                Row {
+                    alias,
+                    identity,
+                    result: note.map_or(status.to_string(), |n| format!("{status} ({n})")),
+                    next: if note == Some(LIVE_LOG_OUT) {
+                        "claude auth logout"
+                    } else {
+                        "-"
+                    },
+                }
+            }
             Err(error) => {
                 halted = server_down(&error);
                 let (result, next) = classify(paths, &alias, &error);
@@ -820,17 +825,32 @@ pub fn abort(paths: &Paths, client: &Client, alias: &str) -> Result<()> {
             journal.server
         );
     }
-    let restore = match client.receipt_state(&journal.migration_id) {
-        Ok((None, state)) if state == "none" => true,
-        Ok((_, state)) => bail!("the server state is {state}; abort refused, rerun the migration"),
-        Err(error) => match error
-            .downcast_ref::<ServerError>()
-            .map(|e| e.reason.as_str())
+    // The server records the cancel first, so a delayed import of this ID can never admit
+    // the grant restored below.
+    let restore = match client.cancel_migration(alias, &journal.migration_id) {
+        Ok(()) => true,
+        Err(error)
+            if error
+                .downcast_ref::<ServerError>()
+                .is_some_and(|e| e.reason == "migration_admitted") =>
         {
-            // The server no longer holds this admission: drop the fence, keep no copy.
-            Some("migration_superseded" | "account_deleted") => false,
-            _ => return Err(error),
-        },
+            match client.receipt_state(&journal.migration_id) {
+                Ok((_, state)) => bail!(
+                    "the server already admitted this migration (state {state}); abort refused, rerun the migration"
+                ),
+                Err(error) => match error
+                    .downcast_ref::<ServerError>()
+                    .map(|e| e.reason.as_str())
+                {
+                    // The server no longer holds this admission: drop the fence, keep no copy.
+                    Some("migration_superseded" | "account_deleted") => false,
+                    _ => return Err(error),
+                },
+            }
+        }
+        Err(error) => {
+            return Err(error.context("the server did not confirm the cancel; nothing restored"));
+        }
     };
     let profile_file = paths.profiles_dir().join(alias).join("credentials.json");
     let retained = dir.join("grant.json");

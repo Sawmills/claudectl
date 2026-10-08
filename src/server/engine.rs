@@ -206,6 +206,10 @@ macro_rules! marker_error {
 }
 marker_error!(Gone, "server account was deleted");
 marker_error!(
+    AdmissionCancelled,
+    "this admission was cancelled (by a delete or an abort); start again"
+);
+marker_error!(
     Superseded,
     "a login renewal replaced this migration's grant before it rotated; its copies may still be valid"
 );
@@ -440,7 +444,7 @@ impl Engine {
             grant: Grant,
             replacement: Option<Identity>,
         }
-        let cancelled = || anyhow::anyhow!("a delete cancelled this admission; start a new login");
+        let cancelled = || anyhow::Error::from(AdmissionCancelled);
         // Retain an acquired grant before any network verification, even if it fails. A
         // delete cancels this row, and a cancelled admission never commits.
         if self.store.pending(user, admission_id).await?.is_none() {
@@ -671,6 +675,17 @@ impl Engine {
     /// A completed admission. A migration counts only after a verified, distinct rotation.
     pub async fn receipt(&self, user: &str, admission: &str) -> Result<Option<Receipt>> {
         Ok(self.receipt_state(user, admission).await?.0)
+    }
+    /// Cancel a migration ID that has not committed, so a delayed import can never admit it.
+    pub async fn cancel_migration(
+        &self,
+        user: &str,
+        alias: &str,
+        admission: &str,
+    ) -> Result<store::CancelOutcome> {
+        let alias = validate_alias(alias)?;
+        validate_alias(admission)?;
+        self.store.cancel_admission(user, admission, alias).await
     }
     /// The receipt and where the admission stands: `none` (never admitted, so a client may
     /// restore its fenced grant), `pending` (admitted, rotation not yet verified) or

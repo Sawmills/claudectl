@@ -472,6 +472,8 @@ async fn migrate_account(
                 server.error(StatusCode::CONFLICT, "migration_superseded")
             } else if e.downcast_ref::<Gone>().is_some() {
                 server.error(StatusCode::GONE, "account_deleted")
+            } else if e.downcast_ref::<engine::AdmissionCancelled>().is_some() {
+                server.error(StatusCode::CONFLICT, "migration_cancelled")
             } else {
                 server.error(StatusCode::CONFLICT, "admission_refused_reconcile_receipt")
             }
@@ -495,6 +497,35 @@ async fn receipt(
         .await
         .map_err(|e| server.engine_error(&e, "receipt_unavailable"))?;
     Ok(private(json!({"receipt": receipt, "state": state})))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelInput {
+    alias: String,
+    migration_id: String,
+}
+/// Cancel a migration ID before it commits. A client restores its fenced grant only after
+/// this answers `cancelled`; a later import with the ID is rejected.
+async fn cancel_migration(
+    State(server): Shared,
+    headers: HeaderMap,
+    body: Body<CancelInput>,
+) -> Result<Response, HttpError> {
+    let machine = server.authorize(&headers).await?;
+    let input = self::body(&server, body)?;
+    match server
+        .engine
+        .cancel_migration(&machine.user, &input.alias, &input.migration_id)
+        .await
+        .map_err(|e| server.engine_error(&e, "cancel_unavailable"))?
+    {
+        crate::server::store::CancelOutcome::Cancelled => {
+            Ok(private(json!({"state": "cancelled"})))
+        }
+        crate::server::store::CancelOutcome::Admitted => {
+            Err(server.error(StatusCode::CONFLICT, "migration_admitted"))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -631,7 +662,8 @@ pub fn router(server: Arc<Server>) -> Router {
         .route(
             "/v2/anthropic/migrations",
             post(migrate_account).get(receipt),
-        );
+        )
+        .route("/v2/anthropic/migrations/cancel", post(cancel_migration));
     enrollment::routes(routes).with_state(server)
 }
 

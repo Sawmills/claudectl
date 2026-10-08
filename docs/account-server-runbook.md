@@ -96,7 +96,8 @@ After the pilot, `claudectl server migrate --all --exclusive-owner` moves every 
 account on a machine in one run (stop every Claude session there first; the command refuses
 while one runs). Read the summary table: rerun for `lost-reply` and `failed:fenced`, run
 `claudectl server migrate --abort <alias>` for `superseded` or `gone`, and stop and report
-for `unrotated`. 7. **Verify** on the Mac and on the devbox: `claudectl server run <alias> -- -p "say ok"` across
+for `unrotated`. A row `migrated (log out the live login)` means the live login on that
+machine holds a retired grant: run `claude auth logout` there; claudectl never deletes it. 7. **Verify** on the Mac and on the devbox: `claudectl server run <alias> -- -p "say ok"` across
 one access-token renewal, then `claudectl server status <alias>`.
 
 ## Alerts
