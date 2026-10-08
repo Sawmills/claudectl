@@ -23,8 +23,8 @@ struct Fake {
     generation: u64,
     /// The server refreshes on the next token request (what a server-side refresh does).
     refresh_next: bool,
-    /// After that, it refreshes again on this many further requests (a second refresh,
-    /// for example `server refresh-access` on another machine).
+    /// Further refreshes that also happened before this request (a second refresh, for
+    /// example `server refresh-access` on another machine).
     extra_refreshes: u32,
 }
 type Shared = Arc<Mutex<Fake>>;
@@ -51,10 +51,8 @@ async fn token(State(fake): State<Shared>, Json(body): Json<Value>) -> Json<Valu
     fake.requests.push(body["previous_revision"].clone());
     if fake.refresh_next {
         fake.refresh_next = false;
-        fake.generation += 1;
-    } else if fake.generation > 1 && fake.extra_refreshes > 0 {
-        fake.extra_refreshes -= 1;
-        fake.generation += 1;
+        fake.generation += 1 + u64::from(fake.extra_refreshes);
+        fake.extra_refreshes = 0;
     }
     let generation = fake.generation;
     let now = chrono::Utc::now().timestamp_millis();
@@ -104,7 +102,7 @@ signal.signal(signal.SIGTERM, term)
 with open(os.environ["FAKE_LOG"] + ".ready", "w") as ready:
     ready.write("idle")
 # A watchdog: a build that never restarts fails the test instead of hanging it.
-deadline = time.time() + 20
+deadline = time.time() + float(os.environ.get("FAKE_WATCHDOG_S", "20"))
 while time.time() < deadline:
     time.sleep(0.05)
 sys.exit(99)
@@ -284,8 +282,8 @@ fn a_relaunch_under_a_terminal_owns_the_foreground() {
     }
 }
 
-/// A second refresh after the successor was fetched: the relaunch uses the newest token,
-/// never a revoked one.
+/// Two refreshes before Claude went idle enough: the relaunch uses the newest token, taken
+/// right before the restart, never a revoked one.
 #[test]
 fn a_restart_uses_the_newest_token_when_the_server_refreshed_again() {
     let env = Env::new();
@@ -309,4 +307,49 @@ fn a_restart_uses_the_newest_token_when_the_server_refreshed_again() {
         String::from_utf8_lossy(&output.stderr)
     );
     env.assert_followed(&env.runs(), "token-3");
+}
+
+/// A busy Claude (a turn that never ends) never makes the monitor ask for a token: inside the
+/// server's margin such a request would refresh the grant and revoke the token the turn uses.
+#[test]
+fn a_busy_claude_never_triggers_a_token_request() {
+    let env = Env::new();
+    // This Claude starts a turn and stays in it until SIGTERM or its watchdog.
+    std::fs::write(
+        &env.claude,
+        FAKE_CLAUDE.replace(
+            r#"{"hook_event_name": "Stop", "session_id": "sess-1"}"#,
+            r#"{"hook_event_name": "UserPromptSubmit", "session_id": "sess-1"}"#,
+        ),
+    )
+    .unwrap();
+    let digest = claudectl::exec::sha256_file(&env.claude).unwrap();
+    private_write(
+        &env.home
+            .path()
+            .join(".claudectl/server/qualified-host-config-builds.json"),
+        &json!([{"sha256": digest, "platform": "linux", "qualified_at": "test",
+            "check": "supervised_host_config"}])
+        .to_string(),
+    );
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+    env.env(&mut command);
+    command
+        .env("FAKE_WATCHDOG_S", "3")
+        .args(["server", "run", "work", "--claude"])
+        .arg(&env.claude)
+        .args(["--", "--model", "opus"]);
+    let output = Command::from_std(command)
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    // The watchdog ended the busy Claude; server run ends with its code, no restart.
+    assert_eq!(
+        output.status.code(),
+        Some(99),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Only the launch asked for a token.
+    assert_eq!(env.fake.lock().unwrap().requests.len(), 1);
 }

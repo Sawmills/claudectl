@@ -82,8 +82,15 @@ pub(super) struct Idle {
     pub since: Option<i64>,
 }
 
+#[cfg(test)]
 pub(super) fn idle_state(events: &[(i64, Event)]) -> Idle {
     let mut idle = Idle::default();
+    fold(&mut idle, events);
+    idle
+}
+
+/// Apply newly read events to the idle state (the monitor reads the log incrementally).
+pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
     for (at, event) in events {
         match event {
             Event::SessionStart(session) => {
@@ -98,7 +105,6 @@ pub(super) fn idle_state(events: &[(i64, Event)]) -> Idle {
             }
         }
     }
-    idle
 }
 
 /// The relaunch arguments: the user's arguments without resume, continue, session-id and
@@ -172,26 +178,36 @@ pub(super) fn decide(i: &Inputs) -> Decision {
     if i.server_expires_at <= i.held_expires_at {
         return Decision::Wait("the new token does not outlive the held one");
     }
+    match idle_gate(i) {
+        Ok(()) => Decision::Restart,
+        Err(reason) => Decision::Wait(reason),
+    }
+}
+
+/// Whether Claude is idle enough to be restarted. The monitor also asks the server for the
+/// token only when this holds: inside the server's margin that request refreshes the grant,
+/// which revokes the token a running turn uses.
+pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     if i.idle.session.is_none() {
-        return Decision::Wait("no session id from Claude yet");
+        return Err("no session id from Claude yet");
     }
     match i.idle.since {
-        None => return Decision::Wait("a turn is running"),
+        None => return Err("a turn is running"),
         Some(since) if i.now - since < i.idle_after_ms => {
-            return Decision::Wait("the last turn ended less than 60 s ago");
+            return Err("the last turn ended less than 60 s ago");
         }
         Some(_) => {}
     }
     if i.tty_idle_ms.is_some_and(|ms| ms < i.tty_gate_ms) {
-        return Decision::Wait("terminal input in the last 5 min");
+        return Err("terminal input in the last 5 min");
     }
     if i.group_grew {
-        return Decision::Wait("Claude has extra processes running");
+        return Err("Claude has extra processes running");
     }
     if i.restarts_last_hour >= RESTARTS_PER_HOUR {
-        return Decision::Wait("restart budget used up for this hour");
+        return Err("restart budget used up for this hour");
     }
-    Decision::Restart
+    Ok(())
 }
 
 /// Append one hook event to `<session dir>/events`. Only the event name, session id,
@@ -229,8 +245,14 @@ pub(super) fn record_hook(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options.open(&path)?;
-    writeln!(file, "{line}")?;
+    let written = options
+        .open(&path)
+        .and_then(|mut file| writeln!(file, "{line}"));
+    if let Err(error) = written {
+        // Tell the monitor its log is incomplete: it then stops renewing this session.
+        let _ = std::fs::File::create(dir.join("hook-error"));
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -453,6 +475,18 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn a_hook_that_cannot_record_leaves_the_error_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let dir = sessions.join("run-z");
+        // `events` is a directory: the append fails.
+        std::fs::create_dir_all(dir.join("events")).unwrap();
+        let input = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#;
+        assert!(record_hook(&sessions, &dir, input, 1).is_err());
+        assert!(dir.join("hook-error").exists());
     }
 
     #[test]

@@ -124,7 +124,8 @@ forces a refresh: it takes the current token, and the server refreshes on demand
 hooks (`--settings <session dir>/hooks.json`, run by a private copy of claudectl) for
 `SessionStart`, `UserPromptSubmit`, `Stop` and the `idle_prompt` notification, which record
 only the event, the session id and the time in `<session dir>/events`. It asks the server
-for the current token every 30 min, and every 5 min in the token's last hour. When the
+for the current token only while Claude passes every idle gate below, at most every 30 min
+(every 5 min in the token's last hour). When the
 revision changed (a refresh revoked the held token), it restarts Claude with
 `--resume <latest session>` on the new token, in the same folder and terminal, from the same
 checked build, and prints `claudectl: server token renewed; resuming session <id>`. It
@@ -134,7 +135,8 @@ access time), no more processes in Claude's group than when it first settled, an
 than 3 restarts in the last hour. A turn in progress is never cut; a draft typed earlier
 than the input gate is lost on restart. Relaunch happens only after claudectl's own
 SIGTERM; any other exit ends `server run` with Claude's exit code. A `-p`/`--print` run is
-never restarted. If Claude sends no hook event within 30 s, renewal is off for that session.
+never restarted. If Claude sends no hook event within 30 s, or a hook could not record an event (the
+`hook-error` marker), renewal is off for that session.
 `session.json` (alias, account, `expires_at`, pid, `renewal`: `on`, `off: <reason>` or
 `renewing`; no token) is updated on every renewal; a supervisor leaves expiry to
 `server run` and skips a renewing session. A per-session lock protects live session
@@ -157,9 +159,12 @@ Conversations that a `server run` before this model stored in
 `<project>/<session>.jsonl` into `~/.claude/projects/<project>/`; otherwise delete the
 directory.
 
-While Claude runs, the client polls the server every five seconds for usage only; it never
-changes the token of the running process. The server refreshes before expiry. After an
-early provider 401, use `server refresh-access work`, then relaunch with `--resume`.
+While Claude runs, the client reads usage every five minutes. It never changes the token of
+the running process; it asks for the current token only while Claude is idle (above), so a
+refresh that request triggers never revokes the token of a running turn of this session.
+Another session's request can still trigger the refresh; a busy session then fails its next
+request and restarts at its next idle point. After an early provider 401, wait for the
+renewal or use `server refresh-access work` (it ends every running session of the account).
 The client never replays tools. On server outage, the token of a running session stays
 valid until provider expiry or rejection. Revocation
 stops new acquisitions; it cannot revoke an access token already delivered.

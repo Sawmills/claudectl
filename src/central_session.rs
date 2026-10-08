@@ -384,8 +384,10 @@ impl Monitor {
         let mut last_usage = 0;
         let mut last_check = 0;
         let mut renewing = self.renewable;
-        let mut pending: Option<Access> = None;
         let mut baseline: Option<usize> = None;
+        let mut offset: u64 = 0;
+        let mut idle = renew::Idle::default();
+        let mut seen_start = false;
         let mut sent: Option<(i64, Restart)> = None;
         while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
             stopped.recv_timeout(Duration::from_millis(timing.tick_ms))
@@ -411,12 +413,33 @@ impl Monitor {
             if !renewing {
                 continue;
             }
-            let text = std::fs::read_to_string(self.directory.join("events")).unwrap_or_default();
-            let events = renew::parse_events(&text);
-            if !events
-                .iter()
-                .any(|(_, e)| matches!(e, renew::Event::SessionStart(_)))
-            {
+            // A hook that could not record an event leaves this marker: the event log may
+            // miss a prompt, so it can no longer prove Claude idle.
+            if self.directory.join("hook-error").exists() {
+                eprintln!(
+                    "claudectl: a Claude hook event was not recorded; server token renewal is off for this session"
+                );
+                outcome.note = Some("off: hook write failed".into());
+                renewing = false;
+                continue;
+            }
+            // Read only what the hooks appended since the last tick.
+            if let Ok(mut file) = File::open(self.directory.join("events")) {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut chunk = String::new();
+                if file.seek(SeekFrom::Start(offset)).is_ok()
+                    && file.read_to_string(&mut chunk).is_ok()
+                    && let Some(end) = chunk.rfind('\n')
+                {
+                    offset += end as u64 + 1;
+                    let events = renew::parse_events(&chunk[..end]);
+                    seen_start |= events
+                        .iter()
+                        .any(|(_, e)| matches!(e, renew::Event::SessionStart(_)));
+                    renew::fold(&mut idle, &events);
+                }
+            }
+            if !seen_start {
                 if now() - started > timing.hooks_wait_ms {
                     eprintln!(
                         "claudectl: Claude sent no hook events; server token renewal is off for this session"
@@ -426,27 +449,10 @@ impl Monitor {
                 }
                 continue;
             }
-            let idle = renew::idle_state(&events);
             // Claude starts its MCP servers after SessionStart: take the baseline once it settled.
             if idle.since.is_some() && baseline.is_none() && now() - started >= timing.settle_ms {
                 baseline = exec::group_size(self.pid);
             }
-            let interval = if self.held_expires_at - now() < 3_600_000 {
-                timing.poll_near_ms
-            } else {
-                timing.poll_far_ms
-            };
-            if pending.is_none() && now() - last_check >= interval {
-                last_check = now();
-                if let Ok(access) = self.client.acquire(&self.account_id, None)
-                    && access.revision != self.held_revision
-                {
-                    pending = Some(access);
-                }
-            }
-            let Some(next) = &pending else {
-                continue;
-            };
             // Unknown membership counts as grown: never restart over unknown processes.
             let group_grew = match (baseline, exec::group_size(self.pid)) {
                 (Some(before), Some(current)) => current > before,
@@ -459,33 +465,41 @@ impl Monitor {
                     .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
                     .map_or(0, |at| now() - at.as_millis() as i64)
             });
-            let decision = renew::decide(&renew::Inputs {
+            let mut inputs = renew::Inputs {
                 now: now(),
                 held_revision: &self.held_revision,
                 held_expires_at: self.held_expires_at,
-                server_revision: &next.revision,
-                server_expires_at: next.expires_at,
+                server_revision: &self.held_revision,
+                server_expires_at: self.held_expires_at,
                 idle: &idle,
                 idle_after_ms: timing.idle_after_ms,
                 tty_gate_ms: timing.tty_idle_ms,
                 tty_idle_ms,
                 group_grew,
                 restarts_last_hour: self.restarts,
-            });
-            if decision == renew::Decision::Restart
-                && let Some(session_id) = idle.session
+            };
+            // Ask the server only while idle: near expiry the request refreshes the grant and
+            // revokes the token a running turn would still use.
+            if renew::idle_gate(&inputs).is_err() {
+                continue;
+            }
+            let interval = if self.held_expires_at - now() < 3_600_000 {
+                timing.poll_near_ms
+            } else {
+                timing.poll_far_ms
+            };
+            if now() - last_check < interval {
+                continue;
+            }
+            last_check = now();
+            let Ok(access) = self.client.acquire(&self.account_id, None) else {
+                continue;
+            };
+            inputs.server_revision = &access.revision;
+            inputs.server_expires_at = access.expires_at;
+            if renew::decide(&inputs) == renew::Decision::Restart
+                && let Some(session_id) = idle.session.clone()
             {
-                // The cached successor may itself be revoked by a later refresh: take the
-                // current token now, and restart only if it is still a newer revision.
-                pending = None;
-                let Ok(access) = self.client.acquire(&self.account_id, None) else {
-                    continue;
-                };
-                if access.revision == self.held_revision
-                    || access.expires_at <= self.held_expires_at
-                {
-                    continue;
-                }
                 // Supervisors see the handoff before Claude stops.
                 let mut status = self.status.clone();
                 status["renewal"] = "renewing".into();
@@ -567,6 +581,10 @@ pub fn run(
             exec::take_foreground(&mut command);
         }
         let _ = std::fs::remove_file(session.directory().join("events"));
+        if !first {
+            // Before spawn: a failed write must not leave a Claude without its monitor.
+            session.set_renewal("on")?;
+        }
         let mut child = command.spawn().context("could not start Claude")?;
         let pid = child.id();
         exec::signals::watch(pid);
@@ -576,9 +594,6 @@ pub fn run(
         } else {
             Foreground(own_group)
         };
-        if !first {
-            session.set_renewal("on")?;
-        }
         let (stop, stopped) = std::sync::mpsc::channel();
         let monitor = Monitor {
             client: client.clone(),
