@@ -58,8 +58,10 @@ receipt lookup.
 `migrate --abort ALIAS` first asks the server to cancel the migration ID. The server
 records the cancel under the alias lock (a cancelled tombstone when nothing arrived yet),
 so a delayed import with that ID is rejected (`409 migration_cancelled`). Only after the
-server confirms the cancel does abort restore the local grant (and, for the live login,
-the Keychain login if it is gone). Once the admission committed, the cancel is refused
+server confirms the cancel does abort restore the local grant, into the profile only. Abort
+never writes the live login, so a login made after any check is never replaced; for a live
+migration the profile gets the fenced live grant, and abort prints `claudectl use <alias>`
+to make it live again. Once the admission committed, the cancel is refused
 (`409 migration_admitted`) and abort reports the state; for a superseded or deleted server
 account it drops the fence without keeping a copy.
 

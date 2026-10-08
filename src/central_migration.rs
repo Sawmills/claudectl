@@ -862,21 +862,16 @@ pub fn abort(paths: &Paths, client: &Client, alias: &str) -> Result<()> {
     let profile_file = paths.profiles_dir().join(alias).join("credentials.json");
     let retained = dir.join("grant.json");
     let aside = dir.join("profile-credentials.json");
-    if restore && journal.live && retained.try_exists()? {
-        // The live login first: put the fenced grant back unless a newer login replaced it.
-        let present = store.read_live_grant()?.is_some() || live_file(paths)?.is_some();
-        if !present {
-            let creds: CredentialsFile = serde_json::from_slice(&private_read(&retained)?)
-                .map_err(|_| anyhow::anyhow!("invalid retained migration grant"))?;
-            // Conditional create: a login that appeared since the check is never replaced.
-            if !store.create_live_login_if_absent(&creds)? {
-                bail!(
-                    "a new live login appeared during the abort; nothing restored. The fence and its grant stay; rerun --abort"
-                );
-            }
-        }
-    }
-    let copy = if journal.live { &aside } else { &retained };
+    // Abort never writes the live login: a login made after any check would be replaced.
+    // The profile gets the fenced grant; for a live migration that is the retained live
+    // grant, the newest copy of the account (the set-aside profile copy may be older).
+    let copy = if journal.live && retained.try_exists()? {
+        &retained
+    } else if journal.live {
+        &aside
+    } else {
+        &retained
+    };
     if restore && copy.try_exists()? {
         if profile_file.try_exists()? {
             bail!("credentials reappeared in the profile; reconcile before aborting");
@@ -890,7 +885,11 @@ pub fn abort(paths: &Paths, client: &Client, alias: &str) -> Result<()> {
     }
     std::fs::remove_file(&journal_path)?;
     File::open(&dir)?.sync_all()?;
-    if restore {
+    if restore && journal.live {
+        println!(
+            "Migration of {alias} aborted; the grant is restored to profile {alias}. The live login was not changed; run `claudectl use {alias}` to make it live."
+        );
+    } else if restore {
         println!("Migration of {alias} aborted; the local grant is restored.");
     } else {
         println!(

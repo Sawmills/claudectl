@@ -581,27 +581,50 @@ fn an_expired_inactive_profile_is_refreshed_before_its_fence() {
 }
 
 #[test]
-fn abort_of_a_live_migration_restores_the_live_login() {
+fn abort_of_a_live_migration_restores_the_profile_and_never_the_live_login() {
     let env = Env::new();
     env.live("me", "u-me-0000", "live");
     env.script("me", Script::Down);
     let (_, text) = env.run(&["--all", "--exclusive-owner"], "");
     assert!(env.fenced("me"), "{text}");
-    // The live login is lost meanwhile (for example a logout); the fence holds the only copy.
+    // The live login is lost meanwhile (for example a logout); abort does not recreate it.
     std::fs::remove_file(env.paths.claude_credentials_file()).unwrap();
     let (ok, text) = env.run(&["--abort", "me"], "");
     assert!(ok, "{text}");
-    let restored: CredentialsFile =
-        serde_json::from_slice(&std::fs::read(env.paths.claude_credentials_file()).unwrap())
-            .unwrap();
+    assert!(text.contains("claudectl use me"), "{text}");
+    assert!(
+        !env.paths.claude_credentials_file().exists(),
+        "abort wrote the live login"
+    );
+    let restored = profile::get_profile_from(&env.paths, "me")
+        .unwrap()
+        .read_credentials()
+        .unwrap();
+    // The profile gets the fenced live grant, the newest copy of the account.
     assert_eq!(
         restored.claude_ai_oauth.refresh_token.as_deref(),
         Some("live-refresh")
     );
-    assert!(
-        env.has_credentials("me"),
-        "the profile copy is restored too"
+    assert!(!env.fenced("me"));
+}
+
+#[test]
+fn abort_leaves_a_login_made_after_the_fence_untouched() {
+    let env = Env::new();
+    env.live("me", "u-me-0000", "live");
+    env.script("me", Script::Down);
+    let (_, text) = env.run(&["--all", "--exclusive-owner"], "");
+    assert!(env.fenced("me"), "{text}");
+    // Another login lands while the fence holds.
+    let newer = serde_json::to_string(&creds("newer", 3_600_000)).unwrap();
+    private_write(&env.paths.claude_credentials_file(), &newer);
+    let (ok, text) = env.run(&["--abort", "me"], "");
+    assert!(ok, "{text}");
+    assert_eq!(
+        std::fs::read_to_string(env.paths.claude_credentials_file()).unwrap(),
+        newer
     );
+    assert!(env.has_credentials("me"));
     assert!(!env.fenced("me"));
 }
 
