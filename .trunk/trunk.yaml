@@ -22,5 +22,8 @@ lint:
     - trivy # install issues in CI
     - trufflehog # not needed for public repo
 actions:
+  disabled:
+    - trunk-fmt-pre-commit
+    - trunk-check-pre-push
   enabled:
     - trunk-upgrade-available
