@@ -176,9 +176,11 @@ impl AuthStore {
             .transpose()
     }
 
-    /// Restore a live login only where none exists. Never replaces a login another process
-    /// created: Ok(false) when one is there. On macOS the Keychain item is the authority and
-    /// is added without `-U` (fails if it exists); the file is created only if absent.
+    /// Restore a live login only where none exists, with one atomic conditional create per
+    /// platform; a login another process created is never replaced (Ok(false)). macOS: the
+    /// Keychain item is the login Claude Code reads; it is added without `-U` and the file is
+    /// left alone (touching it too would open a window between the two writes). Elsewhere the
+    /// credentials file is the login, created with O_EXCL.
     pub(crate) fn create_live_login_if_absent(&self, creds: &CredentialsFile) -> Result<bool> {
         let json = serde_json::to_string(creds)?;
         if self.keychain {
@@ -197,14 +199,15 @@ impl AuthStore {
                 .stdin(Stdio::null())
                 .output()
                 .context("failed to run security(1)")?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                // 45 = errSecDuplicateItem: another login exists; leave it.
-                if output.status.code() == Some(45) || stderr.contains("already exists") {
-                    return Ok(false);
-                }
-                bail!("{}", keychain_write_error(stderr.trim()));
+            if output.status.success() {
+                return Ok(true);
             }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // 45 = errSecDuplicateItem: another login exists; leave it.
+            if output.status.code() == Some(45) || stderr.contains("already exists") {
+                return Ok(false);
+            }
+            bail!("{}", keychain_write_error(stderr.trim()));
         }
         let path = self.paths.claude_credentials_file();
         if let Some(parent) = path.parent() {
@@ -224,8 +227,7 @@ impl AuthStore {
                 file.sync_all()?;
                 Ok(true)
             }
-            // Without a Keychain the file is the login: someone else created it.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(self.keychain),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
             Err(e) => Err(e).context("could not restore the live credentials file"),
         }
     }
