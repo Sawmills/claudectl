@@ -529,20 +529,24 @@ fn stale(usage: &Usage) -> bool {
             .observed_at
             .is_none_or(|at| at > now() || at.saturating_add(300_000) <= now())
 }
+/// A saved server read, if it belongs to the current server and user.
+fn cached_entry(paths: &Paths, connection: &Connection, file: &Path) -> Option<CachedUsage> {
+    let mut cache = private_read(file)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CachedUsage>(&bytes).ok())
+        .filter(|cache| connection.server == cache.server && connection.user_id == cache.user_id)?;
+    // The file name is the alias digest: a renamed copy is not this alias.
+    (cache_path(paths, &cache.account.alias) == file).then(|| {
+        cache.usage.stale = stale(&cache.usage);
+        cache
+    })
+}
 /// The last usage this machine read for `alias` from its current server, if any.
 fn cached_usage(paths: &Paths, alias: &str) -> Option<Usage> {
     let connection = cached_connection(paths)?;
-    let mut usage = private_read(&cache_path(paths, alias))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<CachedUsage>(&bytes).ok())
-        .filter(|cache| {
-            cache.account.alias.eq_ignore_ascii_case(alias)
-                && connection.server == cache.server
-                && connection.user_id == cache.user_id
-        })
-        .map(|cache| cache.usage)?;
-    usage.stale = stale(&usage);
-    Some(usage)
+    cached_entry(paths, &connection, &cache_path(paths, alias))
+        .filter(|cache| cache.account.alias.eq_ignore_ascii_case(alias))
+        .map(|cache| cache.usage)
 }
 fn save_usage(paths: &Paths, client: &Client, account: &Account, usage: &Usage) -> Result<()> {
     atomic(
@@ -650,20 +654,33 @@ pub enum ServerView {
 /// the provider at most once per 5 minutes, so the reads run in parallel. `cached` reads
 /// only this machine's saved copies of the `known` aliases and sends nothing.
 pub fn server_view(paths: &Paths, cached: bool, known: &[String]) -> ServerView {
-    if cached_connection(paths).is_none() {
+    let Some(connection) = cached_connection(paths) else {
         return ServerView::NotConnected;
-    }
+    };
     if cached {
-        return ServerView::Rows(
-            known
-                .iter()
-                .map(|alias| ServerRow {
+        // Every account this machine last read from the server, with what the server said.
+        let mut rows: Vec<ServerRow> = std::fs::read_dir(root(paths).join("status"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| cached_entry(paths, &connection, &entry.path()))
+            .map(|cache| ServerRow {
+                alias: cache.account.alias,
+                available: cache.account.available,
+                usage: Ok(cache.usage),
+            })
+            .collect();
+        for alias in known {
+            if !rows.iter().any(|r| r.alias.eq_ignore_ascii_case(alias)) {
+                rows.push(ServerRow {
                     alias: alias.clone(),
                     available: true,
-                    usage: cached_usage(paths, alias).ok_or_else(|| "no saved usage".into()),
-                })
-                .collect(),
-        );
+                    usage: Err("no saved usage".into()),
+                });
+            }
+        }
+        rows.sort_by(|a, b| a.alias.cmp(&b.alias));
+        return ServerView::Rows(rows);
     }
     let client = match Client::load(paths) {
         Ok(client) => client,

@@ -457,6 +457,14 @@ fn fetch_usages_with_refresh(
                 is_active,
                 ..FetchedUsage::default()
             };
+            // A migrated account runs from the server. The live login may still hold its
+            // retired grant until the user logs out: never read or use it here.
+            if claudectl::central::is_migrated(paths, &profile.meta.alias) {
+                result.error = Some(MIGRATED.into());
+                result.on_server = true;
+                fetched.push(result);
+                continue;
+            }
             let creds = if is_active {
                 live_creds
                     .clone()
@@ -466,12 +474,6 @@ fn fetch_usages_with_refresh(
             };
             let mut creds = match creds {
                 Ok(creds) => creds,
-                Err(_) if claudectl::central::is_migrated(paths, &profile.meta.alias) => {
-                    result.error = Some(MIGRATED.into());
-                    result.on_server = true;
-                    fetched.push(result);
-                    continue;
-                }
                 Err(_) => {
                     result.error = Some("credentials unavailable or invalid".into());
                     fetched.push(result);

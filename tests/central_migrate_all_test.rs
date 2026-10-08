@@ -58,6 +58,8 @@ struct Fake {
     cancelled: HashSet<String>,
     /// Account and usage reads answer 503.
     down: bool,
+    /// Server accounts the server marks unavailable.
+    unavailable: HashSet<String>,
 }
 type Shared = Arc<Mutex<Fake>>;
 
@@ -149,7 +151,7 @@ async fn accounts(State(fake): State<Shared>) -> Response {
                 "account_id": "a".repeat(64),
                 "alias": alias,
                 "identity": {"account_uuid": fake.identities[*alias], "organization_uuid": "org"},
-                "available": true,
+                "available": !fake.unavailable.contains(*alias),
             }))
             .collect::<Vec<_>>()
     ))
@@ -534,6 +536,34 @@ fn status_is_one_table_of_local_and_server_accounts() {
         "a migrated alias shows once:\n{text}"
     );
 
+    // A server-only account (signed in on the server) and an unavailable one, saved by a
+    // normal run, still show offline with --cached.
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.identities.insert("srv".into(), "u-srv-000".into());
+        fake.imported_refresh
+            .insert("srv".into(), "server-login".into());
+        fake.unavailable.insert("b2".into());
+    }
+    let (ok, text) = env.cli(&["status", "--json"]);
+    assert!(ok, "{text}");
+    let (ok, text) = env.cli(&["status", "--json", "--cached"]);
+    assert!(ok, "{text}");
+    let doc = report(&text);
+    let remote = doc["server"]["accounts"].as_array().unwrap();
+    let find = |alias: &str| {
+        remote
+            .iter()
+            .find(|a| a["alias"] == alias)
+            .unwrap_or_else(|| panic!("{alias} missing: {text}"))
+    };
+    assert_eq!(find("srv")["available"], true, "{text}");
+    assert_eq!(find("b2")["available"], false, "{text}");
+    assert_eq!(find("a1")["available"], true, "{text}");
+    let (ok, text) = env.cli(&["status", "--cached"]);
+    assert!(ok, "{text}");
+    assert!(text.contains("srv"), "{text}");
+
     // Server down: local rows still print, server rows say so, exit 0.
     env.fake.lock().unwrap().down = true;
     let (ok, text) = env.cli(&["status"]);
@@ -546,6 +576,33 @@ fn status_is_one_table_of_local_and_server_accounts() {
     let doc = report(&text);
     assert_eq!(doc["server"]["state"], "unreachable", "{text}");
     assert_eq!(doc["accounts"].as_array().unwrap().len(), 3, "{text}");
+}
+
+#[test]
+fn status_shows_a_migrated_live_login_once_as_a_server_row() {
+    let env = Env::new();
+    env.live("me", "u-me-0000", "live");
+    let (ok, text) = env.all();
+    assert!(ok, "{text}");
+    // The live login still holds the retired grant until the user logs out.
+    assert!(env.paths.claude_credentials_file().exists());
+    let (ok, text) = env.cli(&["status", "--json"]);
+    assert!(ok, "{text}");
+    let json = &text[text.find('{').unwrap()..=text.rfind('}').unwrap()];
+    let doc: Value = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        doc["accounts"][0]["error"], "migrated to the account server",
+        "{text}"
+    );
+    assert_eq!(doc["server"]["accounts"][0]["alias"], "me", "{text}");
+    let (ok, text) = env.cli(&["status"]);
+    assert!(ok, "{text}");
+    assert_eq!(
+        text.lines().filter(|l| l.contains(" me ")).count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("on server"), "{text}");
 }
 
 #[test]
