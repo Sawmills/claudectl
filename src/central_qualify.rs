@@ -166,6 +166,13 @@ fn check(
             Ok(())
         }
         outcome => {
+            // The latest result wins: a failed re-check withdraws an earlier pass.
+            let builds = load(paths)?;
+            if builds.iter().any(|q| q.covers(digest)) {
+                let kept: Vec<Qualified> =
+                    builds.into_iter().filter(|q| !q.covers(digest)).collect();
+                atomic(&path(paths), &kept)?;
+            }
             failures.push(Failed {
                 sha256: digest.into(),
                 platform: std::env::consts::OS.into(),
@@ -182,21 +189,7 @@ fn check(
     }
 }
 
-/// `server run` on a build it does not know: check the exact snapshot it will run, once per
-/// build across concurrent launches. A recent failure refuses without a new check.
-pub(super) fn ensure(
-    paths: &Paths,
-    snapshot: &Path,
-    digest: &str,
-    harness: impl FnOnce(&Path, &str) -> Result<bool>,
-) -> Result<()> {
-    if known(paths, digest)? {
-        return Ok(());
-    }
-    let _qualifying = qualify_lock(paths, LOCK_WAIT)?;
-    if known(paths, digest)? {
-        return Ok(());
-    }
+fn refuse_recent_failure(paths: &Paths, digest: &str) -> Result<()> {
     let hold = chrono::Duration::minutes(FAILURE_HOLD_MINUTES);
     if let Some(failed) = load_failures(paths)?.into_iter().find(|f| f.covers(digest))
         && chrono::DateTime::parse_from_rfc3339(&failed.failed_at)
@@ -206,6 +199,27 @@ pub(super) fn ensure(
             "Claude build {digest} failed the launcher check at {}; run `claudectl server qualify` to check it again",
             failed.failed_at
         );
+    }
+    Ok(())
+}
+
+/// `server run` on a build it does not know: check the exact snapshot it will run, once per
+/// build across concurrent launches. A recent failure refuses without a new check.
+pub(super) fn ensure(
+    paths: &Paths,
+    snapshot: &Path,
+    digest: &str,
+    harness: impl FnOnce(&Path, &str) -> Result<bool>,
+) -> Result<()> {
+    // A recent failure refuses even a built-in or earlier-qualified build.
+    refuse_recent_failure(paths, digest)?;
+    if known(paths, digest)? {
+        return Ok(());
+    }
+    let _qualifying = qualify_lock(paths, LOCK_WAIT)?;
+    refuse_recent_failure(paths, digest)?;
+    if known(paths, digest)? {
+        return Ok(());
     }
     eprintln!(
         "claudectl: qualifying Claude build {} (first use, about 15 s)",
@@ -309,6 +323,16 @@ fn print_tail(stderr: &[u8]) {
 }
 
 /// Run `command` to completion within `limit`; past it, kill its process group and fail.
+#[cfg(not(unix))]
+fn output_within(
+    _command: &mut std::process::Command,
+    _limit: Duration,
+) -> Result<std::process::Output> {
+    bail!("Claude build qualification supports Linux and macOS")
+}
+
+/// Run `command` to completion within `limit`; past it, kill its process group and fail.
+#[cfg(unix)]
 fn output_within(
     command: &mut std::process::Command,
     limit: Duration,
@@ -420,6 +444,23 @@ mod tests {
         let (_dir2, file2, digest2) = snapshot_of(&paths2, &binary2);
         assert!(ensure(&paths2, &file2, &digest2, |_, _| bail!("no python3")).is_err());
         assert!(ensure(&paths2, &file2, &digest2, |_, _| panic!("rerun")).is_err());
+    }
+
+    #[test]
+    fn a_failed_recheck_of_a_known_build_refuses_it() {
+        let (_home, paths, binary) = fixture();
+        let (_dir, file, digest) = snapshot_of(&paths, &binary);
+        qualify_with(&paths, &binary, |_, _| Ok(true)).unwrap();
+        assert!(qualify_with(&paths, &binary, |_, _| Ok(false)).is_err());
+        assert!(
+            !is_qualified(&paths, &digest).unwrap(),
+            "the failed check kept the pass"
+        );
+        let error = ensure(&paths, &file, &digest, |_, _| panic!("rerun")).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("claudectl server qualify"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -550,6 +591,7 @@ mod tests {
         assert!(!is_qualified(&paths, &exec::sha256_file(&binary).unwrap()).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_harness_command_past_its_time_limit_is_killed() {
         let mut command = std::process::Command::new("sleep");

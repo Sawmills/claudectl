@@ -167,6 +167,7 @@ pub(super) fn program(path: &Path) -> Result<PathBuf> {
         .canonicalize()
         .map_err(Into::into)
 }
+#[cfg(unix)]
 /// A private copy of the Claude build, made once before any server call. Its hash is what is
 /// checked, recorded and run, whatever happens to the source afterwards.
 struct Build {
@@ -174,6 +175,7 @@ struct Build {
     file: PathBuf,
     digest: String,
 }
+#[cfg(unix)]
 fn snapshot_build(paths: &Paths, binary: &Path) -> Result<Build> {
     let builds = root(paths).join("builds");
     private_dir(&builds)?;
@@ -211,6 +213,7 @@ fn snapshot_build(paths: &Paths, binary: &Path) -> Result<Build> {
         digest,
     })
 }
+#[cfg(unix)]
 /// The build `server run` will execute, qualified on first use; nothing touches the server
 /// before it passes.
 fn qualified_build(
@@ -226,6 +229,7 @@ fn qualified_build(
     Ok(build)
 }
 
+#[cfg(unix)]
 fn snapshot_binary(source: &Path, destination: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -379,6 +383,7 @@ impl Drop for Foreground {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn the_checked_copy_is_what_runs_when_the_source_is_swapped_mid_check() {
         let home = tempfile::tempdir().unwrap();
@@ -399,6 +404,7 @@ mod tests {
         assert!(!super::super::qualify::known(&paths, &swapped).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_launch_removes_build_copies_of_dead_launches_and_keeps_live_ones() {
         let home = tempfile::tempdir().unwrap();
@@ -421,6 +427,7 @@ mod tests {
         assert!(build.file.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_build_that_fails_its_first_check_is_refused_before_any_server_call() {
         let home = tempfile::tempdir().unwrap();
