@@ -465,14 +465,15 @@ fn claude_authorize(url: &reqwest::Url) -> bool {
             (Some("claude.ai"), "/oauth/authorize") | (Some("claude.com"), "/cai/oauth/authorize")
         )
 }
-/// A failed login completion in plain words, by the server's reason.
-fn login_failure(reason: &str) -> Option<String> {
+/// A failed login completion in plain words, by the server's reason. `id` is the login,
+/// for the reasons where the server kept the acquired grant and the login can resume.
+fn login_failure(reason: &str, id: &str) -> Option<String> {
     Some(match reason {
         "login_identity_changed" => "this sign-in is a different Claude account or organization than the saved one (a plan change can move the account to a new organization). Renewal never changes identity: run claudectl server remove <alias>, then claudectl server login <alias>".into(),
         "login_exchange_rejected" => "Claude rejected the sign-in code. Start again and paste the newest code#state within a few minutes".into(),
         "login_state_mismatch" => "the pasted code belongs to another sign-in. Paste the code#state shown for this login".into(),
         "login_expired" => "this sign-in expired. Start the login again".into(),
-        "login_identity_lookup_failed" => "Claude did not confirm which account signed in. Try again; if it repeats, the account may be blocked".into(),
+        "login_identity_lookup_failed" => format!("Claude did not confirm which account signed in; the server kept the sign-in result. Retry verification with claudectl server complete-login {id} --resume; if it repeats, the account may be blocked"),
         _ => return None,
     })
 }
@@ -506,7 +507,7 @@ pub fn login(client: &Client, alias: &str, renew: bool, no_browser: bool) -> Res
         .map_err(|error| {
             let plain = error
                 .downcast_ref::<ServerError>()
-                .and_then(|e| login_failure(&e.reason));
+                .and_then(|e| login_failure(&e.reason, &login.id));
             match plain {
                 Some(plain) => error.context(plain),
                 None => error.context(format!("login result retained if acquired; retry verification with claudectl server complete-login {} --resume", login.id)),
@@ -847,13 +848,19 @@ mod tests {
             "login_expired",
             "login_identity_lookup_failed",
         ] {
-            assert!(super::login_failure(reason).is_some(), "{reason}");
+            assert!(super::login_failure(reason, "L1").is_some(), "{reason}");
         }
-        assert!(super::login_failure("login_incomplete_grant_retained").is_none());
+        assert!(super::login_failure("login_incomplete_grant_retained", "L1").is_none());
         assert!(
-            super::login_failure("login_identity_changed")
+            super::login_failure("login_identity_changed", "L1")
                 .unwrap()
                 .contains("claudectl server remove")
+        );
+        // The server kept the grant: the user can resume this login.
+        assert!(
+            super::login_failure("login_identity_lookup_failed", "L1")
+                .unwrap()
+                .contains("claudectl server complete-login L1 --resume")
         );
     }
 }
