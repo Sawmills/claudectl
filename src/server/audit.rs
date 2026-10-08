@@ -18,6 +18,9 @@ pub struct Event<'a> {
     /// The revoked machine, for a machine revoke.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<&'a str>,
+    /// Why a refresh ran: forced, expired, migration or margin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
 }
 
 /// An audit write failure fails the operation it records.

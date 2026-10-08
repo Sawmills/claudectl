@@ -336,6 +336,16 @@ async fn metrics_count_failures_by_reason_with_the_last_failure_time() {
         .parse()
         .unwrap();
     assert!((now - 5..=now).contains(&last));
+    // Every rotation reason is exported before its first event.
+    for reason in ["expired", "forced", "margin", "migration"] {
+        for series in [
+            "claudectl_token_rotations_total",
+            "claudectl_token_last_rotation_timestamp_seconds",
+        ] {
+            let line = format!("{series}{{reason=\"{reason}\"}} 0\n");
+            assert!(text.contains(&line), "{line} in {text}");
+        }
+    }
 }
 
 #[tokio::test]
