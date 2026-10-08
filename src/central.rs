@@ -647,8 +647,45 @@ pub struct ServerRow {
 /// What the account server reports for `claudectl status`.
 pub enum ServerView {
     NotConnected,
-    Unreachable(String),
+    /// The server did not answer. `aliases`: every account this machine read from it
+    /// before, and the `known` aliases.
+    Unreachable {
+        error: String,
+        aliases: Vec<String>,
+    },
     Rows(Vec<ServerRow>),
+}
+/// Every account this machine last read from the server, with what the server said, plus
+/// the `known` aliases it never read.
+fn cached_rows(
+    paths: &Paths,
+    connection: &Connection,
+    known: &[String],
+    wanted: &dyn Fn(&str) -> bool,
+) -> Vec<ServerRow> {
+    let mut rows: Vec<ServerRow> = std::fs::read_dir(root(paths).join("status"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| cached_entry(paths, connection, &entry.path()))
+        .filter(|cache| wanted(&cache.account.alias))
+        .map(|cache| ServerRow {
+            alias: cache.account.alias,
+            available: cache.account.available,
+            usage: Ok(cache.usage),
+        })
+        .collect();
+    for alias in known.iter().filter(|alias| wanted(alias)) {
+        if !rows.iter().any(|r| r.alias.eq_ignore_ascii_case(alias)) {
+            rows.push(ServerRow {
+                alias: alias.clone(),
+                available: true,
+                usage: Err("no saved usage".into()),
+            });
+        }
+    }
+    rows.sort_by(|a, b| a.alias.cmp(&b.alias));
+    rows
 }
 /// Every server account with its usage. The server answers usage from its cache and polls
 /// the provider at most once per 5 minutes, so the reads run in parallel. `cached` reads
@@ -665,38 +702,22 @@ pub fn server_view(
         return ServerView::NotConnected;
     };
     if cached {
-        // Every account this machine last read from the server, with what the server said.
-        let mut rows: Vec<ServerRow> = std::fs::read_dir(root(paths).join("status"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|entry| cached_entry(paths, &connection, &entry.path()))
-            .filter(|cache| wanted(&cache.account.alias))
-            .map(|cache| ServerRow {
-                alias: cache.account.alias,
-                available: cache.account.available,
-                usage: Ok(cache.usage),
-            })
-            .collect();
-        for alias in known.iter().filter(|alias| wanted(alias)) {
-            if !rows.iter().any(|r| r.alias.eq_ignore_ascii_case(alias)) {
-                rows.push(ServerRow {
-                    alias: alias.clone(),
-                    available: true,
-                    usage: Err("no saved usage".into()),
-                });
-            }
-        }
-        rows.sort_by(|a, b| a.alias.cmp(&b.alias));
-        return ServerView::Rows(rows);
+        return ServerView::Rows(cached_rows(paths, &connection, known, &wanted));
     }
+    let unreachable = |error: anyhow::Error| ServerView::Unreachable {
+        error: format!("{error:#}"),
+        aliases: cached_rows(paths, &connection, known, &wanted)
+            .into_iter()
+            .map(|row| row.alias)
+            .collect(),
+    };
     let client = match Client::load(paths) {
         Ok(client) => client,
-        Err(error) => return ServerView::Unreachable(format!("{error:#}")),
+        Err(error) => return unreachable(error),
     };
     let accounts: Vec<Account> = match client.accounts() {
         Ok(accounts) => accounts.into_iter().filter(|a| wanted(&a.alias)).collect(),
-        Err(error) => return ServerView::Unreachable(format!("{error:#}")),
+        Err(error) => return unreachable(error),
     };
     let client = &client;
     ServerView::Rows(std::thread::scope(|scope| {

@@ -84,7 +84,7 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
         .chain(local_error.as_ref().and(alias).map(str::to_string))
         .collect();
     let view = claudectl::central::server_view(&paths, mode == FetchMode::Cached, &known, alias);
-    let mut remote = server_rows(&view, &known);
+    let mut remote = server_rows(&view);
     if let Some(alias) = alias {
         remote.retain(|f| f.alias.eq_ignore_ascii_case(alias));
     }
@@ -137,13 +137,13 @@ const MIGRATED: &str = "migrated to the account server";
 /// The status error of a server account when the server did not answer.
 const UNREACHABLE: &str = "account server unreachable";
 
-/// Server accounts as status rows. When the server does not answer, the migrated aliases
-/// this machine knows stand in for them.
-fn server_rows(view: &claudectl::central::ServerView, known: &[String]) -> Vec<FetchedUsage> {
+/// Server accounts as status rows. When the server does not answer, the accounts this
+/// machine knows stand in for them.
+fn server_rows(view: &claudectl::central::ServerView) -> Vec<FetchedUsage> {
     use claudectl::central::ServerView;
     match view {
         ServerView::NotConnected => vec![],
-        ServerView::Unreachable(error) => known
+        ServerView::Unreachable { error, aliases } => aliases
             .iter()
             .map(|alias| FetchedUsage {
                 alias: alias.clone(),
@@ -203,7 +203,7 @@ fn server_json(
     use claudectl::central::ServerView;
     let (state, error) = match view {
         ServerView::NotConnected => ("not_connected", None),
-        ServerView::Unreachable(error) => ("unreachable", Some(error.clone())),
+        ServerView::Unreachable { error, .. } => ("unreachable", Some(error.clone())),
         ServerView::Rows(_) => ("connected", None),
     };
     let available = |alias: &str| match view {
@@ -428,6 +428,19 @@ fn fetch_usages_with_refresh(
             // through refresh and persistence. Usage GETs do not hold it.
             let auth_lock = store.lock_auth_state()?;
             let active = profile::get_active_from(paths)?;
+            // A migrated account runs from the server. The live login may still hold its
+            // retired grant until the user logs out: read no live or saved credential for it.
+            if claudectl::central::is_migrated(paths, &profile.meta.alias) {
+                fetched.push(FetchedUsage {
+                    alias: profile.meta.alias.clone(),
+                    label: profile.meta.label.clone(),
+                    is_active: active.as_deref() == Some(profile.meta.alias.as_str()),
+                    error: Some(MIGRATED.into()),
+                    on_server: true,
+                    ..FetchedUsage::default()
+                });
+                continue;
+            }
             let refresh_owner = store.read_refresh_owner();
             let refresh_owner_known = refresh_owner.is_ok();
             let live_creds = match refresh_owner {
@@ -457,14 +470,6 @@ fn fetch_usages_with_refresh(
                 is_active,
                 ..FetchedUsage::default()
             };
-            // A migrated account runs from the server. The live login may still hold its
-            // retired grant until the user logs out: never read or use it here.
-            if claudectl::central::is_migrated(paths, &profile.meta.alias) {
-                result.error = Some(MIGRATED.into());
-                result.on_server = true;
-                fetched.push(result);
-                continue;
-            }
             let creds = if is_active {
                 live_creds
                     .clone()

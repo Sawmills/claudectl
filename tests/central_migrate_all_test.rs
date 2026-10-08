@@ -596,6 +596,23 @@ fn status_is_one_table_of_local_and_server_accounts() {
     let doc = report(&text);
     assert_eq!(doc["server"]["state"], "unreachable", "{text}");
     assert_eq!(doc["accounts"].as_array().unwrap().len(), 3, "{text}");
+    // Every server account this machine read before stays listed, server-only ones too.
+    let remote: Vec<&str> = doc["server"]["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["alias"].as_str().unwrap())
+        .collect();
+    assert_eq!(remote, ["a1", "b2", "srv"], "{text}");
+    for account in doc["server"]["accounts"].as_array().unwrap() {
+        assert_eq!(account["available"], false, "{text}");
+        assert!(
+            account["error"].as_str().unwrap().contains("unreachable"),
+            "{text}"
+        );
+    }
+    let (_, text) = env.cli(&["status"]);
+    assert!(text.lines().any(|l| l.contains("│ srv ")), "{text}");
 }
 
 #[test]
