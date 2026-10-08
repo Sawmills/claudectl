@@ -18,12 +18,24 @@ const HARNESS: [(&str, &str); 3] = [
     ),
 ];
 
+/// The harness case a build must pass. A record from another case (an older launch model)
+/// does not qualify the build for this one.
+const CHECK: &str = "supervised_host_config";
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Qualified {
     sha256: String,
     platform: String,
     qualified_at: String,
+    #[serde(default)]
+    check: String,
+}
+
+impl Qualified {
+    fn covers(&self, digest: &str) -> bool {
+        self.sha256 == digest && self.platform == std::env::consts::OS && self.check == CHECK
+    }
 }
 
 fn path(paths: &Paths) -> PathBuf {
@@ -41,10 +53,7 @@ fn load(paths: &Paths) -> Result<Vec<Qualified>> {
 
 /// True when this machine qualified the build. A damaged list is an error, never a pass.
 pub(super) fn is_qualified(paths: &Paths, digest: &str) -> Result<bool> {
-    let platform = std::env::consts::OS;
-    Ok(load(paths)?
-        .iter()
-        .any(|q| q.sha256 == digest && q.platform == platform))
+    Ok(load(paths)?.iter().any(|q| q.covers(digest)))
 }
 
 /// Run `harness` on a private snapshot of `binary`; record the hash only when it returns true.
@@ -62,14 +71,12 @@ pub(super) fn qualify_with(
     }
     let _lock = lock(paths)?;
     let mut builds = load(paths)?;
-    if !builds
-        .iter()
-        .any(|q| q.sha256 == digest && q.platform == std::env::consts::OS)
-    {
+    if !builds.iter().any(|q| q.covers(&digest)) {
         builds.push(Qualified {
             sha256: digest.clone(),
             platform: std::env::consts::OS.into(),
             qualified_at: chrono::Utc::now().to_rfc3339(),
+            check: CHECK.into(),
         });
         atomic(&path(paths), &builds)?;
     }
@@ -115,7 +122,7 @@ fn harness(snapshot: &Path, digest: &str) -> Result<bool> {
     let passed = output.status.success()
         && String::from_utf8_lossy(&output.stdout).lines().any(|line| {
             serde_json::from_str::<Value>(line)
-                .is_ok_and(|v| v["case"] == "supervised_host_config" && v["checks"] == "passed")
+                .is_ok_and(|v| v["case"] == CHECK && v["checks"] == "passed")
         });
     if !passed {
         eprintln!(
@@ -175,6 +182,20 @@ mod tests {
         assert!(is_qualified(&paths, &digest).unwrap());
         assert_eq!(load(&paths).unwrap().len(), 1);
         assert!(!is_qualified(&paths, &"0".repeat(64)).unwrap());
+    }
+
+    #[test]
+    fn a_build_qualified_by_an_older_check_is_not_qualified() {
+        let (_home, paths, _binary) = fixture();
+        private_dir(&root(&paths)).unwrap();
+        let digest = "1".repeat(64);
+        let old = serde_json::json!([{
+            "sha256": digest,
+            "platform": std::env::consts::OS,
+            "qualified_at": "2026-10-07T00:00:00Z",
+        }]);
+        atomic(&path(&paths), &old).unwrap();
+        assert!(!is_qualified(&paths, &digest).unwrap());
     }
 
     #[test]

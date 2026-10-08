@@ -167,18 +167,18 @@ pub(super) fn program(path: &Path) -> Result<PathBuf> {
         .canonicalize()
         .map_err(Into::into)
 }
-/// Built-in hashes passed the synthetic checks in experiments/settings-renewal; other builds
-/// need `claudectl server qualify` on this machine.
+/// The built-in Linux hash passed the host-config launcher check in experiments/settings-renewal;
+/// other builds (every macOS build) need `claudectl server qualify` on this machine.
 fn supported(paths: &Paths, path: &Path) -> Result<()> {
     let digest = exec::sha256_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
     let allowed = if cfg!(target_os = "macos") {
-        "bbe93063f7a0879a1021b2891e5c9354e5b3b98433e32efe6750f7710afed750"
+        None
     } else if cfg!(target_os = "linux") {
-        "92f2b4fd05d0bdcf7b9a0d4e0ecef4a1e4b368b290cd8fd07cff9a50013f45a2"
+        Some("92f2b4fd05d0bdcf7b9a0d4e0ecef4a1e4b368b290cd8fd07cff9a50013f45a2")
     } else {
         bail!("server-account sessions support Linux and macOS");
     };
-    if digest != allowed && !super::qualify::is_qualified(paths, &digest)? {
+    if allowed != Some(digest.as_str()) && !super::qualify::is_qualified(paths, &digest)? {
         bail!(
             "Claude build {digest} has not passed account-server compatibility checks; run `claudectl server qualify`"
         );

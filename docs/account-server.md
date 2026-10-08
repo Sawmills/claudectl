@@ -37,25 +37,24 @@ code again. An uncertain exchange with no retained response requires a new login
 
 The company user, provider, account UUID, organization UUID, and monotonically
 increasing generation are checked before replacing the session credential. Only
-these Claude binary hashes have synthetic compatibility evidence:
+this Claude binary hash is built in, with synthetic evidence for the host-config launch model:
 
 | Platform    | Claude version | SHA-256                                                            |
 | ----------- | -------------- | ------------------------------------------------------------------ |
 | Linux ARM64 | 2.1.280        | `92f2b4fd05d0bdcf7b9a0d4e0ecef4a1e4b368b290cd8fd07cff9a50013f45a2` |
-| macOS ARM64 | 2.1.288        | `bbe93063f7a0879a1021b2891e5c9354e5b3b98433e32efe6750f7710afed750` |
 
 The launcher hashes a private executable snapshot before running it. Any other
 build is refused until `claudectl server qualify --claude PATH` passes on that
-machine. The command runs the full-launcher renewal check from
+machine. The command runs the full-launcher check `supervised_host_config` from
 `experiments/settings-renewal/supervised.py` against a private snapshot of the build:
-a fake API, an invalid process token, and one settings token change during a Bash
-tool call. Only on a pass does it record the hash in
-`~/.claudectl/server/qualified-builds.json`. A damaged list refuses every build. It
-needs `python3` (and `unshare` on Linux, Homebrew OpenSSL on macOS). On 2026-10-06,
-Claude 2.1.292 on macOS ARM64 (`97a01e5bc74a199e67189435d0331ea3a24eac2e07db4b76d9148c5b0386138f`)
-and Claude 2.1.280 on Linux ARM64 on the devbox
-(`92f2b4fd05d0bdcf7b9a0d4e0ecef4a1e4b368b290cd8fd07cff9a50013f45a2`) passed. The operator
-procedure is in [the runbook](account-server-runbook.md).
+a fake API and a host login in the HOME, one Bash tool call on server token A, then a
+`--resume` relaunch on server token B. The host token must never be sent and the host files
+must not change. Only on a pass does it record the hash, with the check name, in
+`~/.claudectl/server/qualified-builds.json`. An entry recorded by another check (the
+earlier renewal check, before the host-config model) does not qualify a build: run
+`server qualify` again. A damaged list refuses every build. It needs `python3` (and
+`unshare` on Linux, Homebrew OpenSSL on macOS). Claude 2.1.280 on Linux ARM64 on the devbox
+passed on 2026-10-07. The operator procedure is in [the runbook](account-server-runbook.md).
 
 ## Session behavior
 
@@ -90,12 +89,23 @@ access files available to the same OS user. The Mac experiment's fake `security`
 command and OS sandbox are **test fixtures only**. They are never installed by the
 launcher. Managed policy changes during a session and native Keychain ACL behavior
 remain acceptance gaps; a startup scan does not prove lifetime policy isolation.
+The same holds for the host user settings and the project settings of the cwd: the child
+loads them like any host Claude session, and Claude applies settings changes while it runs.
+An edit made after the startup check (for example `env.ANTHROPIC_BASE_URL` or
+`apiKeyHelper` in `.claude/settings.json`) can route the server token, exactly as it would
+route the host login token in a normal session. Run server sessions only in folders you
+trust as much as your host login.
 
-The writer polls the server every five seconds and publishes a changed generation.
-The server refreshes before expiry. An early provider 401 does not automatically
-notify the writer: use `server refresh-access work`, wait for publication, then
-retry the failed prompt. It never automatically replays tools. On server outage,
-the last access token remains available until provider expiry/rejection. Revocation
+Conversations that a `server run` before this model stored in
+`~/.claudectl/server/conversations/<account_id>` are not migrated. To resume one, copy its
+`<project>/<session>.jsonl` into `~/.claude/projects/<project>/`; otherwise delete the
+directory.
+
+While Claude runs, the client polls the server every five seconds for usage only; it never
+changes the token of the running process. The server refreshes before expiry. After an
+early provider 401, use `server refresh-access work`, then relaunch with `--resume`.
+The client never replays tools. On server outage, the token of a running session stays
+valid until provider expiry or rejection. Revocation
 stops new acquisitions; it cannot revoke an access token already delivered.
 
 `status --cached` and `statusline ACCOUNT_ID` read local files only. Native Claude
