@@ -78,6 +78,8 @@ copy afterwards.
 1. **Qualify the Claude build** on every machine that will run sessions:
    `claudectl server qualify --claude claude`. The command resolves the name on `PATH` and
    follows symlinks to the real build. A build that does not pass is refused by `server run`.
+   `server run` also checks a new build on first use (for example after a Claude Code
+   update); a failed build is refused for one hour, then `server qualify` checks it again.
 2. **Inventory every holder** of the pilot grant: claudectl profiles and `~/.claudectl/run-*`
    directories on each machine, the Keychain on both Macs, every `~/.claude/.credentials.json`
    copy on the devbox, the claudectl usage cache, the Claude capacity guard list, headless
