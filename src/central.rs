@@ -458,6 +458,26 @@ pub fn disconnect(paths: &Paths) -> Result<()> {
     println!("Machine disconnected; migrated accounts remain on the server.");
     Ok(())
 }
+/// The Claude sign-in pages a server may send: the one before Claude Code 2.1.295, and the one it uses.
+fn claude_authorize(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && matches!(
+            (url.host_str(), url.path()),
+            (Some("claude.ai"), "/oauth/authorize") | (Some("claude.com"), "/cai/oauth/authorize")
+        )
+}
+/// A failed login completion in plain words, by the server's reason. `id` is the login,
+/// for the reasons where the server kept the acquired grant and the login can resume.
+fn login_failure(reason: &str, id: &str) -> Option<String> {
+    Some(match reason {
+        "login_identity_changed" => "this sign-in is a different Claude account or organization than the saved one (a plan change can move the account to a new organization). Renewal never changes identity: run claudectl server remove <alias>, then claudectl server login <alias>".into(),
+        "login_exchange_rejected" => "Claude rejected the sign-in code. Start again and paste the newest code#state within a few minutes".into(),
+        "login_state_mismatch" => "the pasted code belongs to another sign-in. Paste the code#state shown for this login".into(),
+        "login_expired" => "this sign-in expired. Start the login again".into(),
+        "login_identity_lookup_failed" => format!("Claude did not confirm which account signed in; the server kept the sign-in result. Retry verification with claudectl server complete-login {id} --resume; if it repeats, the account may be blocked"),
+        _ => return None,
+    })
+}
 pub fn login(client: &Client, alias: &str, renew: bool, no_browser: bool) -> Result<()> {
     #[derive(Deserialize)]
     struct Login {
@@ -470,11 +490,7 @@ pub fn login(client: &Client, alias: &str, renew: bool, no_browser: bool) -> Res
         &json!({"alias":alias,"renew":renew}),
     )?;
     let url = reqwest::Url::parse(&login.authorize_url)?;
-    if url.scheme() != "https"
-        || url.host_str() != Some("claude.ai")
-        || url.path() != "/oauth/authorize"
-        || login.expires_at <= now()
-    {
+    if !claude_authorize(&url) || login.expires_at <= now() {
         bail!("invalid Claude login challenge");
     }
     println!("Claude sign-in: {}", login.authorize_url);
@@ -484,10 +500,20 @@ pub fn login(client: &Client, alias: &str, renew: bool, no_browser: bool) -> Res
     let code = dialoguer::Password::new()
         .with_prompt("Paste code#state from the Claude sign-in page")
         .interact()?;
-    let receipt: Receipt = client.post(
-        "/v2/anthropic/login/complete",
-        &json!({"id":login.id,"code":code}),
-    ).with_context(|| format!("login result retained if acquired; retry verification with claudectl server complete-login {} --resume", login.id))?;
+    let receipt: Receipt = client
+        .post(
+            "/v2/anthropic/login/complete",
+            &json!({"id":login.id,"code":code}),
+        )
+        .map_err(|error| {
+            let plain = error
+                .downcast_ref::<ServerError>()
+                .and_then(|e| login_failure(&e.reason, &login.id));
+            match plain {
+                Some(plain) => error.context(plain),
+                None => error.context(format!("login result retained if acquired; retry verification with claudectl server complete-login {} --resume", login.id)),
+            }
+        })?;
     println!("Server account saved: {} ({})", alias, receipt.account_id);
     Ok(())
 }
@@ -1029,5 +1055,42 @@ pub fn dispatch(command: Command) -> Result<()> {
                 _ => unreachable!(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn login_accepts_the_old_and_the_claude_code_2_1_295_sign_in_pages() {
+        let ok = |u: &str| super::claude_authorize(&reqwest::Url::parse(u).unwrap());
+        assert!(ok("https://claude.ai/oauth/authorize?x=1"));
+        assert!(ok("https://claude.com/cai/oauth/authorize?x=1"));
+        assert!(!ok("http://claude.com/cai/oauth/authorize"));
+        assert!(!ok("https://evil.example/cai/oauth/authorize"));
+        assert!(!ok("https://claude.com/oauth/authorize"));
+    }
+    #[test]
+    fn a_login_failure_reason_is_explained_in_plain_words() {
+        for reason in [
+            "login_identity_changed",
+            "login_exchange_rejected",
+            "login_state_mismatch",
+            "login_expired",
+            "login_identity_lookup_failed",
+        ] {
+            assert!(super::login_failure(reason, "L1").is_some(), "{reason}");
+        }
+        assert!(super::login_failure("login_incomplete_grant_retained", "L1").is_none());
+        assert!(
+            super::login_failure("login_identity_changed", "L1")
+                .unwrap()
+                .contains("claudectl server remove")
+        );
+        // The server kept the grant: the user can resume this login.
+        assert!(
+            super::login_failure("login_identity_lookup_failed", "L1")
+                .unwrap()
+                .contains("claudectl server complete-login L1 --resume")
+        );
     }
 }

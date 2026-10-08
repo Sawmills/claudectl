@@ -51,6 +51,12 @@ Each step needs the one before it. Stop at the first failure.
    `deploy/k8s/overlays/staging/kustomization.yaml` (`images[0].digest`), and put the Google
    client ID into `overlays/staging/sso.yaml`. Merge that change.
 
+   **Client first when the sign-in page changes.** A server image that sends a new Claude
+   sign-in URL (for example the Claude Code 2.1.295 flow on `claude.com/cai/oauth/authorize`)
+   needs claudectl 0.1.18 or later on every machine that logs in or renews: older clients
+   refuse the new URL before the browser opens. Release the client, upgrade the machines
+   (`brew upgrade claudectl`; check `claudectl --version`), and only then pin the image.
+
 4. **Argo CD.** Merge the argocd-deploy application. The sync runs the PreSync migration Job
    first, then two server replicas. Check:
 

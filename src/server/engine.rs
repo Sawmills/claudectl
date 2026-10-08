@@ -32,7 +32,29 @@ const PROVIDER: &str = "anthropic";
 /// Keep it short: a refresh revokes the token every `server run` of the account holds, and
 /// the client avoids asking inside this window (claudectl renew::NO_POLL_MS, SAW-12610).
 const MARGIN: i64 = 300_000;
-
+/// Why a login could not finish, as a bounded reason the machine is told. The response
+/// stays retained either way.
+#[derive(Debug)]
+pub struct LoginRefused(pub &'static str);
+impl std::fmt::Display for LoginRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for LoginRefused {}
+/// `error` tagged with `reason`, keeping its message.
+pub(crate) fn refused(
+    reason: &'static str,
+    message: impl std::fmt::Display + Send + Sync + 'static,
+) -> anyhow::Error {
+    anyhow::Error::new(LoginRefused(reason)).context(message)
+}
+/// The reason for a failed login completion; untagged errors keep the generic one.
+pub fn login_reason(error: &anyhow::Error) -> &'static str {
+    error
+        .downcast_ref::<LoginRefused>()
+        .map_or("login_incomplete_grant_retained", |refused| refused.0)
+}
 /// Every value `rotation_reason` returns. `/metrics` exports each from startup, so the first
 /// refresh of a reason shows as an increase.
 pub(crate) const ROTATION_REASONS: [&str; 4] = ["expired", "forced", "margin", "migration"];
@@ -218,7 +240,8 @@ impl Default for Endpoints {
     fn default() -> Self {
         Self {
             api: "https://api.anthropic.com".into(),
-            token: "https://console.anthropic.com/v1/oauth/token".into(),
+            // Claude Code 2.1.295's token endpoint, for code exchange and refresh.
+            token: "https://platform.claude.com/v1/oauth/token".into(),
         }
     }
 }
@@ -398,7 +421,10 @@ impl Engine {
             .await
             .map_err(|_| anyhow::anyhow!("Claude identity lookup unavailable"))?;
         if !response.status().is_success() {
-            bail!("Claude identity lookup rejected");
+            return Err(refused(
+                "login_identity_lookup_failed",
+                "Claude identity lookup rejected",
+            ));
         }
         let value: Value = response
             .json()
@@ -532,7 +558,10 @@ impl Engine {
         }
         let identity = self.identify(&grant.access_token).await?;
         if replacement.is_some_and(|expected| expected != &identity) {
-            bail!("login renewal changed Claude identity; grant retained");
+            return Err(refused(
+                "login_identity_changed",
+                "login renewal changed Claude identity (account or organization, e.g. after a plan move); grant retained. Remove the server account and log in again",
+            ));
         }
         let id = account_id(user, alias);
         let prior = match self.store.account(user, &id).await? {
