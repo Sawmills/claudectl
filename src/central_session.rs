@@ -12,6 +12,9 @@ pub struct Session {
     _lease: File,
     account: Account,
     current: Access,
+    /// Token renewal state for supervisors (the capacity guard): on, off with a reason, or
+    /// renewing. The guard leaves expiry to `server run` and skips a renewing session.
+    renewal: String,
 }
 impl Session {
     pub fn new(paths: &Paths, account: &Account, access: Access) -> Result<Self> {
@@ -41,6 +44,7 @@ impl Session {
             _lease: lease,
             account: account.clone(),
             current: access,
+            renewal: "on".into(),
         };
         session.write()?;
         Ok(session)
@@ -57,8 +61,50 @@ impl Session {
         atomic(
             &self.directory.path().join("session.json"),
             &json!({"alias":self.account.alias,"account_id":self.account.account_id,
-                "expires_at":self.current.expires_at,"pid":std::process::id()}),
+                "expires_at":self.current.expires_at,"pid":std::process::id(),
+                "renewal":self.renewal}),
         )
+    }
+    /// Record the renewal state for supervisors.
+    pub(super) fn set_renewal(&mut self, state: &str) -> Result<()> {
+        self.renewal = state.into();
+        self.write()
+    }
+    /// Adopt a newer token of the same account (after the server refreshed it).
+    pub(super) fn renew(&mut self, access: Access) -> Result<()> {
+        validate(&self.account, &access)?;
+        if access.account_id != self.current.account_id
+            || access.expires_at <= self.current.expires_at
+        {
+            bail!("the new token is not a newer token of this account");
+        }
+        self.current = access;
+        self.write()
+    }
+    pub(super) fn revision(&self) -> &str {
+        &self.current.revision
+    }
+    /// Claude settings that only register the renewal hooks. The hook runs a private copy of
+    /// this claudectl, so an upgrade during the session cannot break it.
+    #[cfg(unix)]
+    pub(super) fn hook_settings(&self) -> Result<PathBuf> {
+        let hook = self.directory().join("claudectl-hook");
+        snapshot_binary(&std::env::current_exe()?, &hook)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o500))?;
+        }
+        let quote =
+            |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+        let command = format!("{} server hook {}", quote(&hook), quote(self.directory()));
+        let entry = json!([{"hooks": [{"type": "command", "command": command}]}]);
+        let settings = self.directory().join("hooks.json");
+        atomic(
+            &settings,
+            &json!({"hooks": {"SessionStart": entry, "UserPromptSubmit": entry,
+                "Stop": entry, "Notification": entry}}),
+        )?;
+        Ok(settings)
     }
     pub fn expires_at(&self) -> i64 {
         self.current.expires_at
@@ -243,6 +289,202 @@ fn snapshot_binary(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The saved terminal modes of a session with a terminal, restored before a relaunch.
+#[cfg(unix)]
+struct Terminal {
+    saved: libc::termios,
+    /// The terminal device: its access time is the last input (as `w` reports idle time).
+    path: Option<PathBuf>,
+}
+#[cfg(unix)]
+impl Terminal {
+    fn save() -> Option<Self> {
+        // SAFETY: isatty, tcgetattr and ttyname only read terminal state into local memory.
+        unsafe {
+            if libc::isatty(libc::STDIN_FILENO) != 1 {
+                return None;
+            }
+            let mut saved: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut saved) != 0 {
+                return None;
+            }
+            let name = libc::ttyname(libc::STDIN_FILENO);
+            let path = (!name.is_null()).then(|| {
+                use std::os::unix::ffi::OsStrExt;
+                PathBuf::from(std::ffi::OsStr::from_bytes(
+                    std::ffi::CStr::from_ptr(name).to_bytes(),
+                ))
+            });
+            Some(Self { saved, path })
+        }
+    }
+    /// Put the terminal back as it was before Claude ran: line modes, then the screen modes a
+    /// full-screen program may leave on (bracketed paste, focus and mouse reports, the
+    /// alternate screen, a hidden cursor).
+    fn restore(&self) {
+        use std::io::Write;
+        // SAFETY: tcsetattr reads the saved modes; claudectl owns the foreground again here.
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved);
+        }
+        let mut out = std::io::stdout();
+        let _ = out.write_all(
+            b"\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1049l\x1b[?25h\r\n",
+        );
+        let _ = out.flush();
+    }
+}
+
+#[cfg(unix)]
+struct Restart {
+    access: Access,
+    session_id: String,
+}
+#[cfg(unix)]
+#[derive(Default)]
+struct Outcome {
+    /// Set only after the monitor itself sent SIGTERM for a renewal.
+    restart: Option<Restart>,
+    /// A renewal state change to record (for example, hooks missing).
+    note: Option<String>,
+}
+/// Watches one Claude process: usage for the status line, and the account's token revision
+/// for renewal (SAW-12610).
+#[cfg(unix)]
+struct Monitor {
+    client: Client,
+    paths: Paths,
+    account_id: String,
+    directory: PathBuf,
+    held_revision: String,
+    held_expires_at: i64,
+    pid: u32,
+    renewable: bool,
+    restarts: usize,
+    tty: Option<PathBuf>,
+}
+#[cfg(unix)]
+impl Monitor {
+    fn watch(self, stopped: std::sync::mpsc::Receiver<()>) -> Outcome {
+        use super::renew;
+        struct StopChild(u32);
+        impl Drop for StopChild {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(-(self.0 as i32), libc::SIGTERM);
+                }
+            }
+        }
+        let _stop_child = StopChild(self.pid);
+        let timing = renew::timing();
+        let started = now();
+        let mut outcome = Outcome::default();
+        let mut last_usage = 0;
+        let mut last_check = 0;
+        let mut renewing = self.renewable;
+        let mut pending: Option<Access> = None;
+        let mut baseline: Option<usize> = None;
+        let mut sent: Option<(i64, Restart)> = None;
+        while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            stopped.recv_timeout(Duration::from_millis(timing.tick_ms))
+        {
+            if now() - last_usage >= 300_000 {
+                if let Ok(usage) = self.client.usage(&self.account_id, false) {
+                    let _ = atomic(
+                        &usage_path(&self.paths, &self.client.connection, &self.account_id),
+                        &usage,
+                    );
+                }
+                last_usage = now();
+            }
+            if let Some((at, _)) = &sent {
+                // Claude did not exit after SIGTERM: stop it.
+                if now() - at > 10_000 {
+                    unsafe {
+                        libc::kill(self.pid as i32, libc::SIGKILL);
+                    }
+                }
+                continue;
+            }
+            if !renewing {
+                continue;
+            }
+            let text = std::fs::read_to_string(self.directory.join("events")).unwrap_or_default();
+            let events = renew::parse_events(&text);
+            if !events
+                .iter()
+                .any(|(_, e)| matches!(e, renew::Event::SessionStart(_)))
+            {
+                if now() - started > timing.hooks_wait_ms {
+                    eprintln!(
+                        "claudectl: Claude sent no hook events; server token renewal is off for this session"
+                    );
+                    outcome.note = Some("off: no hook events".into());
+                    renewing = false;
+                }
+                continue;
+            }
+            let idle = renew::idle_state(&events);
+            // Claude starts its MCP servers after SessionStart: take the baseline once it settled.
+            if idle.since.is_some() && baseline.is_none() && now() - started >= timing.settle_ms {
+                baseline = exec::group_size(self.pid);
+            }
+            let interval = if self.held_expires_at - now() < 3_600_000 {
+                timing.poll_near_ms
+            } else {
+                timing.poll_far_ms
+            };
+            if pending.is_none() && now() - last_check >= interval {
+                last_check = now();
+                if let Ok(access) = self.client.acquire(&self.account_id, None)
+                    && access.revision != self.held_revision
+                {
+                    pending = Some(access);
+                }
+            }
+            let Some(next) = &pending else {
+                continue;
+            };
+            // Unknown membership counts as grown: never restart over unknown processes.
+            let group_grew = match (baseline, exec::group_size(self.pid)) {
+                (Some(before), Some(current)) => current > before,
+                _ => true,
+            };
+            let tty_idle_ms = self.tty.as_ref().map(|path| {
+                std::fs::metadata(path)
+                    .and_then(|m| m.accessed())
+                    .ok()
+                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |at| now() - at.as_millis() as i64)
+            });
+            let decision = renew::decide(&renew::Inputs {
+                now: now(),
+                held_revision: &self.held_revision,
+                held_expires_at: self.held_expires_at,
+                server_revision: &next.revision,
+                server_expires_at: next.expires_at,
+                idle: &idle,
+                idle_after_ms: timing.idle_after_ms,
+                tty_gate_ms: timing.tty_idle_ms,
+                tty_idle_ms,
+                group_grew,
+                restarts_last_hour: self.restarts,
+            });
+            if decision == renew::Decision::Restart
+                && let (Some(access), Some(session_id)) = (pending.take(), idle.session)
+            {
+                // SIGTERM the leader; teardown of the rest of the group follows its exit.
+                unsafe {
+                    libc::kill(self.pid as i32, libc::SIGTERM);
+                }
+                sent = Some((now(), Restart { access, session_id }));
+            }
+        }
+        outcome.restart = sent.map(|(_, restart)| restart);
+        outcome
+    }
+}
+
 #[cfg(unix)]
 pub fn run(
     paths: &Paths,
@@ -259,12 +501,20 @@ pub fn run(
     // other `server run` of this account is using (SAW-12610). The server refreshes on demand
     // near expiry.
     let access = client.acquire(&account.account_id, None)?;
-    let session = Session::new(paths, &account, access)?;
+    let mut session = Session::new(paths, &account, access)?;
     // The checked copy itself runs (same filesystem, so the rename keeps the file).
     let snapshot = session.directory().join("claude");
     std::fs::rename(&build.file, &snapshot)?;
-    let mut command = session.command(&snapshot, args)?;
-    exec::set_process_group(&mut command);
+    // A one-shot `-p` run is never restarted; an interactive session follows the account's
+    // token revision (SAW-12610).
+    let renewable = super::renew::relaunch_args(args, "probe").is_some();
+    let hooks = if renewable {
+        Some(session.hook_settings()?)
+    } else {
+        session.set_renewal("off: one-shot run")?;
+        None
+    };
+    let terminal = Terminal::save();
     struct Signals;
     impl Drop for Signals {
         fn drop(&mut self) {
@@ -273,65 +523,82 @@ pub fn run(
     }
     exec::signals::install();
     let _signals = Signals;
-    let mut child = command.spawn().context("could not start Claude")?;
-    let pid = child.id();
-    exec::signals::watch(pid);
-    let foreground = Foreground::take(pid);
-    let (stop, stopped) = std::sync::mpsc::channel();
-    let writer_client = client.clone();
-    let writer_paths = paths.clone();
-    let writer = std::thread::spawn(move || {
-        struct StopChild(u32);
-        impl Drop for StopChild {
-            fn drop(&mut self) {
-                unsafe {
-                    libc::kill(-(self.0 as i32), libc::SIGTERM);
-                }
-            }
+    let mut launch_args = args.to_vec();
+    let mut restarts: Vec<i64> = Vec::new();
+    let mut first = true;
+    loop {
+        let mut command = session.command(&snapshot, &launch_args)?;
+        if let Some(hooks) = &hooks {
+            command.arg("--settings").arg(hooks);
         }
-        let _stop_child = StopChild(pid);
-        let mut last_usage = 0;
-        while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
-            stopped.recv_timeout(Duration::from_secs(5))
-        {
-            if now() - last_usage >= 300_000 {
-                if let Ok(usage) = writer_client.usage(&account.account_id, false) {
-                    let _ = atomic(
-                        &usage_path(
-                            &writer_paths,
-                            &writer_client.connection,
-                            &account.account_id,
-                        ),
-                        &usage,
-                    );
-                }
-                last_usage = now();
-            }
+        exec::set_process_group(&mut command);
+        if !first {
+            exec::take_foreground(&mut command);
         }
-        session
-    });
-    let waited = exec::wait_exit_no_reap(pid, false);
-    let _ = stop.send(());
-    let session = writer
-        .join()
-        .map_err(|_| anyhow::anyhow!("credential writer stopped unexpectedly"));
-    let descendants = if waited.is_ok() {
-        Some(exec::teardown_group(pid))
-    } else {
-        None
-    };
-    exec::signals::unwatch();
-    drop(foreground);
-    let status = child.wait()?;
-    waited?;
-    let _session = session?;
-    if !matches!(
-        descendants,
-        Some(exec::Descendants::None | exec::Descendants::Terminated | exec::Descendants::Killed)
-    ) {
-        bail!("Claude descendants could not be confirmed stopped");
+        let _ = std::fs::remove_file(session.directory().join("events"));
+        let mut child = command.spawn().context("could not start Claude")?;
+        let pid = child.id();
+        exec::signals::watch(pid);
+        let foreground = Foreground::take(pid);
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let monitor = Monitor {
+            client: client.clone(),
+            paths: paths.clone(),
+            account_id: account.account_id.clone(),
+            directory: session.directory().to_path_buf(),
+            held_revision: session.revision().to_string(),
+            held_expires_at: session.expires_at(),
+            pid,
+            renewable: hooks.is_some(),
+            restarts: restarts
+                .iter()
+                .filter(|&&at| now() - at < 3_600_000)
+                .count(),
+            tty: terminal.as_ref().and_then(|t| t.path.clone()),
+        };
+        let watcher = std::thread::spawn(move || monitor.watch(stopped));
+        let waited = exec::wait_exit_no_reap(pid, terminal.is_some());
+        let _ = stop.send(());
+        let outcome = watcher
+            .join()
+            .map_err(|_| anyhow::anyhow!("session monitor stopped unexpectedly"))?;
+        let descendants = if waited.is_ok() {
+            Some(exec::teardown_group(pid))
+        } else {
+            None
+        };
+        exec::signals::unwatch();
+        drop(foreground);
+        let status = child.wait()?;
+        waited?;
+        if !matches!(
+            descendants,
+            Some(
+                exec::Descendants::None | exec::Descendants::Terminated | exec::Descendants::Killed
+            )
+        ) {
+            bail!("Claude descendants could not be confirmed stopped");
+        }
+        if let Some(note) = &outcome.note {
+            session.set_renewal(note)?;
+        }
+        // Relaunch only after our own SIGTERM; any other exit ends `server run` with the
+        // child's code.
+        let Some(Restart { access, session_id }) = outcome.restart else {
+            return Ok(exec::exit_code_of(&status));
+        };
+        if let Some(terminal) = &terminal {
+            terminal.restore();
+        }
+        session.set_renewal("renewing")?;
+        session.renew(access)?;
+        session.set_renewal("on")?;
+        launch_args =
+            super::renew::relaunch_args(args, &session_id).context("renewal of a one-shot run")?;
+        restarts.push(now());
+        first = false;
+        eprintln!("claudectl: server token renewed; resuming session {session_id}");
     }
-    Ok(exec::exit_code_of(&status))
 }
 #[cfg(not(unix))]
 pub fn run(_: &Paths, _: &Client, _: &str, _: &Path, _: &[OsString]) -> Result<i32> {

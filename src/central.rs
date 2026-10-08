@@ -653,6 +653,9 @@ pub enum Command {
     },
     /// Read the local session usage cache without network access
     Statusline { account_id: String },
+    /// Record a Claude hook event for a running server session (internal; never fails)
+    #[command(hide = true)]
+    Hook { dir: PathBuf },
     /// Transfer a profile, or every saved account with --all, after stopping every previous
     /// grant holder
     Migrate {
@@ -689,6 +692,14 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Disconnect => disconnect(&paths),
         Command::Status { alias, cached } => status(&paths, &alias, cached),
         Command::Statusline { account_id } => statusline(&paths, &account_id),
+        Command::Hook { dir } => {
+            // A hook never blocks or talks to Claude: no output, exit 0 whatever happens.
+            use std::io::Read;
+            let mut input = String::new();
+            let _ = std::io::stdin().take(1 << 20).read_to_string(&mut input);
+            let _ = renew::record_hook(&root(&paths).join("sessions"), &dir, &input, now());
+            Ok(())
+        }
         Command::Qualify { claude } => qualify::qualify(&paths, &claude),
         command => {
             let client = Client::load(&paths)?;
