@@ -219,6 +219,18 @@ mod tests {
     }
 
     #[test]
+    fn the_harness_seeds_the_record_this_client_reads() {
+        // The harness launches `server run` on the candidate build, so its throwaway HOME must
+        // hold a record that `is_qualified` accepts, or every non-built-in build is refused.
+        let (_home, paths, _binary) = fixture();
+        let file = path(&paths);
+        let name = file.file_name().unwrap().to_str().unwrap();
+        let (_, source) = HARNESS[0];
+        assert!(source.contains(&format!("client / '{name}'")), "{name}");
+        assert!(source.contains(&format!("'check': '{CHECK}'")), "{CHECK}");
+    }
+
+    #[test]
     fn a_damaged_list_refuses_instead_of_passing() {
         let (_home, paths, _binary) = fixture();
         private_dir(&root(&paths)).unwrap();
