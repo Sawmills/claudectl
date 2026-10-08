@@ -915,7 +915,11 @@ impl Engine {
     /// is refreshed as usual; it is dead for every holder anyway.
     pub async fn observe_for(&self, user: &str, machine: &str, id: &str) -> Result<Access> {
         let loaded = self.selected(user, id).await?;
-        if loaded.record.phase == Phase::Ready && loaded.record.grant.expires_at > now() {
+        // A pending migration rotates before anything is returned, so it takes the normal path.
+        if loaded.record.phase == Phase::Ready
+            && !matches!(loaded.record.rotation, Rotation::Pending { .. })
+            && loaded.record.grant.expires_at > now()
+        {
             return Ok(loaded.access());
         }
         self.acquire_for(user, machine, id, None).await
