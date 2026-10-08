@@ -412,12 +412,13 @@ pub fn persist_rotated_grant(
         creds.claude_ai_oauth.expires_at = rotated.claude_ai_oauth.expires_at;
         staged.push((sibling, creds));
     }
-    // The origin first: if it cannot hold the rotated grant, no sibling changes either.
-    origin
-        .write_credentials(rotated)
-        .with_context(|| format!("could not save the rotated grant to {}", origin.meta.alias))?;
-    // Each sibling write is atomic: a failed one keeps its old file whole.
+    // Every holder gets the rotated grant even when another write fails: the provider already
+    // invalidated the old refresh token, so a holder left behind needs a new login. Each write
+    // is atomic, so a failed one keeps its old file whole.
     let mut failures = Vec::new();
+    if origin.write_credentials(rotated).is_err() {
+        failures.push(origin.meta.alias.clone());
+    }
     for (sibling, creds) in staged {
         if sibling.write_credentials(&creds).is_err() {
             failures.push(sibling.meta.alias.clone());
@@ -815,7 +816,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_rotated_grant_that_cannot_be_saved_to_its_origin_touches_no_sibling() {
+    fn a_rotated_grant_that_cannot_be_saved_to_its_origin_still_reaches_matching_siblings() {
         use std::os::unix::fs::PermissionsExt;
         let (_tmp, paths, _store) = setup();
         let origin = save_profile_to(&paths, "a@x", &creds("t-a"), None).unwrap();
@@ -829,14 +830,16 @@ mod tests {
         let result = persist_rotated_grant(&paths, None, &origin, &rotated, &key);
         std::fs::set_permissions(&origin.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(result.is_err());
+        // The rotated refresh token survives in the matching sibling; the error names the origin.
+        assert!(result.unwrap_err().to_string().contains("a@x"));
         let sibling = get_profile_from(&paths, "b@x")
             .unwrap()
             .read_credentials()
             .unwrap();
+        assert_eq!(sibling.claude_ai_oauth.access_token, "rotated");
         assert_eq!(
-            sibling.claude_ai_oauth.access_token, "t-b",
-            "a sibling was rotated"
+            sibling.claude_ai_oauth.refresh_token.as_deref(),
+            Some("rt-2")
         );
     }
 }

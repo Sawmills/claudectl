@@ -176,10 +176,11 @@ impl AuthStore {
             .transpose()
     }
 
-    /// Restore a live login only where none exists, with one atomic conditional create per
-    /// platform; a login another process created is never replaced (Ok(false)). macOS: the
-    /// Keychain item is the login Claude Code reads; it is added without `-U` and the file is
-    /// left alone (touching it too would open a window between the two writes). Elsewhere the
+    /// Restore a live login only where none exists; a login another process created is never
+    /// replaced (Ok(false)). macOS: the Keychain item is the login Claude Code reads; it is added
+    /// without `-U`, then both stores are read again. A file login that appeared after the
+    /// caller's absence check would be shadowed by the Keychain, so the item comes back out and
+    /// the restore reports Ok(false) (the caller keeps the fence and its grant). Elsewhere the
     /// credentials file is the login, created with O_EXCL.
     pub(crate) fn create_live_login_if_absent(&self, creds: &CredentialsFile) -> Result<bool> {
         let json = serde_json::to_string(creds)?;
@@ -200,7 +201,39 @@ impl AuthStore {
                 .output()
                 .context("failed to run security(1)")?;
             if output.status.success() {
-                return Ok(true);
+                let file_present = self.paths.claude_credentials_file().try_exists()?;
+                let current = self.read_live_grant()?;
+                return match after_keychain_add(file_present, current.as_ref(), creds) {
+                    KeychainAdd::Restored => Ok(true),
+                    KeychainAdd::Superseded => Ok(false),
+                    KeychainAdd::RollBack => {
+                        // Re-read right before the delete: remove the item only while it is ours.
+                        let still_ours = self
+                            .read_live_grant()?
+                            .as_ref()
+                            .is_some_and(|c| same_grant(c, creds));
+                        if still_ours {
+                            let removed = Command::new("security")
+                                .args([
+                                    "delete-generic-password",
+                                    "-a",
+                                    &user,
+                                    "-s",
+                                    KEYCHAIN_SERVICE,
+                                ])
+                                .stdin(Stdio::null())
+                                .output()
+                                .context("failed to run security(1)")?;
+                            if !removed.status.success() {
+                                bail!(
+                                    "a file login appeared during the restore and the restored Keychain item could not be removed: {}; remove the \"{KEYCHAIN_SERVICE}\" item, then log in again",
+                                    String::from_utf8_lossy(&removed.stderr).trim()
+                                );
+                            }
+                        }
+                        Ok(false)
+                    }
+                };
             }
             let stderr = String::from_utf8_lossy(&output.stderr);
             // 45 = errSecDuplicateItem: another login exists; leave it.
@@ -545,6 +578,39 @@ fn keychain_read() -> Option<String> {
     let raw = String::from_utf8(output.stdout).ok()?;
     let raw = raw.trim();
     (!raw.is_empty()).then(|| raw.to_string())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KeychainAdd {
+    /// The Keychain holds the restored grant and no file login appeared: restored.
+    Restored,
+    /// A file login appeared after the absence check; the restored item would shadow it.
+    RollBack,
+    /// Another login replaced or removed the item; it is not ours to touch.
+    Superseded,
+}
+
+fn same_grant(a: &CredentialsFile, b: &CredentialsFile) -> bool {
+    a.claude_ai_oauth.access_token == b.claude_ai_oauth.access_token
+        && a.claude_ai_oauth.refresh_token == b.claude_ai_oauth.refresh_token
+}
+
+/// Decide a macOS restore after the Keychain add, from both stores read again.
+fn after_keychain_add(
+    file_present: bool,
+    keychain: Option<&CredentialsFile>,
+    restored: &CredentialsFile,
+) -> KeychainAdd {
+    match keychain {
+        Some(current) if same_grant(current, restored) => {
+            if file_present {
+                KeychainAdd::RollBack
+            } else {
+                KeychainAdd::Restored
+            }
+        }
+        _ => KeychainAdd::Superseded,
+    }
 }
 
 fn keychain_write_error(stderr: &str) -> String {
@@ -1145,6 +1211,35 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("{\"a\":1}")
+        );
+    }
+
+    #[test]
+    fn a_keychain_restore_counts_only_when_both_stores_confirm_it() {
+        let ours = test_creds("restored");
+        let newer = test_creds("newer");
+        // No file login appeared and the Keychain holds our grant: restored.
+        assert_eq!(
+            after_keychain_add(false, Some(&ours), &ours),
+            KeychainAdd::Restored
+        );
+        // A file login appeared after the absence check: take our item back out.
+        assert_eq!(
+            after_keychain_add(true, Some(&ours), &ours),
+            KeychainAdd::RollBack
+        );
+        // Another login replaced or removed the item: leave it, nothing restored.
+        assert_eq!(
+            after_keychain_add(false, Some(&newer), &ours),
+            KeychainAdd::Superseded
+        );
+        assert_eq!(
+            after_keychain_add(true, Some(&newer), &ours),
+            KeychainAdd::Superseded
+        );
+        assert_eq!(
+            after_keychain_add(false, None, &ours),
+            KeychainAdd::Superseded
         );
     }
 

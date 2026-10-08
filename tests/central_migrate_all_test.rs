@@ -242,8 +242,8 @@ impl Env {
             &self
                 .paths
                 .claudectl_dir()
-                .join("server/qualified-builds.json"),
-            &json!([{"sha256":digest,"platform":"linux","qualified_at":"2026-10-07T00:00:00Z"}])
+                .join("server/qualified-host-config-builds.json"),
+            &json!([{"sha256":digest,"platform":std::env::consts::OS,"qualified_at":"2026-10-07T00:00:00Z","check":"supervised_host_config"}])
                 .to_string(),
         );
     }
@@ -251,7 +251,7 @@ impl Env {
         std::fs::remove_file(
             self.paths
                 .claudectl_dir()
-                .join("server/qualified-builds.json"),
+                .join("server/qualified-host-config-builds.json"),
         )
         .unwrap();
     }
