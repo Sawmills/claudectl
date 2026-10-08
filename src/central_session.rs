@@ -132,7 +132,7 @@ fn validate(account: &Account, access: &Access) -> Result<()> {
     }
     Ok(())
 }
-fn preflight(paths: &Paths, args: &[OsString]) -> Result<()> {
+fn preflight(paths: &Paths, cwd: &Path, args: &[OsString]) -> Result<()> {
     for (name, _) in std::env::vars_os() {
         if name == exec::CONFIG_DIR_ENV || name.to_str().is_some_and(exec::is_scrubbed_env) {
             bail!(
@@ -150,12 +150,11 @@ fn preflight(paths: &Paths, args: &[OsString]) -> Result<()> {
             bail!("launch argument overrides account isolation");
         }
     }
-    exec::check_settings(
-        &std::env::current_dir()?,
-        &paths.home,
-        &exec::managed_settings_dir(),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))
+    exec::check_settings(cwd, &paths.home, &exec::managed_settings_dir())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // The child keeps the host config, so the host user settings load too: check them with
+    // the same rules (no credential, endpoint or helper override of the server token).
+    exec::check_user_settings(&paths.home).map_err(|e| anyhow::anyhow!("{e}"))
 }
 pub(super) fn program(path: &Path) -> Result<PathBuf> {
     if path.components().count() > 1 {
@@ -211,7 +210,7 @@ pub fn run(
     args: &[OsString],
 ) -> Result<i32> {
     let _slot = exec::RunSlot::take().map_err(|error| anyhow::anyhow!("{error}"))?;
-    preflight(paths, args)?;
+    preflight(paths, &std::env::current_dir()?, args)?;
     let binary = program(binary)?;
     supported(paths, &binary)?;
     let account = client.account(alias)?;
@@ -338,6 +337,28 @@ impl Drop for Foreground {
     fn drop(&mut self) {
         if let Some(group) = self.0 {
             Self::set(group);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_user_settings_cannot_override_the_server_token_or_endpoint() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().into());
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        assert!(preflight(&paths, cwd.path(), &[]).is_ok());
+        for settings in [
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid"}}"#,
+            r#"{"env":{"CLAUDE_CODE_OAUTH_TOKEN":"synthetic-other"}}"#,
+            r#"{"apiKeyHelper":"/bin/echo synthetic"}"#,
+        ] {
+            std::fs::write(home.path().join(".claude/settings.json"), settings).unwrap();
+            assert!(preflight(&paths, cwd.path(), &[]).is_err(), "{settings}");
         }
     }
 }

@@ -1,5 +1,5 @@
 //! Claude build qualification. `server run` accepts a build only when its hash is built in or
-//! passed the renewal handoff check on this machine. An unknown or unreadable list refuses.
+//! passed the launcher check on this machine. An unknown or unreadable list refuses.
 use super::*;
 use crate::exec;
 
@@ -58,7 +58,7 @@ pub(super) fn qualify_with(
     std::fs::copy(binary, &snapshot).context("could not copy the Claude build")?;
     let digest = exec::sha256_file(&snapshot).map_err(|e| anyhow::anyhow!("{e}"))?;
     if !harness(&snapshot, &digest)? {
-        bail!("Claude build {digest} failed the renewal handoff check; it is not qualified");
+        bail!("Claude build {digest} failed the launcher check; it is not qualified");
     }
     let _lock = lock(paths)?;
     let mut builds = load(paths)?;
@@ -76,9 +76,10 @@ pub(super) fn qualify_with(
     Ok(digest)
 }
 
-/// Run the synthetic renewal handoff check: the real launcher and Claude build, a fake API, an
-/// invalid process token, and one settings token change during a tool call. The harness blocks
-/// network access and the real credential store.
+/// Run the synthetic launcher check: the real launcher and Claude build, a fake API and a host
+/// login in the HOME; one tool call on the server token, then a `--resume` relaunch on a new
+/// server token. The host token must never be sent and the host files must not change. The
+/// harness blocks network access and the real credential store.
 fn harness(snapshot: &Path, digest: &str) -> Result<bool> {
     let directory = tempfile::tempdir()?;
     for (name, source) in HARNESS {
@@ -114,7 +115,7 @@ fn harness(snapshot: &Path, digest: &str) -> Result<bool> {
     let passed = output.status.success()
         && String::from_utf8_lossy(&output.stdout).lines().any(|line| {
             serde_json::from_str::<Value>(line)
-                .is_ok_and(|v| v["case"] == "supervised_tool_renewal" && v["checks"] == "passed")
+                .is_ok_and(|v| v["case"] == "supervised_host_config" && v["checks"] == "passed")
         });
     if !passed {
         eprintln!(
@@ -136,7 +137,7 @@ fn harness(snapshot: &Path, digest: &str) -> Result<bool> {
 pub fn qualify(paths: &Paths, claude: &Path) -> Result<()> {
     let binary = session::program(claude)?;
     let digest = qualify_with(paths, &binary, harness)?;
-    println!("Claude build {digest} passed the renewal handoff check and is qualified.");
+    println!("Claude build {digest} passed the launcher check and is qualified.");
     Ok(())
 }
 
