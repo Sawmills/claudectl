@@ -114,8 +114,11 @@ not reload a changed token inside a running process (a `--settings` file, a host
 credentials file and the process environment all behave the same), while a new process with
 `--resume <session>` continues the same session.
 
-Token lifetime is therefore the session limit. At launch the client asks the server for a
-fresh token when less than two hours remain (a server refresh gives about eight hours). The
+Token lifetime is therefore the session limit. A provider refresh revokes the access token
+issued before it, and every `server run` of an account shares that token, so a launch never
+forces a refresh: it takes the current token, and the server refreshes on demand near expiry.
+`claudectl server refresh-access` forces one and ends every running session of that account
+(relaunch each with `--resume`). The
 private session directory records `session.json` (alias, account, `expires_at`, pid; no
 token) so a supervisor such as the capacity guard can relaunch an idle tab with `--resume`
 before the expiry. A tab still running at expiry gets an authentication error on its next

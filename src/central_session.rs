@@ -79,8 +79,6 @@ impl Session {
         Ok(command)
     }
 }
-/// Request a fresh server token at launch when less than this remains (milliseconds).
-const FRESH_TOKEN_MS: i64 = 2 * 3_600_000;
 
 fn retire_expired_sessions(sessions: &Path) -> Result<()> {
     for entry in std::fs::read_dir(sessions)? {
@@ -257,11 +255,10 @@ pub fn run(
     preflight(paths, &std::env::current_dir()?, args)?;
     let build = qualified_build(paths, &program(binary)?, super::qualify::harness)?;
     let account = client.account(alias)?;
-    let mut access = client.acquire(&account.account_id, None)?;
-    // The token is fixed for this process; start with a fresh one when less remains.
-    if access.expires_at - now() < FRESH_TOKEN_MS {
-        access = client.acquire(&account.account_id, Some(&access.revision))?;
-    }
+    // Never force a refresh here: a provider refresh revokes the access token that every
+    // other `server run` of this account is using (SAW-12610). The server refreshes on demand
+    // near expiry.
+    let access = client.acquire(&account.account_id, None)?;
     let session = Session::new(paths, &account, access)?;
     // The checked copy itself runs (same filesystem, so the rename keeps the file).
     let snapshot = session.directory().join("claude");
