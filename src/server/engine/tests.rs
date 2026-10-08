@@ -153,9 +153,16 @@ fn counted_token(count: Arc<AtomicUsize>) -> axum::routing::MethodRouter {
 }
 
 #[tokio::test]
-async fn dashboard_usage_reads_the_store_without_waiting_for_a_poll() {
+async fn dashboard_usage_is_one_owner_scoped_read_without_the_poll_lock() {
     let app = Router::new()
-        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/api/oauth/profile",
+            // One Claude identity per access token, so two users can hold accounts.
+            get(|headers: axum::http::HeaderMap| async move {
+                let token = headers["authorization"].to_str().unwrap().to_owned();
+                Json(json!({"account":{"uuid":token},"organization":{"uuid":"o"}}))
+            }),
+        )
         .route(
             "/api/oauth/usage",
             get(|| async {
@@ -164,7 +171,7 @@ async fn dashboard_usage_reads_the_store_without_waiting_for_a_poll() {
         );
     let f = Fixture::new(app).await;
     let engine = f.engine().await;
-    let receipt = engine
+    let mine = engine
         .admit(
             "person",
             "work",
@@ -174,23 +181,42 @@ async fn dashboard_usage_reads_the_store_without_waiting_for_a_poll() {
         )
         .await
         .unwrap();
-    let empty = engine.cached_usage(&receipt.account_id).await.unwrap();
-    assert!(empty.data.is_none() && empty.observed_at.is_none() && empty.stale);
+    let theirs = engine
+        .admit(
+            "other",
+            "work",
+            "second",
+            grant_until("b", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(engine.cached_usages("person").await.unwrap().is_empty());
     engine
-        .usage("person", &receipt.account_id, false)
+        .usage("person", &mine.account_id, false)
+        .await
+        .unwrap();
+    engine
+        .usage("other", &theirs.account_id, false)
         .await
         .unwrap();
     // A poll in progress holds the poll lock; the dashboard read must not wait for it.
     let _poll = engine.usage_poll.lock().await;
-    let read = tokio::time::timeout(
-        Duration::from_secs(2),
-        engine.cached_usage(&receipt.account_id),
-    )
-    .await
-    .expect("dashboard read waited for the poll lock")
-    .unwrap();
-    assert_eq!(read.data.unwrap()["five_hour"]["utilization"], 42);
-    assert!(read.observed_at.is_some());
+    let read = tokio::time::timeout(Duration::from_secs(2), engine.cached_usages("person"))
+        .await
+        .expect("dashboard read waited for the poll lock")
+        .unwrap();
+    // Only the caller's own account, never another user's cached usage.
+    assert_eq!(read.len(), 1);
+    let usage = read[&mine.account_id].as_ref().unwrap();
+    assert_eq!(usage.data.as_ref().unwrap()["five_hour"]["utilization"], 42);
+    assert!(usage.observed_at.is_some());
+    // A deleted account's usage is gone from the read.
+    engine
+        .remove("person", "machine", &mine.account_id)
+        .await
+        .unwrap();
+    assert!(engine.cached_usages("person").await.unwrap().is_empty());
 }
 
 #[tokio::test]

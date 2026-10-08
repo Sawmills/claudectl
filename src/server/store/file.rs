@@ -399,6 +399,16 @@ impl FileStore {
     pub fn usage(&self, id: &str) -> Result<Option<Vec<u8>>> {
         Ok(self.read(|t| t.usage.get(id).cloned()))
     }
+    pub fn user_usage(&self, user: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        Ok(self.read(|t| {
+            t.accounts
+                .values()
+                .filter(|a| a.user == user)
+                .filter_map(|a| Some((a.id.clone(), t.usage.get(&a.id)?.clone())))
+                .filter(|(_, sealed)| !sealed.is_empty())
+                .collect()
+        }))
+    }
     pub fn put_usage(&self, id: &str, sealed: &[u8]) -> Result<()> {
         self.transact(|t| {
             let keep = t.accounts.contains_key(id) || id.starts_with("__");

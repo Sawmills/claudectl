@@ -27,16 +27,30 @@ impl Engine {
             None => Ok(T::default()),
         }
     }
-    /// The stored observation of an account the caller already scoped to its user (from
-    /// `accounts(user)`). It takes no poll lock and loads no grant, so a slow provider poll
-    /// never delays it. For the dashboard.
-    pub async fn cached_usage(&self, id: &str) -> Result<Usage> {
-        let mut result: Usage = self.stored(id).await?;
-        result.stale = result.data.is_none()
-            || result.error.is_some()
-            || now() >= result.next_retry_at
-            || result.observed_at.is_some_and(|t| t > now() + USABLE);
-        Ok(result)
+    /// The stored observations of `user`'s live accounts, by account ID, in one store read
+    /// scoped to that user. It takes no poll lock and loads no grant, so a slow provider poll
+    /// never delays it. One observation that does not unseal is that account's error only.
+    /// For the dashboard.
+    pub async fn cached_usages(
+        &self,
+        user: &str,
+    ) -> Result<std::collections::BTreeMap<String, Result<Usage>>> {
+        Ok(self
+            .store
+            .user_usage(user)
+            .await?
+            .into_iter()
+            .map(|(id, sealed)| {
+                let usage = self.unseal::<Usage>(&sealed).map(|mut u| {
+                    u.stale = u.data.is_none()
+                        || u.error.is_some()
+                        || now() >= u.next_retry_at
+                        || u.observed_at.is_some_and(|t| t > now() + USABLE);
+                    u
+                });
+                (id, usage)
+            })
+            .collect())
     }
     /// A cached read never contacts the provider. A fresh read uses the current access token
     /// and never refreshes: without a usable token it reports `login_required`.

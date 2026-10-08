@@ -80,36 +80,32 @@ async fn snapshot(server: &Server, headers: &HeaderMap) -> Result<Option<Snapsho
     };
     let unavailable = |_| server.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable");
     let engine = server.engine();
+    // The stored observations of this user's accounts, in one owner-scoped read with no
+    // poll lock. A failed read, or one account that does not unseal, shows as no data and
+    // is counted; it never fails the page.
+    let mut usages = engine.cached_usages(&user).await.unwrap_or_else(|_| {
+        server.error(StatusCode::SERVICE_UNAVAILABLE, "usage_unavailable");
+        Default::default()
+    });
     let mut accounts = Vec::new();
     for account in engine.accounts(&user).await.map_err(unavailable)? {
-        // Cached only: the page shows what the server last observed.
-        // The stored observation only: no poll lock, no account load. A read failure for
-        // one account shows as no data and is counted; it never fails the page.
-        let usage = match engine.cached_usage(&account.account_id).await {
-            Ok(usage) => usage,
-            Err(_) => {
+        let usage = match usages.remove(&account.account_id) {
+            Some(Ok(usage)) => usage,
+            Some(Err(_)) => {
                 server.error(StatusCode::SERVICE_UNAVAILABLE, "usage_unavailable");
                 Default::default()
             }
+            None => Default::default(),
         };
-        let parsed = usage
-            .data
-            .as_ref()
-            .and_then(|d| serde_json::from_value::<crate::api::UsageResponse>(d.clone()).ok());
-        let window = |w: Option<&crate::api::UsageWindow>| Window {
-            used_percent: w
-                .and_then(|w| w.utilization)
-                .filter(|n| n.is_finite() && *n >= 0.0),
-            resets_at: w.and_then(crate::api::UsageWindow::reset_timestamp),
-        };
+        let (five_hour, seven_day, usage_stale) = windows(&usage);
         accounts.push(Account {
             alias: account.alias,
             available: account.available,
             migration: account.migration.into(),
-            five_hour: window(parsed.as_ref().and_then(|u| u.five_hour.as_ref())),
-            seven_day: window(parsed.as_ref().and_then(|u| u.seven_day.as_ref())),
+            five_hour,
+            seven_day,
             observed_at: usage.observed_at.map(|ms| ms / 1000),
-            usage_stale: usage.stale || parsed.is_none(),
+            usage_stale,
         });
     }
     let machines = server
@@ -130,6 +126,25 @@ async fn snapshot(server: &Server, headers: &HeaderMap) -> Result<Option<Snapsho
         accounts,
         machines,
     }))
+}
+
+/// The 5-hour and 7-day windows of a stored observation, and whether it is stale. An
+/// observation without any usage figure is stale, never fresh.
+fn windows(usage: &crate::server::engine::Usage) -> (Window, Window, bool) {
+    let parsed = usage
+        .data
+        .as_ref()
+        .and_then(|d| serde_json::from_value::<crate::api::UsageResponse>(d.clone()).ok());
+    let window = |w: Option<&crate::api::UsageWindow>| Window {
+        used_percent: w
+            .and_then(|w| w.utilization)
+            .filter(|n| n.is_finite() && *n >= 0.0),
+        resets_at: w.and_then(crate::api::UsageWindow::reset_timestamp),
+    };
+    let five = window(parsed.as_ref().and_then(|u| u.five_hour.as_ref()));
+    let week = window(parsed.as_ref().and_then(|u| u.seven_day.as_ref()));
+    let empty = five.used_percent.is_none() && week.used_percent.is_none();
+    (five, week, usage.stale || empty)
 }
 
 fn document(content: &str, refresh: bool) -> Response {
@@ -183,6 +198,35 @@ pub(super) fn routes(router: Router<Arc<Server>>) -> Router<Arc<Server>> {
                     .unwrap_or_else(enrollment::dashboard_error)
             }),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cache_object_without_usage_figures_is_stale() {
+        let usage = |data| crate::server::engine::Usage {
+            data: Some(data),
+            observed_at: Some(1),
+            next_retry_at: i64::MAX,
+            stale: false,
+            ..Default::default()
+        };
+        for data in [
+            serde_json::json!({}),
+            serde_json::json!({"five_hour": null, "seven_day": {"utilization": null}}),
+        ] {
+            let (five, week, stale) = windows(&usage(data));
+            assert!(five.used_percent.is_none() && week.used_percent.is_none());
+            assert!(stale, "no usage figure must not read as fresh");
+        }
+        let (five, _, stale) = windows(&usage(serde_json::json!({
+            "five_hour": {"utilization": 12.0, "resets_at": "2099-01-01T00:00:00Z"}
+        })));
+        assert_eq!(five.used_percent, Some(12.0));
+        assert!(!stale);
+    }
 }
 
 #[cfg(test)]

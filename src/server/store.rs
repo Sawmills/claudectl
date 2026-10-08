@@ -285,6 +285,10 @@ impl Store {
     pub async fn usage(&self, id: &str) -> Result<Option<Vec<u8>>> {
         dispatch!(self, usage(id))
     }
+    /// Cached usage of `user`'s live accounts as (account ID, sealed), in one read.
+    pub async fn user_usage(&self, user: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        dispatch!(self, user_usage(user))
+    }
     /// Store usage only while the account exists, so a poll cannot outlive a delete.
     pub async fn put_usage(&self, id: &str, sealed: &[u8]) -> Result<()> {
         dispatch!(self, put_usage(id, sealed))
