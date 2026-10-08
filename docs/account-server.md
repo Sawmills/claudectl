@@ -128,7 +128,10 @@ for the current token only while Claude passes every idle gate below, at most ev
 (every 5 min in the token's last hour), retrying 30 s after a failed request, and never while
 the held token is valid but expires within 6 min: inside the server's 5 min refresh margin
 that request would refresh the grant and revoke the token a running turn may still use. After
-expiry the held token is dead for every session, so the request then is safe. When the
+expiry the held token is dead for every session, so the request then is safe. One case
+remains: while a migration's rotation is pending (between its admission and its first
+refresh), any token request refreshes the grant; do not migrate an account while `server run`
+sessions use it. When the
 revision changed (a refresh revoked the held token), it restarts Claude with
 `--resume <latest session>` on the new token, in the same folder and terminal, from the same
 checked build, and prints `claudectl: server token renewed; resuming session <id>`. It

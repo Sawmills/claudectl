@@ -94,6 +94,11 @@ copy afterwards.
    rotated.
 6. **Retire the other copies** by digest match on every other holder.
 
+**Do not migrate an account while `server run` sessions use it.** Between a migration
+admission and its first refresh the server marks the rotation pending, and the next token
+request of any session then refreshes the grant, which revokes the token every running session
+holds. Stop those sessions first (SAW-12610; a non-refreshing token read is the follow-up).
+
 After the pilot, `claudectl server migrate --all --exclusive-owner` moves every remaining
 account on a machine in one run (stop every Claude session there first; the command refuses
 while one runs). Read the summary table: rerun for `lost-reply` and `failed:fenced`, run
