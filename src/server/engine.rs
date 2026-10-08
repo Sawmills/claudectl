@@ -30,6 +30,26 @@ const BETA: &str = "oauth-2025-04-20";
 const PROVIDER: &str = "anthropic";
 /// Refresh when less than this remains, so machines always hold a token with room to work.
 const MARGIN: i64 = 300_000;
+/// Why a login could not finish, as a bounded reason the machine is told. The response
+/// stays retained either way.
+#[derive(Debug)]
+pub struct LoginRefused(pub &'static str);
+impl std::fmt::Display for LoginRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for LoginRefused {}
+/// `error` tagged with `reason`, keeping its message.
+pub(crate) fn refused(reason: &'static str, message: &'static str) -> anyhow::Error {
+    anyhow::Error::new(LoginRefused(reason)).context(message)
+}
+/// The reason for a failed login completion; untagged errors keep the generic one.
+pub fn login_reason(error: &anyhow::Error) -> &'static str {
+    error
+        .downcast_ref::<LoginRefused>()
+        .map_or("login_incomplete_grant_retained", |refused| refused.0)
+}
 /// A grant must stay valid this long for admission and identity verification.
 const USABLE: i64 = 60_000;
 /// Refresh lease length. Each provider call needs `CALL_BUDGET` of it left.
@@ -365,7 +385,10 @@ impl Engine {
             .await
             .map_err(|_| anyhow::anyhow!("Claude identity lookup unavailable"))?;
         if !response.status().is_success() {
-            bail!("Claude identity lookup rejected");
+            return Err(refused(
+                "login_identity_lookup_failed",
+                "Claude identity lookup rejected",
+            ));
         }
         let value: Value = response
             .json()
@@ -499,7 +522,10 @@ impl Engine {
         }
         let identity = self.identify(&grant.access_token).await?;
         if replacement.is_some_and(|expected| expected != &identity) {
-            bail!("login renewal changed Claude identity; grant retained");
+            return Err(refused(
+                "login_identity_changed",
+                "login renewal changed Claude identity (account or organization, e.g. after a plan move); grant retained. Remove the server account and log in again",
+            ));
         }
         let id = account_id(user, alias);
         let prior = match self.store.account(user, &id).await? {

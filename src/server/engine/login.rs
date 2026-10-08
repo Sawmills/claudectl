@@ -118,7 +118,7 @@ impl Engine {
             }
             None => {
                 if flow.expires_at < now() {
-                    bail!("login expired");
+                    return Err(super::refused("login_expired", "login expired"));
                 }
                 let (code, state) = pasted
                     .trim()
@@ -142,7 +142,10 @@ impl Engine {
                     .await
                     .map_err(|_| anyhow::anyhow!("login exchange outcome uncertain"))?;
                 if !response.status().is_success() {
-                    bail!("Claude rejected the login exchange");
+                    return Err(super::refused(
+                        "login_exchange_rejected",
+                        "Claude rejected the login exchange",
+                    ));
                 }
                 let bytes = match capped_body(response).await {
                     Ok(bytes) => bytes,

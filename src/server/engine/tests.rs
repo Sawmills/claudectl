@@ -1222,11 +1222,16 @@ async fn a_delete_purges_pending_admission_grants_for_the_alias() {
         organization_uuid: "o".into(),
     };
     let renewal = grant_until("renewed", now() + 3_600_000);
-    assert!(
-        engine
-            .admit("person", "work", "renewal", renewal, Some(&wrong))
-            .await
-            .is_err()
+    let refused = engine
+        .admit("person", "work", "renewal", renewal, Some(&wrong))
+        .await
+        .err()
+        .expect("a changed identity is refused");
+    // The machine is told why: a plan move to another organization changes the identity.
+    assert_eq!(super::login_reason(&refused), "login_identity_changed");
+    assert_eq!(
+        super::login_reason(&anyhow::anyhow!("anything else")),
+        "login_incomplete_grant_retained"
     );
     let pending = engine
         .store()

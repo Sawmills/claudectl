@@ -622,7 +622,15 @@ async fn login_complete(
                 .await
         })
         .await?
-        .map_err(|_| server.error(StatusCode::CONFLICT, "login_incomplete_grant_retained"))?;
+        .map_err(|error| {
+            let reason = engine::login_reason(&error);
+            // Engine errors are fixed texts; no token or code reaches them.
+            eprintln!(
+                "{}",
+                json!({"operation":"login_complete","reason":reason,"error":format!("{error:#}")})
+            );
+            server.error(StatusCode::CONFLICT, reason)
+        })?;
     server.authorize(&headers).await?;
     Ok(private(result))
 }
