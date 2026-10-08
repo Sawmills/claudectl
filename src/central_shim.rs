@@ -134,6 +134,11 @@ fn check_real(real: &Path, target: &Path) -> Result<()> {
 /// Write `<dir>/claude` for `spec`. Replaces an earlier launcher; never a foreign file.
 pub fn install(spec: &Spec, dir: &Path) -> Result<PathBuf> {
     crate::profile::validate_alias(&spec.alias)?;
+    if spec.alias.starts_with('-') {
+        bail!(
+            "an alias that starts with '-' reads as an option in `server run`; rename the server account"
+        );
+    }
     let target = dir.join("claude");
     check_real(&spec.real, &target)?;
     if !spec.claudectl.is_absolute() || !is_executable(&spec.claudectl) {
@@ -199,14 +204,29 @@ pub fn uninstall(dir: &Path) -> Result<bool> {
 /// and not a launcher. The path is kept as found, so an installer symlink keeps following
 /// updates.
 pub fn find_real(explicit: Option<&Path>, path: &OsStr) -> Result<PathBuf> {
+    find_real_from(explicit, path, &std::env::current_dir()?)
+}
+
+/// `path` joined to `base` when relative. Lexical only: a symlink stays a symlink.
+pub fn absolute(path: &Path, base: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+/// `find_real`, with relative PATH entries and `explicit` read against `base`.
+pub fn find_real_from(explicit: Option<&Path>, path: &OsStr, base: &Path) -> Result<PathBuf> {
     if let Some(real) = explicit {
+        let real = &absolute(real, base);
         if !is_executable(real) || is_shim(real) {
             bail!("{} is not a Claude executable", real.display());
         }
         return Ok(real.to_path_buf());
     }
     std::env::split_paths(path)
-        .map(|dir| dir.join("claude"))
+        .map(|dir| absolute(&dir, base).join("claude"))
         .find(|candidate| is_executable(candidate) && !is_shim(candidate))
         .context("no Claude executable on PATH apart from a claudectl shim; pass --claude")
 }
@@ -297,13 +317,17 @@ fn default_dir(paths: &crate::config::Paths) -> PathBuf {
 pub fn dispatch(command: Command) -> Result<()> {
     let paths = &crate::config::default_paths()?;
     let path = std::env::var_os("PATH").unwrap_or_default();
+    let cwd = std::env::current_dir()?;
+    // A relative --dir would point elsewhere from every later shell: make it absolute.
+    let resolve =
+        |dir: Option<PathBuf>| dir.map_or_else(|| default_dir(paths), |d| absolute(&d, &cwd));
     match command {
         Command::Install {
             account,
             claude,
             dir,
         } => {
-            let dir = dir.unwrap_or_else(|| default_dir(paths));
+            let dir = resolve(dir);
             let account = account.unwrap_or_else(|| default_account().into());
             // Only a server account: the launcher never falls back to a local or billed login.
             super::Client::load(paths)?.account(&account)?;
@@ -327,7 +351,7 @@ pub fn dispatch(command: Command) -> Result<()> {
             Ok(())
         }
         Command::Uninstall { dir } => {
-            let dir = dir.unwrap_or_else(|| default_dir(paths));
+            let dir = resolve(dir);
             if uninstall(&dir)? {
                 println!("Removed {}", dir.join("claude").display());
             } else {
@@ -336,7 +360,7 @@ pub fn dispatch(command: Command) -> Result<()> {
             Ok(())
         }
         Command::Status { dir } => {
-            let dir = dir.unwrap_or_else(|| default_dir(paths));
+            let dir = resolve(dir);
             let s = status(&dir, &path)?;
             if !s.installed {
                 println!("No shim at {}", dir.join("claude").display());

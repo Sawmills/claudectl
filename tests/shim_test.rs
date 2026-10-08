@@ -382,3 +382,43 @@ fn a_nested_claude_drops_only_the_server_run_token() {
         ["token=mine marker=unset"]
     );
 }
+
+#[test]
+fn an_alias_that_looks_like_an_option_is_refused() {
+    let f = Fixture::new();
+    for alias in ["-work", "--", "--claude"] {
+        assert!(shim::install(&f.spec(alias), &f.dir).is_err(), "{alias}");
+    }
+    assert!(!f.dir.join("claude").exists());
+}
+
+#[test]
+fn relative_paths_become_absolute_without_resolving_symlinks() {
+    let f = Fixture::new();
+    let bin = f.real.parent().unwrap();
+    // A relative PATH entry, read against a base directory.
+    let found = shim::find_real_from(
+        None,
+        std::ffi::OsStr::new("real bin"),
+        bin.parent().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(found, f.real);
+    assert!(found.is_absolute());
+    // A symlinked real Claude stays the link, not its target.
+    let link = bin.parent().unwrap().join("claude-link");
+    std::os::unix::fs::symlink(&f.real, &link).unwrap();
+    assert_eq!(
+        shim::find_real(Some(&link), std::ffi::OsStr::new("")).unwrap(),
+        link
+    );
+    // A relative --dir is absolute in the PATH line and on disk.
+    assert_eq!(
+        shim::absolute(Path::new("shim"), Path::new("/home/a")),
+        Path::new("/home/a/shim")
+    );
+    assert_eq!(
+        shim::absolute(Path::new("/x/shim"), Path::new("/home/a")),
+        Path::new("/x/shim")
+    );
+}
