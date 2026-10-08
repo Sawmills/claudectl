@@ -95,6 +95,33 @@ reading the old file, so both versions work on one machine during the upgrade. A
 `unshare` on Linux, Homebrew OpenSSL on macOS). Claude 2.1.280 on Linux ARM64 on the devbox
 passed on 2026-10-07. The operator procedure is in [the runbook](account-server-runbook.md).
 
+## Plain `claude` through the server (shim)
+
+`claudectl shim install --account work` writes `~/.local/claudectl/bin/claude`
+(without `--account`, the account is `amir@sawmills.ai` for now). That
+small sh script runs `claudectl server run work --claude <real Claude> -- <your args>`,
+so plain `claude` in a terminal, a script, or a lane uses the server account. Put the
+directory first on PATH; install prints the line and never edits shell files:
+
+```sh
+claudectl shim install --account work
+export PATH="$HOME/.local/claudectl/bin:$PATH"
+claudectl shim status
+```
+
+- Install records the real Claude (the first `claude` on PATH that is not a shim, or
+  `--claude`) as found, so the native installer's `~/.local/bin/claude` link keeps
+  following updates. It records claudectl the same way. Run install again to change the
+  account.
+- The shim passes the real Claude by path, so `server run` never finds the shim on PATH.
+  `server run --claude <shim>` is refused before any server call.
+- `CLAUDECTL_SHIM=off claude ...` runs the real Claude. `-v`, `--version`, `-h`,
+  `--help`, `update`, `doctor`, and `install` as the first argument also run it directly,
+  without a server token.
+- Install refuses an account that is not on the server, a real Claude that is a shim,
+  and an existing `claude` file in the directory that it did not write. `claudectl shim
+  uninstall` removes only its own file.
+
 ## Session behavior
 
 `claudectl server run <alias> -- <claude args>` keeps the host Claude config: the same

@@ -22,6 +22,12 @@ enum Commands {
         #[command(subcommand)]
         command: claudectl::central::Command,
     },
+    /// Make plain `claude` run through `claudectl server run` (a PATH shim)
+    #[cfg(unix)]
+    Shim {
+        #[command(subcommand)]
+        command: claudectl::central::shim::Command,
+    },
     /// Show account status and what to do next
     Status {
         /// Check only this saved profile
@@ -164,6 +170,8 @@ fn main() {
 
     let result = match cli.command {
         Commands::Server { command } => claudectl::central::dispatch(command),
+        #[cfg(unix)]
+        Commands::Shim { command } => claudectl::central::shim::dispatch(command),
         Commands::Status {
             ref alias,
             cached,
