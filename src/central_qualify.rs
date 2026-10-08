@@ -73,9 +73,17 @@ fn load_failures(paths: &Paths) -> Result<Vec<Failed>> {
     if !file.try_exists()? {
         return Ok(Vec::new());
     }
-    serde_json::from_slice(&private_read(&file)?).map_err(|_| {
+    let failures: Vec<Failed> = serde_json::from_slice(&private_read(&file)?).map_err(|_| {
         anyhow::anyhow!("Claude build qualification failure list is invalid; refusing")
-    })
+    })?;
+    // A time that cannot be read is damage, never an expired failure.
+    if failures
+        .iter()
+        .any(|f| chrono::DateTime::parse_from_rfc3339(&f.failed_at).is_err())
+    {
+        bail!("Claude build qualification failure list is invalid; refusing");
+    }
+    Ok(failures)
 }
 
 /// The Linux build that passed the host-config check on the devbox; no macOS build is built in.
@@ -538,6 +546,17 @@ mod tests {
             "check": CHECK, "failed_at": "x", "note": 1}]);
         atomic(&failures_path(&paths), &extra).unwrap();
         assert!(load_failures(&paths).is_err());
+    }
+
+    #[test]
+    fn a_failure_with_an_unreadable_time_refuses() {
+        let (_home, paths, binary) = fixture();
+        let (_dir, file, digest) = snapshot_of(&paths, &binary);
+        let bad = serde_json::json!([{"sha256": digest, "platform": std::env::consts::OS,
+            "check": CHECK, "failed_at": "not a time"}]);
+        atomic(&failures_path(&paths), &bad).unwrap();
+        assert!(load_failures(&paths).is_err());
+        assert!(ensure(&paths, &file, &digest, |_, _| panic!("ran")).is_err());
     }
 
     #[test]
