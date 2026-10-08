@@ -33,7 +33,9 @@ spec:
             description: Read the reason in the structured logs and the audit log. A refresh that failed needs login renewal; never replay a lost refresh response.
             runbook_url: https://github.com/Sawmills/claudectl/blob/main/docs/account-server.md
         - alert: ClaudectlForcedTokenRotation
-          expr: sum(increase(claudectl_token_rotations_total{reason=~"forced|migration"}[10m])) > 0
+          # The last-rotation time, not increase(): a rotation before a pod's first scrape
+          # never shows as a counter increase.
+          expr: time() - max(claudectl_token_last_rotation_timestamp_seconds{reason=~"forced|migration"} > 0) < 600
           for: 0m
           labels:
             severity: warning

@@ -620,6 +620,19 @@ async fn a_client_forced_refresh_is_counted_as_forced() {
             ("migration", 0)
         ]
     );
+    // The time of the last rotation alerts even when no scrape saw the counter at 0.
+    let last = engine.last_rotations();
+    assert_eq!(
+        last.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+        ["expired", "forced", "margin", "migration"]
+    );
+    for (reason, at) in last {
+        if reason == "forced" {
+            assert!((now() / 1000 - at).abs() <= 5, "{at}");
+        } else {
+            assert_eq!(at, 0, "{reason}");
+        }
+    }
 }
 
 #[tokio::test]

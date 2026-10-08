@@ -290,8 +290,9 @@ pub struct Engine {
     /// One task per account in this process; the lease covers other replicas.
     local: StdMutex<BTreeMap<String, Arc<Mutex<()>>>>,
     usage_poll: Mutex<()>,
-    /// Refreshes run by this process, by reason (for `/metrics`).
-    rotations: StdMutex<BTreeMap<&'static str, u64>>,
+    /// Refreshes run by this process, by reason: count and last time in seconds (for
+    /// `/metrics`).
+    rotations: StdMutex<BTreeMap<&'static str, (u64, i64)>>,
 }
 /// The receipt state when no committed admission was visible, from the pending row read
 /// after it.
@@ -329,7 +330,7 @@ impl Engine {
                 .build()?,
             local: StdMutex::new(BTreeMap::new()),
             usage_poll: Mutex::new(()),
-            rotations: StdMutex::new(ROTATION_REASONS.iter().map(|r| (*r, 0)).collect()),
+            rotations: StdMutex::new(ROTATION_REASONS.iter().map(|r| (*r, (0, 0))).collect()),
         })
     }
     pub fn store(&self) -> &Arc<Store> {
@@ -864,12 +865,12 @@ impl Engine {
         if !response.status().is_success() {
             bail!("refresh rejected; login renewal required");
         }
-        *self
-            .rotations
-            .lock()
-            .expect("rotations lock")
-            .entry(reason)
-            .or_default() += 1;
+        {
+            let mut rotations = self.rotations.lock().expect("rotations lock");
+            let rotation = rotations.entry(reason).or_default();
+            rotation.0 += 1;
+            rotation.1 = now() / 1000;
+        }
         let bytes = match capped_body(response).await {
             Ok(bytes) => bytes,
             Err(Body::TooLarge) => {
@@ -1022,7 +1023,17 @@ impl Engine {
             .lock()
             .expect("rotations lock")
             .iter()
-            .map(|(reason, count)| (*reason, *count))
+            .map(|(reason, (count, _))| (*reason, *count))
+            .collect()
+    }
+    /// The last refresh run by this process, by reason, in seconds; 0 if none. The alert
+    /// reads this: a rotation before the first scrape never shows as a counter increase.
+    pub fn last_rotations(&self) -> Vec<(&'static str, i64)> {
+        self.rotations
+            .lock()
+            .expect("rotations lock")
+            .iter()
+            .map(|(reason, (_, last))| (*reason, *last))
             .collect()
     }
     pub async fn audit(&self, event: &audit::Event<'_>) -> Result<()> {

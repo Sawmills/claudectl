@@ -661,8 +661,11 @@ async fn metrics(State(server): Shared, headers: HeaderMap) -> Result<Response, 
         .engine
         .rotations()
         .iter()
-        .map(|(reason, count)| {
-            format!("claudectl_token_rotations_total{{reason=\"{reason}\"}} {count}\n")
+        .zip(server.engine.last_rotations())
+        .map(|((reason, count), (_, last))| {
+            format!(
+                "claudectl_token_rotations_total{{reason=\"{reason}\"}} {count}\nclaudectl_token_last_rotation_timestamp_seconds{{reason=\"{reason}\"}} {last}\n"
+            )
         })
         .collect();
     let output = output + &rotations;
