@@ -3,6 +3,16 @@ use serde::{Deserialize, Serialize};
 
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+
+/// The refresh endpoint. Debug builds let integration tests point it at a synthetic provider;
+/// release builds always use the real one.
+pub fn token_url() -> String {
+    #[cfg(debug_assertions)]
+    if let Ok(url) = std::env::var("CLAUDECTL_TEST_TOKEN_URL") {
+        return url;
+    }
+    TOKEN_URL.into()
+}
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 pub const OAUTH_BETA_HEADER: (&str, &str) = ("anthropic-beta", "oauth-2025-04-20");
@@ -226,7 +236,7 @@ pub async fn refresh_credentials_async(
         "client_id": CLIENT_ID,
     });
     let resp = client
-        .post(TOKEN_URL)
+        .post(token_url())
         .json(&body)
         .send()
         .await

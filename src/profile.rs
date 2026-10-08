@@ -81,14 +81,21 @@ impl Profile {
         )?;
         let json = serde_json::to_string(creds)?;
         let path = self.credentials_path();
-        std::fs::write(&path, json)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
+        // Atomic: a failed write keeps the old file whole.
+        let write = || -> Result<()> {
+            let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
+            std::io::Write::write_all(&mut tmp, json.as_bytes())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tmp.as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            tmp.as_file().sync_all()?;
+            tmp.persist(&path)?;
+            Ok(())
+        };
+        write().with_context(|| format!("failed to write {}", path.display()))
     }
 }
 
@@ -365,6 +372,59 @@ pub fn list_profiles() -> Result<Vec<Profile>> {
 }
 pub fn get_active() -> Result<Option<String>> {
     get_active_from(&config::default_paths()?)
+}
+
+/// Save a rotated grant into its profile and every non-active sibling that held the same
+/// refresh grant (the rotation invalidated their copy too).
+pub fn persist_rotated_grant(
+    paths: &Paths,
+    active: Option<&str>,
+    origin: &Profile,
+    rotated: &CredentialsFile,
+    original_grant_key: &str,
+) -> Result<()> {
+    // The provider already invalidated the old refresh token: save the origin before any
+    // fallible listing, then every matching holder even when another write fails. Each write
+    // is atomic, so a failed one keeps its old file whole.
+    let mut failures = Vec::new();
+    if origin.write_credentials(rotated).is_err() {
+        failures.push(origin.meta.alias.clone());
+    }
+    // Rotation changes the grant for every saved copy, including unexpired
+    // aliases and aliases excluded by a focused status request.
+    for sibling in list_profiles_from(paths)? {
+        if sibling.meta.alias == origin.meta.alias || active == Some(sibling.meta.alias.as_str()) {
+            continue;
+        }
+        let mut creds = match sibling.read_credentials() {
+            Ok(creds) => creds,
+            // An unreadable profile cannot be identified as a matching grant.
+            // Its status row reports that error independently.
+            Err(_) => continue,
+        };
+        if creds
+            .claude_ai_oauth
+            .refresh_token
+            .as_deref()
+            .map(crate::usage_cache::UsageCache::key)
+            .as_deref()
+            != Some(original_grant_key)
+        {
+            continue;
+        }
+        creds.claude_ai_oauth.access_token = rotated.claude_ai_oauth.access_token.clone();
+        creds.claude_ai_oauth.refresh_token = rotated.claude_ai_oauth.refresh_token.clone();
+        creds.claude_ai_oauth.expires_at = rotated.claude_ai_oauth.expires_at;
+        if sibling.write_credentials(&creds).is_err() {
+            failures.push(sibling.meta.alias.clone());
+        }
+    }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "could not update saved aliases: {}",
+        failures.join(", ")
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -747,5 +807,50 @@ mod tests {
             "t1"
         );
         assert_eq!(get_active_from(&paths).unwrap(), Some("a@x".to_string()));
+    }
+
+    #[test]
+    fn a_rotated_grant_reaches_its_origin_even_when_profiles_cannot_be_listed() {
+        let (_tmp, paths, _store) = setup();
+        let origin = save_profile_to(&paths, "a@x", &creds("t-a"), None).unwrap();
+        // A damaged profile makes the listing fail.
+        let broken = paths.profiles_dir().join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("account.json"), "not json").unwrap();
+        let mut rotated = creds("rotated");
+        rotated.claude_ai_oauth.refresh_token = Some("rt-2".into());
+        let key = crate::usage_cache::UsageCache::key("rt");
+        assert!(persist_rotated_grant(&paths, None, &origin, &rotated, &key).is_err());
+        let saved = origin.read_credentials().unwrap();
+        assert_eq!(saved.claude_ai_oauth.refresh_token.as_deref(), Some("rt-2"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rotated_grant_that_cannot_be_saved_to_its_origin_still_reaches_matching_siblings() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, paths, _store) = setup();
+        let origin = save_profile_to(&paths, "a@x", &creds("t-a"), None).unwrap();
+        save_profile_to(&paths, "b@x", &creds("t-b"), None).unwrap();
+        let key = crate::usage_cache::UsageCache::key("rt");
+        let mut rotated = creds("rotated");
+        rotated.claude_ai_oauth.refresh_token = Some("rt-2".into());
+        let file = origin.credentials_path();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::set_permissions(&origin.dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = persist_rotated_grant(&paths, None, &origin, &rotated, &key);
+        std::fs::set_permissions(&origin.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // The rotated refresh token survives in the matching sibling; the error names the origin.
+        assert!(result.unwrap_err().to_string().contains("a@x"));
+        let sibling = get_profile_from(&paths, "b@x")
+            .unwrap()
+            .read_credentials()
+            .unwrap();
+        assert_eq!(sibling.claude_ai_oauth.access_token, "rotated");
+        assert_eq!(
+            sibling.claude_ai_oauth.refresh_token.as_deref(),
+            Some("rt-2")
+        );
     }
 }

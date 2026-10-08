@@ -424,7 +424,7 @@ fn fetch_usages_with_refresh(
                 match refreshed {
                     Ok(rotated) => {
                         creds.claude_ai_oauth = rotated.clone();
-                        if let Err(error) = persist_rotated_grant(paths, active.as_deref(), &profile, &creds, &key) {
+                        if let Err(error) = profile::persist_rotated_grant(paths, active.as_deref(), &profile, &creds, &key) {
                             profile_save_error = Some(format!(
                                 "token refreshed but saving profiles failed; affected aliases may need login ({error})"
                             ));
@@ -464,54 +464,6 @@ fn fetch_usages_with_refresh(
         }
         Ok(fetched)
     })
-}
-
-fn persist_rotated_grant(
-    paths: &config::Paths,
-    active: Option<&str>,
-    origin: &profile::Profile,
-    rotated: &api::CredentialsFile,
-    original_grant_key: &str,
-) -> Result<()> {
-    let mut failures = Vec::new();
-    if origin.write_credentials(rotated).is_err() {
-        failures.push(origin.meta.alias.clone());
-    }
-    // Rotation changes the grant for every saved copy, including unexpired
-    // aliases and aliases excluded by a focused status request.
-    for sibling in profile::list_profiles_from(paths)? {
-        if sibling.meta.alias == origin.meta.alias || active == Some(sibling.meta.alias.as_str()) {
-            continue;
-        }
-        let mut creds = match sibling.read_credentials() {
-            Ok(creds) => creds,
-            // An unreadable profile cannot be identified as a matching grant.
-            // Its status row reports that error independently.
-            Err(_) => continue,
-        };
-        if creds
-            .claude_ai_oauth
-            .refresh_token
-            .as_deref()
-            .map(UsageCache::key)
-            .as_deref()
-            != Some(original_grant_key)
-        {
-            continue;
-        }
-        creds.claude_ai_oauth.access_token = rotated.claude_ai_oauth.access_token.clone();
-        creds.claude_ai_oauth.refresh_token = rotated.claude_ai_oauth.refresh_token.clone();
-        creds.claude_ai_oauth.expires_at = rotated.claude_ai_oauth.expires_at;
-        if sibling.write_credentials(&creds).is_err() {
-            failures.push(sibling.meta.alias.clone());
-        }
-    }
-    anyhow::ensure!(
-        failures.is_empty(),
-        "could not update saved aliases: {}",
-        failures.join(", ")
-    );
-    Ok(())
 }
 
 fn to_account_status(f: &FetchedUsage) -> AccountStatus {

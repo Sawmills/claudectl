@@ -206,6 +206,10 @@ macro_rules! marker_error {
 }
 marker_error!(Gone, "server account was deleted");
 marker_error!(
+    AdmissionCancelled,
+    "this admission was cancelled (by a delete or an abort); start again"
+);
+marker_error!(
     Superseded,
     "a login renewal replaced this migration's grant before it rotated; its copies may still be valid"
 );
@@ -256,6 +260,17 @@ pub struct Engine {
     /// One task per account in this process; the lease covers other replicas.
     local: StdMutex<BTreeMap<String, Arc<Mutex<()>>>>,
     usage_poll: Mutex<()>,
+}
+/// The receipt state when no committed admission was visible, from the pending row read
+/// after it.
+pub(crate) fn state_without_admission(pending: Option<store::PendingState>) -> &'static str {
+    match pending {
+        // Live: an admission may still commit. Committed: it committed after the admission
+        // read; the client's rerun finds the receipt.
+        Some(store::PendingState::Live | store::PendingState::Committed) => "pending",
+        // Cancelled by a delete, or never kept: nothing can be admitted.
+        Some(store::PendingState::Cancelled) | None => "none",
+    }
 }
 impl Engine {
     /// A file-store engine at `state`; it takes the state directory's process lock.
@@ -429,7 +444,7 @@ impl Engine {
             grant: Grant,
             replacement: Option<Identity>,
         }
-        let cancelled = || anyhow::anyhow!("a delete cancelled this admission; start a new login");
+        let cancelled = || anyhow::Error::from(AdmissionCancelled);
         // Retain an acquired grant before any network verification, even if it fails. A
         // delete cancels this row, and a cancelled admission never commits.
         if self.store.pending(user, admission_id).await?.is_none() {
@@ -659,10 +674,40 @@ impl Engine {
     }
     /// A completed admission. A migration counts only after a verified, distinct rotation.
     pub async fn receipt(&self, user: &str, admission: &str) -> Result<Option<Receipt>> {
+        Ok(self.receipt_state(user, admission).await?.0)
+    }
+    /// Cancel a migration ID that has not committed, so a delayed import can never admit it.
+    pub async fn cancel_migration(
+        &self,
+        user: &str,
+        alias: &str,
+        admission: &str,
+    ) -> Result<store::CancelOutcome> {
+        let alias = validate_alias(alias)?;
+        validate_alias(admission)?;
+        self.store.cancel_admission(user, admission, alias).await
+    }
+    /// The receipt and where the admission stands: `none` (never admitted, so a client may
+    /// restore its fenced grant), `pending` (admitted, rotation not yet verified) or
+    /// `complete`. Unrotated, Superseded and Gone stay errors.
+    pub async fn receipt_state(
+        &self,
+        user: &str,
+        admission: &str,
+    ) -> Result<(Option<Receipt>, &'static str)> {
         match self.admitted(user, admission).await? {
-            Some((receipt, Rotation::Rotated | Rotation::NotMigrated, _)) => Ok(Some(receipt)),
+            // A kept grant not yet committed may still be admitted: never "none".
+            None => Ok((
+                None,
+                state_without_admission(
+                    self.store.pending(user, admission).await?.map(|r| r.state),
+                ),
+            )),
+            Some((receipt, Rotation::Rotated | Rotation::NotMigrated, _)) => {
+                Ok((Some(receipt), "complete"))
+            }
             Some((_, Rotation::Unrotated, _)) => Err(Unrotated.into()),
-            _ => Ok(None),
+            Some((_, Rotation::Pending { .. }, _)) => Ok((None, "pending")),
         }
     }
     /// Keep the lease long enough for one provider call; a failed renewal stops the work.
