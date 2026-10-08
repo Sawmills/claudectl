@@ -74,13 +74,20 @@ this Claude binary hash is built in, with synthetic evidence for the host-config
 | ----------- | -------------- | ------------------------------------------------------------------ |
 | Linux ARM64 | 2.1.280        | `92f2b4fd05d0bdcf7b9a0d4e0ecef4a1e4b368b290cd8fd07cff9a50013f45a2` |
 
-The launcher hashes a private executable snapshot before running it. Any other
-build is refused until `claudectl server qualify --claude PATH` passes on that
-machine. The command runs the full-launcher check `supervised_host_config` from
+`server run` copies the build once, before any server call, and hashes that copy; the
+same copy is checked, recorded and run. A build that is not built in or qualified is
+checked on first use: `server run` prints `qualifying Claude build <digest> (first use,
+about 15 s)`, and only on a pass does it ask the server for a token. One check runs at a
+time per machine (`~/.claudectl/server/qualify.lock`); another launch waits up to 90 s and
+prints `waiting for qualification (pid N)`. One check is limited to 75 s. A failed check
+is recorded in `qualify-failures.json` (same key as a pass; a damaged file refuses), and
+launches of that build are refused for one hour without a new check.
+`claudectl server qualify --claude PATH` always runs the check and clears a failure on a
+pass. The check runs the full-launcher check `supervised_host_config` from
 `experiments/settings-renewal/supervised.py` against a private snapshot of the build:
 a fake API and a host login in the HOME, one Bash tool call on server token A, then a
 `--resume` relaunch on server token B. The host token must never be sent and the host files
-must not change. Only on a pass does it record the hash, with the check name, in
+must not change. Only on a pass is the hash recorded, with the check name, in
 `~/.claudectl/server/qualified-host-config-builds.json`. Builds qualified by the earlier
 renewal check (in `qualified-builds.json`, before the host-config model) are not
 qualified for this client: run `server qualify` again after the upgrade. Older clients keep
