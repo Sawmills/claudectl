@@ -14,6 +14,8 @@ use std::{
 mod migration;
 #[path = "central_qualify.rs"]
 mod qualify;
+#[path = "central_renew.rs"]
+mod renew;
 #[path = "central_session.rs"]
 pub mod session;
 pub use migration::{
@@ -651,6 +653,9 @@ pub enum Command {
     },
     /// Read the local session usage cache without network access
     Statusline { account_id: String },
+    /// Record a Claude hook event for a running server session (internal; never fails)
+    #[command(hide = true)]
+    Hook { dir: PathBuf },
     /// Transfer a profile, or every saved account with --all, after stopping every previous
     /// grant holder
     Migrate {
@@ -687,6 +692,17 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Disconnect => disconnect(&paths),
         Command::Status { alias, cached } => status(&paths, &alias, cached),
         Command::Statusline { account_id } => statusline(&paths, &account_id),
+        Command::Hook { dir } => {
+            // A hook never blocks or talks to Claude: no output, exit 0 whatever happens. A
+            // failure leaves the session's error marker, so renewal stops (fail closed).
+            let _ = renew::hook_from(
+                &root(&paths).join("sessions"),
+                &dir,
+                std::io::stdin(),
+                now(),
+            );
+            Ok(())
+        }
         Command::Qualify { claude } => qualify::qualify(&paths, &claude),
         command => {
             let client = Client::load(&paths)?;

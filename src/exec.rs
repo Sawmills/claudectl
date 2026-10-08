@@ -1127,6 +1127,14 @@ fn descendants_in_group(leader: u32) -> std::io::Result<Vec<i32>> {
     group_members_from_listing(&pids[..count.min(pids.len())], leader)
 }
 
+/// The number of other processes in the leader's group; None when it cannot be read.
+#[cfg(unix)]
+pub(crate) fn group_size(leader: u32) -> Option<usize> {
+    descendants_in_group(leader)
+        .ok()
+        .map(|members| members.len())
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 fn descendants_in_group(leader: u32) -> std::io::Result<Vec<i32>> {
     let leader = i32::try_from(leader).unwrap_or(0);
@@ -1478,7 +1486,7 @@ pub(crate) fn set_process_group(_command: &mut Command) {}
 /// this handoff and the exec stops the forked child while claudectl waits
 /// inside spawn; `SpawnWatchdog` suspends claudectl's job then.
 #[cfg(unix)]
-fn take_foreground(command: &mut Command) {
+pub(crate) fn take_foreground(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: getpgrp only reads process state.
     let claudectl_group = unsafe { libc::getpgrp() };
