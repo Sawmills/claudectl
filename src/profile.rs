@@ -383,8 +383,13 @@ pub fn persist_rotated_grant(
     rotated: &CredentialsFile,
     original_grant_key: &str,
 ) -> Result<()> {
-    // Stage every sibling update first, so a listing error writes nothing.
-    let mut staged = Vec::new();
+    // The provider already invalidated the old refresh token: save the origin before any
+    // fallible listing, then every matching holder even when another write fails. Each write
+    // is atomic, so a failed one keeps its old file whole.
+    let mut failures = Vec::new();
+    if origin.write_credentials(rotated).is_err() {
+        failures.push(origin.meta.alias.clone());
+    }
     // Rotation changes the grant for every saved copy, including unexpired
     // aliases and aliases excluded by a focused status request.
     for sibling in list_profiles_from(paths)? {
@@ -410,16 +415,6 @@ pub fn persist_rotated_grant(
         creds.claude_ai_oauth.access_token = rotated.claude_ai_oauth.access_token.clone();
         creds.claude_ai_oauth.refresh_token = rotated.claude_ai_oauth.refresh_token.clone();
         creds.claude_ai_oauth.expires_at = rotated.claude_ai_oauth.expires_at;
-        staged.push((sibling, creds));
-    }
-    // Every holder gets the rotated grant even when another write fails: the provider already
-    // invalidated the old refresh token, so a holder left behind needs a new login. Each write
-    // is atomic, so a failed one keeps its old file whole.
-    let mut failures = Vec::new();
-    if origin.write_credentials(rotated).is_err() {
-        failures.push(origin.meta.alias.clone());
-    }
-    for (sibling, creds) in staged {
         if sibling.write_credentials(&creds).is_err() {
             failures.push(sibling.meta.alias.clone());
         }
@@ -812,6 +807,22 @@ mod tests {
             "t1"
         );
         assert_eq!(get_active_from(&paths).unwrap(), Some("a@x".to_string()));
+    }
+
+    #[test]
+    fn a_rotated_grant_reaches_its_origin_even_when_profiles_cannot_be_listed() {
+        let (_tmp, paths, _store) = setup();
+        let origin = save_profile_to(&paths, "a@x", &creds("t-a"), None).unwrap();
+        // A damaged profile makes the listing fail.
+        let broken = paths.profiles_dir().join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("account.json"), "not json").unwrap();
+        let mut rotated = creds("rotated");
+        rotated.claude_ai_oauth.refresh_token = Some("rt-2".into());
+        let key = crate::usage_cache::UsageCache::key("rt");
+        assert!(persist_rotated_grant(&paths, None, &origin, &rotated, &key).is_err());
+        let saved = origin.read_credentials().unwrap();
+        assert_eq!(saved.claude_ai_oauth.refresh_token.as_deref(), Some("rt-2"));
     }
 
     #[cfg(unix)]
