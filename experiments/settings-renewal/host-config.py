@@ -168,11 +168,14 @@ def run_case(root, case, server):
     assert [r['turn'] for r in results] == [1, 2], summary
     assert results[0].get('is_error') is False, summary
     assert results[1].get('is_error') is True, summary
+    # The turn-2 error is the stale A token rejected by the API, not a client-side failure.
+    by_turn = lambda t: [(r['generation'], r['status']) for r in state['requests'] if r['turn'] == t]
+    assert by_turn(2) and all(x == ('A', 401) for x in by_turn(2)), summary
     if case == 'flag_proactive':
         # The renewal path: a new process resumes the same session with the B token.
         assert resumed and resumed[-1].get('is_error') is False, summary
         assert resumed[-1].get('session_id') == session, summary
-        assert summary['sequence'][-1] == ('B', 200), summary
+        assert by_turn(3) and all(x == ('B', 200) for x in by_turn(3)), summary
     else:
         assert resumed is None, summary
     print(json.dumps({'case': case, 'checks': 'passed', 'turn2_in_same_process_ok': False,
