@@ -50,6 +50,22 @@ fn digests(creds: &CredentialsFile) -> Vec<String> {
     .map(|token| format!("{:x}", Sha256::digest(token.as_bytes())))
     .collect()
 }
+/// Refuse removing a profile while its migration is open (fenced, no receipt): abort restores
+/// the grant into that profile directory. A finished migration does not block removal.
+pub fn ensure_removable(root: &Path, alias: &str) -> Result<()> {
+    let file = directory(root, alias).join("journal.json");
+    if !file.try_exists()? {
+        return Ok(());
+    }
+    let open = serde_json::from_slice::<Journal>(&private_read(&file)?)
+        .map_or(true, |j| j.receipt.is_none());
+    if open {
+        bail!(
+            "{alias} is fenced for a server migration; finish it with `claudectl server migrate --all --exclusive-owner` or undo it with `claudectl server migrate --abort {alias}` before removing the profile"
+        );
+    }
+    Ok(())
+}
 /// Refuse restoring a migrated grant under another alias, including after profile removal.
 pub fn ensure_local_grant(
     root: &Path,

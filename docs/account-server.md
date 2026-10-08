@@ -61,7 +61,8 @@ so a delayed import with that ID is rejected (`409 migration_cancelled`). Only a
 server confirms the cancel does abort restore the local grant, into the profile only. Abort
 never writes the live login, so a login made after any check is never replaced; for a live
 migration the profile gets the fenced live grant, and abort prints `claudectl use <alias>`
-to make it live again. Once the admission committed, the cancel is refused
+to make it live again. `claudectl remove` refuses a profile with an open fence, so abort
+always has its profile directory. Once the admission committed, the cancel is refused
 (`409 migration_admitted`) and abort reports the state; for a superseded or deleted server
 account it drops the fence without keeping a copy.
 

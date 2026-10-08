@@ -609,6 +609,30 @@ fn abort_of_a_live_migration_restores_the_profile_and_never_the_live_login() {
 }
 
 #[test]
+fn a_fenced_profile_cannot_be_removed_and_abort_still_restores_it() {
+    let env = Env::new();
+    env.profile("a1", "u-a1-0000", Script::Down, 3_600_000);
+    let (_, text) = env.all();
+    assert!(env.fenced("a1"), "{text}");
+    let removed = Command::cargo_bin("claudectl")
+        .unwrap()
+        .env("HOME", env.home.path())
+        .args(["remove", "a1"])
+        .output()
+        .unwrap();
+    assert!(!removed.status.success());
+    assert!(
+        String::from_utf8_lossy(&removed.stderr).contains("--abort"),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(env.paths.profiles_dir().join("a1").exists());
+    let (ok, text) = env.run(&["--abort", "a1"], "");
+    assert!(ok, "{text}");
+    assert!(env.has_credentials("a1"));
+}
+
+#[test]
 fn abort_leaves_a_login_made_after_the_fence_untouched() {
     let env = Env::new();
     env.live("me", "u-me-0000", "live");

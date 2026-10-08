@@ -16,7 +16,9 @@ mod migration;
 mod qualify;
 #[path = "central_session.rs"]
 pub mod session;
-pub use migration::{ensure_local, ensure_local_grant, ensure_login_unfenced, migrate};
+pub use migration::{
+    ensure_local, ensure_local_grant, ensure_login_unfenced, ensure_removable, migrate,
+};
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
