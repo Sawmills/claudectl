@@ -4,8 +4,9 @@ Synthetic only. Run like linux.py, under `unshare -Urnm`, from experiments/setti
 The config dir stands in for the real ~/.claude: it holds a host login (.credentials.json with
 token H and a refresh token) and the host identity in .claude.json. The server token travels
 only in a separate settings file passed with --settings. Checks per case: the host token is
-never sent, no refresh or other POST goes out, and the host credentials file and identity are
-byte-identical afterwards.
+never sent, no refresh or other POST goes out, the host credentials file and identity are
+byte-identical afterwards, and turn 2 in the same process fails (no in-process reload).
+flag_proactive also resumes the session in a new process with the B token.
 """
 import hashlib
 import json
@@ -161,19 +162,21 @@ def run_case(root, case, server):
     assert summary['credentials_unchanged'] and summary['identity_unchanged'], summary
     assert not any(m == 'POST' for m, _ in summary['other_requests']), summary
     assert not summary['host_token_sent'], summary
-    expected = {'flag_proactive': ('A', 'B'), 'flag_401': ('A', 'B'), 'env_only': ('A', 'A'),
-                'hostfile_proactive': ('A', 'B'), 'hostfile_401': ('A', 'B')}
-    first, last = summary['sequence'][0], summary['sequence'][-1]
-    assert first == (expected[case][0], 200), summary
-    in_process = [x for x in summary['sequence']][:len(state['requests'])]
-    renewed_in_process = any(g == 'B' and st == 200 for g, st in summary['sequence']
-                             if not resumed) or (resumed is not None and results[-1].get('is_error') is False)
-    print(json.dumps({'case': case, 'safety_checks': 'passed',
-                      'turn2_in_same_process_ok': results[-1].get('is_error') is False,
-                      'resume_new_process_ok': None if resumed is None else
-                      (not resumed[-1].get('is_error') and resumed[-1].get('session_id') == session)}),
-          flush=True)
-
+    # No case renews inside the running process: turn 2 fails with the stale A token.
+    first = summary['sequence'][0]
+    assert first == ('A', 200), summary
+    assert [r['turn'] for r in results] == [1, 2], summary
+    assert results[0].get('is_error') is False, summary
+    assert results[1].get('is_error') is True, summary
+    if case == 'flag_proactive':
+        # The renewal path: a new process resumes the same session with the B token.
+        assert resumed and resumed[-1].get('is_error') is False, summary
+        assert resumed[-1].get('session_id') == session, summary
+        assert summary['sequence'][-1] == ('B', 200), summary
+    else:
+        assert resumed is None, summary
+    print(json.dumps({'case': case, 'checks': 'passed', 'turn2_in_same_process_ok': False,
+                      'resume_new_process_ok': None if resumed is None else True}), flush=True)
 
 if __name__ == '__main__':
     linux.run_case = run_case
