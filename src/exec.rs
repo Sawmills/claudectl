@@ -95,40 +95,16 @@ pub fn managed_settings_dir() -> PathBuf {
 /// itself, Claude Code reads that directory as the project, so it is checked.
 /// A file that exists but cannot be read or parsed is refused. Values are
 /// never read into the error.
-pub fn check_settings(cwd: &Path, home: &Path, managed: &Path) -> Result<(), ExecError> {
-    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
-    let mut files = Vec::new();
-    for dir in cwd.ancestors() {
-        if dir != cwd && dir == home {
-            continue;
-        }
-        files.push(dir.join(".claude/settings.json"));
-        files.push(dir.join(".claude/settings.local.json"));
-    }
-    files.push(managed.join("managed-settings.json"));
-    match std::fs::read_dir(managed.join("managed-settings.d")) {
-        Ok(entries) => {
-            let mut extra = Vec::new();
-            for entry in entries {
-                let entry = entry.map_err(|e| {
-                    ExecError::Refused(format!("cannot list managed settings ({})", e.kind()))
-                })?;
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "json") {
-                    extra.push(path);
-                }
-            }
-            extra.sort();
-            files.extend(extra);
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(ExecError::Refused(format!(
-                "cannot list managed settings ({})",
-                e.kind()
-            )));
-        }
-    }
+/// The host user settings (`~/.claude/settings.json` and `settings.local.json`), for a child
+/// that keeps the host config (`server run`). Same rules as [`check_settings`].
+pub fn check_user_settings(home: &Path) -> Result<(), ExecError> {
+    check_files(vec![
+        home.join(".claude/settings.json"),
+        home.join(".claude/settings.local.json"),
+    ])
+}
+
+fn check_files(files: Vec<std::path::PathBuf>) -> Result<(), ExecError> {
     for file in files {
         let bytes = match std::fs::read(&file) {
             Ok(bytes) => bytes,
@@ -175,6 +151,43 @@ pub fn check_settings(cwd: &Path, home: &Path, managed: &Path) -> Result<(), Exe
         }
     }
     Ok(())
+}
+
+pub fn check_settings(cwd: &Path, home: &Path, managed: &Path) -> Result<(), ExecError> {
+    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let mut files = Vec::new();
+    for dir in cwd.ancestors() {
+        if dir != cwd && dir == home {
+            continue;
+        }
+        files.push(dir.join(".claude/settings.json"));
+        files.push(dir.join(".claude/settings.local.json"));
+    }
+    files.push(managed.join("managed-settings.json"));
+    match std::fs::read_dir(managed.join("managed-settings.d")) {
+        Ok(entries) => {
+            let mut extra = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    ExecError::Refused(format!("cannot list managed settings ({})", e.kind()))
+                })?;
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "json") {
+                    extra.push(path);
+                }
+            }
+            extra.sort();
+            files.extend(extra);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(ExecError::Refused(format!(
+                "cannot list managed settings ({})",
+                e.kind()
+            )));
+        }
+    }
+    check_files(files)
 }
 
 /// `check_settings` for this process's working directory, which the child

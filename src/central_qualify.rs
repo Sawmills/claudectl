@@ -1,5 +1,5 @@
 //! Claude build qualification. `server run` accepts a build only when its hash is built in or
-//! passed the renewal handoff check on this machine. An unknown or unreadable list refuses.
+//! passed the launcher check on this machine. An unknown or unreadable list refuses.
 use super::*;
 use crate::exec;
 
@@ -18,16 +18,30 @@ const HARNESS: [(&str, &str); 3] = [
     ),
 ];
 
+/// The harness case a build must pass. A record from another case (an older launch model)
+/// does not qualify the build for this one.
+const CHECK: &str = "supervised_host_config";
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Qualified {
     sha256: String,
     platform: String,
     qualified_at: String,
+    #[serde(default)]
+    check: String,
 }
 
+impl Qualified {
+    fn covers(&self, digest: &str) -> bool {
+        self.sha256 == digest && self.platform == std::env::consts::OS && self.check == CHECK
+    }
+}
+
+/// Older clients keep `qualified-builds.json` and reject unknown fields, so these records live
+/// in their own file; both client versions can run on one machine during an upgrade.
 fn path(paths: &Paths) -> PathBuf {
-    root(paths).join("qualified-builds.json")
+    root(paths).join("qualified-host-config-builds.json")
 }
 
 fn load(paths: &Paths) -> Result<Vec<Qualified>> {
@@ -41,10 +55,7 @@ fn load(paths: &Paths) -> Result<Vec<Qualified>> {
 
 /// True when this machine qualified the build. A damaged list is an error, never a pass.
 pub(super) fn is_qualified(paths: &Paths, digest: &str) -> Result<bool> {
-    let platform = std::env::consts::OS;
-    Ok(load(paths)?
-        .iter()
-        .any(|q| q.sha256 == digest && q.platform == platform))
+    Ok(load(paths)?.iter().any(|q| q.covers(digest)))
 }
 
 /// Run `harness` on a private snapshot of `binary`; record the hash only when it returns true.
@@ -58,27 +69,26 @@ pub(super) fn qualify_with(
     std::fs::copy(binary, &snapshot).context("could not copy the Claude build")?;
     let digest = exec::sha256_file(&snapshot).map_err(|e| anyhow::anyhow!("{e}"))?;
     if !harness(&snapshot, &digest)? {
-        bail!("Claude build {digest} failed the renewal handoff check; it is not qualified");
+        bail!("Claude build {digest} failed the launcher check; it is not qualified");
     }
     let _lock = lock(paths)?;
     let mut builds = load(paths)?;
-    if !builds
-        .iter()
-        .any(|q| q.sha256 == digest && q.platform == std::env::consts::OS)
-    {
+    if !builds.iter().any(|q| q.covers(&digest)) {
         builds.push(Qualified {
             sha256: digest.clone(),
             platform: std::env::consts::OS.into(),
             qualified_at: chrono::Utc::now().to_rfc3339(),
+            check: CHECK.into(),
         });
         atomic(&path(paths), &builds)?;
     }
     Ok(digest)
 }
 
-/// Run the synthetic renewal handoff check: the real launcher and Claude build, a fake API, an
-/// invalid process token, and one settings token change during a tool call. The harness blocks
-/// network access and the real credential store.
+/// Run the synthetic launcher check: the real launcher and Claude build, a fake API and a host
+/// login in the HOME; one tool call on the server token, then a `--resume` relaunch on a new
+/// server token. The host token must never be sent and the host files must not change. The
+/// harness blocks network access and the real credential store.
 fn harness(snapshot: &Path, digest: &str) -> Result<bool> {
     let directory = tempfile::tempdir()?;
     for (name, source) in HARNESS {
@@ -114,7 +124,7 @@ fn harness(snapshot: &Path, digest: &str) -> Result<bool> {
     let passed = output.status.success()
         && String::from_utf8_lossy(&output.stdout).lines().any(|line| {
             serde_json::from_str::<Value>(line)
-                .is_ok_and(|v| v["case"] == "supervised_tool_renewal" && v["checks"] == "passed")
+                .is_ok_and(|v| v["case"] == CHECK && v["checks"] == "passed")
         });
     if !passed {
         eprintln!(
@@ -136,7 +146,7 @@ fn harness(snapshot: &Path, digest: &str) -> Result<bool> {
 pub fn qualify(paths: &Paths, claude: &Path) -> Result<()> {
     let binary = session::program(claude)?;
     let digest = qualify_with(paths, &binary, harness)?;
-    println!("Claude build {digest} passed the renewal handoff check and is qualified.");
+    println!("Claude build {digest} passed the launcher check and is qualified.");
     Ok(())
 }
 
@@ -174,6 +184,38 @@ mod tests {
         assert!(is_qualified(&paths, &digest).unwrap());
         assert_eq!(load(&paths).unwrap().len(), 1);
         assert!(!is_qualified(&paths, &"0".repeat(64)).unwrap());
+    }
+
+    #[test]
+    fn a_build_qualified_by_an_older_check_is_not_qualified() {
+        let (_home, paths, _binary) = fixture();
+        private_dir(&root(&paths)).unwrap();
+        let digest = "1".repeat(64);
+        let old = serde_json::json!([{
+            "sha256": digest,
+            "platform": std::env::consts::OS,
+            "qualified_at": "2026-10-07T00:00:00Z",
+        }]);
+        atomic(&path(&paths), &old).unwrap();
+        assert!(!is_qualified(&paths, &digest).unwrap());
+    }
+
+    #[test]
+    fn qualifying_leaves_the_list_of_older_clients_unchanged() {
+        // Older clients reject unknown fields, so they must never read a record with `check`.
+        let (_home, paths, binary) = fixture();
+        private_dir(&root(&paths)).unwrap();
+        let legacy = root(&paths).join("qualified-builds.json");
+        let old = serde_json::json!([{
+            "sha256": "1".repeat(64),
+            "platform": std::env::consts::OS,
+            "qualified_at": "2026-10-07T00:00:00Z",
+        }]);
+        atomic(&legacy, &old).unwrap();
+        let before = std::fs::read(&legacy).unwrap();
+        let digest = qualify_with(&paths, &binary, |_, _| Ok(true)).unwrap();
+        assert!(is_qualified(&paths, &digest).unwrap());
+        assert_eq!(std::fs::read(&legacy).unwrap(), before);
     }
 
     #[test]

@@ -37,56 +37,76 @@ code again. An uncertain exchange with no retained response requires a new login
 
 The company user, provider, account UUID, organization UUID, and monotonically
 increasing generation are checked before replacing the session credential. Only
-these Claude binary hashes have synthetic compatibility evidence:
+this Claude binary hash is built in, with synthetic evidence for the host-config launch model:
 
 | Platform    | Claude version | SHA-256                                                            |
 | ----------- | -------------- | ------------------------------------------------------------------ |
 | Linux ARM64 | 2.1.280        | `92f2b4fd05d0bdcf7b9a0d4e0ecef4a1e4b368b290cd8fd07cff9a50013f45a2` |
-| macOS ARM64 | 2.1.288        | `bbe93063f7a0879a1021b2891e5c9354e5b3b98433e32efe6750f7710afed750` |
 
 The launcher hashes a private executable snapshot before running it. Any other
 build is refused until `claudectl server qualify --claude PATH` passes on that
-machine. The command runs the full-launcher renewal check from
+machine. The command runs the full-launcher check `supervised_host_config` from
 `experiments/settings-renewal/supervised.py` against a private snapshot of the build:
-a fake API, an invalid process token, and one settings token change during a Bash
-tool call. Only on a pass does it record the hash in
-`~/.claudectl/server/qualified-builds.json`. A damaged list refuses every build. It
-needs `python3` (and `unshare` on Linux, Homebrew OpenSSL on macOS). On 2026-10-06,
-Claude 2.1.292 on macOS ARM64 (`97a01e5bc74a199e67189435d0331ea3a24eac2e07db4b76d9148c5b0386138f`)
-and Claude 2.1.280 on Linux ARM64 on the devbox
-(`92f2b4fd05d0bdcf7b9a0d4e0ecef4a1e4b368b290cd8fd07cff9a50013f45a2`) passed. The operator
-procedure is in [the runbook](account-server-runbook.md).
+a fake API and a host login in the HOME, one Bash tool call on server token A, then a
+`--resume` relaunch on server token B. The host token must never be sent and the host files
+must not change. Only on a pass does it record the hash, with the check name, in
+`~/.claudectl/server/qualified-host-config-builds.json`. Builds qualified by the earlier
+renewal check (in `qualified-builds.json`, before the host-config model) are not
+qualified for this client: run `server qualify` again after the upgrade. Older clients keep
+reading the old file, so both versions work on one machine during the upgrade. A damaged list refuses every build. It needs `python3` (and
+`unshare` on Linux, Homebrew OpenSSL on macOS). Claude 2.1.280 on Linux ARM64 on the devbox
+passed on 2026-10-07. The operator procedure is in [the runbook](account-server-runbook.md).
 
 ## Session behavior
 
-The credential writer atomically replaces a private `settings.json` containing
-`env.CLAUDE_CODE_OAUTH_TOKEN`. The child starts with an invalid fallback token.
-The tested builds reload the settings token, including with conflicting synthetic
-Keychain responses. Missing/malformed settings retain the last selected token;
-they do not immediately stop network requests. The client has no refresh token.
+`claudectl server run <alias> -- <claude args>` keeps the host Claude config: the same
+`~/.claude` (or the inherited default) with its conversations, skills, hooks, memory and
+folder trust, so `--resume <session>` finds a conversation started on the host login. The
+child receives only the server access token, in `CLAUDE_CODE_OAUTH_TOKEN`; credential and
+routing overrides (`ANTHROPIC_API_KEY` and the like) are removed from its environment, and
+the client never holds a refresh token. Existing project and managed credential overrides
+are refused at startup, and user-supplied `--settings`, `--setting-sources` and `--bare` are
+refused.
 
-Each session gets a private config directory. A per-session lock protects live
-sessions from cleanup. A later launch removes abandoned directories only after
-their recorded access expiry; ordinary exit removes them immediately. Its `projects` directory points at
-persistent conversation storage for the server account. The launcher forces
-`--setting-sources user`, so project/local settings do not override its credential
-while the process runs. Existing project and managed credential overrides are
-refused at startup. User-supplied `--settings`, `--setting-sources`, and `--bare`
-are refused. Normal project instructions and tool operation still need separate
-compatibility checks; settings-based permissions and hooks are not copied from the
-user's ordinary Claude config.
+The synthetic check `experiments/settings-renewal/host-config.py` (Claude 2.1.280, Linux)
+shows, with a host login present in the config dir: the server token is used, the host token
+is never sent, nothing calls a refresh or other POST endpoint, and the host credentials file
+and the host identity in `.claude.json` stay byte-identical. It also shows that Claude does
+not reload a changed token inside a running process (a `--settings` file, a host-managed
+credentials file and the process environment all behave the same), while a new process with
+`--resume <session>` continues the same session.
+
+Token lifetime is therefore the session limit. At launch the client asks the server for a
+fresh token when less than two hours remain (a server refresh gives about eight hours). The
+private session directory records `session.json` (alias, account, `expires_at`, pid; no
+token) so a supervisor such as the capacity guard can relaunch an idle tab with `--resume`
+before the expiry. A tab still running at expiry gets an authentication error on its next
+request; relaunching it with `--resume <session>` continues the conversation. A per-session
+lock protects live session directories; a later launch removes abandoned ones after their
+recorded expiry.
 
 This is not an OS sandbox. Tools inherit the access token environment and can
 access files available to the same OS user. The Mac experiment's fake `security`
 command and OS sandbox are **test fixtures only**. They are never installed by the
 launcher. Managed policy changes during a session and native Keychain ACL behavior
 remain acceptance gaps; a startup scan does not prove lifetime policy isolation.
+The same holds for the host user settings and the project settings of the cwd: the child
+loads them like any host Claude session, and Claude applies settings changes while it runs.
+An edit made after the startup check (for example `env.ANTHROPIC_BASE_URL` or
+`apiKeyHelper` in `.claude/settings.json`) can route the server token, exactly as it would
+route the host login token in a normal session. Run server sessions only in folders you
+trust as much as your host login.
 
-The writer polls the server every five seconds and publishes a changed generation.
-The server refreshes before expiry. An early provider 401 does not automatically
-notify the writer: use `server refresh-access work`, wait for publication, then
-retry the failed prompt. It never automatically replays tools. On server outage,
-the last access token remains available until provider expiry/rejection. Revocation
+Conversations that a `server run` before this model stored in
+`~/.claudectl/server/conversations/<account_id>` are not migrated. To resume one, copy its
+`<project>/<session>.jsonl` into `~/.claude/projects/<project>/`; otherwise delete the
+directory.
+
+While Claude runs, the client polls the server every five seconds for usage only; it never
+changes the token of the running process. The server refreshes before expiry. After an
+early provider 401, use `server refresh-access work`, then relaunch with `--resume`.
+The client never replays tools. On server outage, the token of a running session stays
+valid until provider expiry or rejection. Revocation
 stops new acquisitions; it cannot revoke an access token already delivered.
 
 `status --cached` and `statusline ACCOUNT_ID` read local files only. Native Claude

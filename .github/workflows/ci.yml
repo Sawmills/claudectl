@@ -93,6 +93,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release
+      # The macOS binary for on-device checks of a pull request (no local builds on the Macs).
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: claudectl-macos-arm64
+          path: target/release/claudectl
+          retention-days: 7
       - name: Test
         # Cargo may create jobserver pipes after starting; isolate each test binary.
         env:
