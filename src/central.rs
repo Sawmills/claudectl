@@ -495,6 +495,48 @@ fn claude_authorize(url: &reqwest::Url) -> bool {
             (Some("claude.ai"), "/oauth/authorize") | (Some("claude.com"), "/cai/oauth/authorize")
         )
 }
+/// The pasted `code#state`, checked before any network call: the server's own format, and
+/// the state of the sign-in this command opened (`url`). Errors never repeat the paste.
+fn check_code(pasted: &str, url: &reqwest::Url) -> Result<String> {
+    let pasted = pasted.trim();
+    let Some((_, state)) = pasted
+        .split_once('#')
+        .filter(|(code, state)| !code.is_empty() && !state.is_empty())
+    else {
+        bail!(
+            "the pasted text is not the code#state from the Claude sign-in page\nTry: copy the whole code from the page (it has a # in the middle) and run the command again"
+        );
+    };
+    let expected = url
+        .query_pairs()
+        .find(|(name, _)| name == "state")
+        .map(|(_, value)| value.into_owned());
+    if expected.as_deref() != Some(state) {
+        bail!(
+            "the pasted code is from another sign-in, not the one this command opened\nTry: run the command again and paste the code from the page it opens"
+        );
+    }
+    Ok(pasted.to_string())
+}
+/// The `code#state` from the Claude sign-in page: a visible prompt on a terminal, otherwise
+/// one line from `input`, so `add` also works from a script. `add`, `renew` and `server login`
+/// all come here, so the Try line names no command.
+fn read_code(mut input: impl std::io::BufRead, terminal: bool) -> Result<String> {
+    let prompt = "Paste the code from the Claude sign-in page (code#state)";
+    if terminal {
+        return Ok(dialoguer::Input::<String>::new()
+            .with_prompt(prompt)
+            .interact_text()?);
+    }
+    eprintln!("{prompt}:");
+    let mut line = String::new();
+    if input.read_line(&mut line)? == 0 {
+        bail!(
+            "no code on standard input\nTry: echo '<code#state>' | <the same command> --no-browser"
+        );
+    }
+    Ok(line.trim_end().to_string())
+}
 /// A failed login completion in plain words, by the server's reason. `id` is the login,
 /// for the reasons where the server kept the acquired grant and the login can resume.
 fn login_failure(reason: &str, id: &str) -> Option<String> {
@@ -528,9 +570,12 @@ pub fn login(client: &Client, alias: &str, renew: bool, no_browser: bool) -> Res
     if !no_browser {
         open::that(&login.authorize_url)?;
     }
-    let code = dialoguer::Password::new()
-        .with_prompt("Paste code#state from the Claude sign-in page")
-        .interact()?;
+    // The prompt reads the terminal and draws on stderr: both must be the terminal.
+    let terminal = {
+        use std::io::IsTerminal;
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+    };
+    let code = check_code(&read_code(std::io::stdin().lock(), terminal)?, &url)?;
     let receipt: Receipt = client
         .post(
             "/v2/anthropic/login/complete",
@@ -1249,7 +1294,42 @@ pub fn dispatch(command: Command) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerRow, Usage, candidate};
+    use super::{ServerRow, Usage, candidate, check_code, read_code};
+
+    #[test]
+    fn a_pasted_code_is_checked_against_this_sign_in_before_it_is_sent() {
+        let url = reqwest::Url::parse(
+            "https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-1&code_challenge=x",
+        )
+        .unwrap();
+        assert_eq!(check_code("  abc#st-1 \n", &url).unwrap(), "abc#st-1");
+        for bad in ["", "abc", "#st-1", "abc#", "abc#st-2"] {
+            let error = format!("{:#}", check_code(bad, &url).unwrap_err());
+            assert!(error.contains("Try:"), "{bad}: {error}");
+            // The paste is never repeated (it is a secret).
+            assert!(bad.is_empty() || !error.contains(bad), "{bad}: {error}");
+        }
+        let other = format!("{:#}", check_code("abc#st-2", &url).unwrap_err());
+        assert!(other.contains("another sign-in"), "{other}");
+        let no_state = reqwest::Url::parse("https://claude.ai/oauth/authorize?code=true").unwrap();
+        assert!(check_code("abc#st-1", &no_state).is_err());
+    }
+
+    #[test]
+    fn without_a_terminal_the_code_is_one_line_of_input() {
+        let input = std::io::Cursor::new("abc#st-1\r\nnext line\n");
+        assert_eq!(read_code(input, false).unwrap(), "abc#st-1");
+        // add, renew and server login share this path: the Try line names no command.
+        let error = format!(
+            "{:#}",
+            read_code(std::io::Cursor::new(""), false).unwrap_err()
+        );
+        assert!(
+            error.contains("Try: echo '<code#state>' | <the same command> --no-browser"),
+            "{error}"
+        );
+        assert!(!error.contains("claudectl add"), "{error}");
+    }
 
     fn row(alias: &str, data: serde_json::Value, stale: bool) -> ServerRow {
         ServerRow {
