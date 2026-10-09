@@ -347,6 +347,11 @@ impl Store {
     pub async fn revoke_machine(&self, id: &str, user: Option<&str>) -> Result<bool> {
         dispatch!(self, revoke_machine(id, user))
     }
+    /// Revoke `user`'s machine only while it is active, in one step: true only for the call
+    /// that changed it, so concurrent requests act (and audit) once.
+    pub async fn revoke_active_machine(&self, id: &str, user: &str) -> Result<bool> {
+        dispatch!(self, revoke_active_machine(id, user))
+    }
     pub async fn put_enrollment(&self, kind: &str, key: &str, row: &EnrollmentRow) -> Result<()> {
         dispatch!(self, put_enrollment(kind, key, row))
     }

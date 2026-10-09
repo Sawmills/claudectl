@@ -7,8 +7,14 @@ pub(super) struct Snapshot {
     pub server_time: i64,
     pub accounts: Vec<Account>,
     pub machines: Vec<Machine>,
+    /// This session's form token, for the action forms.
+    pub csrf: String,
+    /// The action that just finished, from the redirect after it.
+    pub done: Option<&'static str>,
 }
 pub(super) struct Account {
+    /// The server account ID: actions name the account by it.
+    pub id: String,
     pub alias: String,
     pub available: bool,
     /// `not_migrated`, `pending`, `unrotated`, or `rotated`.
@@ -288,9 +294,10 @@ fn ledger(accounts: &[Account], names: &[String], now: i64) -> String {
             format!(r#"<span class="note">{note}</span>"#)
         };
         rows += &format!(
-            r#"<tr role="row" class="{}"><td role="cell" class="cell-account"><div class="account-name"><strong translate="no">{}</strong>{note}</div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td>{fable}<td role="cell" class="cell-state"><div class="status"><span class="state {class}">{state}</span><span class="status-detail">{}</span></div></td></tr>"#,
+            r#"<tr role="row" class="{}"><td role="cell" class="cell-account"><div class="account-name"><strong translate="no">{}</strong>{note}<a class="manage" href="/accounts/manage?account={}">Manage</a></div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td>{fable}<td role="cell" class="cell-state"><div class="status"><span class="state {class}">{state}</span><span class="status-detail">{}</span></div></td></tr>"#,
             if a.usage_stale { "stale" } else { "" },
             escape(&names[i]),
+            escape(&a.id),
             window(&a.five_hour, "5-hour", now),
             window(&a.seven_day, "7-day", now),
             observed(a, now)
@@ -302,8 +309,16 @@ fn ledger(accounts: &[Account], names: &[String], now: i64) -> String {
         ""
     };
     format!(
-        r#"<section class="section" aria-labelledby="accounts-title"><div class="section-head"><h2 id="accounts-title">Accounts <span class="count">{}</span></h2></div><table class="ledger" role="table" aria-labelledby="accounts-title"><thead role="rowgroup"><tr role="row"><th scope="col">Account</th><th scope="col" class="col-usage">5-hour window</th><th scope="col" class="col-usage">7-day window</th>{fable_head}<th scope="col" class="col-state">State</th></tr></thead><tbody role="rowgroup">{rows}</tbody></table></section>"#,
+        r#"<section class="section" aria-labelledby="accounts-title"><div class="section-head"><h2 id="accounts-title">Accounts <span class="count">{}</span></h2><a class="button small" href="/accounts/add">Add account</a></div><table class="ledger" role="table" aria-labelledby="accounts-title"><thead role="rowgroup"><tr role="row"><th scope="col">Account</th><th scope="col" class="col-usage">5-hour window</th><th scope="col" class="col-usage">7-day window</th>{fable_head}<th scope="col" class="col-state">State</th></tr></thead><tbody role="rowgroup">{rows}</tbody></table></section>"#,
         accounts.len()
+    )
+}
+/// A one-button POST form with this session's token.
+fn action(path: &str, field: &str, value: &str, csrf: &str, label: &str) -> String {
+    format!(
+        r#"<form class="action" method="post" action="{path}"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="{field}" value="{}"><button class="link-button" type="submit">{label}</button></form>"#,
+        escape(csrf),
+        escape(value)
     )
 }
 fn machines(snapshot: &Snapshot) -> String {
@@ -325,9 +340,16 @@ fn machines(snapshot: &Snapshot) -> String {
         }
         count += 1;
         rows += &format!(
-            r#"<tr role="row"><td role="cell">{}</td><td role="cell" class="cell-account"><span class="alias" translate="no">{}</span></td><td role="cell" class="cell-state"><span class="state ok">Connected</span></td></tr>"#,
+            r#"<tr role="row"><td role="cell">{}</td><td role="cell" class="cell-account"><span class="alias" translate="no">{}</span></td><td role="cell" class="cell-state"><span class="state ok">Connected</span>{}</td></tr>"#,
             escape(name),
-            escape(suffix)
+            escape(suffix),
+            action(
+                "/machines/revoke",
+                "machine",
+                &m.id,
+                &snapshot.csrf,
+                "Revoke"
+            )
         );
     }
     let disclosure = if revoked_count == 0 {
@@ -357,13 +379,86 @@ pub(super) fn overview(snapshot: &Snapshot) -> String {
             .map(|a| a.alias.as_str())
             .collect::<Vec<_>>(),
     );
+    let done = match snapshot.done {
+        Some(done) => format!(r#"<p class="flash" role="status">{done}</p>"#),
+        None => String::new(),
+    };
     format!(
         include_str!("accounts.html"),
         email = escape(&snapshot.email),
         has_accounts = !snapshot.accounts.is_empty(),
-        answer = answer(&snapshot.accounts, &names, snapshot.server_time),
+        answer = done + &answer(&snapshot.accounts, &names, snapshot.server_time),
         ledger = ledger(&snapshot.accounts, &names, snapshot.server_time),
         machines = machines(snapshot)
+    )
+}
+
+/// An action page: the top bar and one main column, never auto-refreshed.
+fn frame(email: &str, title: &str, content: &str) -> String {
+    format!(
+        r#"<div id="action"><header class="topbar"><div class="wrap topbar-inner"><a class="wordmark" href="/accounts" translate="no" aria-label="claudectl accounts">claudectl<span class="caret" aria-hidden="true"></span></a><div class="identity"><span class="email" translate="no">{}</span></div></div></header><main id="main" class="wrap"><p><a href="/accounts">Back to accounts</a></p><section class="action-page"><h1>{title}</h1>{content}</section></main></div>"#,
+        escape(email)
+    )
+}
+fn csrf_field(csrf: &str) -> String {
+    format!(
+        r#"<input type="hidden" name="csrf" value="{}">"#,
+        escape(csrf)
+    )
+}
+/// Add a Claude account: its name, then the Claude sign-in.
+pub(super) fn add_page(email: &str, csrf: &str) -> String {
+    frame(
+        email,
+        "Add a Claude account",
+        &format!(
+            r#"<p>Name the account (for example amir8), then sign in to Claude with it.</p><form class="form" method="post" action="/accounts/add">{}<label for="alias">Account name</label><input id="alias" name="alias" required maxlength="64" autocomplete="off" spellcheck="false"><button class="button primary" type="submit">Continue to Claude sign-in</button></form>"#,
+            csrf_field(csrf)
+        ),
+    )
+}
+/// One account: Renew (a new Claude sign-in) and Remove (type the exact name).
+pub(super) fn manage_page(
+    email: &str,
+    alias: &str,
+    id: &str,
+    csrf: &str,
+    machines: usize,
+) -> String {
+    let who = match machines {
+        1 => "1 connected machine uses".to_string(),
+        n => format!("{n} connected machines use"),
+    };
+    frame(
+        email,
+        &escape(alias),
+        &format!(
+            r#"<h2>Renew</h2><p>Sign in to Claude with this account again. Use it when its login needs attention.</p><form class="form" method="post" action="/accounts/renew">{csrf}<input type="hidden" name="account" value="{id}"><button class="button" type="submit">Renew the sign-in</button></form><h2>Remove</h2><p>{who} the accounts of this server. After the removal, running sessions on this account stop at their next token renewal.</p><form class="form" method="post" action="/accounts/remove">{csrf}<input type="hidden" name="account" value="{id}"><label for="confirm">Type <strong translate="no">{alias}</strong> to remove it</label><input id="confirm" name="confirm" required autocomplete="off" spellcheck="false"><button class="button" type="submit">Remove the account</button></form>"#,
+            csrf = csrf_field(csrf),
+            id = escape(id),
+            alias = escape(alias),
+        ),
+    )
+}
+/// The Claude sign-in of an Add or a Renew, and the field for the code it shows.
+pub(super) fn login_page(
+    email: &str,
+    alias: &str,
+    renew: bool,
+    authorize_url: &str,
+    login: &str,
+    csrf: &str,
+) -> String {
+    let title = if renew { "Renew" } else { "Add" };
+    frame(
+        email,
+        &format!("{title} {}", escape(alias)),
+        &format!(
+            r#"<ol><li><a href="{url}" target="_blank" rel="noopener noreferrer">Open the Claude sign-in</a> and sign in with this account.</li><li>Copy the code the page shows, then paste it here within 5 minutes.</li></ol><form class="form" method="post" action="/accounts/login">{csrf}<input type="hidden" name="login" value="{login}"><label for="code">Code from the Claude sign-in page</label><input id="code" name="code" required autocomplete="off" spellcheck="false"><button class="button primary" type="submit">Save the account</button></form>"#,
+            url = escape(authorize_url),
+            csrf = csrf_field(csrf),
+            login = escape(login),
+        ),
     )
 }
 
@@ -375,6 +470,7 @@ mod tests {
 
     fn account(alias: &str, five: Option<f64>, week: Option<f64>) -> Account {
         Account {
+            id: alias.replace('@', "-at-"),
             alias: alias.into(),
             available: true,
             migration: "rotated".into(),
@@ -399,6 +495,8 @@ mod tests {
             server_time: NOW,
             accounts,
             machines,
+            csrf: "form-token".into(),
+            done: None,
         }
     }
 

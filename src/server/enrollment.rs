@@ -145,6 +145,17 @@ enum Destination {
 struct Session {
     user: String,
     email: String,
+    /// When the person signed in (ms). Missing on sessions from before SAW-12695: they count
+    /// as old, so Remove and Revoke ask for a new sign-in.
+    #[serde(default)]
+    signed_in_at: Option<i64>,
+}
+/// Remove and Revoke need a sign-in this recent (ms).
+pub(super) const REAUTH_MS: i64 = 600_000;
+/// Whether a sign-in at `signed_in_at` is recent enough for Remove and Revoke.
+pub(super) fn recent_sign_in(signed_in_at: Option<i64>, now: i64) -> bool {
+    // The replica that saw the sign-in may run up to a minute ahead of this one.
+    signed_in_at.is_some_and(|at| at - now <= 60_000 && now - at <= REAUTH_MS)
 }
 const SESSION_TTL_MS: i64 = 3_600_000;
 /// A signed-in person who may approve one device.
@@ -728,7 +739,11 @@ async fn dashboard_callback(
     let row = EnrollmentRow {
         lookup: None,
         sealed: server
-            .seal(&Session { user, email })
+            .seal(&Session {
+                user,
+                email,
+                signed_in_at: Some(now()),
+            })
             .map_err(|_| server.unavailable())?,
         expires_at: now() + SESSION_TTL_MS,
         consumed: false,
@@ -869,6 +884,24 @@ pub(super) async fn browser_user(
     server: &Server,
     headers: &HeaderMap,
 ) -> Result<Option<(String, String)>, HttpError> {
+    Ok(browser_session(server, headers)
+        .await?
+        .map(|b| (b.user, b.email)))
+}
+/// A signed-in dashboard browser, for the pages that act.
+pub(super) struct Browser {
+    pub user: String,
+    pub email: String,
+    /// The form token of this session: a digest of its secret cookie, so another site can
+    /// neither read nor forge it.
+    pub csrf: String,
+    pub signed_in_at: Option<i64>,
+}
+/// As `browser_user`, with the session's form token and sign-in time.
+pub(super) async fn browser_session(
+    server: &Server,
+    headers: &HeaderMap,
+) -> Result<Option<Browser>, HttpError> {
     let Some(sso) = server.sso.as_ref() else {
         return Ok(None);
     };
@@ -896,7 +929,32 @@ pub(super) async fn browser_user(
     if !enabled || !server.allowed(&session.email) {
         return Err(server.error(StatusCode::FORBIDDEN, "user_disabled"));
     }
-    Ok(Some((session.user, session.email)))
+    Ok(Some(Browser {
+        user: session.user,
+        email: session.email,
+        csrf: vault::digest(format!("dashboard-form\0{token}").as_bytes()),
+        signed_in_at: session.signed_in_at,
+    }))
+}
+/// A dashboard form post: the same origin and this session's form token, or 403.
+pub(super) fn check_form(
+    server: &Server,
+    headers: &HeaderMap,
+    browser: &Browser,
+    csrf: &str,
+) -> Result<(), HttpError> {
+    let sso = sso(server)?;
+    let origin_ok = same_origin(
+        &sso.public_url,
+        headers.get(header::ORIGIN).and_then(|h| h.to_str().ok()),
+    );
+    // Compared as digests, as machine tokens are: timing shows nothing of the token.
+    let token_ok = vault::digest(browser.csrf.as_bytes()) == vault::digest(csrf.as_bytes());
+    if origin_ok && token_ok {
+        Ok(())
+    } else {
+        Err(server.error(StatusCode::FORBIDDEN, "invalid_browser_request"))
+    }
 }
 pub(super) async fn sign_in(State(server): Shared) -> Result<Response, HttpError> {
     let sso = sso(&server)?;
@@ -976,6 +1034,21 @@ pub(super) fn routes(router: Router<Arc<Server>>) -> Router<Arc<Server>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_and_revoke_need_a_sign_in_of_the_last_ten_minutes() {
+        let now = 10_000_000;
+        assert!(recent_sign_in(Some(now - REAUTH_MS), now));
+        assert!(!recent_sign_in(Some(now - REAUTH_MS - 1), now));
+        // Sessions from before the sign-in time was kept are not recent.
+        assert!(!recent_sign_in(None, now));
+        // Another replica's clock may run a little ahead.
+        assert!(recent_sign_in(Some(now + 30_000), now));
+        assert!(!recent_sign_in(Some(now + 120_000), now));
+        // A session row written before SAW-12695 has no sign-in time.
+        let old: Session = serde_json::from_str(r#"{"user":"u","email":"a@sawmills.ai"}"#).unwrap();
+        assert_eq!(old.signed_in_at, None);
+    }
 
     fn google(hosted: Option<Vec<String>>) -> Configuration {
         Configuration {

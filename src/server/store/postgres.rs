@@ -948,6 +948,16 @@ impl PostgresStore {
             .await?
             == 1)
     }
+    pub async fn revoke_active_machine(&self, id: &str, user: &str) -> Result<bool> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute(
+                "UPDATE machines SET revoked = true WHERE id = $1 AND user_id = $2 AND NOT revoked",
+                &[&id, &user],
+            )
+            .await?
+            == 1)
+    }
     pub async fn put_enrollment(&self, kind: &str, key: &str, row: &EnrollmentRow) -> Result<()> {
         let client = self.pool.get().await?;
         client
