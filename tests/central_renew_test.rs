@@ -34,6 +34,9 @@ struct Fake {
     extra_refreshes: u32,
     /// Hold every token response after the first this long (a slow server or refresh).
     hold_ms: u64,
+    /// A strict order with the fake Claude: on a request after the first, write
+    /// `<this>.inflight`, then answer only once `<this>.ended` exists.
+    handshake: Option<std::path::PathBuf>,
 }
 type Shared = Arc<Mutex<Fake>>;
 
@@ -72,6 +75,19 @@ async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Va
             .push(chrono::Utc::now().timestamp_millis());
     }
     tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+    let handshake = {
+        let fake = shared.lock().unwrap();
+        fake.handshake.clone().filter(|_| fake.requests.len() > 1)
+    };
+    if let Some(log) = handshake {
+        std::fs::write(log.with_extension("log.inflight"), "").unwrap();
+        for _ in 0..200 {
+            if log.with_extension("log.ended").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
     let mut fake = shared.lock().unwrap();
     if fake.refresh_next {
         fake.refresh_next = false;
@@ -132,13 +148,18 @@ if os.environ.get("FAKE_EXTRA_CHILD") and token == "token-1":
     time.sleep(0.5)
     subprocess.Popen(["sleep", "60"])
 if os.environ.get("FAKE_CLEAN_EXIT") and token == "token-1":
-    # The user typed /exit: Claude ends the session (SessionEnd hook), shuts down for a
-    # while, and exits 0. Only then does the server refresh (ready below).
-    time.sleep(0.5)
+    # A strict order: idle (ready arms a server refresh); the monitor's token request is in
+    # flight (the server wrote .inflight and holds the answer); the user types /exit, so
+    # Claude ends the session (SessionEnd hook) and writes .ended; only then does the server
+    # answer, with the new revision; Claude shuts down for a while and exits 0.
+    with open(os.environ["FAKE_LOG"] + ".ready", "w") as ready:
+        ready.write("idle")
+    deadline = time.time() + 10
+    while not os.path.exists(os.environ["FAKE_LOG"] + ".inflight") and time.time() < deadline:
+        time.sleep(0.05)
     subprocess.run(["/bin/sh", "-c", command], check=True, input=json.dumps(
         {"hook_event_name": "SessionEnd", "session_id": "sess-1", "reason": "prompt_input_exit"}).encode())
-    with open(os.environ["FAKE_LOG"] + ".ready", "w") as ready:
-        ready.write("exiting")
+    open(os.environ["FAKE_LOG"] + ".ended", "w").close()
     time.sleep(2)
     sys.exit(0)
 with open(os.environ["FAKE_LOG"] + ".ready", "w") as ready:
@@ -514,11 +535,14 @@ fn an_idle_claude_with_extra_processes_follows_an_early_refresh() {
     assert_eq!(runs[1]["token"], "token-2");
 }
 
-/// A clean /exit ends `server run`, even when a new token revision arrives while Claude
-/// shuts down: only claudectl's own renewal stop may resume (SAW-12610, CX-0119).
+/// A clean /exit ends `server run`, even when a token request in flight across the
+/// SessionEnd answers with a new revision: only claudectl's own renewal stop may resume
+/// (SAW-12610, CX-0119).
 #[test]
 fn a_clean_exit_ends_server_run_without_a_resume() {
     let env = Env::new();
+    // The monitor's request is in flight across the SessionEnd (handshake files).
+    env.fake.lock().unwrap().handshake = Some(env.log.clone());
     let refresher = env.refresh_when_idle();
     let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
     env.env(&mut command);
@@ -536,4 +560,11 @@ fn a_clean_exit_ends_server_run_without_a_resume() {
     assert_eq!(output.status.code(), Some(0), "{stderr}");
     assert!(!stderr.contains("resuming session"), "{stderr}");
     assert_eq!(env.runs().len(), 1, "{:?}", env.runs());
+    // The overlap happened in order: a request was in flight, the session ended, and only
+    // then the request was answered with the new revision.
+    assert!(env.log.with_extension("log.inflight").exists());
+    assert!(env.log.with_extension("log.ended").exists());
+    let fake = env.fake.lock().unwrap();
+    assert!(fake.requests.len() >= 2, "{:?}", fake.requests);
+    assert_eq!(fake.generation, 2);
 }
