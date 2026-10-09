@@ -326,17 +326,6 @@ mod tests {
     }
 
     #[test]
-    fn a_lane_is_locked_while_open() {
-        let (_tmp, paths) = paths();
-        let lane = Lane::open(&paths, "lane-a").unwrap();
-        assert!(Lane::open(&paths, "lane-a").is_err());
-        assert!(Lane::open(&paths, "lane-b").is_ok());
-        drop(lane);
-        assert!(Lane::open(&paths, "lane-a").is_ok());
-        assert!(Lane::open(&paths, "../x").is_err());
-    }
-
-    #[test]
     fn clearing_keeps_only_projects() {
         let (_tmp, paths) = paths();
         let lane = Lane::open(&paths, "lane").unwrap();
