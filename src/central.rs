@@ -143,6 +143,21 @@ pub(super) fn lock(paths: &Paths) -> Result<File> {
         .context("another account-server operation is running")?;
     Ok(file)
 }
+/// A token grant from the server, refused unless it is for this account and user, complete,
+/// and still valid now (a grant can cross expiry in transit).
+fn checked_access(access: Access, id: &str, user_id: &str) -> Result<Access> {
+    if access.provider != "anthropic"
+        || access.account_id != id
+        || access.user_id != user_id
+        || access.access_token.is_empty()
+        || access.expires_at <= now()
+        || access.revision.is_empty()
+        || access.generation == 0
+    {
+        bail!("invalid or mismatched access grant");
+    }
+    Ok(access)
+}
 pub fn origin(server: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(server)
         .map_err(|_| anyhow::anyhow!("invalid account-server origin"))?;
@@ -279,21 +294,26 @@ impl Client {
         Ok(account)
     }
     pub fn acquire(&self, id: &str, previous: Option<&str>) -> Result<Access> {
-        let access: Access = self.post(
-            "/v2/anthropic/token",
-            &json!({"account_id":id,"previous_revision":previous}),
-        )?;
-        if access.provider != "anthropic"
-            || access.account_id != id
-            || access.user_id != self.connection.user_id
-            || access.access_token.is_empty()
-            || access.expires_at <= now()
-            || access.revision.is_empty()
-            || access.generation == 0
-        {
-            bail!("invalid or mismatched access grant");
-        }
-        Ok(access)
+        checked_access(
+            self.post(
+                "/v2/anthropic/token",
+                &json!({"account_id":id,"previous_revision":previous}),
+            )?,
+            id,
+            &self.connection.user_id,
+        )
+    }
+    /// The current token without refreshing an unexpired one (SAW-12657): a session that
+    /// watches for a new revision must never revoke the token another session's turn uses.
+    pub fn observe(&self, id: &str) -> Result<Access> {
+        checked_access(
+            self.post(
+                "/v2/anthropic/token",
+                &json!({"account_id":id,"observe":true}),
+            )?,
+            id,
+            &self.connection.user_id,
+        )
     }
     pub fn usage(&self, id: &str, cached: bool) -> Result<Usage> {
         self.get(&format!(
@@ -1060,6 +1080,29 @@ pub fn dispatch(command: Command) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_grant_that_expired_in_transit_is_refused() {
+        // An observing read returns a grant valid at the server's read time; one that
+        // crossed expiry on the way is dead and goes to the retry path.
+        let access = |expires_at| super::Access {
+            provider: "anthropic".into(),
+            account_id: "a".into(),
+            user_id: "u".into(),
+            identity: super::Identity {
+                account_uuid: "x".into(),
+                organization_uuid: "o".into(),
+            },
+            access_token: "t".into(),
+            expires_at,
+            scopes: vec![],
+            revision: "r".into(),
+            generation: 1,
+        };
+        let now = super::now();
+        assert!(super::checked_access(access(now + 60_000), "a", "u").is_ok());
+        assert!(super::checked_access(access(now - 1), "a", "u").is_err());
+        assert!(super::checked_access(access(now + 60_000), "b", "u").is_err());
+    }
     #[test]
     fn login_accepts_the_old_and_the_claude_code_2_1_295_sign_in_pages() {
         let ok = |u: &str| super::claude_authorize(&reqwest::Url::parse(u).unwrap());

@@ -125,23 +125,26 @@ forces a refresh: it takes the current token, and the server refreshes on demand
 
 `server run` follows the account's token revision (SAW-12610). It registers its own Claude
 hooks (`--settings <session dir>/hooks.json`, run by a private copy of claudectl) for
-`SessionStart`, `UserPromptSubmit`, `Stop` and the `idle_prompt` notification, which record
+`SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure` and the `idle_prompt` notification, which record
 only the event, the session id and the time in `<session dir>/events`. It asks the server
 for the current token only while Claude passes every idle gate below, at most every 30 min
-(every 5 min in the token's last hour), retrying 30 s after a failed request, and never while
-the held token is valid but expires within 6 min: inside the server's 5 min refresh margin
-that request would refresh the grant and revoke the token a running turn may still use. After
-expiry the held token is dead for every session, so the request then is safe. One case
-remains: while a migration's rotation is pending (between its admission and its first
-refresh), any token request refreshes the grant; do not migrate an account while `server run`
-sessions use it. When the
+(every 5 min in the token's last hour), retrying 30 s after a failed request. The request
+observes (`"observe": true`): the server never refreshes an unexpired token for it, so it
+cannot revoke the token another session's turn uses, and a revision that another session's
+refresh superseded early shows at once. After expiry the server refreshes as usual; the held
+token is dead for every session then. One case remains: while a migration's rotation is
+pending (between its admission and its first refresh), the server refreshes for any request;
+do not migrate an account while `server run` sessions use it. When the
 revision changed (a refresh revoked the held token), it restarts Claude with
 `--resume <latest session>` on the new token, in the same folder and terminal, from the same
 checked build, and prints `claudectl: server token renewed; resuming session <id>`. It
 restarts only when all hold: the new token outlives the held one, the last turn ended at
-least 60 s ago with no prompt since, no terminal input for 5 min (the terminal device's
-access time), no more processes in Claude's group than when it first settled, and fewer
-than 3 restarts in the last hour. A turn in progress is never cut; a draft typed earlier
+least 60 s ago with no prompt since (a turn that failed, for example on a revoked token,
+ends with `StopFailure` and counts too), no terminal input for 5 min (the terminal device's
+access time), and fewer than 3 restarts in the last hour. Extra processes in Claude's group
+(an LSP, `caffeinate`, a background shell) do not hold a restart back: the held token is
+already superseded or expired, so it is dead for every holder; work still running in
+Claude's group ends with the restart. A turn in progress is never cut; a draft typed earlier
 than the input gate is lost on restart. Relaunch happens only after claudectl's own
 SIGTERM; any other exit ends `server run` with Claude's exit code. A `-p`/`--print` run is
 never restarted. If Claude sends no hook event within 30 s, or a hook could not record an event (the
@@ -169,8 +172,8 @@ Conversations that a `server run` before this model stored in
 directory.
 
 While Claude runs, the client reads usage every five minutes. It never changes the token of
-the running process; it asks for the current token only while Claude is idle (above), so a
-refresh that request triggers never revokes the token of a running turn of this session.
+the running process; it asks for the current token only while Claude is idle, and that
+request never refreshes an unexpired token (above).
 Another session's request can still trigger the refresh; a busy session then fails its next
 request and restarts at its next idle point. After an early provider 401, wait for the
 renewal or use `server refresh-access work` (it ends every running session of the account).

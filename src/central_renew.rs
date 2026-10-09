@@ -9,18 +9,6 @@ pub(super) const IDLE_AFTER_STOP_MS: i64 = 60_000;
 pub(super) const TTY_IDLE_MS: i64 = 5 * 60_000;
 /// At most this many restarts in one hour.
 pub(super) const RESTARTS_PER_HOUR: usize = 3;
-/// The account server refreshes a grant inside `acquire` when its token expires within 5 min
-/// (src/server/engine.rs MARGIN), and a refresh revokes the token every session holds. While
-/// the held token is still valid and inside this window (the margin plus one minute), the
-/// monitor never asks, so its own request can never revoke a token a running turn still uses.
-pub(super) const NO_POLL_MS: i64 = 6 * 60_000;
-
-/// Whether the monitor may ask the server for the current token now: never while the held
-/// token is valid and inside the server's refresh window; after expiry the held token is dead
-/// for every session, so a refresh revokes nothing usable.
-pub(super) fn may_poll(now: i64, held_expires_at: i64, no_poll_ms: i64) -> bool {
-    held_expires_at <= now || held_expires_at - now > no_poll_ms
-}
 
 /// The monitor's clock. Debug builds honor `CLAUDECTL_TEST_RENEW_FAST=1` so the integration
 /// test does not wait minutes; release builds always use the real values.
@@ -29,11 +17,8 @@ pub(super) struct Timing {
     pub idle_after_ms: i64,
     pub tty_idle_ms: i64,
     pub hooks_wait_ms: i64,
-    pub settle_ms: i64,
     pub poll_far_ms: i64,
     pub poll_near_ms: i64,
-    /// No token request while the held token is valid but expires within this window.
-    pub no_poll_ms: i64,
     /// Wait after a failed token request.
     pub retry_ms: i64,
 }
@@ -46,10 +31,8 @@ pub(super) fn timing() -> Timing {
             idle_after_ms: 300,
             tty_idle_ms: 0,
             hooks_wait_ms: 5_000,
-            settle_ms: 0,
             poll_far_ms: 0,
             poll_near_ms: 0,
-            no_poll_ms: 5_000,
             retry_ms: 0,
         }
     } else {
@@ -58,10 +41,8 @@ pub(super) fn timing() -> Timing {
             idle_after_ms: IDLE_AFTER_STOP_MS,
             tty_idle_ms: TTY_IDLE_MS,
             hooks_wait_ms: 30_000,
-            settle_ms: 30_000,
             poll_far_ms: 1_800_000,
             poll_near_ms: 300_000,
-            no_poll_ms: NO_POLL_MS,
             retry_ms: 30_000,
         }
     }
@@ -85,7 +66,9 @@ pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
             let event = match v["event"].as_str()? {
                 "SessionStart" => Event::SessionStart(v["session_id"].as_str()?.to_string()),
                 "UserPromptSubmit" => Event::Prompt,
-                "Stop" => Event::Stop,
+                // A turn that failed (an API error such as a revoked token) ends with
+                // StopFailure: it ended all the same.
+                "Stop" | "StopFailure" => Event::Stop,
                 "Notification" if v["notification_type"] == "idle_prompt" => Event::IdlePrompt,
                 _ => return None,
             };
@@ -179,7 +162,6 @@ pub(super) struct Inputs<'a> {
     pub tty_gate_ms: i64,
     /// Time since the last terminal input; None without a terminal.
     pub tty_idle_ms: Option<i64>,
-    pub group_grew: bool,
     pub restarts_last_hour: usize,
 }
 
@@ -221,9 +203,9 @@ pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     if i.tty_idle_ms.is_some_and(|ms| ms < i.tty_gate_ms) {
         return Err("terminal input in the last 5 min");
     }
-    if i.group_grew {
-        return Err("Claude has extra processes running");
-    }
+    // Extra processes (an LSP, caffeinate, background shells) do not block: a restart happens
+    // only when the held token was superseded or expired, so it is dead for every holder, and
+    // a gate on them left idle tabs on a dead token for good (SAW-12610).
     if i.restarts_last_hour >= RESTARTS_PER_HOUR {
         return Err("restart budget used up for this hour");
     }
@@ -448,9 +430,29 @@ mod tests {
             idle_after_ms: IDLE_AFTER_STOP_MS,
             tty_gate_ms: TTY_IDLE_MS,
             tty_idle_ms: Some(TTY_IDLE_MS),
-            group_grew: false,
             restarts_last_hour: 0,
         }
+    }
+
+    #[test]
+    fn a_turn_that_ends_in_an_api_error_is_idle_too() {
+        // Claude Code 2.1.295 ends a failed turn (a 401 on a revoked token) with
+        // StopFailure, not Stop (SAW-12610 repro, 10-08 17:13).
+        let text = [
+            r#"{"at":1,"event":"SessionStart","session_id":"s"}"#,
+            r#"{"at":2,"event":"UserPromptSubmit","session_id":"s"}"#,
+            r#"{"at":3,"event":"StopFailure","session_id":"s"}"#,
+        ]
+        .join("\n");
+        let events = parse_events(&text);
+        assert_eq!(events.last(), Some(&(3, Event::Stop)));
+        assert_eq!(
+            idle_state(&events),
+            Idle {
+                session: Some("s".into()),
+                since: Some(3)
+            }
+        );
     }
 
     #[test]
@@ -464,7 +466,8 @@ mod tests {
         let mut same = inputs(&idle);
         same.server_revision = "r1";
         assert_eq!(decide(&same), Decision::Keep);
-        // Busy, too recent, typing, extra processes, no session, or the budget used up.
+        // Busy, too recent, typing, no session, or the budget used up. Extra processes in
+        // Claude's group are no gate: the held token is superseded here (SAW-12610).
         let busy = Idle {
             session: Some("s".into()),
             since: None,
@@ -478,9 +481,6 @@ mod tests {
         let mut typing = inputs(&idle);
         typing.tty_idle_ms = Some(30_000);
         assert!(matches!(decide(&typing), Decision::Wait(_)));
-        let mut grew = inputs(&idle);
-        grew.group_grew = true;
-        assert!(matches!(decide(&grew), Decision::Wait(_)));
         let nosession = Idle {
             session: None,
             since: Some(0),
@@ -493,16 +493,6 @@ mod tests {
         let mut headless = inputs(&idle);
         headless.tty_idle_ms = None;
         assert_eq!(decide(&headless), Decision::Restart);
-    }
-
-    #[test]
-    fn no_token_request_inside_the_servers_refresh_window() {
-        let now = 1_000_000_000;
-        assert!(may_poll(now, now + NO_POLL_MS + 1, NO_POLL_MS));
-        assert!(!may_poll(now, now + NO_POLL_MS, NO_POLL_MS));
-        assert!(!may_poll(now, now + 1, NO_POLL_MS));
-        assert!(may_poll(now, now, NO_POLL_MS));
-        assert!(may_poll(now, now - 60_000, NO_POLL_MS));
     }
 
     #[test]
