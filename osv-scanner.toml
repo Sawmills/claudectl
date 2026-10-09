@@ -1,9 +1,13 @@
-# rsa 0.9.10 comes only from openidconnect (the `server` feature), which uses it to verify
-# SSO ID-token signatures with the provider's public keys. The Marvin attack needs a
-# private-key operation (decryption or signing) the attacker can time; claudectl performs
-# none. No patched rsa release exists. Remove this entry when openidconnect drops rsa or a
-# fixed rsa ships.
+# GHSA-4grx-2x9w-596c is RUSTSEC-2023-0071 (CVE-2023-49092). The GHSA record ends at rsa 0.9.6,
+# but its RustSec alias (updated 2026-09-14) marks every rsa version affected with no fixed
+# release; osv-scanner merges the aliases and reports the GHSA ID, so rsa 0.9.10 matches.
+#
+# At production runtime, rsa comes only from openidconnect (the `server` feature), which uses
+# it to verify SSO ID-token signatures with the provider's public keys. The Marvin attack needs
+# a private-key operation (decryption or signing) that an attacker can time; the shipped
+# client and server perform none. Only tests sign ID tokens, with throwaway generated keys.
+# Remove this entry when openidconnect drops rsa or a fixed rsa release ships.
 [[IgnoredVulns]]
 id = "GHSA-4grx-2x9w-596c"
 ignoreUntil = 2027-01-09
-reason = "rsa via openidconnect verifies public-key signatures only; no private-key operation; no fixed release"
+reason = "RUSTSEC-2023-0071, all rsa versions, no fix; runtime use is public-key signature verification only (openidconnect); tests sign with throwaway keys"
