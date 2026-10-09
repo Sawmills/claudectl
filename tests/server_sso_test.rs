@@ -734,3 +734,331 @@ async fn a_user_removed_from_the_allow_list_loses_the_dashboard() {
     let page = f.get("/accounts", Some(&session)).await;
     assert_eq!(page.status().as_u16(), 403);
 }
+
+// ---------- Dashboard actions (SAW-12695) ----------
+
+/// The `value` of the first hidden input with this name.
+fn hidden(page: &str, name: &str) -> String {
+    let marker = format!(r#"name="{name}" value=""#);
+    let start = page
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no {name}: {page}"))
+        + marker.len();
+    page[start..].split('"').next().unwrap().to_owned()
+}
+
+impl Fixture {
+    async fn post_form(
+        &self,
+        path: &str,
+        cookie: &str,
+        origin: Option<&str>,
+        form: &[(&str, &str)],
+    ) -> reqwest::Response {
+        let mut request = self
+            .http
+            .post(format!("{}{path}", self.origin))
+            .header("accept", BROWSER)
+            .header("cookie", cookie)
+            .form(form);
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        request.send().await.unwrap()
+    }
+    async fn account_id(&self, user: &str, alias: &str) -> Option<String> {
+        self.server
+            .engine()
+            .accounts(user)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.alias == alias)
+            .map(|a| a.account_id)
+    }
+    /// A connected machine of this SSO user.
+    async fn machine(&self, user: &str, id: &str) {
+        self.server
+            .store()
+            .add_machine(&claudectl::server::store::Machine {
+                id: id.into(),
+                user: user.into(),
+                token_hash: claudectl::server::vault::digest(id.as_bytes()),
+                revoked: false,
+            })
+            .await
+            .unwrap();
+    }
+    async fn audit_lines(&self) -> Vec<Value> {
+        claudectl::server::audit::read(self.server.store(), &self._root.path().join("key"))
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_dashboard_action_needs_the_session_token_and_the_same_origin() {
+    let f = Fixture::new().await;
+    let amir = f.user_id("amir@sawmills.ai");
+    f.seed(&amir, "amir-pilot").await;
+    let id = f.account_id(&amir, "amir-pilot").await.unwrap();
+    let session = f.session("amir@sawmills.ai").await;
+    let page = f
+        .get(&format!("/accounts/manage?account={id}"), Some(&session))
+        .await;
+    assert_eq!(page.status().as_u16(), 200);
+    assert_eq!(page.headers()["cache-control"], "no-store");
+    let page = page.text().await.unwrap();
+    let csrf = hidden(&page, "csrf");
+    let origin = f.origin.clone();
+    let remove = |csrf: String, origin: Option<String>| {
+        let (f, session, id) = (&f, session.clone(), id.clone());
+        async move {
+            f.post_form(
+                "/accounts/remove",
+                &session,
+                origin.as_deref(),
+                &[("csrf", &csrf), ("account", &id), ("confirm", "amir-pilot")],
+            )
+            .await
+        }
+    };
+    for (csrf, origin) in [
+        ("wrong".to_owned(), Some(origin.clone())),
+        (String::new(), Some(origin.clone())),
+        (csrf.clone(), None),
+        (csrf.clone(), Some("https://evil.example".to_owned())),
+    ] {
+        let response = remove(csrf, origin).await;
+        assert_eq!(response.status().as_u16(), 403);
+    }
+    assert!(f.account_id(&amir, "amir-pilot").await.is_some());
+}
+
+#[tokio::test]
+async fn remove_needs_the_exact_name_shows_the_machines_and_is_audited() {
+    let f = Fixture::new().await;
+    let amir = f.user_id("amir@sawmills.ai");
+    f.seed(&amir, "amir-pilot").await;
+    let id = f.account_id(&amir, "amir-pilot").await.unwrap();
+    let session = f.session("amir@sawmills.ai").await;
+    f.machine(&amir, "laptop-0123456789ab").await;
+    let page = f
+        .get(&format!("/accounts/manage?account={id}"), Some(&session))
+        .await
+        .text()
+        .await
+        .unwrap();
+    // The page says who loses the account before anything is removed.
+    assert!(page.contains("1 connected machine"), "{page}");
+    assert!(page.contains(r#"autocomplete="off""#), "{page}");
+    let csrf = hidden(&page, "csrf");
+    let origin = Some(f.origin.as_str());
+    for typed in ["AMIR-PILOT", "amir", ""] {
+        let response = f
+            .post_form(
+                "/accounts/remove",
+                &session,
+                origin,
+                &[("csrf", &csrf), ("account", &id), ("confirm", typed)],
+            )
+            .await;
+        assert_eq!(response.status().as_u16(), 400, "{typed:?}");
+    }
+    assert!(f.account_id(&amir, "amir-pilot").await.is_some());
+    let response = f
+        .post_form(
+            "/accounts/remove",
+            &session,
+            origin,
+            &[("csrf", &csrf), ("account", &id), ("confirm", "amir-pilot")],
+        )
+        .await;
+    assert_eq!(response.status().as_u16(), 303);
+    assert_eq!(response.headers()["location"], "/accounts?done=removed");
+    assert!(f.account_id(&amir, "amir-pilot").await.is_none());
+    let audit = f.audit_lines().await;
+    let line = audit.last().unwrap();
+    assert_eq!(line["operation"], "account_remove", "{line}");
+    assert_eq!(line["actor"], "dashboard:amir@sawmills.ai", "{line}");
+    assert_eq!(line["account"], id.as_str(), "{line}");
+    let done = f
+        .get("/accounts?done=removed", Some(&session))
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(done.contains("Account removed"), "{done}");
+}
+
+#[tokio::test]
+async fn another_users_account_or_machine_is_not_found() {
+    let f = Fixture::new().await;
+    let amir = f.user_id("amir@sawmills.ai");
+    f.seed(&amir, "amir-pilot").await;
+    f.seed("someone-else", "not-yours").await;
+    let store = f.server.store();
+    store
+        .record_user("someone-else", "other@sawmills.ai")
+        .await
+        .unwrap();
+    let (foreign, _) = claudectl::server::app::register(store, "other@sawmills.ai", "foreign-box")
+        .await
+        .unwrap();
+    let theirs = f.account_id("someone-else", "not-yours").await.unwrap();
+    let session = f.session("amir@sawmills.ai").await;
+    let page = f
+        .get("/accounts/add", Some(&session))
+        .await
+        .text()
+        .await
+        .unwrap();
+    let csrf = hidden(&page, "csrf");
+    let origin = Some(f.origin.as_str());
+    let response = f
+        .post_form(
+            "/accounts/remove",
+            &session,
+            origin,
+            &[
+                ("csrf", &csrf),
+                ("account", &theirs),
+                ("confirm", "not-yours"),
+            ],
+        )
+        .await;
+    assert_eq!(response.status().as_u16(), 404);
+    assert!(f.account_id("someone-else", "not-yours").await.is_some());
+    let response = f
+        .post_form(
+            "/machines/revoke",
+            &session,
+            origin,
+            &[("csrf", &csrf), ("machine", &foreign)],
+        )
+        .await;
+    assert_eq!(response.status().as_u16(), 404);
+    let manage = f
+        .get(
+            &format!("/accounts/manage?account={theirs}"),
+            Some(&session),
+        )
+        .await;
+    assert_eq!(manage.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn revoke_ends_a_machine_of_this_user_and_is_audited() {
+    let f = Fixture::new().await;
+    let session = f.session("amir@sawmills.ai").await;
+    let amir = f.user_id("amir@sawmills.ai");
+    let laptop = "laptop-0123456789ab".to_string();
+    f.machine(&amir, &laptop).await;
+    let page = f
+        .get("/accounts", Some(&session))
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains(r#"action="/machines/revoke""#), "{page}");
+    let csrf = hidden(&page, "csrf");
+    let response = f
+        .post_form(
+            "/machines/revoke",
+            &session,
+            Some(&f.origin),
+            &[("csrf", &csrf), ("machine", &laptop)],
+        )
+        .await;
+    assert_eq!(response.status().as_u16(), 303);
+    assert_eq!(response.headers()["location"], "/accounts?done=revoked");
+    let machines = f.server.store().machines(&amir).await.unwrap();
+    assert!(
+        machines
+            .iter()
+            .any(|(id, revoked)| id == &laptop && *revoked)
+    );
+    let line = f.audit_lines().await.pop().unwrap();
+    assert_eq!(line["operation"], "machine_revoke", "{line}");
+    assert_eq!(line["actor"], "dashboard:amir@sawmills.ai", "{line}");
+    assert_eq!(line["target"], laptop.as_str(), "{line}");
+}
+
+#[tokio::test]
+async fn add_and_renew_open_a_new_sign_in_with_a_private_paste_field() {
+    let f = Fixture::new().await;
+    let amir = f.user_id("amir@sawmills.ai");
+    f.seed(&amir, "amir-pilot").await;
+    let id = f.account_id(&amir, "amir-pilot").await.unwrap();
+    let session = f.session("amir@sawmills.ai").await;
+    let page = f.get("/accounts/add", Some(&session)).await;
+    assert_eq!(page.status().as_u16(), 200);
+    let csrf = hidden(&page.text().await.unwrap(), "csrf");
+    let origin = Some(f.origin.as_str());
+    for (path, form) in [
+        (
+            "/accounts/add",
+            [("csrf", csrf.as_str()), ("alias", "amir-new")],
+        ),
+        (
+            "/accounts/renew",
+            [("csrf", csrf.as_str()), ("account", id.as_str())],
+        ),
+    ] {
+        let response = f.post_form(path, &session, origin, &form).await;
+        assert_eq!(response.status().as_u16(), 200, "{path}");
+        assert_eq!(response.headers()["cache-control"], "no-store", "{path}");
+        let body = response.text().await.unwrap();
+        assert!(
+            body.contains("https://claude.com/cai/oauth/authorize?"),
+            "{path}: {body}"
+        );
+        assert!(body.contains(r#"name="code""#), "{path}: {body}");
+        assert!(body.contains(r#"autocomplete="off""#), "{path}: {body}");
+        assert!(
+            body.contains(r#"action="/accounts/login""#),
+            "{path}: {body}"
+        );
+        // The sign-in belongs to the dashboard: a machine cannot finish it.
+        let login = hidden(&body, "login");
+        let Err(error) = f
+            .server
+            .engine()
+            .finish_login(&amir, "laptop-0123456789ab", &login, "code#state")
+            .await
+        else {
+            panic!("a machine finished a dashboard sign-in");
+        };
+        assert!(
+            format!("{error:#}").contains("does not belong"),
+            "{error:#}"
+        );
+        // A paste of another sign-in is refused, and nothing is added.
+        let response = f
+            .post_form(
+                "/accounts/login",
+                &session,
+                origin,
+                &[
+                    ("csrf", &csrf),
+                    ("login", &login),
+                    ("code", "secret-code#other"),
+                ],
+            )
+            .await;
+        assert!(response.status().is_client_error(), "{path}");
+        let text = response.text().await.unwrap();
+        assert!(!text.contains("secret-code"), "{text}");
+    }
+    assert!(f.account_id(&amir, "amir-new").await.is_none());
+    // Renew of an account that is not this user's is not found.
+    let response = f
+        .post_form(
+            "/accounts/renew",
+            &session,
+            origin,
+            &[("csrf", &csrf), ("account", &"0".repeat(64))],
+        )
+        .await;
+    assert_eq!(response.status().as_u16(), 404);
+}

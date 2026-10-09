@@ -1,12 +1,16 @@
-//! Read-only browser view for the signed-in company user: own accounts, cached usage, and
-//! own machines. Credentials never enter a page, and a page never contacts Anthropic.
+//! Browser view for the signed-in company user: own accounts, cached usage, and own
+//! machines, plus the account actions (SAW-12695): Add and Renew (a new Claude sign-in with
+//! its code pasted here), Remove (type the exact name), and Revoke a machine. Every action is
+//! a same-origin POST with this session's form token; Remove and Revoke also need a sign-in
+//! of the last 10 minutes. Credentials never enter a page, and the pasted code is never
+//! logged or shown again.
 use super::{
     app::{HttpError, Server},
     enrollment,
 };
 use axum::{
-    Router,
-    extract::State,
+    Form, Router,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -47,8 +51,23 @@ async fn landing(State(server): Shared, headers: HeaderMap) -> Response {
     document(&content, false)
 }
 
-async fn accounts(State(server): Shared, headers: HeaderMap) -> Response {
-    match snapshot(&server, &headers).await {
+/// What a finished action says on the next page (`/accounts?done=...`).
+fn done_text(done: Option<&str>) -> Option<&'static str> {
+    Some(match done? {
+        "saved" => "Account saved.",
+        "removed" => "Account removed.",
+        "revoked" => "Machine revoked. Its access tokens stay valid until they expire.",
+        _ => return None,
+    })
+}
+
+async fn accounts(
+    State(server): Shared,
+    headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let done = done_text(query.get("done").map(String::as_str));
+    match snapshot(&server, &headers, done).await {
         Ok(Some(snapshot)) => document(&render::overview(&snapshot), true),
         Ok(None) => (
             [("cache-control", "no-store")],
@@ -74,10 +93,15 @@ async fn accounts(State(server): Shared, headers: HeaderMap) -> Response {
     }
 }
 
-async fn snapshot(server: &Server, headers: &HeaderMap) -> Result<Option<Snapshot>, HttpError> {
-    let Some((user, email)) = enrollment::browser_user(server, headers).await? else {
+async fn snapshot(
+    server: &Server,
+    headers: &HeaderMap,
+    done: Option<&'static str>,
+) -> Result<Option<Snapshot>, HttpError> {
+    let Some(browser) = enrollment::browser_session(server, headers).await? else {
         return Ok(None);
     };
+    let (user, email, csrf) = (browser.user, browser.email, browser.csrf);
     let unavailable = |_| server.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable");
     let engine = server.engine();
     // The stored observations of this user's accounts, in one owner-scoped read with no
@@ -99,6 +123,7 @@ async fn snapshot(server: &Server, headers: &HeaderMap) -> Result<Option<Snapsho
         };
         let observed = windows(&usage);
         accounts.push(Account {
+            id: account.account_id.clone(),
             alias: account.alias,
             available: account.available,
             migration: account.migration.into(),
@@ -128,7 +153,314 @@ async fn snapshot(server: &Server, headers: &HeaderMap) -> Result<Option<Snapsho
         server_time: chrono::Utc::now().timestamp(),
         accounts,
         machines,
+        csrf,
+        done,
     }))
+}
+
+/// The signed-in browser for an action, or the response to send instead: sign-in without
+/// a session, the error page for a dead or refused one.
+async fn signed_in(
+    server: &Server,
+    headers: &HeaderMap,
+) -> Result<enrollment::Browser, Box<Response>> {
+    match enrollment::browser_session(server, headers).await {
+        Ok(Some(browser)) => Ok(browser),
+        Ok(None) => Err(Box::new(sign_in_again())),
+        Err(error) => Err(Box::new(enrollment::dashboard_error(error))),
+    }
+}
+/// A page or a redirect after an action; never cached.
+fn page(content: String) -> Response {
+    document(&content, false)
+}
+fn after(done: &str) -> Response {
+    (
+        [("cache-control", "no-store")],
+        Redirect::to(&format!("/accounts?done={done}")),
+    )
+        .into_response()
+}
+fn refuse(server: &Server, status: StatusCode, reason: &'static str) -> Response {
+    enrollment::dashboard_error(server.error(status, reason))
+}
+/// This user's account with this ID.
+async fn own_account(
+    server: &Server,
+    user: &str,
+    id: &str,
+) -> Result<super::engine::Account, Box<Response>> {
+    let accounts = server.engine().accounts(user).await.map_err(|_| {
+        refuse(
+            server,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "registry_unavailable",
+        )
+    })?;
+    accounts
+        .into_iter()
+        .find(|a| a.account_id == id)
+        .ok_or_else(|| Box::new(refuse(server, StatusCode::NOT_FOUND, "account_not_found")))
+}
+/// Remove and Revoke: a sign-in of the last 10 minutes, else a new sign-in first.
+fn fresh_sign_in(browser: &enrollment::Browser) -> Result<(), Box<Response>> {
+    if enrollment::recent_sign_in(browser.signed_in_at, chrono::Utc::now().timestamp_millis()) {
+        Ok(())
+    } else {
+        Err(Box::new(sign_in_again()))
+    }
+}
+/// To the Google sign-in, which returns to the dashboard.
+fn sign_in_again() -> Response {
+    (
+        [("cache-control", "no-store")],
+        Redirect::to("/accounts/sign-in"),
+    )
+        .into_response()
+}
+
+async fn add_form(State(server): Shared, headers: HeaderMap) -> Response {
+    match signed_in(&server, &headers).await {
+        Ok(browser) => page(render::add_page(&browser.email, &browser.csrf)),
+        Err(response) => *response,
+    }
+}
+#[derive(serde::Deserialize)]
+struct ManageQuery {
+    account: String,
+}
+async fn manage(
+    State(server): Shared,
+    headers: HeaderMap,
+    Query(query): Query<ManageQuery>,
+) -> Response {
+    let browser = match signed_in(&server, &headers).await {
+        Ok(browser) => browser,
+        Err(response) => return *response,
+    };
+    let account = match own_account(&server, &browser.user, &query.account).await {
+        Ok(account) => account,
+        Err(response) => return *response,
+    };
+    let machines = match server.store().machines(&browser.user).await {
+        Ok(machines) => machines.iter().filter(|(_, revoked)| !revoked).count(),
+        Err(_) => {
+            return refuse(
+                &server,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "registry_unavailable",
+            );
+        }
+    };
+    page(render::manage_page(
+        &browser.email,
+        &account.alias,
+        &account.account_id,
+        &browser.csrf,
+        machines,
+    ))
+}
+/// Start a Claude sign-in owned by the dashboard and show its page.
+async fn start_login(
+    server: &Server,
+    browser: &enrollment::Browser,
+    alias: &str,
+    renew: bool,
+) -> Response {
+    match server
+        .engine()
+        .start_login(
+            &browser.user,
+            super::engine::DASHBOARD_MACHINE,
+            alias,
+            renew,
+        )
+        .await
+    {
+        Ok(login) => page(render::login_page(
+            &browser.email,
+            alias,
+            renew,
+            &login.authorize_url,
+            &login.id,
+            &browser.csrf,
+        )),
+        // An invalid name, or a new name that already exists.
+        Err(_) => refuse(server, StatusCode::BAD_REQUEST, "login_not_started"),
+    }
+}
+#[derive(serde::Deserialize)]
+struct AddForm {
+    csrf: String,
+    alias: String,
+}
+async fn add(State(server): Shared, headers: HeaderMap, Form(form): Form<AddForm>) -> Response {
+    let browser = match signed_in(&server, &headers).await {
+        Ok(browser) => browser,
+        Err(response) => return *response,
+    };
+    if let Err(error) = enrollment::check_form(&server, &headers, &browser, &form.csrf) {
+        return enrollment::dashboard_error(error);
+    }
+    start_login(&server, &browser, form.alias.trim(), false).await
+}
+#[derive(serde::Deserialize)]
+struct AccountForm {
+    csrf: String,
+    account: String,
+}
+async fn renew(
+    State(server): Shared,
+    headers: HeaderMap,
+    Form(form): Form<AccountForm>,
+) -> Response {
+    let browser = match signed_in(&server, &headers).await {
+        Ok(browser) => browser,
+        Err(response) => return *response,
+    };
+    if let Err(error) = enrollment::check_form(&server, &headers, &browser, &form.csrf) {
+        return enrollment::dashboard_error(error);
+    }
+    let account = match own_account(&server, &browser.user, &form.account).await {
+        Ok(account) => account,
+        Err(response) => return *response,
+    };
+    // A new Claude sign-in for the same account; never a forced token refresh.
+    start_login(&server, &browser, &account.alias, true).await
+}
+#[derive(serde::Deserialize)]
+struct LoginForm {
+    csrf: String,
+    login: String,
+    code: String,
+}
+async fn finish_login(
+    State(server): Shared,
+    headers: HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let browser = match signed_in(&server, &headers).await {
+        Ok(browser) => browser,
+        Err(response) => return *response,
+    };
+    if let Err(error) = enrollment::check_form(&server, &headers, &browser, &form.csrf) {
+        return enrollment::dashboard_error(error);
+    }
+    match server
+        .engine()
+        .finish_login(
+            &browser.user,
+            super::engine::DASHBOARD_MACHINE,
+            &form.login,
+            &form.code,
+        )
+        .await
+    {
+        Ok(_) => after("saved"),
+        // The reason only: the code is never logged or shown again.
+        Err(_) => refuse(&server, StatusCode::BAD_REQUEST, "login_not_completed"),
+    }
+}
+#[derive(serde::Deserialize)]
+struct RemoveForm {
+    csrf: String,
+    account: String,
+    confirm: String,
+}
+async fn remove(
+    State(server): Shared,
+    headers: HeaderMap,
+    Form(form): Form<RemoveForm>,
+) -> Response {
+    let browser = match signed_in(&server, &headers).await {
+        Ok(browser) => browser,
+        Err(response) => return *response,
+    };
+    if let Err(error) = enrollment::check_form(&server, &headers, &browser, &form.csrf) {
+        return enrollment::dashboard_error(error);
+    }
+    if let Err(response) = fresh_sign_in(&browser) {
+        return *response;
+    }
+    let account = match own_account(&server, &browser.user, &form.account).await {
+        Ok(account) => account,
+        Err(response) => return *response,
+    };
+    // The exact name, case included: no prefix, no short name.
+    if form.confirm != account.alias {
+        return refuse(&server, StatusCode::BAD_REQUEST, "confirmation_mismatch");
+    }
+    let actor = format!("dashboard:{}", browser.email);
+    match server
+        .engine()
+        .remove_from_dashboard(&browser.user, &actor, &account.account_id)
+        .await
+    {
+        Ok(()) => after("removed"),
+        Err(_) => refuse(
+            &server,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistence_failed",
+        ),
+    }
+}
+#[derive(serde::Deserialize)]
+struct RevokeForm {
+    csrf: String,
+    machine: String,
+}
+async fn revoke(
+    State(server): Shared,
+    headers: HeaderMap,
+    Form(form): Form<RevokeForm>,
+) -> Response {
+    let browser = match signed_in(&server, &headers).await {
+        Ok(browser) => browser,
+        Err(response) => return *response,
+    };
+    if let Err(error) = enrollment::check_form(&server, &headers, &browser, &form.csrf) {
+        return enrollment::dashboard_error(error);
+    }
+    if let Err(response) = fresh_sign_in(&browser) {
+        return *response;
+    }
+    match server
+        .store()
+        .revoke_machine(&form.machine, Some(&browser.user))
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return refuse(&server, StatusCode::NOT_FOUND, "machine_not_found"),
+        Err(_) => {
+            return refuse(
+                &server,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "persistence_failed",
+            );
+        }
+    }
+    let actor = format!("dashboard:{}", browser.email);
+    let audited = server
+        .engine()
+        .audit(&super::audit::Event {
+            operation: "machine_revoke",
+            machine: super::engine::DASHBOARD_MACHINE,
+            account: "",
+            result: "ok",
+            rotated: None,
+            target: Some(&form.machine),
+            reason: None,
+            actor: Some(&actor),
+        })
+        .await;
+    match audited {
+        Ok(()) => after("revoked"),
+        Err(_) => refuse(
+            &server,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit_unavailable",
+        ),
+    }
 }
 
 /// What the dashboard shows of a stored observation.
@@ -235,6 +567,12 @@ pub(super) fn routes(router: Router<Arc<Server>>) -> Router<Arc<Server>> {
                     .unwrap_or_else(enrollment::dashboard_error)
             }),
         )
+        .route("/accounts/add", get(add_form).post(add))
+        .route("/accounts/manage", get(manage))
+        .route("/accounts/renew", post(renew))
+        .route("/accounts/login", post(finish_login))
+        .route("/accounts/remove", post(remove))
+        .route("/machines/revoke", post(revoke))
         .route(
             "/accounts/sign-out",
             post(|state, headers| async move {
@@ -380,6 +718,7 @@ mod preview {
             resets_at: Some(now + hours * 3600 + 300),
         };
         let account = |alias: &str, five, week, migration: &str| Account {
+            id: alias.replace('@', "-at-"),
             alias: alias.into(),
             available: true,
             migration: migration.into(),
@@ -427,12 +766,16 @@ mod preview {
                     revoked: true,
                 },
             ],
+            csrf: "preview".into(),
+            done: None,
         };
         let empty = Snapshot {
             email: full.email.clone(),
             server_time: now,
             accounts: vec![],
             machines: vec![],
+            csrf: "preview".into(),
+            done: None,
         };
         let landing = include_str!("dashboard/landing.html")
             .replace(

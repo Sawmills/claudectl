@@ -147,6 +147,7 @@ pub async fn revoke(store: &Store, key: &Path, machine: &str) -> Result<()> {
             rotated: None,
             target: Some(machine),
             reason: None,
+            actor: None,
         },
     )
     .await
@@ -364,6 +365,7 @@ async fn revoke_machine(
             rotated: None,
             target: Some(&input.id),
             reason: None,
+            actor: None,
         })
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -452,6 +454,7 @@ async fn token(
             rotated: None,
             target: None,
             reason: None,
+            actor: None,
         })
         .await?;
     authorized?;

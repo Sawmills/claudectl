@@ -21,6 +21,9 @@ pub struct Event<'a> {
     /// Why a refresh ran: forced, expired, migration or margin.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
+    /// Who acted in the browser dashboard (`dashboard:<email>`); machine requests have none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<&'a str>,
 }
 
 /// An audit write failure fails the operation it records.

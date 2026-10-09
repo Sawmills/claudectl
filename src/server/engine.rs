@@ -305,6 +305,10 @@ const RECORD_VERSION: u32 = 1;
 /// The usage poll lease: one replica polls the provider at a time.
 const USAGE_LEASE: &str = "__usage";
 
+/// The machine of a sign-in started in the browser dashboard. Machine IDs are
+/// `<name>-<12 hex>`, so no machine has this ID and no machine can finish such a sign-in.
+pub const DASHBOARD_MACHINE: &str = "dashboard";
+
 pub struct Engine {
     store: Arc<Store>,
     key: PathBuf,
@@ -668,6 +672,7 @@ impl Engine {
                         rotated: None,
                         target: None,
                         reason: None,
+                        actor: None,
                     })
                     .await?;
                     return Err(error);
@@ -711,6 +716,7 @@ impl Engine {
             rotated: None,
             target: None,
             reason: None,
+            actor: None,
         })
         .await?;
         refreshed?;
@@ -974,6 +980,7 @@ impl Engine {
             rotated: outcome.as_ref().ok().copied().flatten(),
             target: None,
             reason,
+            actor: None,
         })
         .await?;
         outcome?;
@@ -1045,6 +1052,28 @@ impl Engine {
     }
     /// Delete an account and its sealed grant. Access tokens already given out stay valid
     /// until they expire; the server stops renewing them now.
+    /// Remove an account from the browser dashboard: audited as `account_remove` with the
+    /// signed-in person as actor (`dashboard:<email>`).
+    pub async fn remove_from_dashboard(&self, user: &str, actor: &str, id: &str) -> Result<()> {
+        if !self.store.delete(user, id).await? {
+            return if self.store.deleted(user, id).await? {
+                Err(Gone.into())
+            } else {
+                Err(NotFound.into())
+            };
+        }
+        self.audit(&audit::Event {
+            operation: "account_remove",
+            machine: DASHBOARD_MACHINE,
+            account: id,
+            result: "ok",
+            rotated: None,
+            target: None,
+            reason: None,
+            actor: Some(actor),
+        })
+        .await
+    }
     pub async fn remove(&self, user: &str, machine: &str, id: &str) -> Result<()> {
         if !self.store.delete(user, id).await? {
             return if self.store.deleted(user, id).await? {
@@ -1061,6 +1090,7 @@ impl Engine {
             rotated: None,
             target: None,
             reason: None,
+            actor: None,
         })
         .await
     }
