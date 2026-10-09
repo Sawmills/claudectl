@@ -344,7 +344,7 @@ fn machines(snapshot: &Snapshot) -> String {
         }
         count += 1;
         rows += &format!(
-            r#"<tr role="row"><td role="cell">{}</td><td role="cell" class="cell-account"><span class="alias" translate="no">{}</span></td><td role="cell" class="cell-state"><span class="state ok">Connected</span><span class="status-detail">{}</span>{}</td></tr>"#,
+            r#"<tr role="row"><td role="cell">{}</td><td role="cell" class="cell-account"><span class="alias" translate="no">{}</span></td><td role="cell" class="cell-state"><div class="status"><span class="state ok">Connected</span><span class="status-detail">{}</span></div>{}</td></tr>"#,
             escape(name),
             escape(suffix),
             match m.last_seen_at {

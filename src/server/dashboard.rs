@@ -810,7 +810,7 @@ mod preview {
                 Machine {
                     id: "mac-mini-3f9a1c0e7b24".into(),
                     revoked: false,
-                    last_seen_at: None,
+                    last_seen_at: Some((now - 240) * 1000),
                 },
                 Machine {
                     id: "devbox-81d0aa5c9e13".into(),
