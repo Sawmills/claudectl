@@ -330,7 +330,9 @@ fn report_json(
 ) -> serde_json::Value {
     let mut report = status_json(local, now);
     report["server"] = server_json(view, remote, now);
-    // The account to use and the next command, as the compact view shows them.
+    // The account to use and the next command, as the compact view shows them. `best` may be
+    // a local profile (`next` then says `claudectl use`); `claudectl run` picks only among
+    // accounts with `on_server: true`.
     let both: Vec<&FetchedUsage> = local
         .iter()
         .filter(|f| {
@@ -394,6 +396,7 @@ pub fn status_json(fetched: &[FetchedUsage], now: i64) -> serde_json::Value {
                 "state": state_json(&candidate_of(f, now)),
                 "billed": candidate_of(f, now).billed,
                 "fresh": candidate_of(f, now).fresh,
+                "on_server": f.on_server,
             })
         })
         .collect();
@@ -2462,6 +2465,7 @@ mod tests {
             ("state", "object"),
             ("billed", "bool"),
             ("fresh", "bool"),
+            ("on_server", "bool"),
         ];
         let local = &report["accounts"][0];
         check(local, &account_keys, "accounts[0]");
@@ -2491,10 +2495,34 @@ mod tests {
             "state",
         );
         assert_eq!(local["state"]["kind"], "ready");
+        assert_eq!(local["on_server"], false);
+        assert_eq!(remote["on_server"], true);
         // The new top-level fields agree with the compact view.
         assert_eq!(report["best"], "amir3@sawmills.ai");
         // Short names only when every account shares a domain; "work" has none.
         assert_eq!(report["next"], "claudectl run   (picks amir3@sawmills.ai)");
+    }
+
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                // CSI: ESC [ ... final byte in @..~
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) && c != '[' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+    #[test]
+    fn strip_ansi_removes_colour_codes_only() {
+        assert_eq!(strip_ansi("\u{1b}[38;5;2m20%\u{1b}[39m ┆ x"), "20% ┆ x");
     }
 
     /// The `status --details` table contract (SAW-12696): autoreview and fleet scripts split
@@ -2515,7 +2543,8 @@ mod tests {
             .into_iter()
             .map(to_account_status)
             .collect();
-        let text = details_table(&accounts);
+        // Colour codes appear when the test runs in a terminal: compare the plain text.
+        let text = strip_ansi(&details_table(&accounts));
         let rows: Vec<Vec<String>> = text
             .lines()
             .filter(|l| l.starts_with('│'))

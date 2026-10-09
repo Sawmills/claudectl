@@ -481,7 +481,7 @@ fn status_is_one_table_of_local_and_server_accounts() {
             .keys()
             .map(String::as_str)
             .collect();
-        // Version 1 keeps every key; SAW-12696 added state, billed and fresh (additive only).
+        // Version 1 keeps every key; SAW-12696 added state, billed, fresh and on_server.
         let v1 = HashSet::from([
             "alias",
             "label",
@@ -499,7 +499,7 @@ fn status_is_one_table_of_local_and_server_accounts() {
         assert!(keys.is_superset(&v1), "{text}");
         assert_eq!(
             keys.difference(&v1).copied().collect::<HashSet<_>>(),
-            HashSet::from(["state", "billed", "fresh"]),
+            HashSet::from(["state", "billed", "fresh", "on_server"]),
             "{text}"
         );
         if account["alias"] != "loc" {
