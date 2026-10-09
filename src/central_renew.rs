@@ -104,8 +104,9 @@ pub(super) struct Idle {
     pub limited: Option<(String, i64)>,
     /// When Claude ended its session with no new session since: Claude is exiting.
     pub ended: Option<i64>,
-    /// When a turn in this session last failed with `authentication_failed`: the held token
-    /// is dead, so nothing the user types can succeed until a restart.
+    /// When a turn last failed with `authentication_failed`: the held token is dead, so
+    /// nothing the user types can succeed until a restart. A new session in the same process
+    /// (`/clear`, `/resume`) keeps the token, so only a relaunch (a new event log) clears it.
     pub auth_failed: Option<i64>,
 }
 
@@ -125,7 +126,6 @@ pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
                 idle.since = Some(*at);
                 idle.limited = None;
                 idle.ended = None;
-                idle.auth_failed = None;
             }
             Event::SessionEnd => idle.ended = Some(*at),
             Event::Prompt => {
@@ -720,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_authentication_marks_the_held_token_dead_until_a_new_session() {
+    fn a_failed_authentication_marks_the_held_token_dead_for_the_process() {
         // A forced rotation revokes the held token before its expiry: the failed turn says so.
         let text = [
             r#"{"at":1,"event":"SessionStart","session_id":"s"}"#,
@@ -741,13 +741,20 @@ mod tests {
         // Same revision: the server has no newer token yet, so nothing to follow.
         typing.server_revision = "r1";
         assert_eq!(decide(&typing), Decision::Keep);
-        // The resumed session starts on the new token: alive again.
+        // /clear or /resume starts a session in the same process, on the same dead token.
         let mut events = parse_events(&text);
-        events.push((7, Event::SessionStart("s".into())));
-        let fresh = idle_state(&events);
-        assert_eq!(fresh.auth_failed, None);
+        events.push((7, Event::SessionStart("s2".into())));
+        let cleared = idle_state(&events);
+        assert_eq!(cleared.auth_failed, Some(5));
+        let mut still = inputs(&cleared);
+        still.now = 8;
+        assert!(held_token_dead(&still));
+        // A relaunch on the new token starts a new event log: alive again.
+        let fresh = idle_state(&parse_events(
+            r#"{"at":9,"event":"SessionStart","session_id":"s"}"#,
+        ));
         let mut alive = inputs(&fresh);
-        alive.now = 8;
+        alive.now = 10;
         assert!(!held_token_dead(&alive));
     }
 
