@@ -915,16 +915,20 @@ impl PostgresStore {
             .await?
             > 0)
     }
-    pub async fn machines(&self, user: &str) -> Result<Vec<Machine>> {
+    pub async fn machines(&self, user: &str) -> Result<Vec<MachineSummary>> {
         let client = self.pool.get().await?;
         Ok(client
             .query(
-                "SELECT id, user_id, token_hash, revoked, last_seen_at FROM machines WHERE user_id = $1 ORDER BY id",
+                "SELECT id, revoked, last_seen_at FROM machines WHERE user_id = $1 ORDER BY id",
                 &[&user],
             )
             .await?
             .iter()
-            .map(machine_row)
+            .map(|r| MachineSummary {
+                id: r.get(0),
+                revoked: r.get(1),
+                last_seen_at: r.get(2),
+            })
             .collect())
     }
     pub async fn seen_machine(&self, id: &str, now: i64) -> Result<bool> {

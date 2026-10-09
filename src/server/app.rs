@@ -59,9 +59,39 @@ pub struct Server {
     metrics_token_hash: Option<String>,
     /// Per reason: failure count and the Unix time of the last one.
     failures: Arc<StdMutex<BTreeMap<&'static str, (u64, i64)>>>,
+    seen_writes: SeenWrites,
     work: Arc<Semaphore>,
     /// Set on shutdown: readiness fails while in-flight work finishes.
     draining: AtomicBool,
+}
+
+/// Machines with a last-seen write in flight: at most one per machine, so a burst of
+/// requests from one machine starts one write, not one per request.
+#[derive(Clone, Default)]
+pub(super) struct SeenWrites(Arc<StdMutex<std::collections::HashSet<String>>>);
+/// Frees the machine's slot when its write ends.
+pub(super) struct SeenGuard {
+    writes: SeenWrites,
+    id: String,
+}
+impl SeenWrites {
+    pub(super) fn begin(&self, id: &str) -> Option<SeenGuard> {
+        let mut pending = self.0.lock().expect("seen writes lock");
+        if !pending.insert(id.to_owned()) {
+            return None;
+        }
+        Some(SeenGuard {
+            writes: self.clone(),
+            id: id.to_owned(),
+        })
+    }
+}
+impl Drop for SeenGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.writes.0.lock() {
+            pending.remove(&self.id);
+        }
+    }
 }
 
 pub struct HttpError {
@@ -188,6 +218,7 @@ impl Server {
                 .collect(),
             metrics_token_hash: config.metrics_token_hash,
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
+            seen_writes: SeenWrites::default(),
             work: Arc::new(Semaphore::new(64)),
             draining: AtomicBool::new(false),
         }))
@@ -275,12 +306,17 @@ impl Server {
         {
             return;
         }
+        // One write per machine at a time; the SQL guard still keeps replicas apart.
+        let Some(slot) = self.seen_writes.begin(&machine.id) else {
+            return;
+        };
         let (store, failures, id) = (
             self.engine.store().clone(),
             self.failures.clone(),
             machine.id.clone(),
         );
         tokio::spawn(async move {
+            let _slot = slot;
             if let Err(error) = store.seen_machine(&id, now).await {
                 {
                     let mut failures = failures.lock().expect("metrics lock");
@@ -804,4 +840,22 @@ pub async fn serve_until(
         .await?;
     server.drain().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_machine_has_at_most_one_last_seen_write_in_flight() {
+        let pending = SeenWrites::default();
+        let first = pending.begin("mac-1").expect("first write");
+        assert!(pending.begin("mac-1").is_none(), "a second write waits");
+        assert!(pending.begin("mac-2").is_some(), "other machines are free");
+        drop(first);
+        assert!(
+            pending.begin("mac-1").is_some(),
+            "free again after the write"
+        );
+    }
 }

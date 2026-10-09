@@ -182,6 +182,14 @@ pub struct Machine {
     #[serde(default)]
     pub last_seen_at: Option<i64>,
 }
+/// A machine as listings show it: no token hash, so verifier material never reaches the
+/// dashboard or the device list.
+#[derive(Clone, Debug)]
+pub struct MachineSummary {
+    pub id: String,
+    pub revoked: bool,
+    pub last_seen_at: Option<i64>,
+}
 /// A machine's last-seen time is written at most this often (ms).
 pub const SEEN_EVERY_MS: i64 = 300_000;
 
@@ -340,7 +348,7 @@ impl Store {
         dispatch!(self, set_user_enabled(email, enabled))
     }
     /// The user's machines as (ID, revoked), without token hashes.
-    pub async fn machines(&self, user: &str) -> Result<Vec<Machine>> {
+    pub async fn machines(&self, user: &str) -> Result<Vec<MachineSummary>> {
         dispatch!(self, machines(user))
     }
     /// Record that an active machine was seen at `now`, unless it was within

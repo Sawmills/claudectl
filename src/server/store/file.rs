@@ -487,13 +487,17 @@ impl FileStore {
             (found, found)
         })
     }
-    pub fn machines(&self, user: &str) -> Result<Vec<Machine>> {
+    pub fn machines(&self, user: &str) -> Result<Vec<MachineSummary>> {
         Ok(self.read(|t| {
-            let mut machines: Vec<Machine> = t
+            let mut machines: Vec<MachineSummary> = t
                 .machines
                 .iter()
                 .filter(|m| m.user == user)
-                .cloned()
+                .map(|m| MachineSummary {
+                    id: m.id.clone(),
+                    revoked: m.revoked,
+                    last_seen_at: m.last_seen_at,
+                })
                 .collect();
             machines.sort_by(|a, b| a.id.cmp(&b.id));
             machines

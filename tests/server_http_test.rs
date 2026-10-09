@@ -608,6 +608,16 @@ async fn the_cancel_route_blocks_later_imports_and_refuses_after_commit() {
 
 // ---------- Machine last-seen (SAW-12696 A) ----------
 
+async fn devices_user(f: &Fixture, token: &str) -> String {
+    f.server
+        .store()
+        .machine_by_token(&claudectl::server::vault::digest(token.as_bytes()))
+        .await
+        .unwrap()
+        .unwrap()
+        .user
+}
+
 async fn last_seen(f: &Fixture, token: &str) -> Option<i64> {
     f.server
         .store()
@@ -658,6 +668,15 @@ async fn a_machine_request_records_last_seen_at_most_every_five_minutes() {
         .await;
     assert_eq!(status, 200);
     assert_eq!(devices[0]["last_seen_at"], first, "{devices}");
+    assert!(devices[0].get("token_hash").is_none(), "{devices}");
+    // Listings carry no verifier material (the type has no token hash).
+    let listed = f
+        .server
+        .store()
+        .machines(&devices_user(&f, &mac).await)
+        .await
+        .unwrap();
+    assert_eq!(listed[0].last_seen_at, Some(first));
     // A revoked machine's token is refused and records nothing.
     let (old_id, old) = f.register(AMIR, "old").await;
     f.server
