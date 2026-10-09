@@ -103,7 +103,7 @@ fn date(at: i64) -> String {
 }
 fn reset(at: Option<i64>, now: i64) -> String {
     let Some(at) = at else {
-        return "Reset time unknown".into();
+        return String::new();
     };
     let minutes = (at.saturating_sub(now).max(0) as u64).div_ceil(60);
     let text = if minutes == 0 {
@@ -204,17 +204,25 @@ fn ledger(accounts: &[Account], names: &[String], now: i64) -> String {
         return String::new();
     }
     let show_fable = accounts.iter().any(|a| a.fable.is_some());
+    let candidates: Vec<_> = accounts.iter().map(Account::candidate).collect();
+    let best = crate::accounts::best(&candidates);
     let mut order: Vec<usize> = (0..accounts.len()).collect();
-    // Accounts with room first, then low, limits, and the rest; then by name.
+    // The account to use first; then room, low, the rest, limits; then the most room.
     order.sort_by_key(|&i| {
         let a = &accounts[i];
-        let rank = match (a.has_room(), a.state().0) {
-            (true, "ok") => 0,
-            (true, _) => 1,
-            (false, "bad") => 3,
-            _ => 2,
+        let rank = match (Some(i) == best, a.has_room(), a.state().0) {
+            (true, ..) => 0,
+            (_, true, "ok") => 1,
+            (_, true, _) => 2,
+            (_, false, "bad") => 4,
+            _ => 3,
         };
-        (rank, names[i].clone())
+        let highest = candidates[i]
+            .windows
+            .iter()
+            .filter_map(|w| w.used)
+            .fold(0.0_f64, f64::max);
+        (rank, (highest * 100.0) as i64, names[i].clone())
     });
     let mut rows = String::new();
     for i in order {
@@ -393,6 +401,14 @@ mod tests {
         assert!(html.contains("2 of 2 accounts have room"), "{html}");
         // Short names: the shared domain is dropped everywhere on the page.
         assert!(!html.contains("amir3@sawmills.ai"), "{html}");
+        // The account to use is the first row, then the most room.
+        let row = |name: &str| {
+            html.find(&format!(r#"translate="no">{name}</strong>"#))
+                .unwrap()
+        };
+        assert!(row("amir3") < row("amir"), "{html}");
+        // An unknown reset time adds no text.
+        assert!(!html.contains("Reset time unknown"), "{html}");
     }
 
     #[test]

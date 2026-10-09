@@ -340,18 +340,26 @@ mod preview {
             usage_stale: false,
             billed: false,
         };
-        let mut pending = account("amir4", 0.0, 0.0, "pending");
+        let mut pending = account("amir6@sawmills.ai", 0.0, 0.0, "pending");
         pending.five_hour.used_percent = None;
         pending.seven_day.used_percent = None;
         pending.observed_at = None;
         pending.usage_stale = true;
+        let with_fable = |mut a: Account, used: f64| {
+            a.fable = Some(Window {
+                used_percent: Some(used),
+                resets_at: None,
+            });
+            a
+        };
         let full = Snapshot {
             email: "amir@sawmills.ai".into(),
             server_time: now,
             accounts: vec![
-                account("amir", 12.0, 8.0, "rotated"),
-                account("amir3", 64.0, 31.0, "rotated"),
-                account("amir5", 93.0, 88.0, "unrotated"),
+                with_fable(account("amir3@sawmills.ai", 2.0, 1.0, "rotated"), 0.0),
+                with_fable(account("amir@sawmills.ai", 55.0, 76.0, "rotated"), 16.0),
+                with_fable(account("amir4@sawmills.ai", 0.0, 98.0, "rotated"), 100.0),
+                with_fable(account("amir5@sawmills.ai", 93.0, 88.0, "unrotated"), 40.0),
                 pending,
             ],
             machines: vec![

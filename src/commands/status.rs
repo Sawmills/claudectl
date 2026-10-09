@@ -2122,6 +2122,52 @@ mod tests {
         assert!(!text.contains('│'), "{text}");
     }
 
+    /// Prints the old summary table and the new compact view for the same synthetic
+    /// accounts, for the PR's before/after evidence:
+    /// `cargo test --bin claudectl print_before_and_after -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn print_before_and_after() {
+        // Real time: the old table reads the wall clock for freshness.
+        let now = chrono::Utc::now().timestamp();
+        let at = |secs: i64| {
+            chrono::DateTime::from_timestamp(now + secs, 0)
+                .unwrap()
+                .to_rfc3339()
+        };
+        let (h5, wk) = (at(12 * 3600 + 27 * 60), at(2 * 86400 + 3 * 3600));
+        let w = |five: f64, week: f64, fable: Option<f64>| {
+            let fable = fable.map_or(String::new(), |p| {
+                format!(r#","limits":[{{"kind":"weekly_scoped","percent":{p},"scope":{{"model":{{"id":null,"display_name":"Fable"}},"surface":null}}}}]"#)
+            });
+            format!(
+                r#"{{"five_hour":{{"utilization":{five},"resets_at":"{h5}"}},"seven_day":{{"utilization":{week},"resets_at":"{wk}"}},"extra_usage":{{"is_enabled":false}}{fable}}}"#
+            )
+        };
+        let mut rows = vec![
+            server("amir3@sawmills.ai", &w(2.0, 0.0, Some(0.0))),
+            server("amir2@sawmills.ai", &w(3.0, 1.0, Some(0.0))),
+            server("amir@sawmills.ai", &w(55.0, 76.0, Some(16.0))),
+            server("amir4@sawmills.ai", &w(0.0, 98.0, Some(100.0))),
+            server("amir5@sawmills.ai", &w(0.0, 100.0, Some(100.0))),
+            server("amir6@sawmills.ai", &w(0.0, 100.0, Some(79.0))),
+        ];
+        rows.push(FetchedUsage {
+            is_active: true,
+            ..fetched_json("amir7@sawmills.ai", &w(4.0, 93.0, Some(17.0)), Some("max"))
+        });
+        for row in &mut rows {
+            row.snapshot.fetched_at = Some(now - 30);
+            row.snapshot.valid_until = Some(now + 270);
+        }
+        let accounts: Vec<AccountStatus> = rows.iter().map(to_account_status).collect();
+        println!("=== BEFORE: claudectl status (v0.1.18 summary table) ===");
+        println!("{}", summary_table(&accounts, true));
+        let refs: Vec<&FetchedUsage> = rows.iter().collect();
+        println!("=== AFTER: claudectl ===");
+        print!("{}", compact(&refs, now));
+    }
+
     #[test]
     fn compact_status_without_a_usable_account_says_what_to_do() {
         let now = 1_500;
