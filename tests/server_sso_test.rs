@@ -785,6 +785,7 @@ impl Fixture {
                 user: user.into(),
                 token_hash: claudectl::server::vault::digest(id.as_bytes()),
                 revoked: false,
+                last_seen_at: None,
             })
             .await
             .unwrap();
@@ -973,11 +974,7 @@ async fn revoke_ends_a_machine_of_this_user_and_is_audited() {
     assert_eq!(response.status().as_u16(), 303);
     assert_eq!(response.headers()["location"], "/accounts?done=revoked");
     let machines = f.server.store().machines(&amir).await.unwrap();
-    assert!(
-        machines
-            .iter()
-            .any(|(id, revoked)| id == &laptop && *revoked)
-    );
+    assert!(machines.iter().any(|m| m.id == laptop && m.revoked));
     let audit = f.audit_lines().await;
     // A second submit (back button, double click) changes nothing and writes no audit line.
     let again = f

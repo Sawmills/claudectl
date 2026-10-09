@@ -537,6 +537,20 @@ fn read_code(mut input: impl std::io::BufRead, terminal: bool) -> Result<String>
     }
     Ok(line.trim_end().to_string())
 }
+/// A machine's last authorized request (ms) for `server devices`: `4 min ago`, `3h ago`,
+/// `2d ago`, or `not since the upgrade`.
+fn seen_text(last_seen_at: Option<i64>, now: i64) -> String {
+    let Some(at) = last_seen_at else {
+        return "not since the upgrade".into();
+    };
+    let age = (now - at).max(0) / 1000;
+    match age {
+        0..60 => format!("{age} s ago"),
+        60..3600 => format!("{} min ago", age / 60),
+        3600..86400 => format!("{}h ago", age / 3600),
+        _ => format!("{}d ago", age / 86400),
+    }
+}
 /// A failed login completion in plain words, by the server's reason. `id` is the login,
 /// for the reasons where the server kept the acquired grant and the login can resume.
 fn login_failure(reason: &str, id: &str) -> Option<String> {
@@ -1239,7 +1253,7 @@ pub fn dispatch(command: Command) -> Result<()> {
                         println!("{devices}");
                         return Ok(());
                     }
-                    let mut table = table(&["Machine", "Revoked"]);
+                    let mut table = table(&["Machine", "Revoked", "Last seen"]);
                     for device in devices.as_array().into_iter().flatten() {
                         table.add_row(vec![
                             device["id"].as_str().unwrap_or("-").to_string(),
@@ -1249,6 +1263,7 @@ pub fn dispatch(command: Command) -> Result<()> {
                                 "no"
                             }
                             .into(),
+                            seen_text(device["last_seen_at"].as_i64(), now()),
                         ]);
                     }
                     println!("{table}");
@@ -1295,6 +1310,19 @@ pub fn dispatch(command: Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{ServerRow, Usage, candidate, check_code, read_code};
+
+    #[test]
+    fn a_device_shows_when_it_was_last_seen() {
+        let now = 10_000_000_000;
+        let seen = |ago_s: i64| super::seen_text(Some(now - ago_s * 1000), now);
+        assert_eq!(seen(30), "30 s ago");
+        assert_eq!(seen(240), "4 min ago");
+        assert_eq!(seen(3 * 3600 + 5), "3h ago");
+        assert_eq!(seen(2 * 86400 + 5), "2d ago");
+        assert_eq!(super::seen_text(None, now), "not since the upgrade");
+        // A clock a little behind the server never shows a negative age.
+        assert_eq!(super::seen_text(Some(now + 5_000), now), "0 s ago");
+    }
 
     #[test]
     fn a_pasted_code_is_checked_against_this_sign_in_before_it_is_sent() {

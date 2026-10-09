@@ -177,7 +177,13 @@ pub struct Machine {
     pub user: String,
     pub token_hash: String,
     pub revoked: bool,
+    /// When the machine last made an authorized request (ms), kept to 5-minute steps
+    /// (SAW-12696). None until its first request after the upgrade.
+    #[serde(default)]
+    pub last_seen_at: Option<i64>,
 }
+/// A machine's last-seen time is written at most this often (ms).
+pub const SEEN_EVERY_MS: i64 = 300_000;
 
 /// One-time enrollment state: a device code, an SSO login, or an approval.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -334,8 +340,13 @@ impl Store {
         dispatch!(self, set_user_enabled(email, enabled))
     }
     /// The user's machines as (ID, revoked), without token hashes.
-    pub async fn machines(&self, user: &str) -> Result<Vec<(String, bool)>> {
+    pub async fn machines(&self, user: &str) -> Result<Vec<Machine>> {
         dispatch!(self, machines(user))
+    }
+    /// Record that an active machine was seen at `now`, unless it was within
+    /// `SEEN_EVERY_MS`: true only when this call wrote.
+    pub async fn seen_machine(&self, id: &str, now: i64) -> Result<bool> {
+        dispatch!(self, seen_machine(id, now))
     }
     pub async fn machine_by_token(&self, token_hash: &str) -> Result<Option<Machine>> {
         dispatch!(self, machine_by_token(token_hash))

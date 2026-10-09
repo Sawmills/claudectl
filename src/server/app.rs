@@ -58,7 +58,7 @@ pub struct Server {
     allowed: Vec<String>,
     metrics_token_hash: Option<String>,
     /// Per reason: failure count and the Unix time of the last one.
-    failures: StdMutex<BTreeMap<&'static str, (u64, i64)>>,
+    failures: Arc<StdMutex<BTreeMap<&'static str, (u64, i64)>>>,
     work: Arc<Semaphore>,
     /// Set on shutdown: readiness fails while in-flight work finishes.
     draining: AtomicBool,
@@ -116,6 +116,7 @@ pub(super) async fn add_machine(store: &Store, user: &str, name: &str) -> Result
             user: user.into(),
             token_hash: vault::digest(token.as_bytes()),
             revoked: false,
+            last_seen_at: None,
         })
         .await?;
     Ok((id, token))
@@ -186,7 +187,7 @@ impl Server {
                 .map(|u| u.to_ascii_lowercase())
                 .collect(),
             metrics_token_hash: config.metrics_token_hash,
-            failures: StdMutex::new(BTreeMap::new()),
+            failures: Arc::new(StdMutex::new(BTreeMap::new())),
             work: Arc::new(Semaphore::new(64)),
             draining: AtomicBool::new(false),
         }))
@@ -260,7 +261,40 @@ impl Server {
         if !self.allowed(&user.email) {
             return Err(self.error(StatusCode::FORBIDDEN, "user_not_allowed"));
         }
+        self.seen(&machine);
         Ok(machine)
+    }
+    /// Record the machine's last-seen time off the request path, only when the stored one is
+    /// older than `SEEN_EVERY_MS` (the store checks again). A failed write never fails the
+    /// request; it counts as `machine_seen_store`.
+    fn seen(&self, machine: &Machine) {
+        let now = chrono::Utc::now().timestamp_millis();
+        if machine
+            .last_seen_at
+            .is_some_and(|at| at >= now - store::SEEN_EVERY_MS)
+        {
+            return;
+        }
+        let (store, failures, id) = (
+            self.engine.store().clone(),
+            self.failures.clone(),
+            machine.id.clone(),
+        );
+        tokio::spawn(async move {
+            if let Err(error) = store.seen_machine(&id, now).await {
+                {
+                    let mut failures = failures.lock().expect("metrics lock");
+                    let failure = failures.entry("machine_seen_store").or_default();
+                    failure.0 += 1;
+                    failure.1 = chrono::Utc::now().timestamp();
+                }
+                eprintln!(
+                    "{}",
+                    json!({"operation":"machine_seen","stage":"store","reason":"machine_seen_store",
+                        "machine":id,"error":format!("{error:#}")})
+                );
+            }
+        });
     }
     fn engine_error(&self, error: &anyhow::Error, fallback: &'static str) -> HttpError {
         if error.downcast_ref::<Gone>().is_some() {
@@ -332,7 +366,7 @@ async fn machines(State(server): Shared, headers: HeaderMap) -> Result<Response,
     Ok(private(
         machines
             .into_iter()
-            .map(|(id, revoked)| json!({"id": id, "revoked": revoked}))
+            .map(|m| json!({"id": m.id, "revoked": m.revoked, "last_seen_at": m.last_seen_at}))
             .collect::<Vec<_>>(),
     ))
 }

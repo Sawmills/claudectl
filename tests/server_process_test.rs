@@ -155,7 +155,7 @@ fn setup_if_absent_keeps_existing_state_for_a_restarted_pod() {
         s.machines(&user).await.unwrap()
     });
     assert_eq!(machines.len(), 1);
-    assert_eq!(machines[0].0, machine);
+    assert_eq!(machines[0].id, machine);
 }
 
 #[test]
@@ -195,6 +195,6 @@ fn an_operator_revoke_writes_an_audit_line() {
             let user = s.users().await.unwrap()[0].id.clone();
             s.machines(&user).await.unwrap()
         })[0]
-            .1
+            .revoked
     );
 }

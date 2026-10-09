@@ -142,7 +142,11 @@ async fn snapshot(
         .await
         .map_err(unavailable)?
         .into_iter()
-        .map(|(id, revoked)| Machine { id, revoked })
+        .map(|m| Machine {
+            id: m.id,
+            revoked: m.revoked,
+            last_seen_at: m.last_seen_at,
+        })
         .collect();
     // Revalidate after the awaited reads: a sign-out or a disable meanwhile wins.
     if enrollment::browser_user(server, headers).await?.is_none() {
@@ -243,7 +247,7 @@ async fn manage(
         Err(response) => return *response,
     };
     let machines = match server.store().machines(&browser.user).await {
-        Ok(machines) => machines.iter().filter(|(_, revoked)| !revoked).count(),
+        Ok(machines) => machines.iter().filter(|m| !m.revoked).count(),
         Err(_) => {
             return refuse(
                 &server,
@@ -437,7 +441,7 @@ async fn revoke(
                 .store()
                 .machines(&browser.user)
                 .await
-                .map(|machines| machines.iter().any(|(id, _)| *id == form.machine));
+                .map(|machines| machines.iter().any(|m| m.id == form.machine));
             return match known {
                 Ok(true) => refuse(&server, StatusCode::CONFLICT, "machine_already_revoked"),
                 Ok(false) => refuse(&server, StatusCode::NOT_FOUND, "machine_not_found"),
@@ -806,14 +810,17 @@ mod preview {
                 Machine {
                     id: "mac-mini-3f9a1c0e7b24".into(),
                     revoked: false,
+                    last_seen_at: None,
                 },
                 Machine {
                     id: "devbox-81d0aa5c9e13".into(),
                     revoked: false,
+                    last_seen_at: None,
                 },
                 Machine {
                     id: "old-laptop-0c4e19b2d7aa".into(),
                     revoked: true,
+                    last_seen_at: None,
                 },
             ],
             csrf: "preview".into(),

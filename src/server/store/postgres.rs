@@ -7,8 +7,9 @@ use std::time::Duration;
 use tokio_postgres::{Row, error::SqlState};
 
 /// Schema this binary writes, and the oldest schema it can read.
-pub const SCHEMA_VERSION: i32 = 1;
-const REQUIRED_SCHEMA: i32 = 1;
+/// 2: `machines.last_seen_at` (SAW-12696). A server of this version reads it, so it needs it.
+pub const SCHEMA_VERSION: i32 = 2;
+const REQUIRED_SCHEMA: i32 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_info (
@@ -100,6 +101,7 @@ CREATE TABLE IF NOT EXISTS machines (
     revoked BOOLEAN NOT NULL
 );
 CREATE INDEX IF NOT EXISTS machines_user ON machines (user_id, id);
+ALTER TABLE machines ADD COLUMN IF NOT EXISTS last_seen_at BIGINT;
 CREATE TABLE IF NOT EXISTS enrollment (
     kind TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -175,6 +177,15 @@ fn flow(r: &Row) -> FlowRow {
     }
 }
 
+fn machine_row(r: &tokio_postgres::Row) -> Machine {
+    Machine {
+        id: r.get(0),
+        user: r.get(1),
+        token_hash: r.get(2),
+        revoked: r.get(3),
+        last_seen_at: r.get(4),
+    }
+}
 impl PostgresStore {
     /// Connect with a small pool. A URL without `sslmode=require` connects without TLS,
     /// which only a loopback test database may use.
@@ -221,6 +232,9 @@ impl PostgresStore {
     /// Apply the schema. Only the migration job runs this; `serve` never does.
     pub async fn migrate(&self) -> Result<()> {
         let client = self.pool.get().await?;
+        // A migration that waits on a busy table fails fast instead of blocking every
+        // request behind its lock; the job retries.
+        client.batch_execute("SET lock_timeout = '10s'").await?;
         client.batch_execute(SCHEMA).await?;
         client
             .execute(
@@ -901,32 +915,38 @@ impl PostgresStore {
             .await?
             > 0)
     }
-    pub async fn machines(&self, user: &str) -> Result<Vec<(String, bool)>> {
+    pub async fn machines(&self, user: &str) -> Result<Vec<Machine>> {
         let client = self.pool.get().await?;
         Ok(client
             .query(
-                "SELECT id, revoked FROM machines WHERE user_id = $1 ORDER BY id",
+                "SELECT id, user_id, token_hash, revoked, last_seen_at FROM machines WHERE user_id = $1 ORDER BY id",
                 &[&user],
             )
             .await?
             .iter()
-            .map(|r| (r.get(0), r.get(1)))
+            .map(machine_row)
             .collect())
+    }
+    pub async fn seen_machine(&self, id: &str, now: i64) -> Result<bool> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute(
+                "UPDATE machines SET last_seen_at = $2::BIGINT WHERE id = $1 AND NOT revoked AND (last_seen_at IS NULL OR last_seen_at < $2::BIGINT - $3::BIGINT)",
+                &[&id, &now, &super::SEEN_EVERY_MS],
+            )
+            .await?
+            == 1)
     }
     pub async fn machine_by_token(&self, token_hash: &str) -> Result<Option<Machine>> {
         let client = self.pool.get().await?;
         Ok(client
             .query_opt(
-                "SELECT id, user_id, token_hash, revoked FROM machines WHERE token_hash = $1",
+                "SELECT id, user_id, token_hash, revoked, last_seen_at FROM machines WHERE token_hash = $1",
                 &[&token_hash],
             )
             .await?
-            .map(|r| Machine {
-                id: r.get(0),
-                user: r.get(1),
-                token_hash: r.get(2),
-                revoked: r.get(3),
-            }))
+            .as_ref()
+            .map(machine_row))
     }
     pub async fn add_machine(&self, m: &Machine) -> Result<()> {
         let client = self.pool.get().await?;
