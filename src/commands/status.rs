@@ -2581,6 +2581,19 @@ mod tests {
             .find(|r| r[0] == "amir4@sawmills.ai")
             .expect("amir4 row");
         assert_eq!(amir4[5], "100%", "{text}");
+        // The two notes follow the table directly, one per line, with no blank line between
+        // (as the three println! calls before SAW-12696 printed them).
+        let tail: Vec<&str> = text.lines().rev().take(2).collect();
+        assert_eq!(
+            tail,
+            [
+                "Cached data can lag by 5m. HTTP 429 limits usage checks, not proof of exhausted capacity.",
+                "Percentages are used capacity. Fetch success does not prove model access."
+            ],
+            "{text}"
+        );
+        assert!(text.ends_with("capacity.\n"), "{text}");
+        assert!(!text.contains("\n\n"), "{text}");
     }
 
     #[test]
