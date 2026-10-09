@@ -120,7 +120,7 @@ jobs:
         run: |
           annotations=(--github-annotate)
           if [[ "$TRUNK_FORK" == true ]]; then
-            annotations=("--github-annotate-file=$RUNNER_TEMP/trunk-annotations.bin")
+            annotations=("--github-annotate-file=$RUNNER_TEMP/annotations.bin")
           fi
           if timeout --kill-after=5s 590s "$TRUNK_PATH" check --ci \
             --upstream "$TRUNK_BASE_SHA" --github-commit "$TRUNK_HEAD_SHA" \
@@ -140,7 +140,7 @@ jobs:
         with:
           name: trunk-annotations
           overwrite: true
-          path: ${{ runner.temp }}/trunk-annotations.bin
+          path: ${{ runner.temp }}/annotations.bin
 
       - name: Trunk failure diagnostics
         if: failure()
