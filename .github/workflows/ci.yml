@@ -62,11 +62,38 @@ jobs:
         run: cargo build --release --features server --bin claudectl-server
 
   trunk:
+    permissions:
+      contents: read
+      checks: write
     name: Trunk Check
     # trunk-ignore(actionlint/runner-label): Namespace profile
     runs-on: namespace-profile-sawmills-runner-large
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Fetch Trunk baseline
+        id: baseline
+        timeout-minutes: 2
+        env:
+          TRUNK_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        shell: bash
+        run: |
+          base="$TRUNK_BASE_SHA"
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            base="$(git rev-parse HEAD^1)"
+          fi
+          if [[ -z "$base" || "$base" == 0000000000000000000000000000000000000000 ]]; then
+            echo "::error::Trunk Check requires a valid baseline commit."
+            exit 1
+          fi
+          history=()
+          if [[ "$(git rev-parse --is-shallow-repository)" == true ]]; then
+            history=(--unshallow)
+          fi
+          git fetch --no-tags --no-recurse-submodules "${history[@]}" origin "$base" "$GITHUB_SHA"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
       - name: Cache Trunk and Rust artifacts
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         # yamllint disable-line rule:line-length
@@ -78,11 +105,41 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Set up Trunk
+        timeout-minutes: 2
+        uses: trunk-io/trunk-action/setup@04ba50e7658c81db7356da96657e6e77f220bfa3 # v1
+
       - name: Trunk Check
-        uses: trunk-io/trunk-action@v1
-        with:
-          cache: false
-          check-mode: ${{ github.event_name == 'pull_request' && 'pull_request' || 'all' }}
+        timeout-minutes: 10
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TRUNK_BASE_SHA: ${{ steps.baseline.outputs.base }}
+          TRUNK_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          if timeout --kill-after=5s 590s "$TRUNK_PATH" check --ci \
+            --upstream "$TRUNK_BASE_SHA" --github-commit "$TRUNK_HEAD_SHA" \
+            --github-annotate; then
+            exit 0
+          else
+            status=$?
+            if [[ "$status" == 124 || "$status" == 137 ]]; then
+              echo "::error::Trunk Check exceeded its 10-minute limit; the check process was terminated."
+            fi
+            exit "$status"
+          fi
+
+      - name: Trunk failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          for log in .trunk/logs/cli.log .trunk/logs/daemon.log; do
+            if [[ -f "$log" ]]; then
+              echo "::group::$log (last 200 lines)"
+              tail -n 200 "$log"
+              echo "::endgroup::"
+            fi
+          done
 
   build-macos:
     name: Build (macOS)
