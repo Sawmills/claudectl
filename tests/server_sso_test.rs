@@ -1074,3 +1074,58 @@ async fn add_and_renew_open_a_new_sign_in_with_a_private_paste_field() {
         .await;
     assert_eq!(response.status().as_u16(), 404);
 }
+
+#[tokio::test]
+async fn overlapping_revokes_change_and_audit_the_machine_once() {
+    let f = Fixture::new().await;
+    let session = f.session("amir@sawmills.ai").await;
+    let amir = f.user_id("amir@sawmills.ai");
+    let laptop = "laptop-0123456789ab".to_string();
+    f.machine(&amir, &laptop).await;
+    let page = f
+        .get("/accounts", Some(&session))
+        .await
+        .text()
+        .await
+        .unwrap();
+    let csrf = hidden(&page, "csrf");
+    let before = f.audit_lines().await.len();
+    let mut requests = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let (http, origin, session) = (f.http.clone(), f.origin.clone(), session.clone());
+        let form = [("csrf", csrf.clone()), ("machine", laptop.clone())];
+        requests.spawn(async move {
+            http.post(format!("{origin}/machines/revoke"))
+                .header("accept", BROWSER)
+                .header("cookie", session)
+                .header("origin", origin)
+                .form(&form)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+    }
+    let mut codes = requests.join_all().await;
+    // The contract under the handler: one atomic active-to-revoked change, reported once.
+    let other = "desk-0123456789ab";
+    f.machine(&amir, other).await;
+    let store = f.server.store();
+    assert!(store.revoke_active_machine(other, &amir).await.unwrap());
+    assert!(!store.revoke_active_machine(other, &amir).await.unwrap());
+    assert!(
+        !store
+            .revoke_active_machine(other, "someone-else")
+            .await
+            .unwrap()
+    );
+    codes.sort_unstable();
+    assert_eq!(codes, [303, 409, 409, 409, 409, 409, 409, 409]);
+    let audit = f.audit_lines().await;
+    let revokes = audit[before..]
+        .iter()
+        .filter(|l| l["operation"] == "machine_revoke")
+        .count();
+    assert_eq!(revokes, 1, "{audit:?}");
+}

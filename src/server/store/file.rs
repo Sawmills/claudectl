@@ -521,6 +521,20 @@ impl FileStore {
             (found, found)
         })
     }
+    pub fn revoke_active_machine(&self, id: &str, user: &str) -> Result<bool> {
+        self.transact(|t| {
+            let mut changed = false;
+            for m in t
+                .machines
+                .iter_mut()
+                .filter(|m| m.id == id && m.user == user && !m.revoked)
+            {
+                m.revoked = true;
+                changed = true;
+            }
+            (changed, changed)
+        })
+    }
     pub fn put_enrollment(&self, kind: &str, key: &str, row: &EnrollmentRow) -> Result<()> {
         self.write(|t| {
             t.enrollment.insert(slot(kind, key), row.clone());

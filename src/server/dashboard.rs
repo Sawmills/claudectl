@@ -424,30 +424,30 @@ async fn revoke(
     if let Err(response) = fresh_sign_in(&browser) {
         return *response;
     }
-    // Only a connected machine of this user: a repeated submit writes no second audit line.
-    match server.store().machines(&browser.user).await {
-        Ok(machines) => match machines.iter().find(|(id, _)| *id == form.machine) {
-            None => return refuse(&server, StatusCode::NOT_FOUND, "machine_not_found"),
-            Some((_, true)) => {
-                return refuse(&server, StatusCode::CONFLICT, "machine_already_revoked");
-            }
-            Some((_, false)) => {}
-        },
-        Err(_) => {
-            return refuse(
-                &server,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "registry_unavailable",
-            );
-        }
-    }
+    // One atomic active-to-revoked change: only the request that made it audits, so a
+    // repeated or overlapping submit writes no second audit line.
     match server
         .store()
-        .revoke_machine(&form.machine, Some(&browser.user))
+        .revoke_active_machine(&form.machine, &browser.user)
         .await
     {
         Ok(true) => {}
-        Ok(false) => return refuse(&server, StatusCode::NOT_FOUND, "machine_not_found"),
+        Ok(false) => {
+            let known = server
+                .store()
+                .machines(&browser.user)
+                .await
+                .map(|machines| machines.iter().any(|(id, _)| *id == form.machine));
+            return match known {
+                Ok(true) => refuse(&server, StatusCode::CONFLICT, "machine_already_revoked"),
+                Ok(false) => refuse(&server, StatusCode::NOT_FOUND, "machine_not_found"),
+                Err(_) => refuse(
+                    &server,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "registry_unavailable",
+                ),
+            };
+        }
         Err(_) => {
             return refuse(
                 &server,
