@@ -66,10 +66,16 @@ impl Account {
         if self.migration == "pending" {
             return ("pending", "Migration pending".into());
         }
+        let state = crate::accounts::state(&self.windows());
+        // A known full window stays visible, even on old data (the CLI's "(old data)").
+        if let State::Limit { window, .. } = &state {
+            let old = if self.usage_stale { " (old data)" } else { "" };
+            return ("bad", format!("{window} limit{old}"));
+        }
         if self.usage_stale {
             return ("warn", "Stale usage".into());
         }
-        match (crate::accounts::state(&self.windows()), self.billed) {
+        match (state, self.billed) {
             (State::Ready, false) => ("ok", "Available".into()),
             (State::Low { window }, false) => ("warn", format!("Low ({window})")),
             // Room, but never the account to use: the billing reason is visible.
@@ -531,6 +537,18 @@ mod tests {
         assert!(html.contains("No usage data"), "{html}");
         assert!(html.contains("0 of 1 accounts have room"), "{html}");
         assert!(!html.contains("Use half"), "{html}");
+    }
+
+    #[test]
+    fn a_known_limit_shows_even_without_a_week_figure_or_with_old_data() {
+        let html = overview(&snapshot(vec![account("full", Some(100.0), None)], vec![]));
+        assert!(html.contains("5h limit"), "{html}");
+        assert!(html.contains("0 of 1 accounts have room"), "{html}");
+        let mut old = account("old", Some(100.0), Some(10.0));
+        old.usage_stale = true;
+        let html = overview(&snapshot(vec![old], vec![]));
+        assert!(html.contains("5h limit (old data)"), "{html}");
+        assert!(!html.contains("Use old"), "{html}");
     }
 
     #[test]

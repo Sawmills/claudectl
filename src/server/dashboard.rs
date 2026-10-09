@@ -139,7 +139,7 @@ struct Observed {
     fable: Option<Window>,
     /// The weekly Opus and Sonnet windows, as the CLI reads them.
     models: Vec<crate::accounts::Window>,
-    /// No 5h or week figure, or the server marked it stale.
+    /// No usage figure at all, or the server marked it stale.
     stale: bool,
     /// Extra usage is not known to be off (the CLI's rule for server accounts).
     billed: bool,
@@ -174,8 +174,9 @@ fn windows(usage: &crate::server::engine::Usage) -> Observed {
         .into_iter()
         .filter(|w| matches!(w.name, "Opus" | "Sonnet"))
         .collect();
-    // The same rule as `accounts::state`: without both figures the account is not fresh.
-    let empty = five.used_percent.is_none() || week.used_percent.is_none();
+    // Partial usage is not stale: `accounts::state` reads it (a known full window stays a
+    // limit; otherwise it is unknown and never picked), as in the CLI.
+    let empty = five.used_percent.is_none() && week.used_percent.is_none();
     let billed = parsed
         .as_ref()
         .and_then(|u| u.extra_usage.as_ref())
@@ -249,16 +250,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_response_without_a_5h_or_week_figure_is_stale() {
+    fn partial_usage_is_unknown_but_a_known_full_window_stays_a_limit() {
         let usage = |data| crate::server::engine::Usage {
             data: Some(data),
             ..Default::default()
         };
-        let partial = serde_json::json!({"seven_day": {"utilization": 1.0}});
-        assert!(windows(&usage(partial)).stale);
-        let full = serde_json::json!({"five_hour": {"utilization": 1.0},
-            "seven_day": {"utilization": 1.0}});
-        assert!(!windows(&usage(full)).stale);
+        let state = |data| {
+            let o = windows(&usage(data));
+            let mut all = vec![
+                crate::accounts::Window {
+                    name: "5h",
+                    used: o.five.used_percent,
+                    resets_at: o.five.resets_at,
+                },
+                crate::accounts::Window {
+                    name: "week",
+                    used: o.week.used_percent,
+                    resets_at: o.week.resets_at,
+                },
+            ];
+            all.extend(o.models);
+            (o.stale, crate::accounts::state(&all))
+        };
+        // The shared rule decides, not a stale flag: a partial response is unknown
+        // (never picked), and a confirmed full 5h window stays a visible limit.
+        let (stale, partial) = state(serde_json::json!({"seven_day": {"utilization": 1.0}}));
+        assert!(!stale);
+        assert_eq!(partial, crate::accounts::State::Unknown);
+        let (stale, full) = state(serde_json::json!({"five_hour": {"utilization": 100.0}}));
+        assert!(!stale);
+        assert!(
+            matches!(full, crate::accounts::State::Limit { window: "5h", .. }),
+            "{full:?}"
+        );
     }
 
     #[tokio::test]
@@ -319,8 +343,8 @@ mod tests {
                 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}]
         })));
         assert_eq!(o.five.used_percent, Some(12.0));
-        // No week figure: partial usage is stale, as `accounts::state` reads it.
-        assert!(o.stale);
+        // No week figure: not stale; `accounts::state` reads the partial usage.
+        assert!(!o.stale);
         assert_eq!(o.fable.as_ref().and_then(|w| w.used_percent), Some(100.0));
         assert!(!o.billed, "extra usage known off");
         // Missing extra-usage data is not proof: billed.

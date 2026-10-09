@@ -2257,6 +2257,18 @@ mod tests {
     }
 
     #[test]
+    fn compact_shows_a_known_limit_without_a_week_figure() {
+        let full = server(
+            "amir3@sawmills.ai",
+            r#"{"five_hour":{"utilization":100},"extra_usage":{"is_enabled":false}}"#,
+        );
+        let text = compact(&[&full], 1_500);
+        let row = text.lines().find(|l| l.contains("amir3")).unwrap();
+        assert!(row.contains("5h limit"), "{text}");
+        assert!(!text.contains("(picks"), "{text}");
+    }
+
+    #[test]
     fn compact_marks_every_account_that_may_bill() {
         let may_bill = r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":1}}"#;
         let remote = server("amir3@sawmills.ai", may_bill);
