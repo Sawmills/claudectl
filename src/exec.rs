@@ -1127,7 +1127,6 @@ fn descendants_in_group(leader: u32) -> std::io::Result<Vec<i32>> {
     group_members_from_listing(&pids[..count.min(pids.len())], leader)
 }
 
-
 #[cfg(all(unix, not(target_os = "macos")))]
 fn descendants_in_group(leader: u32) -> std::io::Result<Vec<i32>> {
     let leader = i32::try_from(leader).unwrap_or(0);
