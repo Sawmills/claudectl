@@ -874,7 +874,7 @@ fn local_step(s: &AccountStatus) -> (String, String) {
     }
     let limited = capacity(s);
     if limited.ends_with("limit reached") {
-        return (limited, "Use another model or account".into());
+        return (limited, "Use another account: claudectl run".into());
     }
     if s.h5_pct.is_none() || s.d7_pct.is_none() {
         return (

@@ -518,7 +518,9 @@ pub fn login(client: &Client, alias: &str, renew: bool, no_browser: bool) -> Res
     )?;
     let url = reqwest::Url::parse(&login.authorize_url)?;
     if !claude_authorize(&url) || login.expires_at <= now() {
-        bail!("invalid Claude login challenge");
+        bail!(
+            "invalid Claude login challenge from the account server\nTry: claudectl add <name> again in a minute; if it repeats, check claudectl status"
+        );
     }
     println!("Claude sign-in: {}", login.authorize_url);
     if !no_browser {
