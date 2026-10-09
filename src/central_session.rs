@@ -757,6 +757,9 @@ impl Monitor {
             return None;
         };
         let session_id = activity.idle.session.clone()?;
+        // The record is written before SIGTERM, so sessions that hit the limit together see
+        // it. If Claude exits on its own meanwhile, the record stays without a switch (rare;
+        // it only spreads the next failovers).
         let taken = failover::reserve(
             &self.paths,
             &rows,

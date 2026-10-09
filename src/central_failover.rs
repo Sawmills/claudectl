@@ -158,34 +158,62 @@ pub(super) fn choose(
 /// The prompt a moved session resumes with, so the failed turn continues.
 pub(super) const RECOVERY_PROMPT: &str = "Continue the previous request.";
 
+/// Claude Code flags (2.1.295) that take exactly one value. Flags with many values or an
+/// optional value are left out on purpose: after them, an argument may be a prompt.
+const VALUE_FLAGS: &[&str] = &[
+    "--agent",
+    "--agents",
+    "--append-system-prompt",
+    "--autocompact",
+    "--debug-file",
+    "--effort",
+    "--environment",
+    "--fallback-model",
+    "--input-format",
+    "--json-schema",
+    "--max-budget-usd",
+    "--model",
+    "-n",
+    "--name",
+    "--output-format",
+    "--permission-mode",
+    "--permission-prompts",
+    "--plugin-dir",
+    "--plugin-url",
+    "--remote-control-session-name-prefix",
+    "--system-prompt",
+    "--system-prompt-snapshot",
+];
+
 /// The arguments of a moved session: the user's arguments resumed on `session`
-/// (`renew::relaunch_args`), with the recovery prompt in place of a prompt the user gave (the
-/// resumed conversation already holds it, and Claude takes one prompt). An argument that does
-/// not start with `-` is a prompt when it is first or follows another such argument; after a
-/// flag it is that flag's value. None for a one-shot run.
+/// (`renew::relaunch_args`), plus the recovery prompt so the failed turn continues. Claude
+/// takes one prompt, so the recovery prompt is added only when no argument can be a prompt:
+/// every argument that does not start with `-` follows a flag of `VALUE_FLAGS`. Otherwise the
+/// arguments stay as they are, as on a renewal. None for a one-shot run.
 pub(super) fn resume_args(args: &[OsString], session: &str) -> Option<Vec<OsString>> {
     let mut resumed = super::renew::relaunch_args(args, session)?;
     // `relaunch_args` ends with `--resume <session>`.
-    let tail = resumed.split_off(resumed.len() - 2);
-    let mut out = Vec::new();
-    let mut after_flag = false;
-    for arg in resumed {
-        if arg.to_string_lossy().starts_with('-') {
-            after_flag = true;
-            out.push(arg);
-        } else if after_flag {
-            after_flag = false;
-            out.push(arg);
+    let user = &resumed[..resumed.len() - 2];
+    let mut after_value_flag = false;
+    let mut maybe_prompt = false;
+    for arg in user {
+        let text = arg.to_string_lossy();
+        if text.starts_with('-') {
+            after_value_flag = VALUE_FLAGS.contains(&text.as_ref());
+        } else {
+            maybe_prompt |= !after_value_flag;
+            after_value_flag = false;
         }
     }
-    out.extend(tail);
-    out.push(RECOVERY_PROMPT.into());
-    Some(out)
+    if !maybe_prompt {
+        resumed.push(RECOVERY_PROMPT.into());
+    }
+    Some(resumed)
 }
 
 /// The time limit for confirming one limit. It starts when Claude is first idle enough to
-/// move (the idle gate), not at the failure: a user who typed after the error still gets
-/// the full window once the terminal is quiet.
+/// move (the idle gate), not at the failure: a user who typed after the error still gets the
+/// full window once the terminal is quiet. It keeps running if the gate closes again.
 #[derive(Default)]
 pub(super) struct Deadline {
     failure: Option<i64>,
@@ -427,20 +455,37 @@ mod tests {
     }
 
     #[test]
-    fn a_moved_session_resumes_with_the_recovery_prompt_in_place_of_the_users() {
+    fn the_recovery_prompt_is_added_only_when_no_argument_can_be_a_prompt() {
         let resumed = |args: &[&str]| resume_args(&os(args), "S").unwrap();
+        // Every argument is a flag or a known flag's value: the prompt continues the turn.
         assert_eq!(
-            resumed(&["--model", "opus"]),
-            os(&["--model", "opus", "--resume", "S", RECOVERY_PROMPT])
+            resumed(&["--model", "opus", "--dangerously-skip-permissions"]),
+            os(&[
+                "--model",
+                "opus",
+                "--dangerously-skip-permissions",
+                "--resume",
+                "S",
+                RECOVERY_PROMPT
+            ])
         );
         assert_eq!(
-            resumed(&["fix the tests"]),
-            os(&["--resume", "S", RECOVERY_PROMPT])
+            resumed(&["--effort=high", "--resume", "old"]),
+            os(&["--effort=high", "--resume", "S", RECOVERY_PROMPT])
         );
-        assert_eq!(
-            resumed(&["--model", "opus", "fix the tests", "--resume", "old"]),
-            os(&["--model", "opus", "--resume", "S", RECOVERY_PROMPT])
-        );
+        // An argument that can be a prompt (or a value of a many-value flag): the arguments
+        // stay as they are and no second prompt is added.
+        for args in [
+            &["fix the tests"][..],
+            &["--dangerously-skip-permissions", "fix the tests"],
+            &["--verbose", "fix the tests"],
+            &["--add-dir", "../lib", "../shared"],
+            &["--allowedTools", "Bash", "Read"],
+        ] {
+            let mut expected = os(args);
+            expected.extend(os(&["--resume", "S"]));
+            assert_eq!(resumed(args), expected, "{args:?}");
+        }
         assert_eq!(resume_args(&os(&["-p", "hi"]), "S"), None);
     }
 
