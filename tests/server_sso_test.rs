@@ -1188,6 +1188,8 @@ async fn every_answered_google_sign_in_is_audited() {
     assert_eq!(ok["actor"], "enrollment:amir@sawmills.ai", "{ok}");
     let no = find("enroll_sign_in", "refused");
     assert_eq!(no["reason"], "user_not_allowed", "{no}");
+    // A verified company email refused by the allow list keeps its person.
+    assert_eq!(no["actor"], "enrollment:other@sawmills.ai", "{no}");
     // The foreign-browser callback never reached the provider: no line for it.
     assert_eq!(lines.len(), 4, "{lines:?}");
     // No secret from the sign-in reaches the audit log.

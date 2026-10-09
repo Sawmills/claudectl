@@ -716,11 +716,19 @@ async fn identify_audited(
     kind: &str,
 ) -> Result<(String, String), HttpError> {
     match identify(server, sso, code, verifier, nonce).await {
-        Err(error) if AUDITED_REFUSALS.contains(&error.reason) => {
-            audit_sign_in(server, operation, kind, None, Some(error.reason)).await?;
+        Ok(identity) => Ok(identity),
+        Err((error, email)) if AUDITED_REFUSALS.contains(&error.reason) => {
+            audit_sign_in(
+                server,
+                operation,
+                kind,
+                email.as_deref(),
+                Some(error.reason),
+            )
+            .await?;
             Err(error)
         }
-        other => other,
+        Err((error, _)) => Err(error),
     }
 }
 async fn identify(
@@ -729,57 +737,70 @@ async fn identify(
     code: Option<String>,
     verifier: String,
     nonce: String,
-) -> Result<(String, String), HttpError> {
-    let denied = || server.error(StatusCode::UNAUTHORIZED, "sso_denied");
-    let code = code.ok_or_else(denied)?;
-    let client = sso
-        .client()
-        .await
-        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?;
-    let tokens = client
-        .exchange_code(AuthorizationCode::new(code))
-        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?
-        .set_pkce_verifier(PkceCodeVerifier::new(verifier))
-        .request_async(&sso.http)
-        .await
-        // Only a provider's own error answer is a refusal; a transport or parse failure is
-        // an outage (not audited as a refused sign-in).
-        .map_err(|error| match error {
-            openidconnect::RequestTokenError::ServerResponse(_) => denied(),
-            _ => server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"),
-        })?;
-    // The verifier checks signature, issuer, audience, expiry, and nonce.
-    let verifier = client.id_token_verifier();
-    let id = tokens.extra_fields().id_token().ok_or_else(denied)?;
-    let claims = id
-        .claims(&verifier, &Nonce::new(nonce))
-        .map_err(|_| denied())?;
-    if let Some(expected) = claims.access_token_hash() {
-        let actual = AccessTokenHash::from_token(
-            tokens.access_token(),
-            id.signing_alg().map_err(|_| denied())?,
-            id.signing_key(&verifier).map_err(|_| denied())?,
-        )
-        .map_err(|_| denied())?;
-        if actual != *expected {
-            return Err(denied());
+) -> Result<(String, String), (HttpError, Option<String>)> {
+    // A refusal carries the email only once it is a verified company email (the allow list
+    // check); earlier refusals name no person.
+    let inner = async {
+        let denied = || server.error(StatusCode::UNAUTHORIZED, "sso_denied");
+        let code = code.ok_or_else(denied)?;
+        let client = sso
+            .client()
+            .await
+            .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?;
+        let tokens = client
+            .exchange_code(AuthorizationCode::new(code))
+            .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?
+            .set_pkce_verifier(PkceCodeVerifier::new(verifier))
+            .request_async(&sso.http)
+            .await
+            // Only a provider's own error answer is a refusal; a transport or parse failure is
+            // an outage (not audited as a refused sign-in).
+            .map_err(|error| match error {
+                openidconnect::RequestTokenError::ServerResponse(_) => denied(),
+                _ => server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"),
+            })?;
+        // The verifier checks signature, issuer, audience, expiry, and nonce.
+        let verifier = client.id_token_verifier();
+        let id = tokens.extra_fields().id_token().ok_or_else(denied)?;
+        let claims = id
+            .claims(&verifier, &Nonce::new(nonce))
+            .map_err(|_| denied())?;
+        if let Some(expected) = claims.access_token_hash() {
+            let actual = AccessTokenHash::from_token(
+                tokens.access_token(),
+                id.signing_alg().map_err(|_| denied())?,
+                id.signing_key(&verifier).map_err(|_| denied())?,
+            )
+            .map_err(|_| denied())?;
+            if actual != *expected {
+                return Err(denied());
+            }
         }
+        let refused = || server.error(StatusCode::FORBIDDEN, "company_identity_required");
+        let email = sso
+            .config
+            .company_email(
+                claims.email().map(|e| e.as_str()),
+                claims.email_verified(),
+                claims.additional_claims().hd.as_deref(),
+            )
+            .ok_or_else(refused)?;
+        if !server.allowed(email) {
+            return Ok(Err((
+                server.error(StatusCode::FORBIDDEN, "user_not_allowed"),
+                email.to_owned(),
+            )));
+        }
+        let user = vault::digest(
+            format!("{}\0{}", sso.config.issuer, claims.subject().as_str()).as_bytes(),
+        );
+        Ok(Ok((user, email.to_owned())))
+    };
+    match inner.await {
+        Ok(Ok(identity)) => Ok(identity),
+        Ok(Err((error, email))) => Err((error, Some(email))),
+        Err(error) => Err((error, None)),
     }
-    let refused = || server.error(StatusCode::FORBIDDEN, "company_identity_required");
-    let email = sso
-        .config
-        .company_email(
-            claims.email().map(|e| e.as_str()),
-            claims.email_verified(),
-            claims.additional_claims().hd.as_deref(),
-        )
-        .ok_or_else(refused)?;
-    if !server.allowed(email) {
-        return Err(server.error(StatusCode::FORBIDDEN, "user_not_allowed"));
-    }
-    let user =
-        vault::digest(format!("{}\0{}", sso.config.issuer, claims.subject().as_str()).as_bytes());
-    Ok((user, email.to_owned()))
 }
 /// Finish a dashboard sign-in: the browser that started it gets a session cookie.
 async fn dashboard_callback(
