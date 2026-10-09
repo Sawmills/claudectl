@@ -704,6 +704,12 @@ pub fn status(paths: &Paths, alias: &str, cached: bool, json: bool) -> Result<()
         println!("{}", serde_json::to_string(&usage)?);
         return Ok(());
     }
+    print!("{}", status_text(alias, &usage, now()));
+    Ok(())
+}
+/// The `server status` summary. Its lines and table are a contract: the capacity guard reads
+/// them (SAW-12710; `server_status_text_keeps_its_lines_and_table`).
+fn status_text(alias: &str, usage: &Usage, now: i64) -> String {
     let windows: Option<crate::api::UsageResponse> = usage
         .data
         .clone()
@@ -711,26 +717,26 @@ pub fn status(paths: &Paths, alias: &str, cached: bool, json: bool) -> Result<()
     let mut table = table(&["Window", "Used", "Resets"]);
     if let Some(windows) = &windows {
         // Every window the compact status shows (Fable included), with human reset times.
-        for row in crate::accounts::detail_rows(windows, now() / 1000) {
+        for row in crate::accounts::detail_rows(windows, now / 1000) {
             table.add_row(row.to_vec());
         }
     }
-    println!("{alias} (account server)");
+    let mut out = format!("{alias} (account server)\n");
     if table.row_count() > 0 {
-        println!("{table}");
+        out.push_str(&format!("{table}\n"));
     }
     match usage.observed_at {
-        Some(at) => println!(
-            "Observed {} ago{}.",
-            ago(now().saturating_sub(at)),
+        Some(at) => out.push_str(&format!(
+            "Observed {} ago{}.\n",
+            ago(now.saturating_sub(at)),
             if usage.stale { "; stale" } else { "" }
-        ),
-        None => println!("No usage observed yet."),
+        )),
+        None => out.push_str("No usage observed yet.\n"),
     }
     if let Some(error) = &usage.error {
-        println!("Server reports: {error}");
+        out.push_str(&format!("Server reports: {error}\n"));
     }
-    Ok(())
+    out
 }
 fn ago(ms: i64) -> String {
     let seconds = (ms / 1000).max(0);
@@ -1310,6 +1316,85 @@ pub fn dispatch(command: Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{ServerRow, Usage, candidate, check_code, read_code};
+
+    /// `server status <account> --json` (SAW-12696): the server's usage record as is. Readers
+    /// (the capacity guard, SAW-12710) rely on these keys and types; keys are only added.
+    #[test]
+    fn server_status_json_keeps_every_key_and_type() {
+        let usage = Usage {
+            data: Some(serde_json::json!({"five_hour": {"utilization": 12.0}})),
+            observed_at: Some(1_000),
+            next_retry_at: 0,
+            stale: false,
+            error: None,
+        };
+        let v = serde_json::to_value(&usage).unwrap();
+        assert!(v["data"].is_object(), "{v}");
+        assert!(v["observed_at"].is_number(), "{v}");
+        assert!(v["next_retry_at"].is_number(), "{v}");
+        assert!(v["stale"].is_boolean(), "{v}");
+        assert!(v.get("error").is_some_and(|e| e.is_null()), "{v}");
+        assert_eq!(v["data"]["five_hour"]["utilization"], 12.0);
+    }
+
+    /// `server status <account>` text (SAW-12696): the first line names the account, the
+    /// table has Window | Used | Resets with "N%" used cells, then the observed line.
+    #[test]
+    fn server_status_text_keeps_its_lines_and_table() {
+        let now = 1_800_000_000_000;
+        let usage = Usage {
+            data: Some(serde_json::json!({
+                "five_hour": {"utilization": 12.0},
+                "seven_day": {"utilization": 40.0},
+                "limits": [{"kind": "weekly_scoped", "percent": 100,
+                    "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}]
+            })),
+            observed_at: Some(now - 120_000),
+            next_retry_at: 0,
+            stale: true,
+            error: Some("usage_unavailable".into()),
+        };
+        let text = super::status_text("amir2@sawmills.ai", &usage, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "amir2@sawmills.ai (account server)", "{text}");
+        let rows: Vec<Vec<String>> = lines
+            .iter()
+            .filter(|l| l.starts_with('│'))
+            .map(|l| {
+                l.trim_matches('│')
+                    .split('┆')
+                    .map(|c| c.trim().to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(rows[0], ["Window", "Used", "Resets"], "{text}");
+        let used = |name: &str| {
+            rows.iter()
+                .find(|r| r[0] == name)
+                .unwrap_or_else(|| panic!("{name} row: {text}"))[1]
+                .clone()
+        };
+        assert_eq!(used("5h"), "12%");
+        assert_eq!(used("week"), "40%");
+        assert_eq!(used("Fable"), "100%");
+        assert!(lines.contains(&"Observed 2m ago; stale."), "{text}");
+        assert_eq!(
+            *lines.last().unwrap(),
+            "Server reports: usage_unavailable",
+            "{text}"
+        );
+        let none = Usage {
+            data: None,
+            observed_at: None,
+            next_retry_at: 0,
+            stale: true,
+            error: None,
+        };
+        assert_eq!(
+            super::status_text("work", &none, now),
+            "work (account server)\nNo usage observed yet.\n"
+        );
+    }
 
     #[test]
     fn a_device_shows_when_it_was_last_seen() {
