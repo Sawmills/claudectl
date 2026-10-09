@@ -605,3 +605,141 @@ async fn the_cancel_route_blocks_later_imports_and_refuses_after_commit() {
         "{body}"
     );
 }
+
+// ---------- Machine last-seen (SAW-12696 A) ----------
+
+async fn devices_user(f: &Fixture, token: &str) -> String {
+    f.server
+        .store()
+        .machine_by_token(&claudectl::server::vault::digest(token.as_bytes()))
+        .await
+        .unwrap()
+        .unwrap()
+        .user
+}
+
+async fn last_seen(f: &Fixture, token: &str) -> Option<i64> {
+    f.server
+        .store()
+        .machine_by_token(&claudectl::server::vault::digest(token.as_bytes()))
+        .await
+        .unwrap()
+        .unwrap()
+        .last_seen_at
+}
+
+/// The last-seen write runs off the request path: wait for it a little.
+async fn wait_seen(f: &Fixture, token: &str) -> Option<i64> {
+    for _ in 0..40 {
+        if let Some(at) = last_seen(f, token).await {
+            return Some(at);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+#[tokio::test]
+async fn a_machine_request_records_last_seen_at_most_every_five_minutes() {
+    let f = Fixture::new(None).await;
+    let (_mac_id, mac) = f.register(AMIR, "mac").await;
+    assert_eq!(last_seen(&f, &mac).await, None);
+    let before = chrono::Utc::now().timestamp_millis();
+    assert_eq!(
+        f.call(reqwest::Method::GET, "/v1/me", Some(&mac), None)
+            .await
+            .0,
+        200
+    );
+    let first = wait_seen(&f, &mac).await.expect("last seen recorded");
+    assert!(first >= before, "{first} < {before}");
+    // A second request within 5 minutes writes nothing.
+    assert_eq!(
+        f.call(reqwest::Method::GET, "/v1/me", Some(&mac), None)
+            .await
+            .0,
+        200
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(last_seen(&f, &mac).await, Some(first));
+    // The machine list shows it.
+    let (status, devices) = f
+        .call(reqwest::Method::GET, "/v1/devices", Some(&mac), None)
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(devices[0]["last_seen_at"], first, "{devices}");
+    assert!(devices[0].get("token_hash").is_none(), "{devices}");
+    // Listings carry no verifier material (the type has no token hash).
+    let listed = f
+        .server
+        .store()
+        .machines(&devices_user(&f, &mac).await)
+        .await
+        .unwrap();
+    assert_eq!(listed[0].last_seen_at, Some(first));
+    // A revoked machine's token is refused and records nothing.
+    let (old_id, old) = f.register(AMIR, "old").await;
+    f.server
+        .store()
+        .revoke_machine(&old_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.call(reqwest::Method::GET, "/v1/me", Some(&old), None)
+            .await
+            .0,
+        401
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(last_seen(&f, &old).await, None);
+}
+
+#[tokio::test]
+async fn a_failed_last_seen_write_still_serves_the_request_and_is_counted() {
+    let f = Fixture::new(None).await;
+    if !f.file_store() {
+        return;
+    }
+    let (_mac_id, mac) = f.register(AMIR, "mac").await;
+    // A directory where the state file goes makes every write fail.
+    let (file, saved) = (f.state.join("state.enc"), f.state.join("state.saved"));
+    std::fs::rename(&file, &saved).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    let status = f
+        .call(reqwest::Method::GET, "/v1/me", Some(&mac), None)
+        .await
+        .0;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::remove_dir(&file).unwrap();
+    std::fs::rename(&saved, &file).unwrap();
+    assert_eq!(status, 200);
+    let text = f
+        .http
+        .get(format!("{}/metrics", f.origin))
+        .bearer_auth(&mac)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        text.contains("claudectl_server_failed_requests_total{reason=\"machine_seen_store\"} 1\n"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn the_last_seen_write_waits_five_minutes_then_writes_again() {
+    let f = Fixture::new(None).await;
+    let (id, mac) = f.register(AMIR, "mac").await;
+    let store = f.server.store();
+    let t = 1_800_000_000_000;
+    assert!(store.seen_machine(&id, t).await.unwrap());
+    assert!(!store.seen_machine(&id, t + 299_999).await.unwrap());
+    assert!(store.seen_machine(&id, t + 300_001).await.unwrap());
+    assert_eq!(last_seen(&f, &mac).await, Some(t + 300_001));
+    // A revoked machine is never written.
+    store.revoke_machine(&id, None).await.unwrap();
+    assert!(!store.seen_machine(&id, t + 900_000).await.unwrap());
+}

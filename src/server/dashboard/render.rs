@@ -38,6 +38,8 @@ pub(super) struct Window {
 pub(super) struct Machine {
     pub id: String,
     pub revoked: bool,
+    /// The machine's last authorized request (ms).
+    pub last_seen_at: Option<i64>,
 }
 
 impl Account {
@@ -135,18 +137,20 @@ fn reset(at: Option<i64>, now: i64) -> String {
     };
     format!(r#"<time title="{}">{text}</time>"#, date(at))
 }
+/// `30 s ago`, `4 min ago`, or the date for anything older than two hours (Unix seconds).
+fn since(at: i64, now: i64) -> String {
+    let age = now.saturating_sub(at).max(0);
+    if age < 60 {
+        format!("{age} s ago")
+    } else if age < 7200 {
+        format!("{} min ago", age / 60)
+    } else {
+        date(at)
+    }
+}
 fn observed(a: &Account, now: i64) -> String {
     match a.observed_at {
-        Some(at) => {
-            let age = now.saturating_sub(at).max(0);
-            if age < 60 {
-                format!("Updated {age} s ago")
-            } else if age < 7200 {
-                format!("Updated {} min ago", age / 60)
-            } else {
-                format!("Updated {}", date(at))
-            }
-        }
+        Some(at) => format!("Updated {}", since(at, now)),
         None => "No usage data yet".into(),
     }
 }
@@ -340,9 +344,13 @@ fn machines(snapshot: &Snapshot) -> String {
         }
         count += 1;
         rows += &format!(
-            r#"<tr role="row"><td role="cell">{}</td><td role="cell" class="cell-account"><span class="alias" translate="no">{}</span></td><td role="cell" class="cell-state"><span class="state ok">Connected</span>{}</td></tr>"#,
+            r#"<tr role="row"><td role="cell">{}</td><td role="cell" class="cell-account"><span class="alias" translate="no">{}</span></td><td role="cell" class="cell-state"><div class="status"><span class="state ok">Connected</span><span class="status-detail">{}</span></div>{}</td></tr>"#,
             escape(name),
             escape(suffix),
+            match m.last_seen_at {
+                Some(at) => format!("Seen {}", since(at / 1000, snapshot.server_time)),
+                None => "Not seen since the upgrade".into(),
+            },
             action(
                 "/machines/revoke",
                 "machine",
@@ -465,6 +473,23 @@ pub(super) fn login_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_machine_shows_when_it_was_last_seen() {
+        let now = 1_800_000_000;
+        let machine = |last_seen_at| Machine {
+            id: "laptop-0123456789ab".into(),
+            revoked: false,
+            last_seen_at,
+        };
+        let page = |m| {
+            let mut s = snapshot(vec![], vec![m]);
+            s.server_time = now;
+            machines(&s)
+        };
+        assert!(page(machine(Some((now - 240) * 1000))).contains("Seen 4 min ago"));
+        assert!(page(machine(None)).contains("Not seen since the upgrade"));
+    }
 
     const NOW: i64 = 1_800_000_000;
 
@@ -682,10 +707,12 @@ mod tests {
                 Machine {
                     id: "mac-mini-0123456789ab".into(),
                     revoked: false,
+                    last_seen_at: None,
                 },
                 Machine {
                     id: "old-box-ba9876543210".into(),
                     revoked: true,
+                    last_seen_at: None,
                 },
             ],
         ));
@@ -703,6 +730,7 @@ mod tests {
             vec![Machine {
                 id: "<img src=x>-0123".into(),
                 revoked: false,
+                last_seen_at: None,
             }],
         );
         s.email = "a\"<b>@sawmills.ai".into();

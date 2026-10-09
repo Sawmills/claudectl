@@ -487,14 +487,37 @@ impl FileStore {
             (found, found)
         })
     }
-    pub fn machines(&self, user: &str) -> Result<Vec<(String, bool)>> {
+    pub fn machines(&self, user: &str) -> Result<Vec<MachineSummary>> {
         Ok(self.read(|t| {
-            t.machines
+            let mut machines: Vec<MachineSummary> = t
+                .machines
                 .iter()
                 .filter(|m| m.user == user)
-                .map(|m| (m.id.clone(), m.revoked))
-                .collect()
+                .map(|m| MachineSummary {
+                    id: m.id.clone(),
+                    revoked: m.revoked,
+                    last_seen_at: m.last_seen_at,
+                })
+                .collect();
+            machines.sort_by(|a, b| a.id.cmp(&b.id));
+            machines
         }))
+    }
+    /// Writes the whole sealed state, at most once per machine per `SEEN_EVERY_MS`.
+    pub fn seen_machine(&self, id: &str, now: i64) -> Result<bool> {
+        self.transact(|t| {
+            let mut wrote = false;
+            for m in t.machines.iter_mut().filter(|m| {
+                m.id == id
+                    && !m.revoked
+                    && m.last_seen_at
+                        .is_none_or(|at| at < now - super::SEEN_EVERY_MS)
+            }) {
+                m.last_seen_at = Some(now);
+                wrote = true;
+            }
+            (wrote, wrote)
+        })
     }
     pub fn machine_by_token(&self, token_hash: &str) -> Result<Option<Machine>> {
         Ok(self.read(|t| {

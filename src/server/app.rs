@@ -58,10 +58,40 @@ pub struct Server {
     allowed: Vec<String>,
     metrics_token_hash: Option<String>,
     /// Per reason: failure count and the Unix time of the last one.
-    failures: StdMutex<BTreeMap<&'static str, (u64, i64)>>,
+    failures: Arc<StdMutex<BTreeMap<&'static str, (u64, i64)>>>,
+    seen_writes: SeenWrites,
     work: Arc<Semaphore>,
     /// Set on shutdown: readiness fails while in-flight work finishes.
     draining: AtomicBool,
+}
+
+/// Machines with a last-seen write in flight: at most one per machine, so a burst of
+/// requests from one machine starts one write, not one per request.
+#[derive(Clone, Default)]
+pub(super) struct SeenWrites(Arc<StdMutex<std::collections::HashSet<String>>>);
+/// Frees the machine's slot when its write ends.
+pub(super) struct SeenGuard {
+    writes: SeenWrites,
+    id: String,
+}
+impl SeenWrites {
+    pub(super) fn begin(&self, id: &str) -> Option<SeenGuard> {
+        let mut pending = self.0.lock().expect("seen writes lock");
+        if !pending.insert(id.to_owned()) {
+            return None;
+        }
+        Some(SeenGuard {
+            writes: self.clone(),
+            id: id.to_owned(),
+        })
+    }
+}
+impl Drop for SeenGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.writes.0.lock() {
+            pending.remove(&self.id);
+        }
+    }
 }
 
 pub struct HttpError {
@@ -116,6 +146,7 @@ pub(super) async fn add_machine(store: &Store, user: &str, name: &str) -> Result
             user: user.into(),
             token_hash: vault::digest(token.as_bytes()),
             revoked: false,
+            last_seen_at: None,
         })
         .await?;
     Ok((id, token))
@@ -186,7 +217,8 @@ impl Server {
                 .map(|u| u.to_ascii_lowercase())
                 .collect(),
             metrics_token_hash: config.metrics_token_hash,
-            failures: StdMutex::new(BTreeMap::new()),
+            failures: Arc::new(StdMutex::new(BTreeMap::new())),
+            seen_writes: SeenWrites::default(),
             work: Arc::new(Semaphore::new(64)),
             draining: AtomicBool::new(false),
         }))
@@ -260,7 +292,45 @@ impl Server {
         if !self.allowed(&user.email) {
             return Err(self.error(StatusCode::FORBIDDEN, "user_not_allowed"));
         }
+        self.seen(&machine);
         Ok(machine)
+    }
+    /// Record the machine's last-seen time off the request path, only when the stored one is
+    /// older than `SEEN_EVERY_MS` (the store checks again). A failed write never fails the
+    /// request; it counts as `machine_seen_store`.
+    fn seen(&self, machine: &Machine) {
+        let now = chrono::Utc::now().timestamp_millis();
+        if machine
+            .last_seen_at
+            .is_some_and(|at| at >= now - store::SEEN_EVERY_MS)
+        {
+            return;
+        }
+        // One write per machine at a time; the SQL guard still keeps replicas apart.
+        let Some(slot) = self.seen_writes.begin(&machine.id) else {
+            return;
+        };
+        let (store, failures, id) = (
+            self.engine.store().clone(),
+            self.failures.clone(),
+            machine.id.clone(),
+        );
+        tokio::spawn(async move {
+            let _slot = slot;
+            if let Err(error) = store.seen_machine(&id, now).await {
+                {
+                    let mut failures = failures.lock().expect("metrics lock");
+                    let failure = failures.entry("machine_seen_store").or_default();
+                    failure.0 += 1;
+                    failure.1 = chrono::Utc::now().timestamp();
+                }
+                eprintln!(
+                    "{}",
+                    json!({"operation":"machine_seen","stage":"store","reason":"machine_seen_store",
+                        "machine":id,"error":format!("{error:#}")})
+                );
+            }
+        });
     }
     fn engine_error(&self, error: &anyhow::Error, fallback: &'static str) -> HttpError {
         if error.downcast_ref::<Gone>().is_some() {
@@ -332,7 +402,7 @@ async fn machines(State(server): Shared, headers: HeaderMap) -> Result<Response,
     Ok(private(
         machines
             .into_iter()
-            .map(|(id, revoked)| json!({"id": id, "revoked": revoked}))
+            .map(|m| json!({"id": m.id, "revoked": m.revoked, "last_seen_at": m.last_seen_at}))
             .collect::<Vec<_>>(),
     ))
 }
@@ -770,4 +840,22 @@ pub async fn serve_until(
         .await?;
     server.drain().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_machine_has_at_most_one_last_seen_write_in_flight() {
+        let pending = SeenWrites::default();
+        let first = pending.begin("mac-1").expect("first write");
+        assert!(pending.begin("mac-1").is_none(), "a second write waits");
+        assert!(pending.begin("mac-2").is_some(), "other machines are free");
+        drop(first);
+        assert!(
+            pending.begin("mac-1").is_some(),
+            "free again after the write"
+        );
+    }
 }
