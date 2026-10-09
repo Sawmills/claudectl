@@ -1298,3 +1298,62 @@ table:has(> tbody:empty) + .machines-note {
   font-size: var(--t-xl);
   letter-spacing: -0.02em;
 }
+
+/* ---------- Account actions (SAW-12695) ---------- */
+.action-page {
+  max-width: 40rem;
+  margin-top: var(--s5);
+}
+.action-page h1 {
+  margin: 0 0 var(--s4);
+  font-size: var(--t-xl);
+}
+.action-page h2 {
+  margin: var(--s6) 0 var(--s2);
+  font-size: var(--t-lg);
+}
+.action-page p,
+.action-page li {
+  color: var(--ink-2);
+}
+.form {
+  display: grid;
+  gap: var(--s2);
+  max-width: 28rem;
+  margin-block: var(--s3);
+}
+.form label {
+  color: var(--ink);
+  font-weight: 500;
+}
+.form input {
+  padding: var(--s2) var(--s3);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+.form input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.form .button {
+  justify-self: start;
+}
+form.action {
+  display: inline;
+  margin-left: var(--s3);
+}
+.account-name .manage {
+  margin-left: var(--s3);
+  color: var(--ink-3);
+  font-size: var(--t-sm);
+}
+.flash {
+  margin: 0 0 var(--s4);
+  padding: var(--s2) var(--s3);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  color: var(--ink);
+}

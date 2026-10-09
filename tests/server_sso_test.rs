@@ -978,7 +978,19 @@ async fn revoke_ends_a_machine_of_this_user_and_is_audited() {
             .iter()
             .any(|(id, revoked)| id == &laptop && *revoked)
     );
-    let line = f.audit_lines().await.pop().unwrap();
+    let audit = f.audit_lines().await;
+    // A second submit (back button, double click) changes nothing and writes no audit line.
+    let again = f
+        .post_form(
+            "/machines/revoke",
+            &session,
+            Some(&f.origin),
+            &[("csrf", &csrf), ("machine", &laptop)],
+        )
+        .await;
+    assert_eq!(again.status().as_u16(), 409);
+    assert_eq!(f.audit_lines().await.len(), audit.len());
+    let line = audit.last().unwrap().clone();
     assert_eq!(line["operation"], "machine_revoke", "{line}");
     assert_eq!(line["actor"], "dashboard:amir@sawmills.ai", "{line}");
     assert_eq!(line["target"], laptop.as_str(), "{line}");

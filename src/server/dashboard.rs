@@ -424,6 +424,23 @@ async fn revoke(
     if let Err(response) = fresh_sign_in(&browser) {
         return *response;
     }
+    // Only a connected machine of this user: a repeated submit writes no second audit line.
+    match server.store().machines(&browser.user).await {
+        Ok(machines) => match machines.iter().find(|(id, _)| *id == form.machine) {
+            None => return refuse(&server, StatusCode::NOT_FOUND, "machine_not_found"),
+            Some((_, true)) => {
+                return refuse(&server, StatusCode::CONFLICT, "machine_already_revoked");
+            }
+            Some((_, false)) => {}
+        },
+        Err(_) => {
+            return refuse(
+                &server,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "registry_unavailable",
+            );
+        }
+    }
     match server
         .store()
         .revoke_machine(&form.machine, Some(&browser.user))
@@ -533,7 +550,8 @@ fn document(content: &str, refresh: bool) -> Response {
         "default-src 'none'; style-src 'sha256-{style_hash}'; script-src 'sha256-{script_hash}'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
     );
     let refresh = if refresh {
-        r#"<meta http-equiv="refresh" content="60">"#
+        // To `/accounts` itself: a finished action's note (`?done=`) shows once.
+        r#"<meta http-equiv="refresh" content="60; url=/accounts">"#
     } else {
         ""
     };
@@ -586,6 +604,38 @@ pub(super) fn routes(router: Router<Arc<Server>>) -> Router<Arc<Server>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_and_revoke_send_an_old_sign_in_to_google_first() {
+        let browser = |signed_in_at| enrollment::Browser {
+            user: "u".into(),
+            email: "a@sawmills.ai".into(),
+            csrf: "t".into(),
+            signed_in_at,
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        for old in [None, Some(now - enrollment::REAUTH_MS - 1_000)] {
+            let response = *fresh_sign_in(&browser(old)).unwrap_err();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert_eq!(response.headers()["location"], "/accounts/sign-in");
+        }
+        assert!(fresh_sign_in(&browser(Some(now))).is_ok());
+    }
+
+    #[test]
+    fn the_accounts_page_refreshes_to_itself_without_the_finished_action() {
+        let page = document("x", true);
+        let body = futures_body(page);
+        assert!(body.contains(r#"content="60; url=/accounts""#), "{body}");
+    }
+    fn futures_body(response: Response) -> String {
+        let bytes = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
 
     #[test]
     fn partial_usage_is_unknown_but_a_known_full_window_stays_a_limit() {
@@ -788,6 +838,28 @@ mod preview {
             ("landing", document(&landing, false)),
             ("accounts", document(&render::overview(&full), true)),
             ("empty", document(&render::overview(&empty), true)),
+            ("add", page(render::add_page("amir@sawmills.ai", "preview"))),
+            (
+                "manage",
+                page(render::manage_page(
+                    "amir@sawmills.ai",
+                    "amir3@sawmills.ai",
+                    "preview-account",
+                    "preview",
+                    2,
+                )),
+            ),
+            (
+                "login",
+                page(render::login_page(
+                    "amir@sawmills.ai",
+                    "amir8",
+                    false,
+                    "https://claude.com/cai/oauth/authorize?code=true",
+                    "preview-login",
+                    "preview",
+                )),
+            ),
             (
                 "personal-account",
                 enrollment::dashboard_error(HttpError {

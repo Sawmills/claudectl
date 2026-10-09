@@ -396,7 +396,7 @@ pub(super) fn overview(snapshot: &Snapshot) -> String {
 /// An action page: the top bar and one main column, never auto-refreshed.
 fn frame(email: &str, title: &str, content: &str) -> String {
     format!(
-        r#"<div id="action"><header class="topbar"><div class="wrap topbar-inner"><a class="wordmark" href="/accounts" translate="no" aria-label="claudectl accounts">claudectl<span class="caret" aria-hidden="true"></span></a><div class="identity"><span class="email" translate="no">{}</span></div></div></header><main id="main" class="wrap"><p><a href="/accounts">Back to accounts</a></p><section class="section"><h1>{title}</h1>{content}</section></main></div>"#,
+        r#"<div id="action"><header class="topbar"><div class="wrap topbar-inner"><a class="wordmark" href="/accounts" translate="no" aria-label="claudectl accounts">claudectl<span class="caret" aria-hidden="true"></span></a><div class="identity"><span class="email" translate="no">{}</span></div></div></header><main id="main" class="wrap"><p><a href="/accounts">Back to accounts</a></p><section class="action-page"><h1>{title}</h1>{content}</section></main></div>"#,
         escape(email)
     )
 }

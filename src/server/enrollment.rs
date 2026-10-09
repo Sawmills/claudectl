@@ -154,7 +154,8 @@ struct Session {
 pub(super) const REAUTH_MS: i64 = 600_000;
 /// Whether a sign-in at `signed_in_at` is recent enough for Remove and Revoke.
 pub(super) fn recent_sign_in(signed_in_at: Option<i64>, now: i64) -> bool {
-    signed_in_at.is_some_and(|at| at <= now && now - at <= REAUTH_MS)
+    // The replica that saw the sign-in may run up to a minute ahead of this one.
+    signed_in_at.is_some_and(|at| at - now <= 60_000 && now - at <= REAUTH_MS)
 }
 const SESSION_TTL_MS: i64 = 3_600_000;
 /// A signed-in person who may approve one device.
@@ -1039,9 +1040,14 @@ mod tests {
         let now = 10_000_000;
         assert!(recent_sign_in(Some(now - REAUTH_MS), now));
         assert!(!recent_sign_in(Some(now - REAUTH_MS - 1), now));
-        // Sessions from before the sign-in time was kept, or from the future, are not recent.
+        // Sessions from before the sign-in time was kept are not recent.
         assert!(!recent_sign_in(None, now));
-        assert!(!recent_sign_in(Some(now + 1), now));
+        // Another replica's clock may run a little ahead.
+        assert!(recent_sign_in(Some(now + 30_000), now));
+        assert!(!recent_sign_in(Some(now + 120_000), now));
+        // A session row written before SAW-12695 has no sign-in time.
+        let old: Session = serde_json::from_str(r#"{"user":"u","email":"a@sawmills.ai"}"#).unwrap();
+        assert_eq!(old.signed_in_at, None);
     }
 
     fn google(hosted: Option<Vec<String>>) -> Configuration {
