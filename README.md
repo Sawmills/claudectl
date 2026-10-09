@@ -94,8 +94,11 @@ account, local and server, also has:
 - `state`: `{"kind": "ready" | "low" | "limit" | "unknown", "window": <name or null>}`,
   the same state as the compact view. `low` means a window is above 80%, `limit`
   means a window is full, and `unknown` means the 5h or week figure is missing.
-- `billed`: true unless extra usage is known to be off. `claudectl run` never picks
-  such an account.
+- `billed`: true when the account may bill extra usage, and on any doubt. For a server
+  account it is false only when the usage reports extra usage off. For a local
+  profile it is false only when `billing_class` is `rate_limited`: extra usage off,
+  a plan, and 5h or week usage data. Without any of those it is true, even with
+  extra usage off. `claudectl run` and the compact view never pick a billed account.
 - `fresh`: the usage figures are current enough to choose on.
 - `on_server`: the account is on the account server. `claudectl run` picks only
   among these.
