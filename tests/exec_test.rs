@@ -1100,7 +1100,8 @@ fn an_overlapping_run_in_the_same_process_is_refused() {
     }
     let client = claudectl::central::Client::load(&paths).unwrap();
     let server_error =
-        claudectl::central::session::run(&paths, &client, "work", &second_child, &[]).unwrap_err();
+        claudectl::central::session::run(&paths, &client, "work", &second_child, &[], false)
+            .unwrap_err();
     {
         use std::os::unix::thread::JoinHandleExt;
         // SAFETY: the first runner is alive with its handler installed.
