@@ -1,4 +1,5 @@
-//! Audit trail: one line per migrate, issue, refresh, and revoke.
+//! Audit trail: one line per migrate, issue, refresh, revoke, dashboard action, and Google
+//! sign-in the provider answered.
 //! A line names the operation, machine, account digest, and result, never a token.
 //! Each line goes to stderr and, sealed with the vault key, to the store.
 use super::{store::Store, vault};

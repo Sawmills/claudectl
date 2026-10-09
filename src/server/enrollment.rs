@@ -622,7 +622,15 @@ async fn callback(
         }
         Destination::Enrollment { device } => device,
     };
-    let (user, email) = identify(&server, sso, input.code, login.verifier, login.nonce).await?;
+    let (user, email) = identify_audited(
+        &server,
+        sso,
+        (input.code, login.verifier, login.nonce),
+        "enroll_sign_in",
+        "enrollment",
+    )
+    .await?;
+    audit_sign_in(&server, "enroll_sign_in", "enrollment", Some(&email), None).await?;
     let email = email.as_str();
     let device = server
         .store()
@@ -660,6 +668,61 @@ async fn callback(
 }
 /// Exchange the code and check the signed ID token: company account, allow list. Returns
 /// the user ID and email. Users key on (issuer, subject); an email change keeps the user.
+/// The sign-in refusals that come after Google answered: audited. Earlier ones (a bad or
+/// expired state, another browser's callback) and an unreachable provider are noise a
+/// scanner could cause: metric and log only.
+const AUDITED_REFUSALS: [&str; 4] = [
+    "sso_denied",
+    "company_identity_required",
+    "user_not_allowed",
+    "user_unavailable",
+];
+/// One audit line per Google sign-in that the provider answered: `<kind>:<email>` as actor
+/// when known, `ok` or `refused` with the bounded reason; never a code, token or nonce. An
+/// audit write failure fails the sign-in.
+async fn audit_sign_in(
+    server: &Server,
+    operation: &'static str,
+    kind: &str,
+    email: Option<&str>,
+    refused: Option<&'static str>,
+) -> Result<(), HttpError> {
+    let actor = email.map(|email| format!("{kind}:{email}"));
+    server
+        .engine()
+        .audit(&super::audit::Event {
+            operation,
+            machine: if kind == "dashboard" {
+                super::engine::DASHBOARD_MACHINE
+            } else {
+                "enrollment"
+            },
+            account: "",
+            result: if refused.is_some() { "refused" } else { "ok" },
+            rotated: None,
+            target: None,
+            reason: refused,
+            actor: actor.as_deref(),
+        })
+        .await
+        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable"))
+}
+/// `identify`, with its answered refusals audited under `operation`.
+async fn identify_audited(
+    server: &Server,
+    sso: &Sso,
+    (code, verifier, nonce): (Option<String>, String, String),
+    operation: &'static str,
+    kind: &str,
+) -> Result<(String, String), HttpError> {
+    match identify(server, sso, code, verifier, nonce).await {
+        Err(error) if AUDITED_REFUSALS.contains(&error.reason) => {
+            audit_sign_in(server, operation, kind, None, Some(error.reason)).await?;
+            Err(error)
+        }
+        other => other,
+    }
+}
 async fn identify(
     server: &Server,
     sso: &Sso,
@@ -726,15 +789,31 @@ async fn dashboard_callback(
     if presented.as_deref() != Some(browser) {
         return Err(server.error(StatusCode::UNAUTHORIZED, "invalid_browser_login"));
     }
-    let (user, email) = identify(server, sso, code, verifier, nonce).await?;
+    let (user, email) = identify_audited(
+        server,
+        sso,
+        (code, verifier, nonce),
+        "dashboard_sign_in",
+        "dashboard",
+    )
+    .await?;
     if !server
         .store()
         .record_user(&user, &email)
         .await
         .map_err(|_| server.unavailable())?
     {
+        audit_sign_in(
+            server,
+            "dashboard_sign_in",
+            "dashboard",
+            Some(&email),
+            Some("user_unavailable"),
+        )
+        .await?;
         return Err(server.error(StatusCode::FORBIDDEN, "user_unavailable"));
     }
+    audit_sign_in(server, "dashboard_sign_in", "dashboard", Some(&email), None).await?;
     let token = secret();
     let row = EnrollmentRow {
         lookup: None,
