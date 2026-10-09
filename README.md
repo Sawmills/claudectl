@@ -1,8 +1,9 @@
 # claudectl
 
-Manage multiple Claude Code accounts. Switch profiles, check rate limits across all
-accounts, and tab-complete profile names. Sibling of
-[codexctl](https://github.com/Sawmills/codexctl).
+Run Claude Code on the company's shared Claude accounts. claudectl picks the account
+with the most room, moves a session to another account at a usage limit, and shows
+every account's usage in the terminal and in a browser dashboard. It also manages
+local Claude Code profiles. Sibling of [codexctl](https://github.com/Sawmills/codexctl).
 
 ## Install
 
@@ -10,7 +11,40 @@ accounts, and tab-complete profile names. Sibling of
 cargo install --git https://github.com/Sawmills/claudectl
 ```
 
-## Usage
+## Use a company account server
+
+The account server holds the Claude accounts. A connected machine gets short-lived
+access tokens only, never a refresh token.
+
+```bash
+claudectl server connect https://claudectl.example.com --name laptop   # once per machine
+claudectl add amir8              # add an account: sign in to Claude, paste the code
+claudectl                        # the accounts, the one to use, and the next command
+claudectl run                    # start Claude on the account with the most room
+claudectl run amir2              # start on amir2 (full name, email name, or prefix)
+echo '<code#state>' | claudectl add amir8 --no-browser   # add from a script
+```
+
+- `claudectl run` without an account moves the session to another account when a
+  turn hits a usage limit. It resumes the same conversation and never picks an
+  account that may bill extra usage. A named run stays on its account unless you
+  add `--failover`; `--no-failover` turns it off.
+- `claudectl add` and `claudectl renew` show the pasted code. Without a terminal
+  they read it from standard input (the last line of the example above).
+- `claudectl status --details` shows token expiry and fetch diagnostics, and
+  `claudectl status --json` prints a machine-readable report (see below).
+- `claudectl shim install` makes plain `claude` run through the server.
+- The server's dashboard (its URL, signed in with Google) shows the same accounts and
+  lets you add, renew, or remove an account and revoke a machine.
+
+When a command fails, its last line starts with `Try:` and names the next command.
+See the [commands, migration contract, and pilot gates](docs/account-server.md).
+
+## Local profiles (without a server)
+
+The commands below manage Claude Code logins saved on this machine. `login`, `save`,
+`use`, `switch`, `list`, `remove`, `whoami`, `label`, and `launcher` no longer show
+in `claudectl --help`, but they keep working.
 
 ### Save accounts
 
@@ -386,9 +420,3 @@ Two safety rules are baked in:
 If `status --details` shows an expired token, follow the default view's `Next step`.
 Claude Code refreshes the active login. Status can refresh saved accounts when
 refresh ownership is known. Log in again when the login is missing or rejected.
-
-## Company account server (implementation preview)
-
-`claudectl server` connects to a private company account server and runs Claude with
-access-only credentials. Claude-only users do not need Codex. See the
-[commands, migration contract, and remaining pilot gates](docs/account-server.md).

@@ -180,3 +180,33 @@ fn run_on_a_machine_without_a_server_says_how_to_connect() {
         out(&o)
     );
 }
+
+/// SAW-12696 C: the local-profile commands the server path replaces are hidden but keep
+/// working (the capacity guard runs `claudectl use`); lane and script commands stay listed.
+#[test]
+fn local_profile_commands_are_hidden_but_still_work() {
+    let home = Home::new();
+    let commands = listed(&out(&home.run(&["--help"])));
+    for hidden in [
+        "login", "save", "use", "switch", "list", "remove", "whoami", "label", "launcher",
+    ] {
+        assert!(
+            !commands.contains(&hidden.to_string()),
+            "{hidden} listed: {commands:?}"
+        );
+        let o = home.run(&[hidden, "--help"]);
+        assert!(o.status.success(), "{hidden} --help: {}", out(&o));
+    }
+    for visible in ["run", "status", "add", "renew", "rm", "server", "exec", "claude", "rate", "completions"] {
+        assert!(
+            commands.contains(&visible.to_string()),
+            "{visible} missing: {commands:?}"
+        );
+    }
+    // `use` still runs (not "unrecognized subcommand"): it fails only for the missing profile.
+    let o = home.run(&["use", "nobody"]);
+    assert!(!o.status.success());
+    let text = out(&o);
+    assert!(!text.contains("unrecognized subcommand"), "{text}");
+    assert!(text.contains("nobody"), "{text}");
+}
