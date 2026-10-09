@@ -709,3 +709,18 @@ async fn a_failed_last_seen_write_still_serves_the_request_and_is_counted() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn the_last_seen_write_waits_five_minutes_then_writes_again() {
+    let f = Fixture::new(None).await;
+    let (id, mac) = f.register(AMIR, "mac").await;
+    let store = f.server.store();
+    let t = 1_800_000_000_000;
+    assert!(store.seen_machine(&id, t).await.unwrap());
+    assert!(!store.seen_machine(&id, t + 299_999).await.unwrap());
+    assert!(store.seen_machine(&id, t + 300_001).await.unwrap());
+    assert_eq!(last_seen(&f, &mac).await, Some(t + 300_001));
+    // A revoked machine is never written.
+    store.revoke_machine(&id, None).await.unwrap();
+    assert!(!store.seen_machine(&id, t + 900_000).await.unwrap());
+}
