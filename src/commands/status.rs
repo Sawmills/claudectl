@@ -111,8 +111,7 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
     }
     if json {
         let now = chrono::Utc::now().timestamp();
-        let mut report = status_json(&local, now);
-        report["server"] = server_json(&view, &remote, now);
+        let report = report_json(&local, &view, &remote, now);
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
@@ -310,6 +309,51 @@ fn window_json(window: Option<&api::UsageWindow>) -> serde_json::Value {
 }
 
 /// The `status --json` document: `{version, accounts: [...]}`, sorted by alias.
+/// `{"kind": "ready" | "low" | "limit" | "unknown", "window": <name or null>}`.
+fn state_json(c: &claudectl::accounts::Candidate) -> serde_json::Value {
+    use claudectl::accounts::State;
+    let (kind, window) = match claudectl::accounts::state(&c.windows) {
+        State::Ready => ("ready", None),
+        State::Low { window } => ("low", Some(window)),
+        State::Limit { window, .. } => ("limit", Some(window)),
+        State::Unknown => ("unknown", None),
+    };
+    serde_json::json!({ "kind": kind, "window": window })
+}
+/// The whole `status --json` document: local accounts, the server section, and the account
+/// to use. Version 1; keys are only ever added (`status_json_version_1_keeps_every_key_and_type`).
+fn report_json(
+    local: &[FetchedUsage],
+    view: &claudectl::central::ServerView,
+    remote: &[FetchedUsage],
+    now: i64,
+) -> serde_json::Value {
+    let mut report = status_json(local, now);
+    report["server"] = server_json(view, remote, now);
+    // The account to use and the next command, as the compact view shows them.
+    let both: Vec<&FetchedUsage> = local
+        .iter()
+        .filter(|f| {
+            !(f.on_server
+                && remote
+                    .iter()
+                    .any(|r| r.alias.eq_ignore_ascii_case(&f.alias)))
+        })
+        .chain(remote)
+        .collect();
+    let candidates: Vec<_> = both.iter().map(|f| candidate_of(f, now)).collect();
+    report["best"] = claudectl::accounts::best(&candidates)
+        .map(|i| both[i].alias.clone())
+        .into();
+    let compact = compact(&both, now);
+    report["next"] = compact
+        .lines()
+        .last()
+        .and_then(|l| l.strip_prefix("Next: "))
+        .unwrap_or_default()
+        .into();
+    report
+}
 pub fn status_json(fetched: &[FetchedUsage], now: i64) -> serde_json::Value {
     let mut fetched: Vec<&FetchedUsage> = fetched.iter().collect();
     fetched.sort_by(|a, b| a.alias.cmp(&b.alias));
@@ -346,6 +390,10 @@ pub fn status_json(fetched: &[FetchedUsage], now: i64) -> serde_json::Value {
                 "usage_age_seconds": f.snapshot.fetched_at.map(|at| now.saturating_sub(at).max(0)),
                 "usage_stale": !f.snapshot.is_fresh_at(now),
                 "error": f.error,
+                // Added in SAW-12696: the shared account model's view of this account.
+                "state": state_json(&candidate_of(f, now)),
+                "billed": candidate_of(f, now).billed,
+                "fresh": candidate_of(f, now).fresh,
             })
         })
         .collect();
@@ -709,6 +757,12 @@ fn print_fetched_at() {
 }
 
 fn print_table(accounts: &[AccountStatus]) {
+    print!("{}", details_table(accounts));
+}
+
+/// The `status --details` table and its two notes. Its columns and cells are a contract:
+/// autoreview and fleet scripts parse it (`status_details_table_keeps_its_columns_and_cells`).
+fn details_table(accounts: &[AccountStatus]) -> String {
     let show_models = accounts
         .iter()
         .any(|a| a.opus_pct.is_some() || a.sonnet_pct.is_some());
@@ -742,11 +796,9 @@ fn print_table(accounts: &[AccountStatus]) {
             show_label,
         ));
     }
-    println!("{table}");
-    println!("Percentages are used capacity. Fetch success does not prove model access.");
-    println!(
-        "Cached data can lag by 5m. HTTP 429 limits usage checks, not proof of exhausted capacity."
-    );
+    format!(
+        "{table}\nPercentages are used capacity. Fetch success does not prove model access.\nCached data can lag by 5m. HTTP 429 limits usage checks, not proof of exhausted capacity.\n"
+    )
 }
 
 /// Describe the next action without treating expired tokens or API throttling
@@ -2331,6 +2383,175 @@ mod tests {
         assert!(exhausted(&usage(
             r#"{"limits":[{"kind":"weekly_scoped","percent":100,"scope":{"model":{"display_name":"Fable"}}}]}"#
         )));
+    }
+
+    /// The JSON contract of `status --json` version 1 (SAW-12696): readers may rely on every
+    /// key below with this type. New keys may be added; none may go or change type.
+    #[test]
+    fn status_json_version_1_keeps_every_key_and_type() {
+        use serde_json::Value;
+        let off = r#""extra_usage":{"is_enabled":false,"used_credits":0}"#;
+        let local = fetched_json(
+            "work",
+            &format!(
+                r#"{{"five_hour":{{"utilization":20,"resets_at":"2026-10-07T10:00:00Z"}},"seven_day":{{"utilization":30}},{off}}}"#
+            ),
+            Some("max"),
+        );
+        let remote = server(
+            "amir3@sawmills.ai",
+            &format!(
+                r#"{{"five_hour":{{"utilization":2}},"seven_day":{{"utilization":1}},{off}}}"#
+            ),
+        );
+        let view = claudectl::central::ServerView::NotConnected;
+        let report = report_json(&[local], &view, &[remote], 1_500);
+        let is = |v: &Value, kind: &str| match kind {
+            "string" => v.is_string(),
+            "bool" => v.is_boolean(),
+            "number" => v.is_number(),
+            "array" => v.is_array(),
+            "object" => v.is_object(),
+            "string|null" => v.is_string() || v.is_null(),
+            "number|null" => v.is_number() || v.is_null(),
+            "bool|null" => v.is_boolean() || v.is_null(),
+            "object|null" => v.is_object() || v.is_null(),
+            _ => unreachable!(),
+        };
+        let check = |v: &Value, keys: &[(&str, &str)], at: &str| {
+            for (key, kind) in keys {
+                assert!(v.get(*key).is_some(), "{at}.{key} missing: {v}");
+                assert!(is(&v[*key], kind), "{at}.{key} is not {kind}: {v}");
+            }
+        };
+        assert_eq!(report["version"], 1);
+        check(
+            &report,
+            &[
+                ("version", "number"),
+                ("accounts", "array"),
+                ("server", "object"),
+                ("best", "string|null"),
+                ("next", "string"),
+            ],
+            "report",
+        );
+        check(
+            &report["server"],
+            &[
+                ("state", "string"),
+                ("error", "string|null"),
+                ("accounts", "array"),
+            ],
+            "server",
+        );
+        let account_keys = [
+            ("alias", "string"),
+            ("label", "string|null"),
+            ("active", "bool"),
+            ("plan", "string|null"),
+            ("billing_class", "string"),
+            ("exhausted", "bool|null"),
+            ("windows", "object"),
+            ("extra_usage", "object|null"),
+            ("token_expires_in_seconds", "number|null"),
+            ("usage_age_seconds", "number|null"),
+            ("usage_stale", "bool"),
+            ("error", "string|null"),
+            // Added in SAW-12696 (additive).
+            ("state", "object"),
+            ("billed", "bool"),
+            ("fresh", "bool"),
+        ];
+        let local = &report["accounts"][0];
+        check(local, &account_keys, "accounts[0]");
+        let remote = &report["server"]["accounts"][0];
+        check(remote, &account_keys, "server.accounts[0]");
+        check(remote, &[("available", "bool")], "server.accounts[0]");
+        for window in [
+            "five_hour",
+            "seven_day",
+            "seven_day_opus",
+            "seven_day_sonnet",
+            "fable_weekly",
+        ] {
+            assert!(local["windows"].get(window).is_some(), "windows.{window}");
+        }
+        check(
+            &local["windows"]["five_hour"],
+            &[
+                ("used_percent", "number|null"),
+                ("resets_at", "string|null"),
+            ],
+            "windows.five_hour",
+        );
+        check(
+            &local["state"],
+            &[("kind", "string"), ("window", "string|null")],
+            "state",
+        );
+        assert_eq!(local["state"]["kind"], "ready");
+        // The new top-level fields agree with the compact view.
+        assert_eq!(report["best"], "amir3@sawmills.ai");
+        // Short names only when every account shares a domain; "work" has none.
+        assert_eq!(report["next"], "claudectl run   (picks amir3@sawmills.ai)");
+    }
+
+    /// The `status --details` table contract (SAW-12696): autoreview and fleet scripts split
+    /// rows on "│" and "┆" and find columns by these header names.
+    #[test]
+    fn status_details_table_keeps_its_columns_and_cells() {
+        let fable = fetched_json(
+            "amir4@sawmills.ai",
+            r#"{"five_hour":{"utilization":7},"seven_day":{"utilization":98},"limits":[{"kind":"weekly_scoped","percent":100,"scope":{"model":{"id":null,"display_name":"Fable"},"surface":null}}]}"#,
+            Some("max"),
+        );
+        let plain = fetched_json(
+            "work",
+            r#"{"five_hour":{"utilization":20},"seven_day":{"utilization":30}}"#,
+            Some("max"),
+        );
+        let accounts: Vec<AccountStatus> = [&fable, &plain]
+            .into_iter()
+            .map(to_account_status)
+            .collect();
+        let text = details_table(&accounts);
+        let rows: Vec<Vec<String>> = text
+            .lines()
+            .filter(|l| l.starts_with('│'))
+            .map(|l| {
+                l.trim_matches('│')
+                    .split('┆')
+                    .map(|c| c.trim().to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            rows[0],
+            [
+                "Account",
+                "5h",
+                "5h Reset",
+                "7d",
+                "7d Reset",
+                "Fable 7d",
+                "Token expiry",
+                "Account capacity",
+                "Data age",
+                "Next fetch",
+                "Usage fetch"
+            ],
+            "{text}"
+        );
+        let work = rows.iter().find(|r| r[0] == "work").expect("work row");
+        assert_eq!(work.len(), rows[0].len(), "{text}");
+        assert_eq!(work[1], "20%", "{text}");
+        assert_eq!(work[3], "30%", "{text}");
+        let amir4 = rows
+            .iter()
+            .find(|r| r[0] == "amir4@sawmills.ai")
+            .expect("amir4 row");
+        assert_eq!(amir4[5], "100%", "{text}");
     }
 
     #[test]
