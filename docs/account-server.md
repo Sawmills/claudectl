@@ -139,9 +139,13 @@ revision changed (a refresh revoked the held token), it restarts Claude with
 `--resume <latest session>` on the new token, in the same folder and terminal, from the same
 checked build, and prints `claudectl: server token renewed; resuming session <id>`. It
 restarts only when all hold: the new token outlives the held one, the last turn ended at
-least 60 s ago with no prompt since, no terminal input for 5 min (the terminal device's
+least 60 s ago with no prompt since (a turn that failed, for example on a revoked token,
+ends with `StopFailure` and counts too), no terminal input for 5 min (the terminal device's
 access time), no more processes in Claude's group than when it first settled, and fewer
-than 3 restarts in the last hour. A turn in progress is never cut; a draft typed earlier
+than 3 restarts in the last hour. The process-group gate holds only until the held token
+expires: an LSP, `caffeinate` or a background shell never leaves the group, and after expiry
+the held token is dead for every holder, so an idle session restarts anyway; work still
+running in Claude's group ends with the restart. A turn in progress is never cut; a draft typed earlier
 than the input gate is lost on restart. Relaunch happens only after claudectl's own
 SIGTERM; any other exit ends `server run` with Claude's exit code. A `-p`/`--print` run is
 never restarted. If Claude sends no hook event within 30 s, or a hook could not record an event (the

@@ -16,6 +16,20 @@ pub struct Session {
     /// renewing. The guard leaves expiry to `server run` and skips a renewing session.
     renewal: String,
 }
+/// The Claude settings file for `dir`: every hook event the renewal monitor reads runs
+/// `hook server hook <dir>`.
+fn write_hook_settings(dir: &Path, hook: &Path) -> Result<PathBuf> {
+    let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    let command = format!("{} server hook {}", quote(hook), quote(dir));
+    let entry = json!([{"hooks": [{"type": "command", "command": command}]}]);
+    let settings = dir.join("hooks.json");
+    atomic(
+        &settings,
+        &json!({"hooks": {"SessionStart": entry, "UserPromptSubmit": entry,
+            "Stop": entry, "StopFailure": entry, "Notification": entry}}),
+    )?;
+    Ok(settings)
+}
 impl Session {
     pub fn new(paths: &Paths, account: &Account, access: Access) -> Result<Self> {
         validate(account, &access)?;
@@ -94,17 +108,7 @@ impl Session {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o500))?;
         }
-        let quote =
-            |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
-        let command = format!("{} server hook {}", quote(&hook), quote(self.directory()));
-        let entry = json!([{"hooks": [{"type": "command", "command": command}]}]);
-        let settings = self.directory().join("hooks.json");
-        atomic(
-            &settings,
-            &json!({"hooks": {"SessionStart": entry, "UserPromptSubmit": entry,
-                "Stop": entry, "Notification": entry}}),
-        )?;
-        Ok(settings)
+        write_hook_settings(self.directory(), &hook)
     }
     pub fn expires_at(&self) -> i64 {
         self.current.expires_at
@@ -767,6 +771,30 @@ impl Drop for Foreground {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_hook_settings_record_failed_turns() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::from_home(home.path().into());
+        let dir = paths.claudectl_dir().join("server/sessions/run-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                super::write_hook_settings(&dir, std::path::Path::new("/bin/true")).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "Stop",
+            "StopFailure",
+            "Notification",
+        ] {
+            assert!(settings["hooks"][event].is_array(), "{event}: {settings}");
+        }
+    }
+
     use super::*;
 
     #[cfg(unix)]

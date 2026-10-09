@@ -85,7 +85,9 @@ pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
             let event = match v["event"].as_str()? {
                 "SessionStart" => Event::SessionStart(v["session_id"].as_str()?.to_string()),
                 "UserPromptSubmit" => Event::Prompt,
-                "Stop" => Event::Stop,
+                // A turn that failed (an API error such as a revoked token) ends with
+                // StopFailure: it ended all the same.
+                "Stop" | "StopFailure" => Event::Stop,
                 "Notification" if v["notification_type"] == "idle_prompt" => Event::IdlePrompt,
                 _ => return None,
             };
@@ -221,7 +223,10 @@ pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     if i.tty_idle_ms.is_some_and(|ms| ms < i.tty_gate_ms) {
         return Err("terminal input in the last 5 min");
     }
-    if i.group_grew {
+    // Extra processes (an LSP, caffeinate, background shells) never leave the group. Before
+    // expiry they block a restart; once the held token expired it is dead for every holder,
+    // and an idle tab would otherwise wait on it forever (SAW-12610).
+    if i.group_grew && i.now < i.held_expires_at {
         return Err("Claude has extra processes running");
     }
     if i.restarts_last_hour >= RESTARTS_PER_HOUR {
@@ -451,6 +456,66 @@ mod tests {
             group_grew: false,
             restarts_last_hour: 0,
         }
+    }
+
+    #[test]
+    fn a_turn_that_ends_in_an_api_error_is_idle_too() {
+        // Claude Code 2.1.295 ends a failed turn (a 401 on a revoked token) with
+        // StopFailure, not Stop (SAW-12610 repro, 10-08 17:13).
+        let text = [
+            r#"{"at":1,"event":"SessionStart","session_id":"s"}"#,
+            r#"{"at":2,"event":"UserPromptSubmit","session_id":"s"}"#,
+            r#"{"at":3,"event":"StopFailure","session_id":"s"}"#,
+        ]
+        .join("\n");
+        let events = parse_events(&text);
+        assert_eq!(events.last(), Some(&(3, Event::Stop)));
+        assert_eq!(
+            idle_state(&events),
+            Idle {
+                session: Some("s".into()),
+                since: Some(3)
+            }
+        );
+    }
+
+    #[test]
+    fn after_expiry_extra_processes_no_longer_block_a_restart() {
+        // rust-analyzer, caffeinate and background shells grow Claude's group and never
+        // leave: before expiry they block, after expiry the held token is dead for every
+        // holder, so the idle tab restarts (SAW-12610 repro run-0pccny).
+        let idle = Idle {
+            session: Some("s".into()),
+            since: Some(10_000_000 - IDLE_AFTER_STOP_MS),
+        };
+        let mut grew = inputs(&idle);
+        grew.group_grew = true;
+        assert!(matches!(decide(&grew), Decision::Wait(_)));
+        grew.held_expires_at = grew.now;
+        assert_eq!(decide(&grew), Decision::Restart);
+        assert_eq!(idle_gate(&grew), Ok(()));
+        // The other gates still hold after expiry.
+        let mut typing = grew_after_expiry(&idle);
+        typing.tty_idle_ms = Some(30_000);
+        assert!(matches!(decide(&typing), Decision::Wait(_)));
+        let busy = Idle {
+            session: Some("s".into()),
+            since: None,
+        };
+        assert!(matches!(
+            decide(&grew_after_expiry(&busy)),
+            Decision::Wait(_)
+        ));
+        let mut budget = grew_after_expiry(&idle);
+        budget.restarts_last_hour = RESTARTS_PER_HOUR;
+        assert!(matches!(decide(&budget), Decision::Wait(_)));
+    }
+
+    fn grew_after_expiry<'a>(idle: &'a Idle) -> Inputs<'a> {
+        let mut i = inputs(idle);
+        i.group_grew = true;
+        i.held_expires_at = i.now - 1;
+        i
     }
 
     #[test]
