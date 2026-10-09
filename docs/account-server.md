@@ -299,6 +299,15 @@ claudectl-server audit --key-file /keys/vault-key
 - **Audit.** Every migrate, issue, refresh, and revoke writes one line to stderr and one
   sealed row to the store: operation, machine, account digest, result, and for a refresh
   whether the provider rotated the refresh token. No line holds a token.
+  Dashboard actions (`account_remove`, `machine_revoke`) and every Google sign-in that the
+  provider answered (`dashboard_sign_in`, `enroll_sign_in`) also write one line, with the
+  person as `actor` (`dashboard:<email>` or `enrollment:<email>`; a refusal names the person
+  only once the email is a verified company email, as for `user_not_allowed`) and, for a refused
+  sign-in, the bounded `reason` (`sso_denied`, `company_identity_required`,
+  `user_not_allowed`, `user_unavailable`, or `persistence_failed` when the user row could not
+  be written). A bad or expired sign-in state, another browser's callback, or a provider
+  that cannot be reached (`sso_unavailable`) is not audited (metric and log only). An audit write
+  failure fails the operation.
 - **Metrics.** `/metrics` (scrape token or machine token) exports
   `claudectl_server_failed_requests_total{reason}` and
   `claudectl_server_last_failure_timestamp_seconds{reason}`. The staging overlay in

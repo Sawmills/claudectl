@@ -79,6 +79,8 @@ struct Issuer {
     rogue: Arc<CoreRsaPrivateSigningKey>,
     /// The ID token the next token request returns.
     next: Arc<Mutex<Option<String>>>,
+    /// Discovery names a token endpoint nobody listens on: the provider is unreachable.
+    dead_token: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Issuer {
     /// Sign the next ID token for the pending login with `nonce`.
@@ -122,6 +124,7 @@ async fn issuer() -> (Issuer, tokio::task::JoinHandle<()>) {
         key: Arc::new(key()),
         rogue: Arc::new(key()),
         next: Arc::default(),
+        dead_token: Arc::default(),
     };
     let app = Router::new()
         .route(
@@ -130,7 +133,11 @@ async fn issuer() -> (Issuer, tokio::task::JoinHandle<()>) {
                 Json(json!({
                     "issuer": i.origin,
                     "authorization_endpoint": format!("{}/auth", i.origin),
-                    "token_endpoint": format!("{}/token", i.origin),
+                    "token_endpoint": if i.dead_token.load(std::sync::atomic::Ordering::SeqCst) {
+                        "http://127.0.0.1:9/token".to_string()
+                    } else {
+                        format!("{}/token", i.origin)
+                    },
                     "jwks_uri": format!("{}/jwks", i.origin),
                     "response_types_supported": ["code"],
                     "subject_types_supported": ["public"],
@@ -1125,4 +1132,100 @@ async fn overlapping_revokes_change_and_audit_the_machine_once() {
         .filter(|l| l["operation"] == "machine_revoke")
         .count();
     assert_eq!(revokes, 1, "{audit:?}");
+}
+
+/// Every Google sign-in the provider answered leaves one audit line: who, when, result and
+/// the refusal reason. Noise before the provider (another browser's callback) does not.
+#[tokio::test]
+async fn every_answered_google_sign_in_is_audited() {
+    let f = Fixture::new().await;
+    // Dashboard: one success, one personal account refused, one foreign-browser callback.
+    f.session("amir@sawmills.ai").await;
+    let refused = f
+        .dashboard_callback(Token::new("someone@gmail.com", None), None)
+        .await;
+    assert_eq!(refused.status().as_u16(), 403);
+    let foreign = f
+        .dashboard_callback(
+            Token::new("amir@sawmills.ai", Some("sawmills.ai")),
+            Some("claudectl-login=another-browser"),
+        )
+        .await;
+    assert_eq!(foreign.status().as_u16(), 401);
+    // Machine enrollment: one success, one company user not on the allow list.
+    let (status, body) = f
+        .callback(Token::new("amir@sawmills.ai", Some("sawmills.ai")))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = f
+        .callback(Token::new("other@sawmills.ai", Some("sawmills.ai")))
+        .await;
+    assert_eq!(status, 403, "{body}");
+
+    let lines: Vec<Value> = f
+        .audit_lines()
+        .await
+        .into_iter()
+        .filter(|l| {
+            l["operation"]
+                .as_str()
+                .is_some_and(|o| o.ends_with("_sign_in"))
+        })
+        .collect();
+    let find = |operation: &str, result: &str| {
+        lines
+            .iter()
+            .find(|l| l["operation"] == operation && l["result"] == result)
+            .unwrap_or_else(|| panic!("no {operation} {result} in {lines:?}"))
+            .clone()
+    };
+    let ok = find("dashboard_sign_in", "ok");
+    assert_eq!(ok["actor"], "dashboard:amir@sawmills.ai", "{ok}");
+    assert!(ok["at"].is_string(), "{ok}");
+    let no = find("dashboard_sign_in", "refused");
+    assert_eq!(no["reason"], "company_identity_required", "{no}");
+    let ok = find("enroll_sign_in", "ok");
+    assert_eq!(ok["actor"], "enrollment:amir@sawmills.ai", "{ok}");
+    let no = find("enroll_sign_in", "refused");
+    assert_eq!(no["reason"], "user_not_allowed", "{no}");
+    // A verified company email refused by the allow list keeps its person.
+    assert_eq!(no["actor"], "enrollment:other@sawmills.ai", "{no}");
+    // The foreign-browser callback never reached the provider: no line for it.
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    // No secret from the sign-in reaches the audit log.
+    for line in &lines {
+        let text = line.to_string();
+        for secret in ["\"c\"", "test-secret", "id_token"] {
+            assert!(!text.contains(secret), "{text}");
+        }
+    }
+}
+
+/// A provider that cannot be reached is an outage, not a refusal: no sign-in audit line.
+#[tokio::test]
+async fn an_unreachable_token_endpoint_is_not_an_audited_refusal() {
+    let f = Fixture::new().await;
+    f.issuer
+        .dead_token
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let dashboard = f
+        .dashboard_callback(Token::new("amir@sawmills.ai", Some("sawmills.ai")), None)
+        .await;
+    assert_eq!(dashboard.status().as_u16(), 503);
+    let (status, body) = f
+        .callback(Token::new("amir@sawmills.ai", Some("sawmills.ai")))
+        .await;
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("sso_unavailable"), "{body}");
+    let lines: Vec<Value> = f
+        .audit_lines()
+        .await
+        .into_iter()
+        .filter(|l| {
+            l["operation"]
+                .as_str()
+                .is_some_and(|o| o.ends_with("_sign_in"))
+        })
+        .collect();
+    assert!(lines.is_empty(), "{lines:?}");
 }

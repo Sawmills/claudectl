@@ -622,7 +622,15 @@ async fn callback(
         }
         Destination::Enrollment { device } => device,
     };
-    let (user, email) = identify(&server, sso, input.code, login.verifier, login.nonce).await?;
+    let (user, email) = identify_audited(
+        &server,
+        sso,
+        (input.code, login.verifier, login.nonce),
+        "enroll_sign_in",
+        "enrollment",
+    )
+    .await?;
+    audit_sign_in(&server, "enroll_sign_in", "enrollment", Some(&email), None).await?;
     let email = email.as_str();
     let device = server
         .store()
@@ -660,58 +668,139 @@ async fn callback(
 }
 /// Exchange the code and check the signed ID token: company account, allow list. Returns
 /// the user ID and email. Users key on (issuer, subject); an email change keeps the user.
+/// The sign-in refusals that come after Google answered: audited. Earlier ones (a bad or
+/// expired state, another browser's callback) and an unreachable provider are noise a
+/// scanner could cause: metric and log only.
+const AUDITED_REFUSALS: [&str; 4] = [
+    "sso_denied",
+    "company_identity_required",
+    "user_not_allowed",
+    "user_unavailable",
+];
+/// One audit line per Google sign-in that the provider answered: `<kind>:<email>` as actor
+/// when known, `ok` or `refused` with the bounded reason; never a code, token or nonce. An
+/// audit write failure fails the sign-in.
+async fn audit_sign_in(
+    server: &Server,
+    operation: &'static str,
+    kind: &str,
+    email: Option<&str>,
+    refused: Option<&'static str>,
+) -> Result<(), HttpError> {
+    let actor = email.map(|email| format!("{kind}:{email}"));
+    server
+        .engine()
+        .audit(&super::audit::Event {
+            operation,
+            machine: if kind == "dashboard" {
+                super::engine::DASHBOARD_MACHINE
+            } else {
+                "enrollment"
+            },
+            account: "",
+            result: if refused.is_some() { "refused" } else { "ok" },
+            rotated: None,
+            target: None,
+            reason: refused,
+            actor: actor.as_deref(),
+        })
+        .await
+        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable"))
+}
+/// `identify`, with its answered refusals audited under `operation`.
+async fn identify_audited(
+    server: &Server,
+    sso: &Sso,
+    (code, verifier, nonce): (Option<String>, String, String),
+    operation: &'static str,
+    kind: &str,
+) -> Result<(String, String), HttpError> {
+    match identify(server, sso, code, verifier, nonce).await {
+        Ok(identity) => Ok(identity),
+        Err((error, email)) if AUDITED_REFUSALS.contains(&error.reason) => {
+            audit_sign_in(
+                server,
+                operation,
+                kind,
+                email.as_deref(),
+                Some(error.reason),
+            )
+            .await?;
+            Err(error)
+        }
+        Err((error, _)) => Err(error),
+    }
+}
 async fn identify(
     server: &Server,
     sso: &Sso,
     code: Option<String>,
     verifier: String,
     nonce: String,
-) -> Result<(String, String), HttpError> {
-    let denied = || server.error(StatusCode::UNAUTHORIZED, "sso_denied");
-    let code = code.ok_or_else(denied)?;
-    let client = sso
-        .client()
-        .await
-        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?;
-    let tokens = client
-        .exchange_code(AuthorizationCode::new(code))
-        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?
-        .set_pkce_verifier(PkceCodeVerifier::new(verifier))
-        .request_async(&sso.http)
-        .await
-        .map_err(|_| denied())?;
-    // The verifier checks signature, issuer, audience, expiry, and nonce.
-    let verifier = client.id_token_verifier();
-    let id = tokens.extra_fields().id_token().ok_or_else(denied)?;
-    let claims = id
-        .claims(&verifier, &Nonce::new(nonce))
-        .map_err(|_| denied())?;
-    if let Some(expected) = claims.access_token_hash() {
-        let actual = AccessTokenHash::from_token(
-            tokens.access_token(),
-            id.signing_alg().map_err(|_| denied())?,
-            id.signing_key(&verifier).map_err(|_| denied())?,
-        )
-        .map_err(|_| denied())?;
-        if actual != *expected {
-            return Err(denied());
+) -> Result<(String, String), (HttpError, Option<String>)> {
+    // A refusal carries the email only once it is a verified company email (the allow list
+    // check); earlier refusals name no person.
+    let inner = async {
+        let denied = || server.error(StatusCode::UNAUTHORIZED, "sso_denied");
+        let code = code.ok_or_else(denied)?;
+        let client = sso
+            .client()
+            .await
+            .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?;
+        let tokens = client
+            .exchange_code(AuthorizationCode::new(code))
+            .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?
+            .set_pkce_verifier(PkceCodeVerifier::new(verifier))
+            .request_async(&sso.http)
+            .await
+            // Only a provider's own error answer is a refusal; a transport or parse failure is
+            // an outage (not audited as a refused sign-in).
+            .map_err(|error| match error {
+                openidconnect::RequestTokenError::ServerResponse(_) => denied(),
+                _ => server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"),
+            })?;
+        // The verifier checks signature, issuer, audience, expiry, and nonce.
+        let verifier = client.id_token_verifier();
+        let id = tokens.extra_fields().id_token().ok_or_else(denied)?;
+        let claims = id
+            .claims(&verifier, &Nonce::new(nonce))
+            .map_err(|_| denied())?;
+        if let Some(expected) = claims.access_token_hash() {
+            let actual = AccessTokenHash::from_token(
+                tokens.access_token(),
+                id.signing_alg().map_err(|_| denied())?,
+                id.signing_key(&verifier).map_err(|_| denied())?,
+            )
+            .map_err(|_| denied())?;
+            if actual != *expected {
+                return Err(denied());
+            }
         }
+        let refused = || server.error(StatusCode::FORBIDDEN, "company_identity_required");
+        let email = sso
+            .config
+            .company_email(
+                claims.email().map(|e| e.as_str()),
+                claims.email_verified(),
+                claims.additional_claims().hd.as_deref(),
+            )
+            .ok_or_else(refused)?;
+        if !server.allowed(email) {
+            return Ok(Err((
+                server.error(StatusCode::FORBIDDEN, "user_not_allowed"),
+                email.to_owned(),
+            )));
+        }
+        let user = vault::digest(
+            format!("{}\0{}", sso.config.issuer, claims.subject().as_str()).as_bytes(),
+        );
+        Ok(Ok((user, email.to_owned())))
+    };
+    match inner.await {
+        Ok(Ok(identity)) => Ok(identity),
+        Ok(Err((error, email))) => Err((error, Some(email))),
+        Err(error) => Err((error, None)),
     }
-    let refused = || server.error(StatusCode::FORBIDDEN, "company_identity_required");
-    let email = sso
-        .config
-        .company_email(
-            claims.email().map(|e| e.as_str()),
-            claims.email_verified(),
-            claims.additional_claims().hd.as_deref(),
-        )
-        .ok_or_else(refused)?;
-    if !server.allowed(email) {
-        return Err(server.error(StatusCode::FORBIDDEN, "user_not_allowed"));
-    }
-    let user =
-        vault::digest(format!("{}\0{}", sso.config.issuer, claims.subject().as_str()).as_bytes());
-    Ok((user, email.to_owned()))
 }
 /// Finish a dashboard sign-in: the browser that started it gets a session cookie.
 async fn dashboard_callback(
@@ -726,15 +815,40 @@ async fn dashboard_callback(
     if presented.as_deref() != Some(browser) {
         return Err(server.error(StatusCode::UNAUTHORIZED, "invalid_browser_login"));
     }
-    let (user, email) = identify(server, sso, code, verifier, nonce).await?;
-    if !server
-        .store()
-        .record_user(&user, &email)
-        .await
-        .map_err(|_| server.unavailable())?
-    {
+    let (user, email) = identify_audited(
+        server,
+        sso,
+        (code, verifier, nonce),
+        "dashboard_sign_in",
+        "dashboard",
+    )
+    .await?;
+    let recorded = server.store().record_user(&user, &email).await;
+    let Ok(recorded) = recorded else {
+        // The provider answered: the sign-in is audited even when the user row could not
+        // be written (that audit may fail too, on the same store).
+        audit_sign_in(
+            server,
+            "dashboard_sign_in",
+            "dashboard",
+            Some(&email),
+            Some("persistence_failed"),
+        )
+        .await?;
+        return Err(server.unavailable());
+    };
+    if !recorded {
+        audit_sign_in(
+            server,
+            "dashboard_sign_in",
+            "dashboard",
+            Some(&email),
+            Some("user_unavailable"),
+        )
+        .await?;
         return Err(server.error(StatusCode::FORBIDDEN, "user_unavailable"));
     }
+    audit_sign_in(server, "dashboard_sign_in", "dashboard", Some(&email), None).await?;
     let token = secret();
     let row = EnrollmentRow {
         lookup: None,

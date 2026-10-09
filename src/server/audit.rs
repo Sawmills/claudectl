@@ -1,4 +1,5 @@
-//! Audit trail: one line per migrate, issue, refresh, and revoke.
+//! Audit trail: one line per migrate, issue, refresh, revoke, dashboard action, and Google
+//! sign-in the provider answered.
 //! A line names the operation, machine, account digest, and result, never a token.
 //! Each line goes to stderr and, sealed with the vault key, to the store.
 use super::{store::Store, vault};
@@ -18,7 +19,9 @@ pub struct Event<'a> {
     /// The revoked machine, for a machine revoke.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<&'a str>,
-    /// Why a refresh ran: forced, expired, migration or margin.
+    /// Why a refresh ran (`forced`, `expired`, `migration`, `margin`), or why a sign-in was
+    /// refused (`sso_denied`, `company_identity_required`, `user_not_allowed`,
+    /// `user_unavailable`, `persistence_failed`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
     /// Who acted in the browser dashboard (`dashboard:<email>`); machine requests have none.
