@@ -295,6 +295,24 @@ impl Client {
         }
         Ok(access)
     }
+    /// The current token without refreshing an unexpired one (SAW-12657): a session that
+    /// watches for a new revision must never revoke the token another session's turn uses.
+    pub fn observe(&self, id: &str) -> Result<Access> {
+        let access: Access = self.post(
+            "/v2/anthropic/token",
+            &json!({"account_id":id,"observe":true}),
+        )?;
+        if access.provider != "anthropic"
+            || access.account_id != id
+            || access.user_id != self.connection.user_id
+            || access.access_token.is_empty()
+            || access.revision.is_empty()
+            || access.generation == 0
+        {
+            bail!("invalid or mismatched access grant");
+        }
+        Ok(access)
+    }
     pub fn usage(&self, id: &str, cached: bool) -> Result<Usage> {
         self.get(&format!(
             "/v2/anthropic/usage?account_id={}&cached={cached}",

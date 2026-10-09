@@ -19,6 +19,8 @@ const ACCOUNT: &str = "ababababababababababababababababababababababababababababa
 struct Fake {
     /// The `previous_revision` of every token request, in order.
     requests: Vec<Value>,
+    /// The `observe` flag of every token request, in order.
+    observes: Vec<bool>,
     /// When each token request arrived (ms).
     request_times: Vec<i64>,
     /// The first token's lifetime (ms); later tokens live longer.
@@ -64,6 +66,8 @@ async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Va
     {
         let mut fake = shared.lock().unwrap();
         fake.requests.push(body["previous_revision"].clone());
+        fake.observes
+            .push(body["observe"].as_bool().unwrap_or(false));
         fake.request_times
             .push(chrono::Utc::now().timestamp_millis());
     }
@@ -122,6 +126,11 @@ def term(*_):
         out.write(status.get("renewal", ""))
     sys.exit(143)
 signal.signal(signal.SIGTERM, term)
+if os.environ.get("FAKE_EXTRA_CHILD") and token == "token-1":
+    # An LSP, caffeinate or a background shell: it joins Claude's group after the monitor
+    # took its baseline, and never leaves.
+    time.sleep(0.5)
+    subprocess.Popen(["sleep", "60"])
 with open(os.environ["FAKE_LOG"] + ".ready", "w") as ready:
     ready.write("idle")
 # A watchdog: a build that never restarts fails the test instead of hanging it.
@@ -434,10 +443,10 @@ fn a_prompt_during_the_token_request_cancels_the_restart() {
     assert_eq!(env.runs().len(), 1);
 }
 
-/// A held token inside the server's refresh window: the monitor asks nothing until it
-/// expires (a request then would refresh and revoke a token a turn may use), then follows.
+/// A held token inside the server's refresh window: the monitor only observes (a request that
+/// never refreshes an unexpired token), so it may ask at once and never revokes a turn's token.
 #[test]
-fn no_token_request_while_the_held_token_is_inside_the_refresh_window() {
+fn inside_the_refresh_window_the_monitor_only_observes() {
     let env = Env::new();
     env.fake.lock().unwrap().first_life_ms = Some(3_000);
     let refresher = env.refresh_when_idle();
@@ -447,7 +456,6 @@ fn no_token_request_while_the_held_token_is_inside_the_refresh_window() {
         .args(["server", "run", "work", "--claude"])
         .arg(&env.claude)
         .args(["--", "--model", "opus"]);
-    let started = chrono::Utc::now().timestamp_millis();
     let output = Command::from_std(command)
         .timeout(std::time::Duration::from_secs(60))
         .output()
@@ -460,13 +468,38 @@ fn no_token_request_while_the_held_token_is_inside_the_refresh_window() {
         String::from_utf8_lossy(&output.stderr)
     );
     let fake = env.fake.lock().unwrap();
-    // The launch, then nothing until the 3 s token expired.
-    assert!(fake.request_times.len() >= 2, "{:?}", fake.request_times);
-    for at in &fake.request_times[1..] {
-        assert!(
-            *at >= started + 3_000,
-            "a request {} ms after launch",
-            at - started
-        );
-    }
+    // The launch acquires; every monitor request observes.
+    assert!(fake.observes.len() >= 2, "{:?}", fake.observes);
+    assert!(!fake.observes[0], "{:?}", fake.observes);
+    assert!(fake.observes[1..].iter().all(|o| *o), "{:?}", fake.observes);
+}
+
+/// Extra processes in Claude's group (an LSP, caffeinate, a background shell) never block
+/// following a revision another session's refresh superseded before expiry (SAW-12610,
+/// 10-08 17:08 repro).
+#[test]
+fn an_idle_claude_with_extra_processes_follows_an_early_refresh() {
+    let env = Env::new();
+    let refresher = env.refresh_when_idle();
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+    env.env(&mut command);
+    command
+        .env("FAKE_EXTRA_CHILD", "1")
+        .args(["server", "run", "work", "--claude"])
+        .arg(&env.claude)
+        .args(["--", "--model", "opus"]);
+    let output = Command::from_std(command)
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    refresher.join().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let runs = env.runs();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(runs[1]["token"], "token-2");
 }

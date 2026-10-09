@@ -404,7 +404,6 @@ struct Activity {
     offset: u64,
     idle: super::renew::Idle,
     seen_start: bool,
-    baseline: Option<usize>,
 }
 #[cfg(unix)]
 impl Monitor {
@@ -418,21 +417,8 @@ impl Monitor {
         &'a self,
         activity: &'a mut Activity,
         timing: &super::renew::Timing,
-        started: i64,
         server: Option<&'a Access>,
     ) -> super::renew::Inputs<'a> {
-        // Claude starts its MCP servers after SessionStart: take the baseline once it settled.
-        if activity.idle.since.is_some()
-            && activity.baseline.is_none()
-            && now() - started >= timing.settle_ms
-        {
-            activity.baseline = exec::group_size(self.pid);
-        }
-        // Unknown membership counts as grown: never restart over unknown processes.
-        let group_grew = match (activity.baseline, exec::group_size(self.pid)) {
-            (Some(before), Some(current)) => current > before,
-            _ => true,
-        };
         let tty_idle_ms = self.tty.as_ref().map(|path| {
             std::fs::metadata(path)
                 .and_then(|m| m.accessed())
@@ -450,7 +436,6 @@ impl Monitor {
             idle_after_ms: timing.idle_after_ms,
             tty_gate_ms: timing.tty_idle_ms,
             tty_idle_ms,
-            group_grew,
             restarts_last_hour: self.restarts,
         }
     }
@@ -526,9 +511,9 @@ impl Monitor {
                 }
                 continue;
             }
-            // Ask the server only while idle: near expiry the request refreshes the grant and
-            // revokes the token a running turn would still use.
-            if renew::idle_gate(&self.inputs(&mut activity, &timing, started, None)).is_err() {
+            // Ask the server only while idle: after expiry the request refreshes the grant,
+            // and a turn that starts meanwhile would get the old, dead token.
+            if renew::idle_gate(&self.inputs(&mut activity, &timing, None)).is_err() {
                 continue;
             }
             let interval = if self.held_expires_at - now() < 3_600_000 {
@@ -539,14 +524,11 @@ impl Monitor {
             if !retry_now && now() - last_check < interval {
                 continue;
             }
-            // Inside the server's refresh window our request would refresh the grant and
-            // revoke the token a turn may still use: wait for expiry instead.
-            if !renew::may_poll(now(), self.held_expires_at, timing.no_poll_ms) {
-                continue;
-            }
             last_check = now();
             retry_now = false;
-            let access = match self.client.acquire(&self.account_id, None) {
+            // An observing read never refreshes an unexpired token, so it cannot revoke the
+            // token another session's turn uses; a superseded revision shows at once.
+            let access = match self.client.observe(&self.account_id) {
                 Ok(access) => access,
                 Err(_) => {
                     // Retry soon: one failure near expiry must not use up the token's life.
@@ -562,7 +544,7 @@ impl Monitor {
                 renewing = false;
                 continue;
             }
-            let inputs = self.inputs(&mut activity, &timing, started, Some(&access));
+            let inputs = self.inputs(&mut activity, &timing, Some(&access));
             if renew::idle_gate(&inputs).is_err() {
                 // Claude became busy: restart at its next idle point, without the poll wait.
                 retry_now = true;
