@@ -1,7 +1,8 @@
 # Claude accounts on a company account server
 
 Implementation preview; do not deploy real refresh grants until the remaining
-pilot checks below pass. The design research is in
+pilot checks below pass. The one exception is the current fleet pilot, which runs by
+owner decision only (see [Current fleet pilot](#current-fleet-pilot)). The design research is in
 [the central design](superpowers/specs/2026-10-02-claudectl-central-design.md).
 
 A company server holds Claude refresh credentials. Each enrolled machine receives
@@ -302,6 +303,19 @@ claudectl-server audit --key-file /keys/vault-key
   `claudectl_server_failed_requests_total{reason}` and
   `claudectl_server_last_failure_timestamp_seconds{reason}`. The staging overlay in
   `deploy/k8s` alerts on both through the existing alert routing.
+
+## Current fleet pilot
+
+The account owner (Amir Jakoby, Sawmills) decided to run a pilot before the release
+gates below pass. Its bounds:
+
+- Server: the Sawmills staging account server only.
+- Accounts: the owner's own Claude accounts only. No other person enrolls a real
+  account.
+- Machines: Sawmills fleet machines that the owner connects.
+- End: the pilot ends when the release gates pass, or when the owner stops it.
+
+This exception is not a general release. Everyone else waits for the gates.
 
 ## Validation and remaining release gates
 

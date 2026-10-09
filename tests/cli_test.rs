@@ -80,17 +80,17 @@ fn help_shows_all_subcommands() {
     let mut cmd = Command::cargo_bin("claudectl").unwrap();
     let output = cmd.arg("--help").output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
+    // The local-profile commands are hidden since SAW-12696 C and keep working
+    // (`ux_cli_test::local_profile_commands_are_hidden_but_still_work`).
     for subcommand in [
+        "run",
         "status",
-        "login",
-        "save",
-        "use",
-        "switch",
-        "list",
-        "remove",
-        "whoami",
-        "label",
+        "add",
+        "renew",
+        "rm",
         "rate",
+        "exec",
+        "claude",
         "completions",
     ] {
         assert!(stdout.contains(subcommand), "missing {subcommand}");

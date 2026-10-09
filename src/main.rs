@@ -97,30 +97,37 @@ enum Commands {
         json: bool,
     },
     /// Log into a Claude account via OAuth and save it as a profile
+    #[command(hide = true)]
     Login {
         /// Profile alias to save the login as
         alias: String,
     },
     /// Save the current live Claude Code login as a profile
+    #[command(hide = true)]
     Save {
         /// Custom alias (defaults to email)
         alias: Option<String>,
     },
     /// Switch to a profile by alias (or most available if omitted)
+    #[command(hide = true)]
     Use {
         /// Profile alias to switch to (auto-selects most available if omitted)
         alias: Option<String>,
     },
     /// Interactive fuzzy picker to switch accounts
+    #[command(hide = true)]
     Switch,
     /// List saved profiles
+    #[command(hide = true)]
     List,
     /// Remove a saved profile
+    #[command(hide = true)]
     Remove {
         /// Profile alias to remove
         alias: String,
     },
     /// Show current active account
+    #[command(hide = true)]
     Whoami,
     /// Count responses and rate-limit errors per account in claudectl claude lanes
     Rate {
@@ -135,6 +142,7 @@ enum Commands {
     #[command(hide = true)]
     Statusline,
     /// Set or clear a profile's display label
+    #[command(hide = true)]
     Label {
         /// Profile alias to label
         alias: String,
@@ -184,6 +192,7 @@ enum Commands {
         args: Vec<std::ffi::OsString>,
     },
     /// Write a launcher script pinned to one saved profile and one executable
+    #[command(hide = true)]
     Launcher {
         /// Saved profile the launcher runs on
         #[arg(long)]
