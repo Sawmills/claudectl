@@ -15,8 +15,8 @@ cargo install --git https://github.com/Sawmills/claudectl
 ## Use a company account server
 
 > **Implementation preview.** The account server is not release-approved. Do not
-> enroll real Claude accounts (`claudectl add`, `claudectl server login`) outside the
-> pilot until the remaining checks in
+> enroll real Claude accounts (`claudectl add`, `claudectl server login`) until the
+> remaining checks in
 > [docs/account-server.md](docs/account-server.md#validation-and-remaining-release-gates)
 > pass. The server keeps each account's refresh grant.
 
