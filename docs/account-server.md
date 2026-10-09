@@ -178,7 +178,10 @@ checked build, and prints `claudectl: server token renewed; resuming session <id
 restarts only when all hold: the new token outlives the held one, the last turn ended at
 least 60 s ago with no prompt since (a turn that failed, for example on a revoked token,
 ends with `StopFailure` and counts too), no terminal input for 5 min (the terminal device's
-access time), and fewer than 3 restarts in the last hour. Extra processes in Claude's group
+access time), and fewer than 3 restarts in the last hour. Once the held token is dead (it
+expired, or a turn failed with `authentication_failed`), the 60 s wait and the input gate no
+longer apply and the request runs every 30 s: every turn fails on that token, and a user who
+retries would otherwise hold the restart back for good (SAW-12610, 10-09). Extra processes in Claude's group
 (an LSP, `caffeinate`, a background shell) do not hold a restart back: the held token is
 already superseded or expired, so it is dead for every holder; work still running in
 Claude's group ends with the restart. A turn in progress is never cut; a draft typed earlier

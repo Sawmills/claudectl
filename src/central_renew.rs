@@ -56,6 +56,9 @@ pub(super) enum Event {
     IdlePrompt,
     /// A turn failed with `rate_limit` in this session; it also ended the turn.
     Limited(String),
+    /// A turn failed with `authentication_failed`: the held token is dead; it also ended the
+    /// turn.
+    AuthFailed,
     /// Claude ended the session (/exit, /clear, logout): it is shutting down unless a new
     /// session starts.
     SessionEnd,
@@ -77,7 +80,8 @@ pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
                     Some(session) => Event::Limited(session.to_string()),
                     None => Event::Stop,
                 },
-                // A turn that failed (an API error such as a revoked token) ends with
+                "StopFailure" if v["error"] == "authentication_failed" => Event::AuthFailed,
+                // A turn that failed (another API error) ends with
                 // StopFailure: it ended all the same.
                 "Stop" | "StopFailure" => Event::Stop,
                 "Notification" if v["notification_type"] == "idle_prompt" => Event::IdlePrompt,
@@ -100,6 +104,10 @@ pub(super) struct Idle {
     pub limited: Option<(String, i64)>,
     /// When Claude ended its session with no new session since: Claude is exiting.
     pub ended: Option<i64>,
+    /// When a turn last failed with `authentication_failed`: the held token is dead, so
+    /// nothing the user types can succeed until a restart. A new session in the same process
+    /// (`/clear`, `/resume`) keeps the token, so only a relaunch (a new event log) clears it.
+    pub auth_failed: Option<i64>,
 }
 
 #[cfg(test)]
@@ -132,6 +140,10 @@ pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
             Event::Limited(session) => {
                 idle.since = Some(*at);
                 idle.limited = Some((session.clone(), *at));
+            }
+            Event::AuthFailed => {
+                idle.since = Some(*at);
+                idle.auth_failed = Some(*at);
             }
         }
     }
@@ -224,14 +236,17 @@ pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     if i.idle.ended.is_some() {
         return Err("Claude is ending the session");
     }
+    // With a dead held token every turn fails, so the waits that protect a turn or a draft
+    // only keep the tab dead: a user who retries resets them for good (SAW-12610 10-09).
+    let dead = held_token_dead(i);
     match i.idle.since {
         None => return Err("a turn is running"),
-        Some(since) if i.now - since < i.idle_after_ms => {
+        Some(since) if !dead && i.now - since < i.idle_after_ms => {
             return Err("the last turn ended less than 60 s ago");
         }
         Some(_) => {}
     }
-    if i.tty_idle_ms.is_some_and(|ms| ms < i.tty_gate_ms) {
+    if !dead && i.tty_idle_ms.is_some_and(|ms| ms < i.tty_gate_ms) {
         return Err("terminal input in the last 5 min");
     }
     // Extra processes (an LSP, caffeinate, background shells) do not block: a restart happens
@@ -241,6 +256,12 @@ pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
         return Err("restart budget used up for this hour");
     }
     Ok(())
+}
+
+/// Whether the held token can no longer work: it expired, or a turn failed with
+/// `authentication_failed` (a forced rotation revokes it before expiry).
+pub(super) fn held_token_dead(i: &Inputs) -> bool {
+    i.now >= i.held_expires_at || i.idle.auth_failed.is_some()
 }
 
 /// The error types of a failed turn in Claude Code's StopFailure hook (2.1.295).
@@ -493,6 +514,7 @@ mod tests {
                 since: None,
                 limited: None,
                 ended: None,
+                auth_failed: None,
             }
         );
         let idle = [(1, SessionStart("a".into())), (2, Prompt), (3, Stop)];
@@ -503,6 +525,7 @@ mod tests {
                 since: Some(3),
                 limited: None,
                 ended: None,
+                auth_failed: None,
             }
         );
         // A new session (/clear, /resume) replaces the old one and starts idle.
@@ -518,6 +541,7 @@ mod tests {
                 since: Some(5),
                 limited: None,
                 ended: None,
+                auth_failed: None,
             }
         );
         // idle_prompt keeps the earlier idle start.
@@ -606,6 +630,7 @@ mod tests {
                 since: Some(3),
                 limited: None,
                 ended: None,
+                auth_failed: None,
             }
         );
     }
@@ -617,6 +642,7 @@ mod tests {
             since: Some(10_000_000 - IDLE_AFTER_STOP_MS),
             limited: None,
             ended: None,
+            auth_failed: None,
         };
         assert_eq!(decide(&inputs(&idle)), Decision::Restart);
         // Same revision: the held token is still the live one.
@@ -630,6 +656,7 @@ mod tests {
             since: None,
             limited: None,
             ended: None,
+            auth_failed: None,
         };
         assert!(matches!(decide(&inputs(&busy)), Decision::Wait(_)));
         let recent = Idle {
@@ -637,6 +664,7 @@ mod tests {
             since: Some(10_000_000 - 1_000),
             limited: None,
             ended: None,
+            auth_failed: None,
         };
         assert!(matches!(decide(&inputs(&recent)), Decision::Wait(_)));
         let mut typing = inputs(&idle);
@@ -647,6 +675,7 @@ mod tests {
             since: Some(0),
             limited: None,
             ended: None,
+            auth_failed: None,
         };
         assert!(matches!(decide(&inputs(&nosession)), Decision::Wait(_)));
         let mut budget = inputs(&idle);
@@ -659,12 +688,84 @@ mod tests {
     }
 
     #[test]
+    fn a_dead_held_token_restarts_even_while_the_user_types() {
+        // SAW-12610 10-09 19:12Z: the held token expired while the user typed; every prompt
+        // failed with authentication_failed, and each try reset the 5-min input gate, so the
+        // tab never restarted. A draft typed into a dead token cannot succeed.
+        let idle = Idle {
+            session: Some("s".into()),
+            since: Some(10_000_000 - 1_000),
+            limited: None,
+            ended: None,
+            auth_failed: None,
+        };
+        let mut expired = inputs(&idle);
+        expired.held_expires_at = expired.now - 1;
+        expired.tty_idle_ms = Some(5_000);
+        assert_eq!(decide(&expired), Decision::Restart);
+        // A running turn, an exiting session and the budget still hold.
+        let busy = Idle {
+            session: Some("s".into()),
+            since: None,
+            limited: None,
+            ended: None,
+            auth_failed: None,
+        };
+        let mut running = inputs(&busy);
+        running.held_expires_at = running.now - 1;
+        assert!(matches!(decide(&running), Decision::Wait(_)));
+        let mut budget = expired;
+        budget.restarts_last_hour = RESTARTS_PER_HOUR;
+        assert!(matches!(decide(&budget), Decision::Wait(_)));
+    }
+
+    #[test]
+    fn a_failed_authentication_marks_the_held_token_dead_for_the_process() {
+        // A forced rotation revokes the held token before its expiry: the failed turn says so.
+        let text = [
+            r#"{"at":1,"event":"SessionStart","session_id":"s"}"#,
+            r#"{"at":2,"event":"UserPromptSubmit","session_id":"s"}"#,
+            r#"{"at":3,"event":"StopFailure","session_id":"s","error":"authentication_failed"}"#,
+            r#"{"at":4,"event":"UserPromptSubmit","session_id":"s"}"#,
+            r#"{"at":5,"event":"StopFailure","session_id":"s","error":"authentication_failed"}"#,
+        ]
+        .join("\n");
+        let idle = idle_state(&parse_events(&text));
+        assert_eq!(idle.auth_failed, Some(5));
+        assert_eq!(idle.since, Some(5));
+        let mut typing = inputs(&idle);
+        typing.now = 6;
+        typing.tty_idle_ms = Some(1_000);
+        assert!(held_token_dead(&typing));
+        assert_eq!(decide(&typing), Decision::Restart);
+        // Same revision: the server has no newer token yet, so nothing to follow.
+        typing.server_revision = "r1";
+        assert_eq!(decide(&typing), Decision::Keep);
+        // /clear or /resume starts a session in the same process, on the same dead token.
+        let mut events = parse_events(&text);
+        events.push((7, Event::SessionStart("s2".into())));
+        let cleared = idle_state(&events);
+        assert_eq!(cleared.auth_failed, Some(5));
+        let mut still = inputs(&cleared);
+        still.now = 8;
+        assert!(held_token_dead(&still));
+        // A relaunch on the new token starts a new event log: alive again.
+        let fresh = idle_state(&parse_events(
+            r#"{"at":9,"event":"SessionStart","session_id":"s"}"#,
+        ));
+        let mut alive = inputs(&fresh);
+        alive.now = 10;
+        assert!(!held_token_dead(&alive));
+    }
+
+    #[test]
     fn a_new_revision_without_a_later_expiry_is_not_followed() {
         let idle = Idle {
             session: Some("s".into()),
             since: Some(0),
             limited: None,
             ended: None,
+            auth_failed: None,
         };
         let mut older = inputs(&idle);
         older.server_expires_at = older.held_expires_at;
