@@ -517,8 +517,9 @@ fn check_code(pasted: &str, url: &reqwest::Url) -> Result<String> {
     Ok(pasted.to_string())
 }
 /// The `code#state` from the Claude sign-in page: a visible prompt on a terminal, otherwise
-/// one line from `input`, so `add` also works from a script.
-fn read_code(mut input: impl std::io::BufRead, terminal: bool) -> Result<String> {
+/// one line from `input`, so `add` also works from a script. `command` names the asking
+/// command in the Try line.
+fn read_code(mut input: impl std::io::BufRead, terminal: bool, command: &str) -> Result<String> {
     let prompt = "Paste the code from the Claude sign-in page (code#state)";
     if terminal {
         return Ok(dialoguer::Input::<String>::new()
@@ -529,7 +530,7 @@ fn read_code(mut input: impl std::io::BufRead, terminal: bool) -> Result<String>
     let mut line = String::new();
     if input.read_line(&mut line)? == 0 {
         bail!(
-            "no code on standard input\nTry: echo '<code#state>' | claudectl add <name> --no-browser"
+            "no code on standard input\nTry: echo '<code#state>' | claudectl {command} <name> --no-browser"
         );
     }
     Ok(line.trim_end().to_string())
@@ -567,11 +568,16 @@ pub fn login(client: &Client, alias: &str, renew: bool, no_browser: bool) -> Res
     if !no_browser {
         open::that(&login.authorize_url)?;
     }
+    // The prompt reads the terminal and draws on stderr: both must be the terminal.
     let terminal = {
         use std::io::IsTerminal;
-        std::io::stdin().is_terminal()
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
     };
-    let code = check_code(&read_code(std::io::stdin().lock(), terminal)?, &url)?;
+    let command = if renew { "renew" } else { "add" };
+    let code = check_code(
+        &read_code(std::io::stdin().lock(), terminal, command)?,
+        &url,
+    )?;
     let receipt: Receipt = client
         .post(
             "/v2/anthropic/login/complete",
@@ -1303,10 +1309,17 @@ mod tests {
 
     #[test]
     fn without_a_terminal_the_code_is_one_line_of_input() {
-        let input = std::io::Cursor::new("abc#st-1\nnext line\n");
-        assert_eq!(read_code(input, false).unwrap(), "abc#st-1");
-        let empty = std::io::Cursor::new("");
-        assert!(read_code(empty, false).is_err());
+        let input = std::io::Cursor::new("abc#st-1\r\nnext line\n");
+        assert_eq!(read_code(input, false, "add").unwrap(), "abc#st-1");
+        // The Try line names the command that asked.
+        for command in ["add", "renew"] {
+            let empty = std::io::Cursor::new("");
+            let error = format!("{:#}", read_code(empty, false, command).unwrap_err());
+            assert!(
+                error.contains(&format!("| claudectl {command} <name> --no-browser")),
+                "{error}"
+            );
+        }
     }
 
     fn row(alias: &str, data: serde_json::Value, stale: bool) -> ServerRow {
