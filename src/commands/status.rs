@@ -71,6 +71,11 @@ impl AccountStatus {
 
 pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> Result<()> {
     let paths = config::default_paths()?;
+    // The short names the compact view shows (`amir2`) name accounts here too.
+    let resolved = alias
+        .map(|name| resolve_name(&paths, name, mode == FetchMode::Cached))
+        .transpose()?;
+    let alias = resolved.as_deref();
     // An alias may exist only on the server.
     let (mut local, local_error) = match fetch_usages(alias, mode) {
         Ok(fetched) => (fetched, None),
@@ -376,6 +381,24 @@ pub fn fetch_alias(alias: &str, mode: FetchMode) -> Result<Option<FetchedUsage>>
 
 pub fn fetch_all_usages() -> Result<Vec<FetchedUsage>> {
     fetch_usages(None, FetchMode::Normal)
+}
+
+/// The local or server account `name` names (`claudectl::accounts::resolve`). With no
+/// account known at all, the name stays as typed and the lookup reports it.
+fn resolve_name(paths: &config::Paths, name: &str, cached: bool) -> Result<String> {
+    let mut names: Vec<String> = profile::list_profiles_from(paths)?
+        .into_iter()
+        .map(|p| p.meta.alias)
+        .collect();
+    for alias in claudectl::central::server_aliases(paths, cached) {
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(&alias)) {
+            names.push(alias);
+        }
+    }
+    if names.is_empty() {
+        return Ok(name.to_owned());
+    }
+    Ok(claudectl::accounts::resolve(name, &names)?.to_owned())
 }
 
 fn fetch_usages(alias: Option<&str>, mode: FetchMode) -> Result<Vec<FetchedUsage>> {
@@ -1227,7 +1250,10 @@ fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
         Some(i) if fetched[i].on_server => {
             out.push_str(&format!("Next: claudectl run   (picks {})\n", names[i]));
         }
-        Some(i) => out.push_str(&format!("Next: claudectl use {}\n", fetched[i].alias)),
+        Some(i) => out.push_str(&format!(
+            "Next: claudectl use {}\n",
+            claudectl::shell::arg(&fetched[i].alias)
+        )),
         None => {
             // Room, but not provably free of billing: name one; never pick it silently.
             let unpicked = order.iter().copied().find(|&i| {
@@ -1241,11 +1267,11 @@ fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
             match unpicked {
                 Some(i) if fetched[i].on_server => out.push_str(&format!(
                     "Next: claudectl run {}   (not picked automatically: it may bill)\n",
-                    names[i]
+                    claudectl::shell::arg(&names[i])
                 )),
                 Some(i) => out.push_str(&format!(
                     "Next: claudectl use {}   (not picked automatically: it may bill)\n",
-                    fetched[i].alias
+                    claudectl::shell::arg(&fetched[i].alias)
                 )),
                 None => match fix {
                     Some(command) => out.push_str(&format!("Next: {command}\n")),
@@ -2201,6 +2227,32 @@ mod tests {
         assert_eq!(
             compact(&[&local], now).lines().last().unwrap(),
             "Next: claudectl use work"
+        );
+    }
+
+    #[test]
+    fn compact_next_lines_quote_an_account_name_a_shell_would_run() {
+        let now = 1_500;
+        // Room but extra usage not known off: named, never picked, and quoted.
+        let may_bill = r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":1}}"#;
+        let remote = server("work; touch PWNED", may_bill);
+        assert_eq!(
+            compact(&[&remote], now).lines().last().unwrap(),
+            "Next: claudectl run 'work; touch PWNED'   (not picked automatically: it may bill)"
+        );
+        let local = fetched_json("my work", may_bill, Some("max"));
+        assert_eq!(
+            compact(&[&local], now).lines().last().unwrap(),
+            "Next: claudectl use 'my work'   (not picked automatically: it may bill)"
+        );
+        let free = fetched_json(
+            "my work",
+            r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":1},"extra_usage":{"is_enabled":false}}"#,
+            Some("max"),
+        );
+        assert_eq!(
+            compact(&[&free], now).lines().last().unwrap(),
+            "Next: claudectl use 'my work'"
         );
     }
 

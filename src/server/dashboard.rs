@@ -105,6 +105,7 @@ async fn snapshot(server: &Server, headers: &HeaderMap) -> Result<Option<Snapsho
             five_hour: observed.five,
             seven_day: observed.week,
             fable: observed.fable,
+            model_windows: observed.models,
             observed_at: usage.observed_at.map(|ms| ms / 1000),
             usage_stale: observed.stale,
             billed: observed.billed,
@@ -136,6 +137,8 @@ struct Observed {
     week: Window,
     /// The weekly Fable limit, when the account has one.
     fable: Option<Window>,
+    /// The weekly Opus and Sonnet windows, as the CLI reads them.
+    models: Vec<crate::accounts::Window>,
     /// No usage figure at all, or the server marked it stale.
     stale: bool,
     /// Extra usage is not known to be off (the CLI's rule for server accounts).
@@ -164,6 +167,13 @@ fn windows(usage: &crate::server::engine::Usage) -> Observed {
             used_percent: limit.percent.filter(|n| n.is_finite() && *n >= 0.0),
             resets_at: None,
         });
+    let models = parsed
+        .as_ref()
+        .map(crate::accounts::windows)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|w| matches!(w.name, "Opus" | "Sonnet"))
+        .collect();
     let empty = five.used_percent.is_none() && week.used_percent.is_none();
     let billed = parsed
         .as_ref()
@@ -174,6 +184,7 @@ fn windows(usage: &crate::server::engine::Usage) -> Observed {
         five,
         week,
         fable,
+        models,
         stale: usage.stale || empty,
         billed,
     }
@@ -336,6 +347,7 @@ mod preview {
             five_hour: window(five, 2),
             seven_day: window(week, 142),
             fable: None,
+            model_windows: vec![],
             observed_at: Some(now - 42),
             usage_stale: false,
             billed: false,

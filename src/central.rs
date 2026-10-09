@@ -792,6 +792,26 @@ pub fn pick_account(paths: &Paths) -> Result<String> {
     }
 }
 
+/// The server account names, for name resolution: live, else this machine's saved copies.
+pub fn server_aliases(paths: &Paths, cached: bool) -> Vec<String> {
+    let Some(connection) = cached_connection(paths) else {
+        return vec![];
+    };
+    let saved = || {
+        cached_rows(paths, &connection, &[], &|_| true)
+            .into_iter()
+            .map(|row| row.alias)
+            .collect()
+    };
+    if cached {
+        return saved();
+    }
+    match Client::load(paths).and_then(|client| client.accounts()) {
+        Ok(accounts) => accounts.into_iter().map(|a| a.alias).collect(),
+        Err(_) => saved(),
+    }
+}
+
 pub fn server_view(
     paths: &Paths,
     cached: bool,
@@ -1118,7 +1138,10 @@ pub fn dispatch(command: Command) -> Result<()> {
                     Ok(())
                 }
                 Command::Login { alias, no_browser } => login(&client, &alias, false, no_browser),
-                Command::Renew { alias, no_browser } => login(&client, &alias, true, no_browser),
+                Command::Renew { alias, no_browser } => {
+                    let alias = client.account(&alias)?.alias;
+                    login(&client, &alias, true, no_browser)
+                }
                 Command::Migrate {
                     alias,
                     all,

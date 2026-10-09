@@ -17,6 +17,8 @@ pub(super) struct Account {
     pub seven_day: Window,
     /// The weekly Fable limit, when the account has one.
     pub fable: Option<Window>,
+    /// The weekly Opus and Sonnet windows, when the account has them.
+    pub model_windows: Vec<crate::accounts::Window>,
     /// Unix seconds of the server's last usage observation.
     pub observed_at: Option<i64>,
     pub usage_stale: bool,
@@ -44,6 +46,7 @@ impl Account {
         if let Some(fable) = &self.fable {
             out.push(w("Fable", fable));
         }
+        out.extend(self.model_windows.iter().cloned());
         out
     }
     fn candidate(&self) -> crate::accounts::Candidate {
@@ -196,7 +199,10 @@ fn answer(accounts: &[Account], names: &[String], now: i64) -> String {
         r#"<h1 id="answer-title">Use {name}</h1><p class="next-step">{} of the 5-hour window and {} of the week left{next}.</p>{}{count}"#,
         left(&a.five_hour),
         left(&a.seven_day),
-        command("cmd-run", &format!("claudectl run {}", names[best])),
+        command(
+            "cmd-run",
+            &format!("claudectl run {}", crate::shell::arg(&names[best]))
+        ),
     )
 }
 fn ledger(accounts: &[Account], names: &[String], now: i64) -> String {
@@ -344,6 +350,7 @@ mod tests {
                 resets_at: Some(NOW + 6 * 86400 + 22 * 3600),
             },
             fable: None,
+            model_windows: vec![],
             observed_at: Some(NOW - 30),
             usage_stale: false,
             billed: false,
@@ -409,6 +416,38 @@ mod tests {
         assert!(row("amir3") < row("amir"), "{html}");
         // An unknown reset time adds no text.
         assert!(!html.contains("Reset time unknown"), "{html}");
+    }
+
+    #[test]
+    fn the_copyable_command_quotes_an_account_name_a_shell_would_run() {
+        let html = overview(&snapshot(
+            vec![account("work; touch PWNED", Some(2.0), Some(1.0))],
+            vec![],
+        ));
+        assert!(!html.contains("claudectl run work;"), "{html}");
+        assert!(
+            html.contains(&escape("claudectl run 'work; touch PWNED'")),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn an_opus_or_sonnet_limit_is_a_limit_as_in_the_cli() {
+        let mut opus = account("amir3", Some(0.0), Some(0.0));
+        opus.model_windows.push(crate::accounts::Window {
+            name: "Opus",
+            used: Some(100.0),
+            resets_at: Some(NOW + 3600),
+        });
+        let html = overview(&snapshot(
+            vec![opus, account("amir", Some(55.0), Some(76.0))],
+            vec![],
+        ));
+        assert!(
+            html.contains(r#"<h1 id="answer-title">Use amir</h1>"#),
+            "{html}"
+        );
+        assert!(html.contains("Opus limit"), "{html}");
     }
 
     #[test]
