@@ -131,6 +131,32 @@ fn every_argument_of_the_daily_commands_has_help_and_run_has_an_example() {
 }
 
 #[test]
+fn every_visible_server_command_argument_has_help() {
+    let home = Home::new();
+    let commands = listed(&out(&home.run(&["server", "--help"])));
+    for command in commands.iter().filter(|c| c.as_str() != "help") {
+        let help = out(&home.run(&["server", command, "--help"]));
+        let args: Vec<&str> = help
+            .lines()
+            .skip_while(|l| !(l.starts_with("Arguments:") || l.starts_with("Options:")))
+            .filter(|l| l.starts_with("  ") && !l.contains("--help"))
+            .collect();
+        for line in args {
+            let trimmed = line.trim_start();
+            // "<NAME>  description" or "--flag <V>  description": text after a 2-space gap.
+            let described = trimmed
+                .split("  ")
+                .skip(1)
+                .any(|part| !part.trim().is_empty());
+            assert!(
+                described,
+                "server {command}: no help for {trimmed:?}\n{help}"
+            );
+        }
+    }
+}
+
+#[test]
 fn rm_without_yes_and_without_a_terminal_refuses_with_the_next_command() {
     let home = Home::new();
     let o = home.run(&["rm", "work"]);

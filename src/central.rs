@@ -885,9 +885,12 @@ pub fn statusline(paths: &Paths, id: &str) -> Result<()> {
 pub enum Command {
     /// Enroll this machine with company SSO
     Connect {
+        /// Account server URL (shown on the server's home page)
         server: String,
+        /// Name for this machine, as it shows in `claudectl server devices`
         #[arg(long)]
         name: String,
+        /// Print the sign-in link instead of opening a browser
         #[arg(long)]
         no_browser: bool,
     },
@@ -899,14 +902,18 @@ pub enum Command {
     },
     /// Sign in directly on the server; refresh credentials never reach this client
     Login {
+        /// Name for the new account
         alias: String,
+        /// Print the sign-in link instead of opening a browser
         #[arg(long)]
         no_browser: bool,
     },
     /// Complete a browser login, or retry verification of its retained result
     #[command(hide = true)]
     CompleteLogin {
+        /// Login ID that `server login` printed
         id: String,
+        /// Retry the verification of a sign-in the server already kept
         #[arg(long)]
         resume: bool,
     },
@@ -916,27 +923,35 @@ pub enum Command {
     RefreshAccess { alias: String },
     /// Repair an existing server grant through identity-pinned sign-in
     Renew {
+        /// Account to repair: full name, email name, or a unique prefix
         alias: String,
+        /// Print the sign-in link instead of opening a browser
         #[arg(long)]
         no_browser: bool,
     },
     /// Run the tested Claude build with access-only credentials
     Run {
+        /// Account to use: full name, email name, or a unique prefix
         alias: String,
+        /// Claude executable to run (default: `claude` on PATH)
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
+        /// Arguments for Claude, after `--`
         #[arg(last = true)]
         args: Vec<std::ffi::OsString>,
     },
     /// Qualify a Claude build: run the synthetic renewal handoff check, record it only on a pass
     #[command(hide = true)]
     Qualify {
+        /// Claude executable to check (default: `claude` on PATH)
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
     },
     /// Read subscription usage; --cached works entirely offline
     Status {
+        /// Account to show: full name, email name, or a unique prefix
         alias: String,
+        /// Use the saved usage only; no network
         #[arg(long)]
         cached: bool,
         /// Print the raw JSON instead of a table
@@ -952,6 +967,7 @@ pub enum Command {
     /// Transfer a profile, or every saved account with --all, after stopping every previous
     /// grant holder
     Migrate {
+        /// Saved profile to move to the server
         #[arg(required_unless_present_any = ["all", "abort"], conflicts_with_all = ["all", "abort"])]
         alias: Option<String>,
         /// Every saved account: inactive ones first, the live login last
@@ -972,9 +988,15 @@ pub enum Command {
         json: bool,
     },
     /// Stop a machine from acquiring further access tokens
-    Revoke { machine_id: String },
+    Revoke {
+        /// Machine ID from `claudectl server devices`
+        machine_id: String,
+    },
     /// Delete a server account and its refresh grant; tokens already issued expire on their own
-    Remove { alias: String },
+    Remove {
+        /// Account to remove: full name, email name, or a unique prefix
+        alias: String,
+    },
     /// Remove this machine's local connection; does not revoke it on the server
     Disconnect,
 }
