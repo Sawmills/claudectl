@@ -644,10 +644,14 @@ impl Monitor {
             }
             // Ask the server only while idle: after expiry the request refreshes the grant,
             // and a turn that starts meanwhile would get the old, dead token.
-            if renew::idle_gate(&self.inputs(&mut activity, &timing, None)).is_err() {
+            let before = self.inputs(&mut activity, &timing, None);
+            if renew::idle_gate(&before).is_err() {
                 continue;
             }
-            let interval = if self.held_expires_at - now() < 3_600_000 {
+            // A dead held token: the tab is useless until the new token shows, so ask often.
+            let interval = if renew::held_token_dead(&before) {
+                timing.retry_ms
+            } else if self.held_expires_at - now() < 3_600_000 {
                 timing.poll_near_ms
             } else {
                 timing.poll_far_ms
