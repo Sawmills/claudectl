@@ -19,7 +19,9 @@ pub struct Event<'a> {
     /// The revoked machine, for a machine revoke.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<&'a str>,
-    /// Why a refresh ran: forced, expired, migration or margin.
+    /// Why a refresh ran (`forced`, `expired`, `migration`, `margin`), or why a sign-in was
+    /// refused (`sso_denied`, `company_identity_required`, `user_not_allowed`,
+    /// `user_unavailable`, `persistence_failed`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
     /// Who acted in the browser dashboard (`dashboard:<email>`); machine requests have none.
