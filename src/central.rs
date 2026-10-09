@@ -642,21 +642,9 @@ pub fn status(paths: &Paths, alias: &str, cached: bool, json: bool) -> Result<()
         .and_then(|data| serde_json::from_value(data).ok());
     let mut table = table(&["Window", "Used", "Resets"]);
     if let Some(windows) = &windows {
-        for (name, window) in [
-            ("5h", &windows.five_hour),
-            ("week", &windows.seven_day),
-            ("week Opus", &windows.seven_day_opus),
-            ("week Sonnet", &windows.seven_day_sonnet),
-        ] {
-            if let Some(window) = window {
-                table.add_row(vec![
-                    name.to_string(),
-                    window
-                        .utilization
-                        .map_or("-".into(), |used| format!("{used:.0}%")),
-                    window.resets_at.clone().unwrap_or_else(|| "-".into()),
-                ]);
-            }
+        // Every window the compact status shows (Fable included), with human reset times.
+        for row in crate::accounts::detail_rows(windows, now() / 1000) {
+            table.add_row(row.to_vec());
         }
     }
     println!("{alias} (account server)");

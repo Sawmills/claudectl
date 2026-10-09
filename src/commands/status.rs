@@ -1060,22 +1060,6 @@ fn with_label(mut row: Vec<Cell>, account: &AccountStatus, show_label: bool) -> 
     row
 }
 
-/// `5h in 12h 52m`-style time from now to `at`.
-fn until(at: i64, now: i64) -> String {
-    let secs = at.saturating_sub(now);
-    if secs <= 0 {
-        return "now".into();
-    }
-    let (d, h, m) = (secs / 86_400, secs % 86_400 / 3_600, secs % 3_600 / 60);
-    if d > 0 {
-        format!("in {d}d {h}h")
-    } else if h > 0 {
-        format!("in {h}h {m}m")
-    } else {
-        format!("in {}m", m.max(1))
-    }
-}
-
 /// An account as the shared picker (`claudectl::accounts`) sees it. A local profile is
 /// never billed only when it is `rate_limited`; a server account only when extra usage is
 /// known off.
@@ -1126,7 +1110,7 @@ fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
             .iter()
             .find(|w| w.name == name)
             .and_then(|w| w.resets_at)
-            .map(|at| format!("{name} {}", until(at, now)))
+            .map(|at| format!("{name} {}", claudectl::accounts::until(at, now)))
     };
     // Usable accounts first (best first), then low, limits, and unknown.
     let rank = |i: usize| {

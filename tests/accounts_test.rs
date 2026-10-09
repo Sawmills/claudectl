@@ -137,3 +137,37 @@ fn windows_come_from_a_usage_response_including_fable() {
     assert_eq!(names, ["5h", "week", "Fable"]);
     assert_eq!(windows[2].used, Some(100.0));
 }
+
+#[test]
+fn reset_times_read_as_time_from_now_and_a_local_clock_time() {
+    let now = 1_000_000;
+    assert_eq!(accounts::until(now + 7 * 3_600 + 52 * 60, now), "in 7h 52m");
+    assert_eq!(
+        accounts::until(now + 2 * 86_400 + 4 * 3_600, now),
+        "in 2d 4h"
+    );
+    assert_eq!(accounts::until(now + 30, now), "in 1m");
+    assert_eq!(accounts::until(now - 5, now), "now");
+}
+
+#[test]
+fn detail_rows_show_every_window_with_a_human_reset() {
+    let usage: claudectl::api::UsageResponse = serde_json::from_value(serde_json::json!({
+        "five_hour": {"utilization": 3.0, "resets_at": "1970-01-12T15:46:40Z"},
+        "seven_day": {"utilization": 1.0},
+        "limits": [{"kind": "weekly_scoped", "percent": 16.0,
+            "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}]
+    }))
+    .unwrap();
+    let rows = accounts::detail_rows(&usage, 1_000_000);
+    assert_eq!(rows[0][0], "5h");
+    assert_eq!(rows[0][1], "3%");
+    // No raw RFC 3339 timestamp: time from now, then the clock time.
+    assert!(rows[0][2].starts_with("in "), "{rows:?}");
+    assert!(
+        !rows[0][2].contains("+00:00") && !rows[0][2].contains(":00Z"),
+        "{rows:?}"
+    );
+    assert_eq!(rows[1][2], "-");
+    assert_eq!(rows[2], ["Fable", "16%", "-"]);
+}

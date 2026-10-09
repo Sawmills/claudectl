@@ -41,6 +41,50 @@ pub fn windows(usage: &crate::api::UsageResponse) -> Vec<Window> {
     out
 }
 
+/// `in 7h 52m`-style time from `now` to `at`.
+pub fn until(at: i64, now: i64) -> String {
+    let secs = at.saturating_sub(now);
+    if secs <= 0 {
+        return "now".into();
+    }
+    let (d, h, m) = (secs / 86_400, secs % 86_400 / 3_600, secs % 3_600 / 60);
+    if d > 0 {
+        format!("in {d}d {h}h")
+    } else if h > 0 {
+        format!("in {h}h {m}m")
+    } else {
+        format!("in {}m", m.max(1))
+    }
+}
+
+/// One row per window for a detail view: name, percent used, and the reset as time from
+/// now plus the local clock time (`in 7h 52m (Fri 08:10)`), never a raw timestamp.
+pub fn detail_rows(usage: &crate::api::UsageResponse, now: i64) -> Vec<[String; 3]> {
+    windows(usage)
+        .into_iter()
+        .map(|w| {
+            let reset = w.resets_at.map_or_else(
+                || "-".to_string(),
+                |at| {
+                    let clock = chrono::DateTime::from_timestamp(at, 0)
+                        .map(|t| {
+                            t.with_timezone(&chrono::Local)
+                                .format("%a %H:%M")
+                                .to_string()
+                        })
+                        .unwrap_or_default();
+                    format!("{} ({clock})", until(at, now))
+                },
+            );
+            [
+                w.name.to_string(),
+                w.used.map_or_else(|| "-".into(), |p| format!("{p:.0}%")),
+                reset,
+            ]
+        })
+        .collect()
+}
+
 /// Above this a window is low.
 pub const LOW: f64 = 80.0;
 
