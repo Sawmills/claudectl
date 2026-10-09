@@ -1196,7 +1196,7 @@ fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
         if f.error.is_none() && !c.fresh && !matches!(state, State::Unknown) {
             text.push_str(" (old data)");
         }
-        if c.billed && !f.on_server && f.error.is_none() {
+        if c.billed && f.error.is_none() && matches!(state, State::Ready | State::Low { .. }) {
             text.push_str(" (may bill)");
         }
         if f.is_active {
@@ -2254,6 +2254,15 @@ mod tests {
             compact(&[&free], now).lines().last().unwrap(),
             "Next: claudectl use 'my work'"
         );
+    }
+
+    #[test]
+    fn compact_marks_every_account_that_may_bill() {
+        let may_bill = r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":1}}"#;
+        let remote = server("amir3@sawmills.ai", may_bill);
+        let text = compact(&[&remote], 1_500);
+        let row = text.lines().find(|l| l.contains("amir3")).unwrap();
+        assert!(row.contains("ready (may bill)"), "{text}");
     }
 
     #[test]

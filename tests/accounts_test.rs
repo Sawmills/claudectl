@@ -171,3 +171,27 @@ fn detail_rows_show_every_window_with_a_human_reset() {
     assert_eq!(rows[1][2], "-");
     assert_eq!(rows[2], ["Fable", "16%", "-"]);
 }
+
+#[test]
+fn a_missing_5h_or_week_figure_makes_the_whole_account_unknown() {
+    let none = |name| Window {
+        name,
+        used: None,
+        resets_at: None,
+    };
+    // Only model windows (a partial response): never ready, never picked.
+    let partial = vec![none("5h"), none("week"), w("Fable", 1.0, None)];
+    assert_eq!(accounts::state(&partial), State::Unknown);
+    let no_week = vec![w("5h", 1.0, Some(100)), none("week")];
+    assert_eq!(accounts::state(&no_week), State::Unknown);
+    // A full window still wins: a known limit is not unknown.
+    let limited = vec![w("5h", 100.0, Some(100)), none("week")];
+    assert!(matches!(accounts::state(&limited), State::Limit { .. }));
+    let candidates = [Candidate {
+        name: "partial".into(),
+        windows: partial,
+        fresh: true,
+        billed: false,
+    }];
+    assert_eq!(accounts::best(&candidates), None);
+}

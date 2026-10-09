@@ -1280,6 +1280,23 @@ mod tests {
         assert!(!candidate(&failed).fresh);
     }
     #[test]
+    fn a_partial_usage_response_is_never_picked() {
+        let partial = serde_json::json!({"limits": [{"kind": "weekly_scoped", "percent": 1,
+            "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}],
+            "extra_usage": {"is_enabled": false}});
+        let full = serde_json::json!({"five_hour": {"utilization": 50.0},
+            "seven_day": {"utilization": 50.0}, "extra_usage": {"is_enabled": false}});
+        let candidates = [
+            candidate(&row("partial", partial, false)),
+            candidate(&row("full", full, false)),
+        ];
+        assert_eq!(crate::accounts::best(&candidates), Some(1));
+        assert_eq!(
+            crate::accounts::state(&candidates[0].windows),
+            crate::accounts::State::Unknown
+        );
+    }
+    #[test]
     fn a_grant_that_expired_in_transit_is_refused() {
         // An observing read returns a grant valid at the server's read time; one that
         // crossed expiry on the way is dead and goes to the retry path.

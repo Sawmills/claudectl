@@ -139,7 +139,7 @@ struct Observed {
     fable: Option<Window>,
     /// The weekly Opus and Sonnet windows, as the CLI reads them.
     models: Vec<crate::accounts::Window>,
-    /// No usage figure at all, or the server marked it stale.
+    /// No 5h or week figure, or the server marked it stale.
     stale: bool,
     /// Extra usage is not known to be off (the CLI's rule for server accounts).
     billed: bool,
@@ -174,7 +174,8 @@ fn windows(usage: &crate::server::engine::Usage) -> Observed {
         .into_iter()
         .filter(|w| matches!(w.name, "Opus" | "Sonnet"))
         .collect();
-    let empty = five.used_percent.is_none() && week.used_percent.is_none();
+    // The same rule as `accounts::state`: without both figures the account is not fresh.
+    let empty = five.used_percent.is_none() || week.used_percent.is_none();
     let billed = parsed
         .as_ref()
         .and_then(|u| u.extra_usage.as_ref())
@@ -247,6 +248,19 @@ pub(super) fn routes(router: Router<Arc<Server>>) -> Router<Arc<Server>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_response_without_a_5h_or_week_figure_is_stale() {
+        let usage = |data| crate::server::engine::Usage {
+            data: Some(data),
+            ..Default::default()
+        };
+        let partial = serde_json::json!({"seven_day": {"utilization": 1.0}});
+        assert!(windows(&usage(partial)).stale);
+        let full = serde_json::json!({"five_hour": {"utilization": 1.0},
+            "seven_day": {"utilization": 1.0}});
+        assert!(!windows(&usage(full)).stale);
+    }
+
     #[tokio::test]
     async fn the_landing_badge_follows_readiness_and_goes_down_during_drain() {
         let root = tempfile::tempdir().unwrap();
@@ -305,7 +319,8 @@ mod tests {
                 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}]
         })));
         assert_eq!(o.five.used_percent, Some(12.0));
-        assert!(!o.stale);
+        // No week figure: partial usage is stale, as `accounts::state` reads it.
+        assert!(o.stale);
         assert_eq!(o.fable.as_ref().and_then(|w| w.used_percent), Some(100.0));
         assert!(!o.billed, "extra usage known off");
         // Missing extra-usage data is not proof: billed.

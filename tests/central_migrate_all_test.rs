@@ -535,7 +535,7 @@ fn status_is_one_table_of_local_and_server_accounts() {
     assert!(!text.contains("Cannot read saved login"), "{text}");
     assert_eq!(
         text.lines()
-            .filter(|l| l.split_whitespace().any(|w| w == "a1"))
+            .filter(|l| !l.starts_with("Next:") && l.split_whitespace().any(|w| w == "a1"))
             .count(),
         1,
         "a migrated alias shows once:\n{text}"

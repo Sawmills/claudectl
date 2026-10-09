@@ -69,11 +69,14 @@ impl Account {
         if self.usage_stale {
             return ("warn", "Stale usage".into());
         }
-        match crate::accounts::state(&self.windows()) {
-            State::Ready => ("ok", "Available".into()),
-            State::Low { window } => ("warn", format!("Low ({window})")),
-            State::Limit { window, .. } => ("bad", format!("{window} limit")),
-            State::Unknown => ("warn", "No usage data".into()),
+        match (crate::accounts::state(&self.windows()), self.billed) {
+            (State::Ready, false) => ("ok", "Available".into()),
+            (State::Low { window }, false) => ("warn", format!("Low ({window})")),
+            // Room, but never the account to use: the billing reason is visible.
+            (State::Ready, true) => ("warn", "Available, may bill".into()),
+            (State::Low { window }, true) => ("warn", format!("Low ({window}), may bill")),
+            (State::Limit { window, .. }, _) => ("bad", format!("{window} limit")),
+            (State::Unknown, _) => ("warn", "No usage data".into()),
         }
     }
     fn has_room(&self) -> bool {
@@ -172,13 +175,41 @@ fn answer(accounts: &[Account], names: &[String], now: i64) -> String {
             )
         );
     }
-    let room = accounts.iter().filter(|a| a.has_room()).count();
+    // Room counts only accounts safe to recommend; room that may bill is counted apart.
+    let room = accounts
+        .iter()
+        .filter(|a| a.has_room() && !a.billed)
+        .count();
+    let billed_room = accounts.iter().filter(|a| a.has_room() && a.billed).count();
+    let more = match billed_room {
+        0 => String::new(),
+        n => format!(" ({n} more may bill)"),
+    };
     let count = format!(
-        r#"<p class="context">{room} of {} accounts have room. Usage as the server last observed it; this page refreshes every 60 seconds.</p>"#,
+        r#"<p class="context">{room} of {} accounts have room{more}. Usage as the server last observed it; this page refreshes every 60 seconds.</p>"#,
         accounts.len()
     );
     let candidates: Vec<_> = accounts.iter().map(Account::candidate).collect();
     let Some(best) = crate::accounts::best(&candidates) else {
+        // As the CLI Next line: name one account that may bill, never pick it.
+        let may_bill: Vec<_> = candidates
+            .iter()
+            .map(|c| crate::accounts::Candidate {
+                fresh: c.fresh && c.billed,
+                billed: false,
+                ..c.clone()
+            })
+            .collect();
+        if let Some(i) = crate::accounts::best(&may_bill) {
+            return format!(
+                r#"<h1 id="answer-title">No account without billing has room</h1>{count}<p class="next-step">{} has room but may use extra usage billing, so it is never picked automatically.</p>{}"#,
+                escape(&names[i]),
+                command(
+                    "cmd-run",
+                    &format!("claudectl run {}", crate::shell::arg(&names[i]))
+                ),
+            );
+        }
         return format!(
             r#"<h1 id="answer-title">No account has room now</h1>{count}<p class="next-step">The table below shows when each limit resets.</p>"#
         );
@@ -474,6 +505,32 @@ mod tests {
         );
         // Without any Fable limit there is no Fable column.
         assert!(!html.contains("Fable window"), "{html}");
+    }
+
+    #[test]
+    fn a_billed_account_shows_may_bill_and_is_not_counted_as_room() {
+        let mut billed = account("roomy", Some(0.0), Some(0.0));
+        billed.billed = true;
+        let html = overview(&snapshot(vec![billed], vec![]));
+        assert!(html.contains("Available, may bill"), "{html}");
+        assert!(!html.contains(r#"<span class="state ok">"#), "{html}");
+        assert!(html.contains("0 of 1 accounts have room"), "{html}");
+        assert!(html.contains("1 more may bill"), "{html}");
+        // The hero names it the way the CLI Next line does, and never as the pick.
+        assert!(
+            html.contains(r#"<h1 id="answer-title">No account without billing has room</h1>"#),
+            "{html}"
+        );
+        assert!(html.contains("claudectl run roomy"), "{html}");
+        assert!(!html.contains("Use roomy"), "{html}");
+    }
+
+    #[test]
+    fn a_missing_week_figure_is_no_usage_data_as_in_the_cli() {
+        let html = overview(&snapshot(vec![account("half", Some(1.0), None)], vec![]));
+        assert!(html.contains("No usage data"), "{html}");
+        assert!(html.contains("0 of 1 accounts have room"), "{html}");
+        assert!(!html.contains("Use half"), "{html}");
     }
 
     #[test]

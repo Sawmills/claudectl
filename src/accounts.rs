@@ -100,21 +100,25 @@ pub enum State {
         window: &'static str,
         resets_at: Option<i64>,
     },
-    /// No usage figure at all.
+    /// No figure for the 5h or the week window: partial usage is never a basis to pick.
     Unknown,
 }
 
-/// The state of an account from its windows. A full window (Fable included) is a limit.
+/// The state of an account from its windows. A full window (Fable included) is a limit;
+/// otherwise a missing 5h or week figure makes the whole account unknown.
 pub fn state(windows: &[Window]) -> State {
     let known: Vec<_> = windows.iter().filter(|w| w.used.is_some()).collect();
-    if known.is_empty() {
-        return State::Unknown;
-    }
     if let Some(full) = known.iter().find(|w| w.used >= Some(100.0)) {
         return State::Limit {
             window: full.name,
             resets_at: full.resets_at,
         };
+    }
+    if ["5h", "week"]
+        .iter()
+        .any(|name| !known.iter().any(|w| w.name == *name))
+    {
+        return State::Unknown;
     }
     match known.iter().find(|w| w.used > Some(LOW)) {
         Some(low) => State::Low { window: low.name },
