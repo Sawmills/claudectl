@@ -18,6 +18,9 @@ mod qualify;
 mod renew;
 #[path = "central_session.rs"]
 pub mod session;
+#[cfg(unix)]
+#[path = "central_shim.rs"]
+pub mod shim;
 pub use migration::{
     ensure_local, ensure_local_grant, ensure_login_unfenced, ensure_removable, is_fenced,
     is_migrated, migrate,
@@ -925,6 +928,11 @@ pub enum Command {
 }
 pub fn dispatch(command: Command) -> Result<()> {
     let paths = crate::config::default_paths()?;
+    // Before any connection is loaded: a shim passed as Claude would run itself.
+    #[cfg(unix)]
+    if let Command::Run { claude, .. } | Command::Qualify { claude } = &command {
+        shim::refuse_shim_program(claude)?;
+    }
     match command {
         Command::Connect {
             server,
