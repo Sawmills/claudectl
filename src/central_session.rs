@@ -26,7 +26,7 @@ fn write_hook_settings(dir: &Path, hook: &Path) -> Result<PathBuf> {
     atomic(
         &settings,
         &json!({"hooks": {"SessionStart": entry, "UserPromptSubmit": entry,
-            "Stop": entry, "StopFailure": entry, "Notification": entry}}),
+            "Stop": entry, "StopFailure": entry, "Notification": entry, "SessionEnd": entry}}),
     )?;
     Ok(settings)
 }
@@ -694,7 +694,11 @@ impl Monitor {
                 }
             }
         }
-        outcome.restart = sent.map(|(_, restart)| restart);
+        // Claude may have ended its session just before our SIGTERM (a /exit while the
+        // request ran): that exit is the user's, never a renewal (CX-0119).
+        let ended_first = self.read_events(&mut activity).is_ok()
+            && matches!((&sent, activity.idle.ended), (Some((at, _)), Some(end)) if end <= *at);
+        outcome.restart = sent.filter(|_| !ended_first).map(|(_, restart)| restart);
         outcome.notice = pending.notice.take();
         outcome
     }
@@ -711,8 +715,10 @@ impl Monitor {
         if atomic(&self.directory.join("session.json"), &status).is_err() {
             return Err(());
         }
-        // SIGTERM the leader; teardown of the rest of the group follows its exit.
-        if unsafe { libc::kill(self.pid as i32, libc::SIGTERM) } != 0 {
+        // SIGTERM the leader; teardown of the rest of the group follows its exit. A leader
+        // that already exited (not yet reaped, so kill would still succeed) left on its own.
+        if exec::has_exited(self.pid) || unsafe { libc::kill(self.pid as i32, libc::SIGTERM) } != 0
+        {
             let mut status = self.status.clone();
             status["renewal"] = "on".into();
             let _ = atomic(&self.directory.join("session.json"), &status);
@@ -1033,6 +1039,7 @@ mod tests {
             "Stop",
             "StopFailure",
             "Notification",
+            "SessionEnd",
         ] {
             assert!(settings["hooks"][event].is_array(), "{event}: {settings}");
         }

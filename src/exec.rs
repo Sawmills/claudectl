@@ -1230,6 +1230,23 @@ fn descendants_in_group(_leader: u32) -> std::io::Result<Vec<i32>> {
     Ok(Vec::new())
 }
 
+/// Whether the child `pid` already exited, without reaping it. A zombie still accepts
+/// signals, so this tells an exit apart from a delivered signal.
+#[cfg(unix)]
+pub(crate) fn has_exited(pid: u32) -> bool {
+    // SAFETY: waitid writes only into `info`; WNOWAIT leaves the child reapable.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        ) == 0
+            && info.si_pid() != 0
+    }
+}
+
 /// Wait until the child exits, without reaping it. For an interactive child,
 /// a stop (Ctrl-Z) also suspends claudectl, as its shell job.
 #[cfg(unix)]
@@ -2281,4 +2298,27 @@ pub fn parse_duration(input: &str) -> Result<Duration, String> {
         }
     };
     Ok(Duration::from_secs(seconds))
+}
+
+#[cfg(all(test, unix))]
+mod exit_tests {
+    #[test]
+    fn an_exited_child_is_told_apart_from_a_running_one_without_reaping_it() {
+        let mut done = std::process::Command::new("true").spawn().unwrap();
+        super::wait_exit_no_reap(done.id(), false).unwrap();
+        // Exited but not reaped: kill would still succeed, has_exited says so.
+        assert!(super::has_exited(done.id()));
+        assert!(
+            super::has_exited(done.id()),
+            "the check must not reap the child"
+        );
+        done.wait().unwrap();
+        let mut running = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        assert!(!super::has_exited(running.id()));
+        running.kill().unwrap();
+        running.wait().unwrap();
+    }
 }
