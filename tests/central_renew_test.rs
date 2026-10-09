@@ -131,6 +131,16 @@ if os.environ.get("FAKE_EXTRA_CHILD") and token == "token-1":
     # took its baseline, and never leaves.
     time.sleep(0.5)
     subprocess.Popen(["sleep", "60"])
+if os.environ.get("FAKE_CLEAN_EXIT") and token == "token-1":
+    # The user typed /exit: Claude ends the session (SessionEnd hook), shuts down for a
+    # while, and exits 0. Only then does the server refresh (ready below).
+    time.sleep(0.5)
+    subprocess.run(["/bin/sh", "-c", command], check=True, input=json.dumps(
+        {"hook_event_name": "SessionEnd", "session_id": "sess-1", "reason": "prompt_input_exit"}).encode())
+    with open(os.environ["FAKE_LOG"] + ".ready", "w") as ready:
+        ready.write("exiting")
+    time.sleep(2)
+    sys.exit(0)
 with open(os.environ["FAKE_LOG"] + ".ready", "w") as ready:
     ready.write("idle")
 # A watchdog: a build that never restarts fails the test instead of hanging it.
@@ -502,4 +512,28 @@ fn an_idle_claude_with_extra_processes_follows_an_early_refresh() {
     let runs = env.runs();
     assert_eq!(runs.len(), 2, "{runs:?}");
     assert_eq!(runs[1]["token"], "token-2");
+}
+
+/// A clean /exit ends `server run`, even when a new token revision arrives while Claude
+/// shuts down: only claudectl's own renewal stop may resume (SAW-12610, CX-0119).
+#[test]
+fn a_clean_exit_ends_server_run_without_a_resume() {
+    let env = Env::new();
+    let refresher = env.refresh_when_idle();
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+    env.env(&mut command);
+    command
+        .env("FAKE_CLEAN_EXIT", "1")
+        .args(["server", "run", "work", "--claude"])
+        .arg(&env.claude)
+        .args(["--", "--model", "opus"]);
+    let output = Command::from_std(command)
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    refresher.join().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(!stderr.contains("resuming session"), "{stderr}");
+    assert_eq!(env.runs().len(), 1, "{:?}", env.runs());
 }

@@ -56,6 +56,9 @@ pub(super) enum Event {
     IdlePrompt,
     /// A turn failed with `rate_limit` in this session; it also ended the turn.
     Limited(String),
+    /// Claude ended the session (/exit, /clear, logout): it is shutting down unless a new
+    /// session starts.
+    SessionEnd,
 }
 
 /// One event per line: `{"at": <ms>, "event": "<hook event>", "session_id": "..",
@@ -78,6 +81,7 @@ pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
                 // StopFailure: it ended all the same.
                 "Stop" | "StopFailure" => Event::Stop,
                 "Notification" if v["notification_type"] == "idle_prompt" => Event::IdlePrompt,
+                "SessionEnd" => Event::SessionEnd,
                 _ => return None,
             };
             Some((at, event))
@@ -94,6 +98,8 @@ pub(super) struct Idle {
     /// The session and time of the latest turn that failed with `rate_limit`, until the
     /// next prompt or session.
     pub limited: Option<(String, i64)>,
+    /// When Claude ended its session with no new session since: Claude is exiting.
+    pub ended: Option<i64>,
 }
 
 #[cfg(test)]
@@ -111,7 +117,9 @@ pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
                 idle.session = Some(session.clone());
                 idle.since = Some(*at);
                 idle.limited = None;
+                idle.ended = None;
             }
+            Event::SessionEnd => idle.ended = Some(*at),
             Event::Prompt => {
                 idle.since = None;
                 idle.limited = None;
@@ -211,6 +219,10 @@ pub(super) fn decide(i: &Inputs) -> Decision {
 pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     if i.idle.session.is_none() {
         return Err("no session id from Claude yet");
+    }
+    // A clean exit (/exit) ends `server run`; it is never turned into a resume (CX-0119).
+    if i.idle.ended.is_some() {
+        return Err("Claude is ending the session");
     }
     match i.idle.since {
         None => return Err("a turn is running"),
@@ -349,6 +361,29 @@ pub(super) fn record_hook(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_ended_session_is_never_restarted_until_a_new_one_starts() {
+        // /exit fires SessionEnd, then Claude shuts down: never a restart (CX-0119).
+        let text = [
+            r#"{"at":1,"event":"SessionStart","session_id":"s"}"#,
+            r#"{"at":2,"event":"Stop","session_id":"s"}"#,
+            r#"{"at":3,"event":"SessionEnd","session_id":"s","reason":"prompt_input_exit"}"#,
+        ]
+        .join("\n");
+        let ended = idle_state(&parse_events(&text));
+        assert_eq!(ended.ended, Some(3));
+        let mut i = inputs(&ended);
+        i.now = 10_000_000;
+        assert!(matches!(decide(&i), Decision::Wait(_)));
+        // /clear ends the session and starts a new one: that one may follow a new token.
+        let cleared = [
+            (1, Event::SessionStart("s".into())),
+            (3, Event::SessionEnd),
+            (4, Event::SessionStart("t".into())),
+        ];
+        assert_eq!(idle_state(&cleared).ended, None);
+    }
+
     use super::*;
 
     #[test]
@@ -457,6 +492,7 @@ mod tests {
                 session: Some("a".into()),
                 since: None,
                 limited: None,
+                ended: None,
             }
         );
         let idle = [(1, SessionStart("a".into())), (2, Prompt), (3, Stop)];
@@ -466,6 +502,7 @@ mod tests {
                 session: Some("a".into()),
                 since: Some(3),
                 limited: None,
+                ended: None,
             }
         );
         // A new session (/clear, /resume) replaces the old one and starts idle.
@@ -480,6 +517,7 @@ mod tests {
                 session: Some("b".into()),
                 since: Some(5),
                 limited: None,
+                ended: None,
             }
         );
         // idle_prompt keeps the earlier idle start.
@@ -567,6 +605,7 @@ mod tests {
                 session: Some("s".into()),
                 since: Some(3),
                 limited: None,
+                ended: None,
             }
         );
     }
@@ -577,6 +616,7 @@ mod tests {
             session: Some("s".into()),
             since: Some(10_000_000 - IDLE_AFTER_STOP_MS),
             limited: None,
+            ended: None,
         };
         assert_eq!(decide(&inputs(&idle)), Decision::Restart);
         // Same revision: the held token is still the live one.
@@ -589,12 +629,14 @@ mod tests {
             session: Some("s".into()),
             since: None,
             limited: None,
+            ended: None,
         };
         assert!(matches!(decide(&inputs(&busy)), Decision::Wait(_)));
         let recent = Idle {
             session: Some("s".into()),
             since: Some(10_000_000 - 1_000),
             limited: None,
+            ended: None,
         };
         assert!(matches!(decide(&inputs(&recent)), Decision::Wait(_)));
         let mut typing = inputs(&idle);
@@ -604,6 +646,7 @@ mod tests {
             session: None,
             since: Some(0),
             limited: None,
+            ended: None,
         };
         assert!(matches!(decide(&inputs(&nosession)), Decision::Wait(_)));
         let mut budget = inputs(&idle);
@@ -621,6 +664,7 @@ mod tests {
             session: Some("s".into()),
             since: Some(0),
             limited: None,
+            ended: None,
         };
         let mut older = inputs(&idle);
         older.server_expires_at = older.held_expires_at;
