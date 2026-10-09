@@ -303,8 +303,9 @@ claudectl-server audit --key-file /keys/vault-key
   provider answered (`dashboard_sign_in`, `enroll_sign_in`) also write one line, with the
   person as `actor` (`dashboard:<email>` or `enrollment:<email>`) and, for a refused
   sign-in, the bounded `reason` (`sso_denied`, `company_identity_required`,
-  `user_not_allowed`, `user_unavailable`). A bad or expired sign-in state, another browser's
-  callback, or an unreachable provider is not audited (metric and log only). An audit write
+  `user_not_allowed`, `user_unavailable`, or `persistence_failed` when the user row could not
+  be written). A bad or expired sign-in state, another browser's callback, or a provider
+  that cannot be reached (`sso_unavailable`) is not audited (metric and log only). An audit write
   failure fails the operation.
 - **Metrics.** `/metrics` (scrape token or machine token) exports
   `claudectl_server_failed_requests_total{reason}` and

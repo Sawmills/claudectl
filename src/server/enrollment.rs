@@ -742,7 +742,12 @@ async fn identify(
         .set_pkce_verifier(PkceCodeVerifier::new(verifier))
         .request_async(&sso.http)
         .await
-        .map_err(|_| denied())?;
+        // Only a provider's own error answer is a refusal; a transport or parse failure is
+        // an outage (not audited as a refused sign-in).
+        .map_err(|error| match error {
+            openidconnect::RequestTokenError::ServerResponse(_) => denied(),
+            _ => server.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"),
+        })?;
     // The verifier checks signature, issuer, audience, expiry, and nonce.
     let verifier = client.id_token_verifier();
     let id = tokens.extra_fields().id_token().ok_or_else(denied)?;
@@ -797,12 +802,21 @@ async fn dashboard_callback(
         "dashboard",
     )
     .await?;
-    if !server
-        .store()
-        .record_user(&user, &email)
-        .await
-        .map_err(|_| server.unavailable())?
-    {
+    let recorded = server.store().record_user(&user, &email).await;
+    let Ok(recorded) = recorded else {
+        // The provider answered: the sign-in is audited even when the user row could not
+        // be written (that audit may fail too, on the same store).
+        audit_sign_in(
+            server,
+            "dashboard_sign_in",
+            "dashboard",
+            Some(&email),
+            Some("persistence_failed"),
+        )
+        .await?;
+        return Err(server.unavailable());
+    };
+    if !recorded {
         audit_sign_in(
             server,
             "dashboard_sign_in",

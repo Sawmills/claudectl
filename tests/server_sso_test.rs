@@ -79,6 +79,8 @@ struct Issuer {
     rogue: Arc<CoreRsaPrivateSigningKey>,
     /// The ID token the next token request returns.
     next: Arc<Mutex<Option<String>>>,
+    /// Discovery names a token endpoint nobody listens on: the provider is unreachable.
+    dead_token: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Issuer {
     /// Sign the next ID token for the pending login with `nonce`.
@@ -122,6 +124,7 @@ async fn issuer() -> (Issuer, tokio::task::JoinHandle<()>) {
         key: Arc::new(key()),
         rogue: Arc::new(key()),
         next: Arc::default(),
+        dead_token: Arc::default(),
     };
     let app = Router::new()
         .route(
@@ -130,7 +133,11 @@ async fn issuer() -> (Issuer, tokio::task::JoinHandle<()>) {
                 Json(json!({
                     "issuer": i.origin,
                     "authorization_endpoint": format!("{}/auth", i.origin),
-                    "token_endpoint": format!("{}/token", i.origin),
+                    "token_endpoint": if i.dead_token.load(std::sync::atomic::Ordering::SeqCst) {
+                        "http://127.0.0.1:9/token".to_string()
+                    } else {
+                        format!("{}/token", i.origin)
+                    },
                     "jwks_uri": format!("{}/jwks", i.origin),
                     "response_types_supported": ["code"],
                     "subject_types_supported": ["public"],
@@ -1190,4 +1197,33 @@ async fn every_answered_google_sign_in_is_audited() {
             assert!(!text.contains(secret), "{text}");
         }
     }
+}
+
+/// A provider that cannot be reached is an outage, not a refusal: no sign-in audit line.
+#[tokio::test]
+async fn an_unreachable_token_endpoint_is_not_an_audited_refusal() {
+    let f = Fixture::new().await;
+    f.issuer
+        .dead_token
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let dashboard = f
+        .dashboard_callback(Token::new("amir@sawmills.ai", Some("sawmills.ai")), None)
+        .await;
+    assert_eq!(dashboard.status().as_u16(), 503);
+    let (status, body) = f
+        .callback(Token::new("amir@sawmills.ai", Some("sawmills.ai")))
+        .await;
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("sso_unavailable"), "{body}");
+    let lines: Vec<Value> = f
+        .audit_lines()
+        .await
+        .into_iter()
+        .filter(|l| {
+            l["operation"]
+                .as_str()
+                .is_some_and(|o| o.ends_with("_sign_in"))
+        })
+        .collect();
+    assert!(lines.is_empty(), "{lines:?}");
 }
