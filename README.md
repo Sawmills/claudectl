@@ -29,7 +29,7 @@ echo '<code#state>' | claudectl add amir8 --no-browser   # add from a script
   turn hits a usage limit. It resumes the same conversation and never picks an
   account that may bill extra usage. A named run stays on its account unless you
   add `--failover`; `--no-failover` turns it off.
-- `claudectl add` and `claudectl renew` show the pasted code. Without a terminal
+- `claudectl add` and `claudectl renew` show the code as you paste it. Without a terminal
   they read it from standard input (the last line of the example above).
 - `claudectl status --details` shows token expiry and fetch diagnostics, and
   `claudectl status --json` prints a machine-readable report (see below).
