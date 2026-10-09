@@ -441,3 +441,40 @@ fn execute_permission_is_checked_for_this_user_not_any_class() {
     assert!(shim::install(&spec, &f.dir).is_err());
     assert!(shim::find_real(Some(&f.real), std::ffi::OsStr::new("")).is_err());
 }
+
+#[test]
+fn direct_branches_inside_a_session_drop_the_session_token() {
+    let f = Fixture::new();
+    std::fs::write(
+        &f.real,
+        "#!/bin/sh\necho \"real token=${CLAUDE_CODE_OAUTH_TOKEN-unset} marker=${CLAUDECTL_SERVER_RUN-unset}\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &f.claudectl,
+        "#!/bin/sh\necho \"routed token=${CLAUDE_CODE_OAUTH_TOKEN-unset} marker=${CLAUDECTL_SERVER_RUN-unset}\"\n",
+    )
+    .unwrap();
+    shim::install(&f.spec("amir3"), &f.dir).unwrap();
+    let session = [
+        ("CLAUDE_CODE_OAUTH_TOKEN", "session-token"),
+        ("CLAUDECTL_SERVER_RUN", "/sessions/run-x"),
+    ];
+    // Direct branches never carry the session's token to the real Claude.
+    for args in [&["--version"][..], &["doctor"][..]] {
+        assert_eq!(f.run(args, &session), ["real token=unset marker=unset"]);
+    }
+    let mut off = session.to_vec();
+    off.push(("CLAUDECTL_SHIM", "off"));
+    assert_eq!(f.run(&["-p", "x"], &off), ["real token=unset marker=unset"]);
+    // The routed path keeps both, so server run's preflight can check provenance.
+    assert_eq!(
+        f.run(&["-p", "x"], &session),
+        ["routed token=session-token marker=/sessions/run-x"]
+    );
+    // Outside a session, a token the user set for the real Claude stays.
+    assert_eq!(
+        f.run(&["--version"], &[("CLAUDE_CODE_OAUTH_TOKEN", "mine")]),
+        ["real token=mine marker=unset"]
+    );
+}

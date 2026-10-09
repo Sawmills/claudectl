@@ -124,10 +124,12 @@ claudectl shim status
   the marker names a session under `~/.claudectl/server/sessions`, that session still
   holds its lease, and the digest matches. Any other inherited credential is refused, so
   a hand-set marker cannot pass a hand-set token. The shim passes the environment
-  through unchanged.
+  through unchanged on that path. Its direct branches (`CLAUDECTL_SHIM=off` and the
+  token-free first arguments) drop the session's token and marker when the marker is
+  set, so a direct Claude never runs on the server account.
 - Install refuses an account that is not on the server, a real Claude that is a shim,
   and an existing `claude` file in the directory that it did not write. `claudectl shim
-  uninstall` removes only its own file.
+uninstall` removes only its own file.
 
 ## Session behavior
 
