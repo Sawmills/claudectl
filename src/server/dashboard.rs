@@ -97,15 +97,17 @@ async fn snapshot(server: &Server, headers: &HeaderMap) -> Result<Option<Snapsho
             }
             None => Default::default(),
         };
-        let (five_hour, seven_day, usage_stale) = windows(&usage);
+        let observed = windows(&usage);
         accounts.push(Account {
             alias: account.alias,
             available: account.available,
             migration: account.migration.into(),
-            five_hour,
-            seven_day,
+            five_hour: observed.five,
+            seven_day: observed.week,
+            fable: observed.fable,
             observed_at: usage.observed_at.map(|ms| ms / 1000),
-            usage_stale,
+            usage_stale: observed.stale,
+            billed: observed.billed,
         });
     }
     let machines = server
@@ -128,9 +130,21 @@ async fn snapshot(server: &Server, headers: &HeaderMap) -> Result<Option<Snapsho
     }))
 }
 
-/// The 5-hour and 7-day windows of a stored observation, and whether it is stale. An
-/// observation without any usage figure is stale, never fresh.
-fn windows(usage: &crate::server::engine::Usage) -> (Window, Window, bool) {
+/// What the dashboard shows of a stored observation.
+struct Observed {
+    five: Window,
+    week: Window,
+    /// The weekly Fable limit, when the account has one.
+    fable: Option<Window>,
+    /// No usage figure at all, or the server marked it stale.
+    stale: bool,
+    /// Extra usage is not known to be off (the CLI's rule for server accounts).
+    billed: bool,
+}
+
+/// The windows of a stored observation. An observation without any usage figure is
+/// stale, never fresh.
+fn windows(usage: &crate::server::engine::Usage) -> Observed {
     let parsed = usage
         .data
         .as_ref()
@@ -143,8 +157,26 @@ fn windows(usage: &crate::server::engine::Usage) -> (Window, Window, bool) {
     };
     let five = window(parsed.as_ref().and_then(|u| u.five_hour.as_ref()));
     let week = window(parsed.as_ref().and_then(|u| u.seven_day.as_ref()));
+    let fable = parsed
+        .as_ref()
+        .and_then(crate::api::UsageResponse::fable_weekly)
+        .map(|limit| Window {
+            used_percent: limit.percent.filter(|n| n.is_finite() && *n >= 0.0),
+            resets_at: None,
+        });
     let empty = five.used_percent.is_none() && week.used_percent.is_none();
-    (five, week, usage.stale || empty)
+    let billed = parsed
+        .as_ref()
+        .and_then(|u| u.extra_usage.as_ref())
+        .and_then(|e| e.is_enabled)
+        != Some(false);
+    Observed {
+        five,
+        week,
+        fable,
+        stale: usage.stale || empty,
+        billed,
+    }
 }
 
 fn document(content: &str, refresh: bool) -> Response {
@@ -251,15 +283,25 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({"five_hour": null, "seven_day": {"utilization": null}}),
         ] {
-            let (five, week, stale) = windows(&usage(data));
-            assert!(five.used_percent.is_none() && week.used_percent.is_none());
-            assert!(stale, "no usage figure must not read as fresh");
+            let o = windows(&usage(data));
+            assert!(o.five.used_percent.is_none() && o.week.used_percent.is_none());
+            assert!(o.stale, "no usage figure must not read as fresh");
         }
-        let (five, _, stale) = windows(&usage(serde_json::json!({
-            "five_hour": {"utilization": 12.0, "resets_at": "2099-01-01T00:00:00Z"}
+        let o = windows(&usage(serde_json::json!({
+            "five_hour": {"utilization": 12.0, "resets_at": "2099-01-01T00:00:00Z"},
+            "extra_usage": {"is_enabled": false},
+            "limits": [{"kind": "weekly_scoped", "percent": 100.0,
+                "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}]
         })));
-        assert_eq!(five.used_percent, Some(12.0));
-        assert!(!stale);
+        assert_eq!(o.five.used_percent, Some(12.0));
+        assert!(!o.stale);
+        assert_eq!(o.fable.as_ref().and_then(|w| w.used_percent), Some(100.0));
+        assert!(!o.billed, "extra usage known off");
+        // Missing extra-usage data is not proof: billed.
+        let missing = windows(&usage(
+            serde_json::json!({"five_hour": {"utilization": 1.0}}),
+        ));
+        assert!(missing.billed);
     }
 }
 
@@ -293,8 +335,10 @@ mod preview {
             migration: migration.into(),
             five_hour: window(five, 2),
             seven_day: window(week, 142),
+            fable: None,
             observed_at: Some(now - 42),
             usage_stale: false,
+            billed: false,
         };
         let mut pending = account("amir4", 0.0, 0.0, "pending");
         pending.five_hour.used_percent = None;

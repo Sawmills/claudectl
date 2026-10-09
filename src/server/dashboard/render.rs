@@ -15,9 +15,13 @@ pub(super) struct Account {
     pub migration: String,
     pub five_hour: Window,
     pub seven_day: Window,
+    /// The weekly Fable limit, when the account has one.
+    pub fable: Option<Window>,
     /// Unix seconds of the server's last usage observation.
     pub observed_at: Option<i64>,
     pub usage_stale: bool,
+    /// Extra usage is not known to be off: never the account to use.
+    pub billed: bool,
 }
 pub(super) struct Window {
     pub used_percent: Option<f64>,
@@ -29,33 +33,59 @@ pub(super) struct Machine {
 }
 
 impl Account {
-    fn used(&self) -> impl Iterator<Item = f64> + '_ {
-        [self.five_hour.used_percent, self.seven_day.used_percent]
-            .into_iter()
-            .flatten()
+    /// The windows as the shared account model sees them (`crate::accounts`).
+    fn windows(&self) -> Vec<crate::accounts::Window> {
+        let w = |name, w: &Window| crate::accounts::Window {
+            name,
+            used: w.used_percent,
+            resets_at: w.resets_at,
+        };
+        let mut out = vec![w("5h", &self.five_hour), w("week", &self.seven_day)];
+        if let Some(fable) = &self.fable {
+            out.push(w("Fable", fable));
+        }
+        out
     }
-    fn state(&self) -> (&'static str, &'static str) {
-        if !self.available {
-            ("bad", "Login needs attention")
-        } else if self.migration == "pending" {
-            ("pending", "Migration pending")
-        } else if self.usage_stale {
-            ("warn", "Stale usage")
-        } else if self.used().any(|n| n >= 100.0) {
-            ("bad", "Exhausted")
-        } else if self.used().any(|n| n > 80.0) {
-            ("warn", "Nearly exhausted")
-        } else {
-            ("ok", "Available")
+    fn candidate(&self) -> crate::accounts::Candidate {
+        crate::accounts::Candidate {
+            name: self.alias.clone(),
+            windows: self.windows(),
+            fresh: self.available && !self.usage_stale && self.migration != "pending",
+            billed: self.billed,
         }
     }
+    /// The same states the CLI shows (`crate::accounts::state`), as (CSS class, label).
+    fn state(&self) -> (&'static str, String) {
+        use crate::accounts::State;
+        if !self.available {
+            return ("bad", "Login needs attention".into());
+        }
+        if self.migration == "pending" {
+            return ("pending", "Migration pending".into());
+        }
+        if self.usage_stale {
+            return ("warn", "Stale usage".into());
+        }
+        match crate::accounts::state(&self.windows()) {
+            State::Ready => ("ok", "Available".into()),
+            State::Low { window } => ("warn", format!("Low ({window})")),
+            State::Limit { window, .. } => ("bad", format!("{window} limit")),
+            State::Unknown => ("warn", "No usage data".into()),
+        }
+    }
+    fn has_room(&self) -> bool {
+        self.candidate().fresh
+            && matches!(
+                crate::accounts::state(&self.windows()),
+                crate::accounts::State::Ready | crate::accounts::State::Low { .. }
+            )
+    }
+    /// A migration note only when it asks for something.
     fn migration(&self) -> &'static str {
         match self.migration.as_str() {
-            "not_migrated" => "Signed in on the server",
             "pending" => "Migration pending",
             "unrotated" => "Migrated · old copies still valid",
-            "rotated" => "Migrated",
-            _ => "Migration state unknown",
+            _ => "",
         }
     }
 }
@@ -63,7 +93,7 @@ impl Account {
 fn command(id: &str, text: &str) -> String {
     let text = escape(text);
     format!(
-        r#"<div class="command"><pre tabindex="0"><code id="{id}" translate="no">{text}</code></pre><button class="button primary copy" type="button" data-copy="{id}" aria-label="Copy {text}">Copy</button></div><p class="command-note">POSIX shell syntax.</p>"#
+        r#"<div class="command"><pre tabindex="0"><code id="{id}" translate="no">{text}</code></pre><button class="button primary copy" type="button" data-copy="{id}" aria-label="Copy {text}">Copy</button></div>"#
     )
 }
 fn date(at: i64) -> String {
@@ -129,7 +159,7 @@ fn window(w: &Window, label: &str, now: i64) -> String {
         r#"<span class="cell-label" aria-hidden="true">{label}</span><div class="usage {severity} {unknown}"><div class="usage-top"><span class="usage-value">{value}</span><span class="usage-reset">{time}</span></div>{meter}</div>"#
     )
 }
-fn answer(accounts: &[Account]) -> String {
+fn answer(accounts: &[Account], names: &[String], now: i64) -> String {
     if accounts.is_empty() {
         return format!(
             r#"<h1 id="answer-title">No server accounts yet</h1><p>Move the Claude accounts saved on a connected machine to this server. Run it on a machine you connected with this Google account.</p>{}<p class="hint">Machines an operator registered on the server host belong to a separate server user, so their accounts do not show here.</p>"#,
@@ -139,48 +169,89 @@ fn answer(accounts: &[Account]) -> String {
             )
         );
     }
-    let ready = accounts
-        .iter()
-        .filter(|a| matches!(a.state().1, "Available" | "Nearly exhausted"))
-        .count();
-    format!(
-        r#"<h1 id="answer-title">{ready} of {} accounts available</h1><p class="context">Usage as the server last observed it. This page refreshes every 60 seconds.</p>"#,
+    let room = accounts.iter().filter(|a| a.has_room()).count();
+    let count = format!(
+        r#"<p class="context">{room} of {} accounts have room. Usage as the server last observed it; this page refreshes every 60 seconds.</p>"#,
         accounts.len()
+    );
+    let candidates: Vec<_> = accounts.iter().map(Account::candidate).collect();
+    let Some(best) = crate::accounts::best(&candidates) else {
+        return format!(
+            r#"<h1 id="answer-title">No account has room now</h1>{count}<p class="next-step">The table below shows when each limit resets.</p>"#
+        );
+    };
+    let a = &accounts[best];
+    let name = escape(&names[best]);
+    let left = |w: &Window| {
+        w.used_percent
+            .map(|n| format!("{:.0}%", (100.0 - n).clamp(0.0, 100.0)))
+            .unwrap_or_else(|| "unknown".into())
+    };
+    let next = a
+        .five_hour
+        .resets_at
+        .map(|at| format!(", 5h resets {}", crate::accounts::until(at, now)))
+        .unwrap_or_default();
+    format!(
+        r#"<h1 id="answer-title">Use {name}</h1><p class="next-step">{} of the 5-hour window and {} of the week left{next}.</p>{}{count}"#,
+        left(&a.five_hour),
+        left(&a.seven_day),
+        command("cmd-run", &format!("claudectl run {}", names[best])),
     )
 }
-fn ledger(accounts: &[Account], now: i64) -> String {
+fn ledger(accounts: &[Account], names: &[String], now: i64) -> String {
     if accounts.is_empty() {
         return String::new();
     }
-    let mut sorted: Vec<_> = accounts.iter().collect();
-    sorted.sort_by_key(|a| {
-        (
-            match a.state().1 {
-                "Available" => 0,
-                "Nearly exhausted" => 1,
-                "Exhausted" => 2,
-                "Stale usage" => 3,
-                "Migration pending" => 4,
-                _ => 5,
-            },
-            a.alias.as_str(),
-        )
+    let show_fable = accounts.iter().any(|a| a.fable.is_some());
+    let mut order: Vec<usize> = (0..accounts.len()).collect();
+    // Accounts with room first, then low, limits, and the rest; then by name.
+    order.sort_by_key(|&i| {
+        let a = &accounts[i];
+        let rank = match (a.has_room(), a.state().0) {
+            (true, "ok") => 0,
+            (true, _) => 1,
+            (false, "bad") => 3,
+            _ => 2,
+        };
+        (rank, names[i].clone())
     });
     let mut rows = String::new();
-    for a in sorted {
+    for i in order {
+        let a = &accounts[i];
         let (class, state) = a.state();
+        let fable = if show_fable {
+            let cell = a
+                .fable
+                .as_ref()
+                .map(|w| window(w, "Fable", now))
+                .unwrap_or_default();
+            format!(r#"<td role="cell" class="cell-usage">{cell}</td>"#)
+        } else {
+            String::new()
+        };
+        let note = a.migration();
+        let note = if note.is_empty() {
+            String::new()
+        } else {
+            format!(r#"<span class="note">{note}</span>"#)
+        };
         rows += &format!(
-            r#"<tr role="row" class="{}"><td role="cell" class="cell-account"><div class="account-name"><strong translate="no">{}</strong><span class="note">{}</span></div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-state"><div class="status"><span class="state {class}">{state}</span><span class="status-detail">{}</span></div></td></tr>"#,
+            r#"<tr role="row" class="{}"><td role="cell" class="cell-account"><div class="account-name"><strong translate="no">{}</strong>{note}</div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td>{fable}<td role="cell" class="cell-state"><div class="status"><span class="state {class}">{state}</span><span class="status-detail">{}</span></div></td></tr>"#,
             if a.usage_stale { "stale" } else { "" },
-            escape(&a.alias),
-            a.migration(),
+            escape(&names[i]),
             window(&a.five_hour, "5-hour", now),
             window(&a.seven_day, "7-day", now),
             observed(a, now)
         );
     }
+    let fable_head = if show_fable {
+        r#"<th scope="col" class="col-usage">Fable window</th>"#
+    } else {
+        ""
+    };
     format!(
-        r#"<section class="section" aria-labelledby="accounts-title"><div class="section-head"><h2 id="accounts-title">Accounts <span class="count">{}</span></h2><p>Refreshes every 60 seconds</p></div><table class="ledger" role="table" aria-labelledby="accounts-title"><thead role="rowgroup"><tr role="row"><th scope="col">Account</th><th scope="col" class="col-usage">5-hour window</th><th scope="col" class="col-usage">7-day window</th><th scope="col" class="col-state">State</th></tr></thead><tbody role="rowgroup">{rows}</tbody></table></section>"#,
+        r#"<section class="section" aria-labelledby="accounts-title"><div class="section-head"><h2 id="accounts-title">Accounts <span class="count">{}</span></h2></div><table class="ledger" role="table" aria-labelledby="accounts-title"><thead role="rowgroup"><tr role="row"><th scope="col">Account</th><th scope="col" class="col-usage">5-hour window</th><th scope="col" class="col-usage">7-day window</th>{fable_head}<th scope="col" class="col-state">State</th></tr></thead><tbody role="rowgroup">{rows}</tbody></table></section>"#,
         accounts.len()
     )
 }
@@ -227,12 +298,20 @@ fn machines(snapshot: &Snapshot) -> String {
 }
 
 pub(super) fn overview(snapshot: &Snapshot) -> String {
+    // The same short names as the CLI: the domain goes when all accounts share it.
+    let names = crate::accounts::short_names(
+        &snapshot
+            .accounts
+            .iter()
+            .map(|a| a.alias.as_str())
+            .collect::<Vec<_>>(),
+    );
     format!(
         include_str!("accounts.html"),
         email = escape(&snapshot.email),
         has_accounts = !snapshot.accounts.is_empty(),
-        answer = answer(&snapshot.accounts),
-        ledger = ledger(&snapshot.accounts, snapshot.server_time),
+        answer = answer(&snapshot.accounts, &names, snapshot.server_time),
+        ledger = ledger(&snapshot.accounts, &names, snapshot.server_time),
         machines = machines(snapshot)
     )
 }
@@ -256,8 +335,10 @@ mod tests {
                 used_percent: week,
                 resets_at: Some(NOW + 6 * 86400 + 22 * 3600),
             },
+            fable: None,
             observed_at: Some(NOW - 30),
             usage_stale: false,
+            billed: false,
         }
     }
     fn snapshot(accounts: Vec<Account>, machines: Vec<Machine>) -> Snapshot {
@@ -270,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn accounts_show_bars_reset_times_and_migration_state() {
+    fn accounts_show_bars_reset_times_and_actionable_migration_state() {
         let mut pending = account("amir3", None, None);
         pending.migration = "pending".into();
         pending.observed_at = None;
@@ -279,11 +360,7 @@ mod tests {
             vec![account("amir5", Some(93.0), Some(40.0)), pending],
             vec![],
         ));
-        assert!(html.contains("1 of 2 accounts available"), "{html}");
-        assert!(
-            !overview(&snapshot(vec![account("x", Some(100.0), None)], vec![]))
-                .contains("1 of 1 accounts available")
-        );
+        assert!(html.contains("1 of 2 accounts have room"), "{html}");
         assert!(
             html.contains(
                 r#"<progress class="meter warn" aria-hidden="true" max="100" value="7">"#
@@ -291,11 +368,73 @@ mod tests {
         );
         assert!(html.contains("Resets in 2h 5m"));
         assert!(html.contains("Resets in 6d 22h"));
-        assert!(html.contains("Nearly exhausted"));
+        assert!(html.contains("Low (5h)"), "{html}");
         assert!(html.contains("Migration pending"));
-        assert!(html.contains("Migrated</span>"));
+        // A finished migration is history, not status: no subtitle.
+        assert!(!html.contains(">Migrated<"), "{html}");
         assert!(html.contains("Updated 30 s ago"));
         assert!(html.contains("No usage data yet"));
+    }
+
+    #[test]
+    fn the_hero_names_the_best_account_with_a_copyable_run_command() {
+        let html = overview(&snapshot(
+            vec![
+                account("amir@sawmills.ai", Some(55.0), Some(76.0)),
+                account("amir3@sawmills.ai", Some(2.0), Some(1.0)),
+            ],
+            vec![],
+        ));
+        assert!(
+            html.contains(r#"<h1 id="answer-title">Use amir3</h1>"#),
+            "{html}"
+        );
+        assert!(html.contains("claudectl run amir3"), "{html}");
+        assert!(html.contains("2 of 2 accounts have room"), "{html}");
+        // Short names: the shared domain is dropped everywhere on the page.
+        assert!(!html.contains("amir3@sawmills.ai"), "{html}");
+    }
+
+    #[test]
+    fn a_fable_limit_is_a_limit_and_billed_accounts_are_never_the_hero() {
+        let mut fable = account("amir4", Some(0.0), Some(98.0));
+        fable.fable = Some(Window {
+            used_percent: Some(100.0),
+            resets_at: None,
+        });
+        let html = overview(&snapshot(vec![fable], vec![]));
+        assert!(html.contains("Fable limit"), "{html}");
+        assert!(html.contains("0 of 1 accounts have room"), "{html}");
+        assert!(html.contains("No account has room now"), "{html}");
+        assert!(html.contains("Fable window"), "a Fable column: {html}");
+        let mut billed = account("roomy", Some(0.0), Some(0.0));
+        billed.billed = true;
+        let html = overview(&snapshot(
+            vec![billed, account("busy", Some(50.0), Some(50.0))],
+            vec![],
+        ));
+        assert!(
+            html.contains(r#"<h1 id="answer-title">Use busy</h1>"#),
+            "{html}"
+        );
+        // Without any Fable limit there is no Fable column.
+        assert!(!html.contains("Fable window"), "{html}");
+    }
+
+    #[test]
+    fn notes_are_not_repeated() {
+        let mut unrotated = account("a", Some(1.0), Some(1.0));
+        unrotated.migration = "unrotated".into();
+        let html = overview(&snapshot(vec![unrotated], vec![]));
+        assert!(html.contains("old copies still valid"), "{html}");
+        assert!(!html.contains("POSIX shell syntax."), "{html}");
+        assert!(
+            html.to_lowercase()
+                .matches("refreshes every 60 seconds")
+                .count()
+                <= 1,
+            "{html}"
+        );
     }
 
     #[test]
