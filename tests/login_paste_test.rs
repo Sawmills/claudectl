@@ -116,3 +116,27 @@ fn a_wrong_paste_fails_here_and_sends_nothing() {
         assert!(env.completions.lock().unwrap().is_empty(), "{paste:?}");
     }
 }
+
+#[test]
+fn every_login_command_reads_the_code_and_names_no_other_command() {
+    for args in [
+        &["add", "work", "--no-browser"][..],
+        &["server", "login", "work", "--no-browser"],
+    ] {
+        let env = Env::new();
+        let output = Command::cargo_bin("claudectl")
+            .unwrap()
+            .env_clear()
+            .env("HOME", env.home.path())
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .args(args)
+            .write_stdin("")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?}: {stderr}");
+        assert!(stderr.contains("<the same command>"), "{args:?}: {stderr}");
+        assert!(!stderr.contains("claudectl add"), "{args:?}: {stderr}");
+    }
+}
