@@ -3,7 +3,8 @@
 Run Claude Code on the company's shared Claude accounts. claudectl picks the account
 with the most room, moves a session to another account at a usage limit, and shows
 every account's usage in the terminal and in a browser dashboard. It also manages
-local Claude Code profiles. Sibling of [codexctl](https://github.com/Sawmills/codexctl).
+local Claude Code profiles. The account server is an implementation preview (see
+below). Sibling of [codexctl](https://github.com/Sawmills/codexctl).
 
 ## Install
 
@@ -12,6 +13,12 @@ cargo install --git https://github.com/Sawmills/claudectl
 ```
 
 ## Use a company account server
+
+> **Implementation preview.** The account server is not release-approved. Do not
+> enroll real Claude accounts (`claudectl add`, `claudectl server login`) outside the
+> pilot until the remaining checks in
+> [docs/account-server.md](docs/account-server.md#validation-and-remaining-release-gates)
+> pass. The server keeps each account's refresh grant.
 
 The account server holds the Claude accounts. A connected machine gets short-lived
 access tokens only, never a refresh token.
@@ -37,7 +44,9 @@ echo '<code#state>' | claudectl add amir8 --no-browser   # add from a script
 - The server's dashboard (its URL, signed in with Google) shows the same accounts and
   lets you add, renew, or remove an account and revoke a machine.
 
-When a command fails, its last line starts with `Try:` and names the next command.
+Most failures name the next command on a last line that starts with `Try:`. Setup
+failures, such as a `~/.claudectl` directory that cannot be created, print only the
+error.
 See the [commands, migration contract, and pilot gates](docs/account-server.md).
 
 ## Local profiles (without a server)
