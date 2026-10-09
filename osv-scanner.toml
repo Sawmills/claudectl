@@ -1,6 +1,8 @@
 # GHSA-4grx-2x9w-596c is RUSTSEC-2023-0071 (CVE-2023-49092). The GHSA record ends at rsa 0.9.6,
 # but its RustSec alias (updated 2026-09-14) marks every rsa version affected with no fixed
-# release; osv-scanner merges the aliases and reports the GHSA ID, so rsa 0.9.10 matches.
+# release, so rsa 0.9.10 matches. osv-scanner 1.3.6 (pinned in .trunk/trunk.yaml) reports the
+# finding as RUSTSEC-2023-0071, and Trunk displays its GHSA alias. IgnoredVulns matches IDs
+# exactly, so both IDs are listed below.
 #
 # At production runtime, rsa comes only from openidconnect (the `server` feature), which uses
 # it to verify SSO ID-token signatures with the provider's public keys. The Marvin attack needs
@@ -11,3 +13,9 @@
 id = "GHSA-4grx-2x9w-596c"
 ignoreUntil = 2027-01-09
 reason = "RUSTSEC-2023-0071, all rsa versions, no fix; runtime use is public-key signature verification only (openidconnect); tests sign with throwaway keys"
+
+# The ID osv-scanner 1.3.6 reports for this finding (see above).
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+ignoreUntil = 2027-01-09
+reason = "Same advisory as GHSA-4grx-2x9w-596c above; runtime use is public-key signature verification only (openidconnect); tests sign with throwaway keys"
