@@ -112,7 +112,9 @@ pub(super) fn live_sessions(paths: &Paths, own: &Path) -> HashMap<String, usize>
 
 /// The account to move to: a fresh, never-billed account in the Ready state (not Low, not
 /// at a limit), not the current or an already tried one, not a recent failover target, and
-/// not one that would then hold more than half of the live sessions.
+/// not one that would then hold more than half of the live sessions. The cap is best-effort:
+/// failovers take the records lock (`reserve`), but a plain `claudectl run` starts without it
+/// and never applies the cap, so a run that starts meanwhile is not counted.
 pub(super) fn choose(
     rows: &[ServerRow],
     current: &str,
@@ -158,12 +160,14 @@ pub(super) fn choose(
 /// The prompt a moved session resumes with, so the failed turn continues.
 pub(super) const RECOVERY_PROMPT: &str = "Continue the previous request.";
 
-/// Claude Code flags (2.1.295) that take exactly one value. Flags with many values or an
-/// optional value are left out on purpose: after them, an argument may be a prompt.
+/// Claude Code flags (2.1.295 `--help` and the CLI reference) that take exactly one value.
+/// Flags with many values or an optional value are left out on purpose: after them, an
+/// argument may be a prompt.
 const VALUE_FLAGS: &[&str] = &[
     "--agent",
     "--agents",
     "--append-system-prompt",
+    "--append-system-prompt-file",
     "--autocompact",
     "--debug-file",
     "--effort",
@@ -182,6 +186,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--plugin-url",
     "--remote-control-session-name-prefix",
     "--system-prompt",
+    "--system-prompt-file",
     "--system-prompt-snapshot",
 ];
 
@@ -473,6 +478,14 @@ mod tests {
             resumed(&["--effort=high", "--resume", "old"]),
             os(&["--effort=high", "--resume", "S", RECOVERY_PROMPT])
         );
+        // One-value flags the CLI reference documents but `--help` does not list.
+        for flag in ["--system-prompt-file", "--append-system-prompt-file"] {
+            assert_eq!(
+                resumed(&[flag, "prompt.txt"]),
+                os(&[flag, "prompt.txt", "--resume", "S", RECOVERY_PROMPT]),
+                "{flag}"
+            );
+        }
         // An argument that can be a prompt (or a value of a many-value flag): the arguments
         // stay as they are and no second prompt is added.
         for args in [

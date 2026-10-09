@@ -26,6 +26,8 @@ struct Fake {
     spare_full: bool,
     /// `work` keeps room: the failed turn was a short throttle.
     throttle: bool,
+    /// An observing token read of `work` returns a newer token (a renewal follows).
+    renew_work: bool,
     /// Every usage read: (account id, cached).
     usage_reads: Vec<(String, String)>,
 }
@@ -70,19 +72,25 @@ async fn usage(
 
 async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Value> {
     let id = body["account_id"].as_str().unwrap_or_default().to_string();
+    let renewed = id == WORK && body["observe"] == true && shared.lock().unwrap().renew_work;
     let (name, org) = if id == WORK {
         shared.lock().unwrap().work_used = true;
         ("work", "org-work")
     } else {
         ("spare", "org-spare")
     };
+    let (token, revision, hours) = if renewed {
+        (format!("token-{name}-2"), format!("revision-{name}-2"), 9)
+    } else {
+        (format!("token-{name}"), format!("revision-{name}"), 8)
+    };
     Json(json!({
         "provider": "anthropic", "account_id": id, "user_id": "person",
         "identity": identity(org),
-        "access_token": format!("token-{name}"),
-        "expires_at": chrono::Utc::now().timestamp_millis() + 8 * 3_600_000,
+        "access_token": token,
+        "expires_at": chrono::Utc::now().timestamp_millis() + hours * 3_600_000,
         "scopes": ["user:inference", "user:profile"],
-        "revision": format!("revision-{name}"),
+        "revision": revision,
         "generation": 1,
     }))
 }
@@ -304,4 +312,30 @@ fn a_throttle_without_a_full_window_never_moves_the_session() {
     assert_eq!(env.runs().len(), 1);
     assert!(env.records().is_empty());
     assert!(!stderr.contains("usage limit"), "{stderr}");
+}
+
+/// The no-room notice waits for the terminal: when a renewal restarts Claude afterwards, it
+/// is printed after the terminal was restored, before the next Claude starts.
+#[test]
+fn a_no_room_notice_before_a_renewal_is_printed_between_the_two_claudes() {
+    let env = Env::new();
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.spare_full = true;
+        fake.renew_work = true;
+    }
+    let output = env.run(&["run", "work", "--failover"], "20");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The renewed Claude (token-work-2) exits 7 at once.
+    assert_eq!(output.status.code(), Some(7), "{stderr}");
+    let runs = env.runs();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(runs[1]["token"], "token-work-2");
+    let notice = stderr
+        .find("no other account has room now")
+        .unwrap_or_else(|| panic!("{stderr}"));
+    let renewed = stderr
+        .find("server token renewed")
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(notice < renewed, "{stderr}");
 }

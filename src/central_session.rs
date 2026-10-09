@@ -920,16 +920,20 @@ pub fn run(
         if let Some(note) = &outcome.note {
             session.set_renewal(note)?;
         }
-        if let Some(notice) = &outcome.notice {
-            eprintln!("claudectl: {notice}");
-        }
         // Relaunch only after our own SIGTERM; any other exit ends `server run` with the
         // child's code.
         let Some(Restart { kind, session_id }) = outcome.restart else {
+            if let Some(notice) = &outcome.notice {
+                eprintln!("claudectl: {notice}");
+            }
             return Ok(exec::exit_code_of(&status));
         };
         if let Some(terminal) = &terminal {
             terminal.restore();
+        }
+        // A failover notice from this Claude, once the terminal is Claude's no longer.
+        if let Some(notice) = &outcome.notice {
+            eprintln!("claudectl: {notice}");
         }
         // Renewing until the next Claude runs.
         session.set_renewal("renewing")?;
