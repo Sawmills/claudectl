@@ -35,6 +35,10 @@ async fn usage() -> Json<Value> {
     }))
 }
 
+async fn remove() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
 /// Records the request, then refuses it: the test needs only what the CLI asked for.
 async fn login_start(
     State(logins): State<Logins>,
@@ -67,6 +71,7 @@ impl Env {
             .route("/v2/anthropic/accounts", get(accounts))
             .route("/v2/anthropic/usage", get(usage))
             .route("/v2/anthropic/login/start", post(login_start))
+            .route("/v2/anthropic/accounts/{id}", axum::routing::delete(remove))
             .with_state(logins.clone());
         std::thread::spawn(move || {
             tokio::runtime::Runtime::new()
@@ -141,4 +146,44 @@ fn status_resolves_the_short_name_of_a_server_account() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(stdout.contains("amir2"), "{stdout}");
+}
+
+#[test]
+fn rm_names_the_resolved_account_before_and_after_it_removes_it() {
+    let env = Env::new();
+    // A prefix: the confirmation names the account it would remove, never the typed text.
+    let output = env.claudectl(&["rm", "am"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Try: claudectl rm amir2@sawmills.ai --yes"),
+        "{stderr}"
+    );
+    let output = env.claudectl(&["rm", "am", "--yes"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("amir2@sawmills.ai removed"), "{stdout}");
+}
+
+#[test]
+fn cached_server_status_resolves_the_short_name() {
+    let env = Env::new();
+    // A live read saves the usage on this machine.
+    assert!(
+        env.claudectl(&["server", "status", "amir2"])
+            .status
+            .success()
+    );
+    let output = env.claudectl(&["server", "status", "amir2", "--cached", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let usage: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(usage["data"]["five_hour"]["utilization"], 3, "{usage}");
 }

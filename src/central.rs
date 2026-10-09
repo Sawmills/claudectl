@@ -618,6 +618,11 @@ fn save_usage(paths: &Paths, client: &Client, account: &Account, usage: &Usage) 
 fn read_usage(paths: &Paths, alias: &str, cached: bool) -> Result<Usage> {
     let alias = profile::validate_alias(alias)?;
     if cached {
+        let aliases = server_aliases(paths, true);
+        let alias = match aliases.is_empty() {
+            true => alias,
+            false => crate::accounts::resolve(alias, &aliases)?,
+        };
         return Ok(cached_usage(paths, alias).unwrap_or(Usage {
             data: None,
             observed_at: None,
@@ -761,16 +766,14 @@ pub fn candidate(row: &ServerRow) -> crate::accounts::Candidate {
     }
 }
 
+const NOT_CONNECTED: &str = "this machine is not connected to an account server\nTry: claudectl server connect <server-url> --name <machine>";
+
 /// The server account `claudectl run` starts on when none is named: `accounts::best`
 /// over live usage. Refuses with the account list when none has room.
 pub fn pick_account(paths: &Paths) -> Result<String> {
     let rows = match server_view(paths, false, &[], None) {
         ServerView::Rows(rows) => rows,
-        ServerView::NotConnected => {
-            bail!(
-                "this machine is not connected to an account server\nTry: claudectl server connect <server-url> --name <machine>"
-            )
-        }
+        ServerView::NotConnected => bail!(NOT_CONNECTED),
         ServerView::Unreachable { error, .. } => {
             bail!("the account server did not answer: {error}\nTry: claudectl status")
         }
@@ -1042,9 +1045,18 @@ pub fn run(account: Option<&str>, claude: PathBuf, args: Vec<std::ffi::OsString>
 /// `claudectl rm`: `server remove` after a confirmation, or with `--yes`.
 pub fn remove_confirmed(account: &str, yes: bool) -> Result<()> {
     use std::io::IsTerminal;
+    let paths = crate::config::default_paths()?;
+    if cached_connection(&paths).is_none() {
+        bail!(NOT_CONNECTED);
+    }
+    // The confirmation names the account a prefix or short name resolves to.
+    let account = Client::load(&paths)?.account(account)?.alias;
     if !yes {
         if !std::io::stdin().is_terminal() {
-            bail!("removing an account needs a confirmation\nTry: claudectl rm {account} --yes");
+            bail!(
+                "removing an account needs a confirmation\nTry: claudectl rm {} --yes",
+                crate::shell::arg(&account)
+            );
         }
         let confirmed = dialoguer::Confirm::new()
             .with_prompt(format!(
@@ -1056,9 +1068,7 @@ pub fn remove_confirmed(account: &str, yes: bool) -> Result<()> {
             bail!("not removed");
         }
     }
-    dispatch(Command::Remove {
-        alias: account.to_owned(),
-    })
+    dispatch(Command::Remove { alias: account })
 }
 
 pub fn dispatch(command: Command) -> Result<()> {
@@ -1214,7 +1224,8 @@ pub fn dispatch(command: Command) -> Result<()> {
                             .map_err(|_| Unavailable)?,
                     )?;
                     println!(
-                        "Server account removed. Access tokens already issued stay valid until they expire."
+                        "Server account {} removed. Access tokens already issued stay valid until they expire.",
+                        account.alias
                     );
                     Ok(())
                 }

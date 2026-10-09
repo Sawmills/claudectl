@@ -157,12 +157,13 @@ fn every_visible_server_command_argument_has_help() {
 }
 
 #[test]
-fn rm_without_yes_and_without_a_terminal_refuses_with_the_next_command() {
+fn rm_on_a_machine_without_a_server_refuses_before_it_asks() {
+    // With a server, the refusal names the resolved account (tests/ux_names_test.rs).
     let home = Home::new();
     let o = home.run(&["rm", "work"]);
     assert!(!o.status.success());
     assert!(
-        out(&o).contains("Try: claudectl rm work --yes"),
+        out(&o).contains("Try: claudectl server connect"),
         "{}",
         out(&o)
     );
