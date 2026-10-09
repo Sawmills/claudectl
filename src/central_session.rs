@@ -107,6 +107,14 @@ impl Session {
     pub(super) fn account(&self) -> &Account {
         &self.account
     }
+    /// Hook settings that use the hook copy of `previous` (moved here): a failover keeps the
+    /// claudectl the session started with, even when the installed one changed since.
+    #[cfg(unix)]
+    pub(super) fn adopt_hook(&self, previous: &Session) -> Result<PathBuf> {
+        let hook = self.directory().join("claudectl-hook");
+        std::fs::rename(previous.directory().join("claudectl-hook"), &hook)?;
+        write_hook_settings(self.directory(), &hook)
+    }
     /// Claude settings that only register the renewal hooks. The hook runs a private copy of
     /// this claudectl, so an upgrade during the session cannot break it.
     #[cfg(unix)]
@@ -420,13 +428,6 @@ struct Restart {
     kind: RestartKind,
     session_id: String,
 }
-/// The prompt a moved session resumes with, so the failed turn continues.
-#[cfg(unix)]
-const RECOVERY_PROMPT: &str = "Continue the previous request.";
-/// How long a limit may wait for a usage read that confirms it (ms): the server reads the
-/// provider at most every 5 minutes.
-#[cfg(unix)]
-const CONFIRM_FOR_MS: i64 = 6 * 60_000;
 /// Failover state that outlives one Claude process of the run.
 #[cfg(unix)]
 #[derive(Clone, Default)]
@@ -443,6 +444,8 @@ struct Outcome {
     restart: Option<Restart>,
     /// A renewal state change to record (for example, hooks missing).
     note: Option<String>,
+    /// A failover notice for stderr once Claude no longer owns the terminal.
+    notice: Option<String>,
 }
 /// Watches one Claude process: usage for the status line, and the account's token revision
 /// for renewal (SAW-12610).
@@ -471,6 +474,9 @@ struct Pending {
     /// The failure (by its time) that is done: switched, a throttle, given up, or no room.
     handled: Option<i64>,
     last_read: i64,
+    deadline: super::failover::Deadline,
+    /// Shown when Claude exits: why the session did not move.
+    notice: Option<String>,
 }
 /// Fold the events appended to `path` since the last read into the activity. A missing log
 /// before the first event is no error; any other failure is returned and leaves the activity
@@ -689,6 +695,7 @@ impl Monitor {
             }
         }
         outcome.restart = sent.map(|(_, restart)| restart);
+        outcome.notice = pending.notice.take();
         outcome
     }
 }
@@ -728,7 +735,7 @@ impl Monitor {
         let mut inputs = self.inputs(activity, timing, None);
         inputs.restarts_last_hour = state.last_hour;
         super::renew::idle_gate(&inputs).ok()?;
-        if now() - failed_at > CONFIRM_FOR_MS {
+        if pending.deadline.expired(failed_at, now()) {
             pending.handled = Some(failed_at);
             return None;
         }
@@ -749,20 +756,39 @@ impl Monitor {
         let ServerView::Rows(rows) = server_view(&self.paths, false, &[], None) else {
             return None;
         };
-        let live = failover::live_sessions(&self.paths, &self.directory);
-        let recent = failover::recent(&self.paths, now(), failover::STAGGER_MS);
-        let Some(to) = failover::choose(&rows, &self.alias, &state.tried, &live, &recent) else {
-            pending.handled = Some(failed_at);
-            eprintln!(
-                "claudectl: {} reached its usage limit and no other account has room now\nTry: claudectl status",
-                self.alias
-            );
-            return None;
-        };
-        let account = self.client.account(&to).ok()?;
-        // Never a forced refresh: that revokes the token other sessions of `to` hold.
-        let access = self.client.acquire(&account.account_id, None).ok()?;
-        Some((account, access))
+        let session_id = activity.idle.session.clone()?;
+        let taken = failover::reserve(
+            &self.paths,
+            &rows,
+            &self.alias,
+            &state.tried,
+            &self.directory,
+            &session_id,
+            |to| {
+                let account = self.client.account(to).ok()?;
+                // Never a forced refresh: that revokes the token other sessions of `to` hold.
+                let access = self.client.acquire(&account.account_id, None).ok()?;
+                Some((account, access))
+            },
+        );
+        match taken {
+            Ok(failover::Reserved::Taken(_, target)) => Some(target),
+            // The lock or the record failed, or the account had no token now: try again.
+            Err(_) | Ok(failover::Reserved::NotTaken) => None,
+            Ok(failover::Reserved::NoRoom) => {
+                pending.handled = Some(failed_at);
+                // Never printed over Claude's screen: session.json now, stderr at exit.
+                let notice = format!(
+                    "{} reached its usage limit and no other account has room now\nTry: claudectl status",
+                    self.alias
+                );
+                let mut status = self.status.clone();
+                status["failover"] = notice.clone().into();
+                let _ = atomic(&self.directory.join("session.json"), &status);
+                pending.notice = Some(notice);
+                None
+            }
+        }
     }
 }
 
@@ -891,6 +917,9 @@ pub fn run(
         if let Some(note) = &outcome.note {
             session.set_renewal(note)?;
         }
+        if let Some(notice) = &outcome.notice {
+            eprintln!("claudectl: {notice}");
+        }
         // Relaunch only after our own SIGTERM; any other exit ends `server run` with the
         // child's code.
         let Some(Restart { kind, session_id }) = outcome.restart else {
@@ -901,10 +930,10 @@ pub fn run(
         }
         // Renewing until the next Claude runs.
         session.set_renewal("renewing")?;
-        launch_args =
-            super::renew::relaunch_args(args, &session_id).context("restart of a one-shot run")?;
         match kind {
             RestartKind::Renew(access) => {
+                launch_args = super::renew::relaunch_args(args, &session_id)
+                    .context("renewal of a one-shot run")?;
                 session.renew(access)?;
                 restarts.push(now());
                 eprintln!("claudectl: server token renewed; resuming session {session_id}");
@@ -912,25 +941,18 @@ pub fn run(
             RestartKind::Failover { account, access } => {
                 // A new session for the new account: its session.json names the new alias
                 // before Claude starts again. The checked binary moves with it.
+                // The switch was recorded when the account was reserved (`failover::reserve`).
+                launch_args = super::failover::resume_args(args, &session_id)
+                    .context("failover of a one-shot run")?;
                 let from = session.account().alias.clone();
                 let next = Session::new(paths, &account, access)?;
                 let moved = next.directory().join("claude");
                 std::fs::rename(&snapshot, &moved)?;
                 snapshot = moved;
-                hooks = Some(next.hook_settings()?);
+                hooks = Some(next.adopt_hook(&session)?);
                 session = next;
-                let record = super::failover::Record {
-                    at: now(),
-                    from: from.clone(),
-                    to: account.alias.clone(),
-                    session_id: session_id.clone(),
-                };
-                if let Err(error) = super::failover::record(paths, &record) {
-                    eprintln!("claudectl: warning: failover not recorded: {error:#}");
-                }
                 tried.push(from.clone());
                 failovers.push(now());
-                launch_args.push(RECOVERY_PROMPT.into());
                 eprintln!(
                     "claudectl: {from} reached its usage limit; resuming session {session_id} on {}",
                     account.alias
@@ -1012,6 +1034,49 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    #[test]
+    fn a_failover_session_keeps_the_hook_copy_it_started_with() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().into());
+        let identity = super::super::Identity {
+            account_uuid: "a".into(),
+            organization_uuid: "o".into(),
+        };
+        let account = |c: &str| Account {
+            provider: "anthropic".into(),
+            account_id: c.repeat(64),
+            alias: c.into(),
+            identity: identity.clone(),
+            available: true,
+        };
+        let access = |a: &Account| Access {
+            provider: "anthropic".into(),
+            account_id: a.account_id.clone(),
+            user_id: "u".into(),
+            identity: identity.clone(),
+            access_token: "synthetic".into(),
+            expires_at: now() + 3_600_000,
+            scopes: vec!["user:inference".into()],
+            revision: "r".into(),
+            generation: 1,
+        };
+        let (a, b) = (account("a"), account("b"));
+        let first = Session::new(&paths, &a, access(&a)).unwrap();
+        first.hook_settings().unwrap();
+        let original = std::fs::read(first.directory().join("claudectl-hook")).unwrap();
+        let next = Session::new(&paths, &b, access(&b)).unwrap();
+        let settings = next.adopt_hook(&first).unwrap();
+        let hook = next.directory().join("claudectl-hook");
+        assert_eq!(std::fs::read(&hook).unwrap(), original);
+        assert!(!first.directory().join("claudectl-hook").exists());
+        let text = std::fs::read_to_string(settings).unwrap();
+        assert!(text.contains(&hook.display().to_string()), "{text}");
+        assert!(
+            !text.contains(&first.directory().display().to_string()),
+            "{text}"
+        );
+    }
+
     #[test]
     fn the_child_is_marked_as_a_server_run_session() {
         let home = tempfile::tempdir().unwrap();

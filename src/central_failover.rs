@@ -3,7 +3,7 @@
 //! starts it; a fresh usage read must show a full window; the next account has room, never
 //! bills, and is not crowded (the guide's 50% cap).
 use super::*;
-use std::collections::HashMap;
+use std::{collections::HashMap, ffi::OsString};
 
 /// What a fresh usage read says about a `rate_limit` turn failure.
 #[derive(Debug, PartialEq)]
@@ -153,6 +153,111 @@ pub(super) fn choose(
         })
         .collect();
     crate::accounts::best(&candidates).map(|i| open[i].alias.clone())
+}
+
+/// The prompt a moved session resumes with, so the failed turn continues.
+pub(super) const RECOVERY_PROMPT: &str = "Continue the previous request.";
+
+/// The arguments of a moved session: the user's arguments resumed on `session`
+/// (`renew::relaunch_args`), with the recovery prompt in place of a prompt the user gave (the
+/// resumed conversation already holds it, and Claude takes one prompt). An argument that does
+/// not start with `-` is a prompt when it is first or follows another such argument; after a
+/// flag it is that flag's value. None for a one-shot run.
+pub(super) fn resume_args(args: &[OsString], session: &str) -> Option<Vec<OsString>> {
+    let mut resumed = super::renew::relaunch_args(args, session)?;
+    // `relaunch_args` ends with `--resume <session>`.
+    let tail = resumed.split_off(resumed.len() - 2);
+    let mut out = Vec::new();
+    let mut after_flag = false;
+    for arg in resumed {
+        if arg.to_string_lossy().starts_with('-') {
+            after_flag = true;
+            out.push(arg);
+        } else if after_flag {
+            after_flag = false;
+            out.push(arg);
+        }
+    }
+    out.extend(tail);
+    out.push(RECOVERY_PROMPT.into());
+    Some(out)
+}
+
+/// The time limit for confirming one limit. It starts when Claude is first idle enough to
+/// move (the idle gate), not at the failure: a user who typed after the error still gets
+/// the full window once the terminal is quiet.
+#[derive(Default)]
+pub(super) struct Deadline {
+    failure: Option<i64>,
+    opened_at: i64,
+}
+impl Deadline {
+    /// Called on each tick the idle gate passes; true once `CONFIRM_FOR_MS` passed since the
+    /// first such tick for this failure.
+    pub(super) fn expired(&mut self, failed_at: i64, now: i64) -> bool {
+        if self.failure != Some(failed_at) {
+            self.failure = Some(failed_at);
+            self.opened_at = now;
+        }
+        now - self.opened_at > CONFIRM_FOR_MS
+    }
+}
+/// How long a limit may wait for a usage read that confirms it (ms): the server reads the
+/// provider at most every 5 minutes.
+pub(super) const CONFIRM_FOR_MS: i64 = 6 * 60_000;
+
+/// Choose the account to move to and record the switch, under a lock on this machine's
+/// records: sessions that hit the limit together then see each other's choice (the stagger
+/// and the 50% cap), instead of all choosing the same account.
+/// What `reserve` found.
+#[derive(Debug, PartialEq)]
+pub(super) enum Reserved<T> {
+    /// The account to move to, taken and recorded.
+    Taken(String, T),
+    /// No account has room.
+    NoRoom,
+    /// An account has room but could not be taken now (no token): try again.
+    NotTaken,
+}
+
+/// `take` gets the chosen account ready (its token); only a taken account is recorded.
+pub(super) fn reserve<T>(
+    paths: &Paths,
+    rows: &[ServerRow],
+    current: &str,
+    tried: &[String],
+    own: &Path,
+    session_id: &str,
+    take: impl FnOnce(&str) -> Option<T>,
+) -> Result<Reserved<T>> {
+    private_dir(&root(paths))?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock = options.open(root(paths).join("failovers.lock"))?;
+    lock.lock()?;
+    let live = live_sessions(paths, own);
+    let recent = recent(paths, now(), STAGGER_MS);
+    let Some(to) = choose(rows, current, tried, &live, &recent) else {
+        return Ok(Reserved::NoRoom);
+    };
+    let Some(taken) = take(&to) else {
+        return Ok(Reserved::NotTaken);
+    };
+    record(
+        paths,
+        &Record {
+            at: now(),
+            from: current.to_string(),
+            to: to.clone(),
+            session_id: session_id.to_string(),
+        },
+    )?;
+    Ok(Reserved::Taken(to, taken))
 }
 
 #[cfg(test)]
@@ -315,5 +420,67 @@ mod tests {
         let live = live_sessions(&paths, &own);
         assert_eq!(live.get("free"), Some(&2));
         assert_eq!(live.get("cur"), Some(&1));
+    }
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn a_moved_session_resumes_with_the_recovery_prompt_in_place_of_the_users() {
+        let resumed = |args: &[&str]| resume_args(&os(args), "S").unwrap();
+        assert_eq!(
+            resumed(&["--model", "opus"]),
+            os(&["--model", "opus", "--resume", "S", RECOVERY_PROMPT])
+        );
+        assert_eq!(
+            resumed(&["fix the tests"]),
+            os(&["--resume", "S", RECOVERY_PROMPT])
+        );
+        assert_eq!(
+            resumed(&["--model", "opus", "fix the tests", "--resume", "old"]),
+            os(&["--model", "opus", "--resume", "S", RECOVERY_PROMPT])
+        );
+        assert_eq!(resume_args(&os(&["-p", "hi"]), "S"), None);
+    }
+
+    #[test]
+    fn the_confirm_window_starts_when_claude_is_first_idle_enough() {
+        let mut deadline = Deadline::default();
+        // The gate first opens 6.5 min after the failure (the user typed): not expired.
+        assert!(!deadline.expired(0, 390_000));
+        assert!(!deadline.expired(0, 390_000 + CONFIRM_FOR_MS - 1));
+        assert!(deadline.expired(0, 390_000 + CONFIRM_FOR_MS + 1));
+        // A new failure starts a new window.
+        assert!(!deadline.expired(500_000, 800_000));
+    }
+
+    #[test]
+    fn sessions_that_hit_the_limit_together_choose_different_accounts() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().to_path_buf());
+        let rows = vec![
+            row("cur", full()),
+            row("a", room(10.0, 10.0)),
+            row("b", room(20.0, 20.0)),
+        ];
+        let own = home.path().join("none");
+        let take = |_: &str| Some(());
+        let first = reserve(&paths, &rows, "cur", &[], &own, "s-1", take).unwrap();
+        let second = reserve(&paths, &rows, "cur", &[], &own, "s-2", take).unwrap();
+        assert_eq!(first, Reserved::Taken("a".into(), ()));
+        assert_eq!(second, Reserved::Taken("b".into(), ()));
+        let records = recent(&paths, now(), STAGGER_MS);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].session_id, "s-1");
+        // Nothing left, or the account could not be taken: no record.
+        assert_eq!(
+            reserve(&paths, &rows, "cur", &[], &own, "s-3", take).unwrap(),
+            Reserved::NoRoom
+        );
+        let rows = vec![row("cur", full()), row("c", room(1.0, 1.0))];
+        let failed = reserve(&paths, &rows, "cur", &[], &own, "s-4", |_| None::<()>).unwrap();
+        assert_eq!(failed, Reserved::NotTaken);
+        assert_eq!(recent(&paths, now(), STAGGER_MS).len(), 2);
     }
 }
