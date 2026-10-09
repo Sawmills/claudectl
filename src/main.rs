@@ -19,6 +19,7 @@ pub struct Cli {
 const RUN_EXAMPLES: &str = "Examples:
   claudectl run                 start Claude on the account with the most room
   claudectl run amir2           start on amir2 (full name, email name, or a unique prefix)
+  claudectl run amir2 --failover   on a usage limit, move the session to another account
   claudectl run -- --resume ID  pass arguments to Claude after --";
 
 #[derive(Subcommand)]
@@ -31,6 +32,12 @@ enum Commands {
         /// Claude executable to run (default: `claude` on PATH)
         #[arg(long, default_value = "claude")]
         claude: std::path::PathBuf,
+        /// On a usage limit, resume the session on another account (default without an account)
+        #[arg(long, conflicts_with = "no_failover")]
+        failover: bool,
+        /// Stay on the account at a usage limit (default with a named account)
+        #[arg(long)]
+        no_failover: bool,
         /// Arguments for Claude, after `--`
         #[arg(last = true)]
         args: Vec<std::ffi::OsString>,
@@ -227,8 +234,14 @@ fn main() {
         Commands::Run {
             account,
             claude,
+            failover,
+            no_failover,
             args,
-        } => claudectl::central::run(account.as_deref(), claude, args),
+        } => {
+            // A named account is a choice: it stays unless failover is asked for.
+            let failover = !no_failover && (failover || account.is_none());
+            claudectl::central::run(account.as_deref(), claude, failover, args)
+        }
         Commands::Add { name, no_browser } => claudectl::central::dispatch(ServerCommand::Login {
             alias: name,
             no_browser,

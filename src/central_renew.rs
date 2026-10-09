@@ -54,6 +54,8 @@ pub(super) enum Event {
     Prompt,
     Stop,
     IdlePrompt,
+    /// A turn failed with `rate_limit` in this session; it also ended the turn.
+    Limited(String),
 }
 
 /// One event per line: `{"at": <ms>, "event": "<hook event>", "session_id": "..",
@@ -66,6 +68,12 @@ pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
             let event = match v["event"].as_str()? {
                 "SessionStart" => Event::SessionStart(v["session_id"].as_str()?.to_string()),
                 "UserPromptSubmit" => Event::Prompt,
+                // A turn that failed with a usage limit can move the session to another
+                // account (SAW-12693); it ended all the same.
+                "StopFailure" if v["error"] == "rate_limit" => match v["session_id"].as_str() {
+                    Some(session) => Event::Limited(session.to_string()),
+                    None => Event::Stop,
+                },
                 // A turn that failed (an API error such as a revoked token) ends with
                 // StopFailure: it ended all the same.
                 "Stop" | "StopFailure" => Event::Stop,
@@ -83,6 +91,9 @@ pub(super) struct Idle {
     pub session: Option<String>,
     /// Since when Claude waits for input; None while a turn runs.
     pub since: Option<i64>,
+    /// The session and time of the latest turn that failed with `rate_limit`, until the
+    /// next prompt or session.
+    pub limited: Option<(String, i64)>,
 }
 
 #[cfg(test)]
@@ -99,12 +110,20 @@ pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
             Event::SessionStart(session) => {
                 idle.session = Some(session.clone());
                 idle.since = Some(*at);
+                idle.limited = None;
             }
-            Event::Prompt => idle.since = None,
+            Event::Prompt => {
+                idle.since = None;
+                idle.limited = None;
+            }
             // A turn just ended: the idle time starts now.
             Event::Stop => idle.since = Some(*at),
             Event::IdlePrompt => {
                 idle.since.get_or_insert(*at);
+            }
+            Event::Limited(session) => {
+                idle.since = Some(*at);
+                idle.limited = Some((session.clone(), *at));
             }
         }
     }
@@ -212,6 +231,23 @@ pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The error types of a failed turn in Claude Code's StopFailure hook (2.1.295).
+const TURN_ERRORS: &[&str] = &[
+    "authentication_failed",
+    "oauth_org_not_allowed",
+    "account_on_hold",
+    "verification_required",
+    "billing_error",
+    "rate_limit",
+    "overloaded",
+    "invalid_request",
+    "model_not_found",
+    "server_error",
+    "unknown",
+    "max_output_tokens",
+    "cloud_credential_error",
+];
+
 /// The most hook input read; a longer input counts as a failed event.
 pub(super) const HOOK_INPUT_LIMIT: usize = 1 << 20;
 
@@ -277,11 +313,21 @@ pub(super) fn record_hook(
             return Err(error.into());
         }
     };
+    // The error type of a failed turn, only from Claude Code's known values; its details
+    // and the last message are never kept.
+    let error = (v["hook_event_name"] == "StopFailure").then(|| {
+        let known = v["error"]
+            .as_str()
+            .filter(|e| TURN_ERRORS.contains(e))
+            .unwrap_or("unknown");
+        serde_json::Value::from(known)
+    });
     let line = serde_json::json!({
         "at": now,
         "event": v["hook_event_name"],
         "session_id": v["session_id"],
         "notification_type": v["notification_type"],
+        "error": error,
     });
     let path = dir.join("events");
     let mut options = std::fs::OpenOptions::new();
@@ -304,6 +350,72 @@ pub(super) fn record_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rate_limited_turn_failure_is_a_limit_event_that_also_ends_the_turn() {
+        let text = concat!(
+            r#"{"at":1,"event":"SessionStart","session_id":"s-1"}"#,
+            "\n",
+            r#"{"at":2,"event":"UserPromptSubmit","session_id":"s-1"}"#,
+            "\n",
+            r#"{"at":3,"event":"StopFailure","session_id":"s-1","error":"rate_limit"}"#,
+            "\n",
+            r#"{"at":4,"event":"StopFailure","session_id":"s-1","error":"overloaded"}"#,
+        );
+        assert_eq!(
+            parse_events(text),
+            vec![
+                (1, Event::SessionStart("s-1".into())),
+                (2, Event::Prompt),
+                (3, Event::Limited("s-1".into())),
+                (4, Event::Stop),
+            ]
+        );
+        let events = parse_events(text);
+        let idle = idle_state(&events[..3]);
+        assert_eq!(idle.since, Some(3));
+        assert_eq!(idle.limited, Some(("s-1".to_string(), 3)));
+        // A new prompt or a new session clears it: only the latest turn counts.
+        let mut idle = idle_state(&events[..3]);
+        fold(&mut idle, &[(5, Event::Prompt)]);
+        assert_eq!(idle.limited, None);
+        let mut idle = idle_state(&events[..3]);
+        fold(&mut idle, &[(5, Event::SessionStart("s-2".into()))]);
+        assert_eq!(idle.limited, None);
+    }
+
+    #[test]
+    fn the_hook_keeps_only_a_known_error_type_of_a_failed_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let dir = sessions.join("run-x");
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = |error: &str| {
+            serde_json::json!({"hook_event_name": "StopFailure", "session_id": "s-1",
+                "error": error, "error_details": "secret detail",
+                "last_assistant_message": "secret text"})
+            .to_string()
+        };
+        record_hook(&sessions, &dir, &input("rate_limit"), 1).unwrap();
+        record_hook(&sessions, &dir, &input("something new"), 2).unwrap();
+        let stop = serde_json::json!({"hook_event_name": "Stop", "session_id": "s-1",
+            "error": "rate_limit"});
+        record_hook(&sessions, &dir, &stop.to_string(), 3).unwrap();
+        let log = std::fs::read_to_string(dir.join("events")).unwrap();
+        assert!(!log.contains("secret"), "{log}");
+        let errors: Vec<serde_json::Value> = log
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["error"].clone())
+            .collect();
+        assert_eq!(
+            errors,
+            vec![
+                serde_json::json!("rate_limit"),
+                serde_json::json!("unknown"),
+                serde_json::Value::Null
+            ]
+        );
+    }
 
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
@@ -343,7 +455,8 @@ mod tests {
             idle_state(&busy),
             Idle {
                 session: Some("a".into()),
-                since: None
+                since: None,
+                limited: None,
             }
         );
         let idle = [(1, SessionStart("a".into())), (2, Prompt), (3, Stop)];
@@ -351,7 +464,8 @@ mod tests {
             idle_state(&idle),
             Idle {
                 session: Some("a".into()),
-                since: Some(3)
+                since: Some(3),
+                limited: None,
             }
         );
         // A new session (/clear, /resume) replaces the old one and starts idle.
@@ -364,7 +478,8 @@ mod tests {
             idle_state(&switched),
             Idle {
                 session: Some("b".into()),
-                since: Some(5)
+                since: Some(5),
+                limited: None,
             }
         );
         // idle_prompt keeps the earlier idle start.
@@ -450,7 +565,8 @@ mod tests {
             idle_state(&events),
             Idle {
                 session: Some("s".into()),
-                since: Some(3)
+                since: Some(3),
+                limited: None,
             }
         );
     }
@@ -460,6 +576,7 @@ mod tests {
         let idle = Idle {
             session: Some("s".into()),
             since: Some(10_000_000 - IDLE_AFTER_STOP_MS),
+            limited: None,
         };
         assert_eq!(decide(&inputs(&idle)), Decision::Restart);
         // Same revision: the held token is still the live one.
@@ -471,11 +588,13 @@ mod tests {
         let busy = Idle {
             session: Some("s".into()),
             since: None,
+            limited: None,
         };
         assert!(matches!(decide(&inputs(&busy)), Decision::Wait(_)));
         let recent = Idle {
             session: Some("s".into()),
             since: Some(10_000_000 - 1_000),
+            limited: None,
         };
         assert!(matches!(decide(&inputs(&recent)), Decision::Wait(_)));
         let mut typing = inputs(&idle);
@@ -484,6 +603,7 @@ mod tests {
         let nosession = Idle {
             session: None,
             since: Some(0),
+            limited: None,
         };
         assert!(matches!(decide(&inputs(&nosession)), Decision::Wait(_)));
         let mut budget = inputs(&idle);
@@ -500,6 +620,7 @@ mod tests {
         let idle = Idle {
             session: Some("s".into()),
             since: Some(0),
+            limited: None,
         };
         let mut older = inputs(&idle);
         older.server_expires_at = older.held_expires_at;

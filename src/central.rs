@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "central_failover.rs"]
+mod failover;
 #[path = "central_migration.rs"]
 mod migration;
 #[path = "central_qualify.rs"]
@@ -959,6 +961,9 @@ pub enum Command {
         /// Claude executable to run (default: `claude` on PATH)
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
+        /// On a usage limit, resume the session on another account
+        #[arg(long)]
+        failover: bool,
         /// Arguments for Claude, after `--`
         #[arg(last = true)]
         args: Vec<std::ffi::OsString>,
@@ -1025,7 +1030,12 @@ pub enum Command {
 }
 /// `claudectl run`: `server run` on the named account, or on `pick_account` when none is
 /// named. The account name resolves like every other (`accounts::resolve`).
-pub fn run(account: Option<&str>, claude: PathBuf, args: Vec<std::ffi::OsString>) -> Result<()> {
+pub fn run(
+    account: Option<&str>,
+    claude: PathBuf,
+    failover: bool,
+    args: Vec<std::ffi::OsString>,
+) -> Result<()> {
     let paths = crate::config::default_paths()?;
     let alias = match account {
         Some(name) => name.to_owned(),
@@ -1038,6 +1048,7 @@ pub fn run(account: Option<&str>, claude: PathBuf, args: Vec<std::ffi::OsString>
     dispatch(Command::Run {
         alias,
         claude,
+        failover,
         args,
     })
 }
@@ -1171,9 +1182,10 @@ pub fn dispatch(command: Command) -> Result<()> {
                 Command::Run {
                     alias,
                     claude,
+                    failover,
                     args,
                 } => {
-                    let code = session::run(&paths, &client, &alias, &claude, &args)?;
+                    let code = session::run(&paths, &client, &alias, &claude, &args, failover)?;
                     std::process::exit(code)
                 }
                 Command::Devices { json } => {

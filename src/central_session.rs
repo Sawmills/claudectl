@@ -104,6 +104,9 @@ impl Session {
     pub(super) fn revision(&self) -> &str {
         &self.current.revision
     }
+    pub(super) fn account(&self) -> &Account {
+        &self.account
+    }
     /// Claude settings that only register the renewal hooks. The hook runs a private copy of
     /// this claudectl, so an upgrade during the session cannot break it.
     #[cfg(unix)]
@@ -406,9 +409,32 @@ impl Terminal {
 }
 
 #[cfg(unix)]
+enum RestartKind {
+    /// A newer token of the same account (SAW-12610).
+    Renew(Access),
+    /// The account is at a usage limit: the session moves to `account` (SAW-12693).
+    Failover { account: Account, access: Access },
+}
+#[cfg(unix)]
 struct Restart {
-    access: Access,
+    kind: RestartKind,
     session_id: String,
+}
+/// The prompt a moved session resumes with, so the failed turn continues.
+#[cfg(unix)]
+const RECOVERY_PROMPT: &str = "Continue the previous request.";
+/// How long a limit may wait for a usage read that confirms it (ms): the server reads the
+/// provider at most every 5 minutes.
+#[cfg(unix)]
+const CONFIRM_FOR_MS: i64 = 6 * 60_000;
+/// Failover state that outlives one Claude process of the run.
+#[cfg(unix)]
+#[derive(Clone, Default)]
+struct Failover {
+    /// Accounts this run already left.
+    tried: Vec<String>,
+    /// Failovers in the last hour (its own budget, apart from renewals).
+    last_hour: usize,
 }
 #[cfg(unix)]
 #[derive(Default)]
@@ -434,6 +460,17 @@ struct Monitor {
     tty: Option<PathBuf>,
     /// The session.json content, to mark the session renewing before SIGTERM.
     status: serde_json::Value,
+    /// The account's alias, and the failover state when this run may move accounts.
+    alias: String,
+    failover: Option<Failover>,
+}
+/// Where the monitor is with the latest `rate_limit` turn failure.
+#[cfg(unix)]
+#[derive(Default)]
+struct Pending {
+    /// The failure (by its time) that is done: switched, a throttle, given up, or no room.
+    handled: Option<i64>,
+    last_read: i64,
 }
 /// Fold the events appended to `path` since the last read into the activity. A missing log
 /// before the first event is no error; any other failure is returned and leaves the activity
@@ -528,6 +565,7 @@ impl Monitor {
         let mut activity = Activity::default();
         let mut retry_now = false;
         let mut sent: Option<(i64, Restart)> = None;
+        let mut pending = Pending::default();
         while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
             stopped.recv_timeout(Duration::from_millis(timing.tick_ms))
         {
@@ -577,6 +615,27 @@ impl Monitor {
                 }
                 continue;
             }
+            // A usage limit first: while one is pending, renewal waits (one restart decision
+            // per tick, and a failover wins).
+            if self.failover.is_some()
+                && let Some((session_id, failed_at)) = activity.idle.limited.clone()
+                && activity.idle.session.as_deref() == Some(session_id.as_str())
+                && pending.handled != Some(failed_at)
+            {
+                if let Some((account, access)) =
+                    self.failover_target(&mut activity, &timing, &mut pending, failed_at)
+                {
+                    match self.stop_for_restart() {
+                        Ok(true) => {
+                            let kind = RestartKind::Failover { account, access };
+                            sent = Some((now(), Restart { kind, session_id }));
+                        }
+                        Ok(false) => break,
+                        Err(()) => {}
+                    }
+                }
+                continue;
+            }
             // Ask the server only while idle: after expiry the request refreshes the grant,
             // and a turn that starts meanwhile would get the old, dead token.
             if renew::idle_gate(&self.inputs(&mut activity, &timing, None)).is_err() {
@@ -619,27 +678,91 @@ impl Monitor {
             if decision == renew::Decision::Restart
                 && let Some(session_id) = activity.idle.session.clone()
             {
-                // Supervisors see the handoff before Claude stops.
-                let mut status = self.status.clone();
-                status["renewal"] = "renewing".into();
-                if atomic(&self.directory.join("session.json"), &status).is_err() {
-                    // Without the marker a supervisor could relaunch this session too.
-                    continue;
+                match self.stop_for_restart() {
+                    Ok(true) => {
+                        let kind = RestartKind::Renew(access);
+                        sent = Some((now(), Restart { kind, session_id }));
+                    }
+                    Ok(false) => break,
+                    Err(()) => continue,
                 }
-                // SIGTERM the leader; teardown of the rest of the group follows its exit.
-                // Only a delivered signal makes the coming exit a renewal: if Claude already
-                // exited, `server run` ends with its code.
-                if unsafe { libc::kill(self.pid as i32, libc::SIGTERM) } != 0 {
-                    let mut status = self.status.clone();
-                    status["renewal"] = "on".into();
-                    let _ = atomic(&self.directory.join("session.json"), &status);
-                    break;
-                }
-                sent = Some((now(), Restart { access, session_id }));
             }
         }
         outcome.restart = sent.map(|(_, restart)| restart);
         outcome
+    }
+}
+
+#[cfg(unix)]
+impl Monitor {
+    /// Mark the session renewing, then SIGTERM Claude. Ok(true): the signal was delivered,
+    /// so the coming exit is a restart. Ok(false): Claude already exited. Err: the marker
+    /// could not be written (without it a supervisor could relaunch this session too).
+    fn stop_for_restart(&self) -> std::result::Result<bool, ()> {
+        let mut status = self.status.clone();
+        status["renewal"] = "renewing".into();
+        if atomic(&self.directory.join("session.json"), &status).is_err() {
+            return Err(());
+        }
+        // SIGTERM the leader; teardown of the rest of the group follows its exit.
+        if unsafe { libc::kill(self.pid as i32, libc::SIGTERM) } != 0 {
+            let mut status = self.status.clone();
+            status["renewal"] = "on".into();
+            let _ = atomic(&self.directory.join("session.json"), &status);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+    /// The account and token to move to for the limit a turn hit at `failed_at`, once a
+    /// fresh usage read confirms it and Claude is idle. None: not yet, or `pending` records
+    /// that this failure needs no switch (a throttle, no account with room, or no answer).
+    fn failover_target(
+        &self,
+        activity: &mut Activity,
+        timing: &super::renew::Timing,
+        pending: &mut Pending,
+        failed_at: i64,
+    ) -> Option<(Account, Access)> {
+        use super::failover::{self, Confirm};
+        let state = self.failover.as_ref()?;
+        let mut inputs = self.inputs(activity, timing, None);
+        inputs.restarts_last_hour = state.last_hour;
+        super::renew::idle_gate(&inputs).ok()?;
+        if now() - failed_at > CONFIRM_FOR_MS {
+            pending.handled = Some(failed_at);
+            return None;
+        }
+        if now() - pending.last_read < timing.retry_ms {
+            return None;
+        }
+        pending.last_read = now();
+        // A fresh read, not this machine's copy: only a current full window is a limit.
+        let usage = self.client.usage(&self.account_id, false).ok()?;
+        match failover::confirm(&usage, failed_at) {
+            Confirm::NotYet => return None,
+            Confirm::Throttle => {
+                pending.handled = Some(failed_at);
+                return None;
+            }
+            Confirm::Limit => {}
+        }
+        let ServerView::Rows(rows) = server_view(&self.paths, false, &[], None) else {
+            return None;
+        };
+        let live = failover::live_sessions(&self.paths, &self.directory);
+        let recent = failover::recent(&self.paths, now(), failover::STAGGER_MS);
+        let Some(to) = failover::choose(&rows, &self.alias, &state.tried, &live, &recent) else {
+            pending.handled = Some(failed_at);
+            eprintln!(
+                "claudectl: {} reached its usage limit and no other account has room now\nTry: claudectl status",
+                self.alias
+            );
+            return None;
+        };
+        let account = self.client.account(&to).ok()?;
+        // Never a forced refresh: that revokes the token other sessions of `to` hold.
+        let access = self.client.acquire(&account.account_id, None).ok()?;
+        Some((account, access))
     }
 }
 
@@ -650,6 +773,7 @@ pub fn run(
     alias: &str,
     binary: &Path,
     args: &[OsString],
+    failover: bool,
 ) -> Result<i32> {
     let _slot = exec::RunSlot::take().map_err(|error| anyhow::anyhow!("{error}"))?;
     preflight(paths, &std::env::current_dir()?, args)?;
@@ -661,12 +785,12 @@ pub fn run(
     let access = client.acquire(&account.account_id, None)?;
     let mut session = Session::new(paths, &account, access)?;
     // The checked copy itself runs (same filesystem, so the rename keeps the file).
-    let snapshot = session.directory().join("claude");
+    let mut snapshot = session.directory().join("claude");
     std::fs::rename(&build.file, &snapshot)?;
     // A one-shot `-p` run is never restarted; an interactive session follows the account's
     // token revision (SAW-12610).
     let renewable = super::renew::relaunch_args(args, "probe").is_some();
-    let hooks = if renewable {
+    let mut hooks = if renewable {
         Some(session.hook_settings()?)
     } else {
         session.set_renewal("off: one-shot run")?;
@@ -683,6 +807,9 @@ pub fn run(
     let _signals = Signals;
     let mut launch_args = args.to_vec();
     let mut restarts: Vec<i64> = Vec::new();
+    // Failovers have their own budget; they never use up renewals (and the reverse).
+    let mut failovers: Vec<i64> = Vec::new();
+    let mut tried: Vec<String> = Vec::new();
     let mut first = true;
     loop {
         let mut command = session.command(&snapshot, &launch_args)?;
@@ -717,7 +844,7 @@ pub fn run(
         let monitor = Monitor {
             client: client.clone(),
             paths: paths.clone(),
-            account_id: account.account_id.clone(),
+            account_id: session.account().account_id.clone(),
             directory: session.directory().to_path_buf(),
             held_revision: session.revision().to_string(),
             held_expires_at: session.expires_at(),
@@ -729,6 +856,14 @@ pub fn run(
                 .count(),
             tty: terminal.as_ref().and_then(|t| t.path.clone()),
             status: session.status(),
+            alias: session.account().alias.clone(),
+            failover: (failover && hooks.is_some()).then(|| Failover {
+                tried: tried.clone(),
+                last_hour: failovers
+                    .iter()
+                    .filter(|&&at| now() - at < 3_600_000)
+                    .count(),
+            }),
         };
         let watcher = std::thread::spawn(move || monitor.watch(stopped));
         let waited = exec::wait_exit_no_reap(pid, terminal.is_some());
@@ -758,7 +893,7 @@ pub fn run(
         }
         // Relaunch only after our own SIGTERM; any other exit ends `server run` with the
         // child's code.
-        let Some(Restart { access, session_id }) = outcome.restart else {
+        let Some(Restart { kind, session_id }) = outcome.restart else {
             return Ok(exec::exit_code_of(&status));
         };
         if let Some(terminal) = &terminal {
@@ -766,16 +901,47 @@ pub fn run(
         }
         // Renewing until the next Claude runs.
         session.set_renewal("renewing")?;
-        session.renew(access)?;
         launch_args =
-            super::renew::relaunch_args(args, &session_id).context("renewal of a one-shot run")?;
-        restarts.push(now());
+            super::renew::relaunch_args(args, &session_id).context("restart of a one-shot run")?;
+        match kind {
+            RestartKind::Renew(access) => {
+                session.renew(access)?;
+                restarts.push(now());
+                eprintln!("claudectl: server token renewed; resuming session {session_id}");
+            }
+            RestartKind::Failover { account, access } => {
+                // A new session for the new account: its session.json names the new alias
+                // before Claude starts again. The checked binary moves with it.
+                let from = session.account().alias.clone();
+                let next = Session::new(paths, &account, access)?;
+                let moved = next.directory().join("claude");
+                std::fs::rename(&snapshot, &moved)?;
+                snapshot = moved;
+                hooks = Some(next.hook_settings()?);
+                session = next;
+                let record = super::failover::Record {
+                    at: now(),
+                    from: from.clone(),
+                    to: account.alias.clone(),
+                    session_id: session_id.clone(),
+                };
+                if let Err(error) = super::failover::record(paths, &record) {
+                    eprintln!("claudectl: warning: failover not recorded: {error:#}");
+                }
+                tried.push(from.clone());
+                failovers.push(now());
+                launch_args.push(RECOVERY_PROMPT.into());
+                eprintln!(
+                    "claudectl: {from} reached its usage limit; resuming session {session_id} on {}",
+                    account.alias
+                );
+            }
+        }
         first = false;
-        eprintln!("claudectl: server token renewed; resuming session {session_id}");
     }
 }
 #[cfg(not(unix))]
-pub fn run(_: &Paths, _: &Client, _: &str, _: &Path, _: &[OsString]) -> Result<i32> {
+pub fn run(_: &Paths, _: &Client, _: &str, _: &Path, _: &[OsString], _: bool) -> Result<i32> {
     bail!("server sessions require Linux or macOS")
 }
 
