@@ -11,3 +11,9 @@
 id = "GHSA-4grx-2x9w-596c"
 ignoreUntil = 2027-01-09
 reason = "RUSTSEC-2023-0071, all rsa versions, no fix; runtime use is public-key signature verification only (openidconnect); tests sign with throwaway keys"
+
+# osv-scanner reports this finding under its RustSec ID; the ignore matches IDs exactly.
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+ignoreUntil = 2027-01-09
+reason = "Same advisory as GHSA-4grx-2x9w-596c above; runtime use is public-key signature verification only (openidconnect); tests sign with throwaway keys"
