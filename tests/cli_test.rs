@@ -156,7 +156,7 @@ fn cached_status_needs_no_network_or_saved_profiles() {
     assert!(
         String::from_utf8(output.stdout)
             .unwrap()
-            .contains("no profiles saved")
+            .contains("No accounts yet")
     );
 }
 
@@ -236,9 +236,9 @@ fn status_default_explains_login_without_token_columns() {
         .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("Login needed"), "{text}");
-    assert!(text.contains("claudectl login 'missing'"), "{text}");
-    assert!(text.contains("Next step"), "{text}");
+    // The compact view (SAW-12677): the state, and the fix as the Next line.
+    assert!(text.contains("login needed"), "{text}");
+    assert!(text.contains("Next: claudectl login 'missing'"), "{text}");
     assert!(!text.contains("Token expiry"), "{text}");
     assert!(!text.contains("Usage fetch"), "{text}");
 }

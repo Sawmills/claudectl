@@ -528,21 +528,15 @@ fn status_is_one_table_of_local_and_server_accounts() {
     let (ok, text) = env.cli(&["status"]);
     assert!(ok, "{text}");
     assert!(!text.trim_start().starts_with('{'), "{text}");
-    for word in [
-        "State",
-        "loc",
-        "local",
-        "a1",
-        "b2",
-        "on server",
-        "42",
-        "claudectl server run 'a1'",
-    ] {
+    // The compact view (SAW-12677): one line per account and one Next line.
+    for word in ["State", "loc", "a1", "b2", "42", "Next: claudectl"] {
         assert!(text.contains(word), "{word} missing:\n{text}");
     }
     assert!(!text.contains("Cannot read saved login"), "{text}");
     assert_eq!(
-        text.lines().filter(|l| l.contains("│ a1 ")).count(),
+        text.lines()
+            .filter(|l| !l.starts_with("Next:") && l.split_whitespace().any(|w| w == "a1"))
+            .count(),
         1,
         "a migrated alias shows once:\n{text}"
     );
@@ -594,7 +588,7 @@ fn status_is_one_table_of_local_and_server_accounts() {
     let (ok, text) = env.cli(&["status"]);
     assert!(ok, "{text}");
     assert!(text.contains("loc"), "{text}");
-    assert!(text.contains("Server unreachable"), "{text}");
+    assert!(text.contains("server unreachable"), "{text}");
     assert!(!text.contains("Cannot read saved login"), "{text}");
     let (ok, text) = env.cli(&["status", "--json"]);
     assert!(ok, "{text}");
@@ -617,7 +611,11 @@ fn status_is_one_table_of_local_and_server_accounts() {
         );
     }
     let (_, text) = env.cli(&["status"]);
-    assert!(text.lines().any(|l| l.contains("│ srv ")), "{text}");
+    assert!(
+        text.lines()
+            .any(|l| l.split_whitespace().next() == Some("srv")),
+        "{text}"
+    );
 }
 
 #[test]
@@ -651,7 +649,7 @@ fn status_handles_pending_removed_unknown_and_refused_accounts() {
         "{text}"
     );
     let (_, text) = env.cli(&["status", "--cached"]);
-    assert!(text.contains("Migration pending"), "{text}");
+    assert!(text.contains("migration pending"), "{text}");
 
     // An alias removed from the server is not "on server".
     env.fake.lock().unwrap().imported_refresh.remove("a1");
@@ -659,10 +657,10 @@ fn status_handles_pending_removed_unknown_and_refused_accounts() {
     assert!(ok, "{text}");
     let row = text
         .lines()
-        .find(|l| l.contains("│ a1 "))
+        .find(|l| l.split_whitespace().any(|w| w == "a1"))
         .unwrap_or_else(|| panic!("{text}"));
-    assert!(row.contains("Not on server"), "{text}");
-    assert!(!row.contains("server run"), "{text}");
+    assert!(row.contains("not on server"), "{text}");
+    assert!(!row.starts_with('→'), "never the account to use:\n{text}");
 
     // A typo is not an available server account, even offline.
     let (ok, text) = env.cli(&["status", "nosuch", "--cached", "--json"]);
@@ -674,8 +672,8 @@ fn status_handles_pending_removed_unknown_and_refused_accounts() {
     assert!(ok, "{text}");
     assert_eq!(report(&text)["server"]["state"], "rejected", "{text}");
     let (_, text) = env.cli(&["status"]);
-    assert!(text.contains("Server refused"), "{text}");
-    assert!(!text.contains("Server unreachable"), "{text}");
+    assert!(text.contains("server refused"), "{text}");
+    assert!(!text.contains("server unreachable"), "{text}");
 }
 
 #[test]
@@ -698,11 +696,16 @@ fn status_shows_a_migrated_live_login_once_as_a_server_row() {
     let (ok, text) = env.cli(&["status"]);
     assert!(ok, "{text}");
     assert_eq!(
-        text.lines().filter(|l| l.contains(" me ")).count(),
+        text.lines()
+            .filter(|l| !l.starts_with("Next:") && l.split_whitespace().any(|w| w == "me"))
+            .count(),
         1,
         "{text}"
     );
-    assert!(text.contains("on server"), "{text}");
+    assert!(
+        text.contains("Next: claudectl run"),
+        "a server account is the one to run:\n{text}"
+    );
 }
 
 #[test]

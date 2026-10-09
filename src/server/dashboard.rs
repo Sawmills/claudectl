@@ -97,15 +97,18 @@ async fn snapshot(server: &Server, headers: &HeaderMap) -> Result<Option<Snapsho
             }
             None => Default::default(),
         };
-        let (five_hour, seven_day, usage_stale) = windows(&usage);
+        let observed = windows(&usage);
         accounts.push(Account {
             alias: account.alias,
             available: account.available,
             migration: account.migration.into(),
-            five_hour,
-            seven_day,
+            five_hour: observed.five,
+            seven_day: observed.week,
+            fable: observed.fable,
+            model_windows: observed.models,
             observed_at: usage.observed_at.map(|ms| ms / 1000),
-            usage_stale,
+            usage_stale: observed.stale,
+            billed: observed.billed,
         });
     }
     let machines = server
@@ -128,9 +131,23 @@ async fn snapshot(server: &Server, headers: &HeaderMap) -> Result<Option<Snapsho
     }))
 }
 
-/// The 5-hour and 7-day windows of a stored observation, and whether it is stale. An
-/// observation without any usage figure is stale, never fresh.
-fn windows(usage: &crate::server::engine::Usage) -> (Window, Window, bool) {
+/// What the dashboard shows of a stored observation.
+struct Observed {
+    five: Window,
+    week: Window,
+    /// The weekly Fable limit, when the account has one.
+    fable: Option<Window>,
+    /// The weekly Opus and Sonnet windows, as the CLI reads them.
+    models: Vec<crate::accounts::Window>,
+    /// No usage figure at all, or the server marked it stale.
+    stale: bool,
+    /// Extra usage is not known to be off (the CLI's rule for server accounts).
+    billed: bool,
+}
+
+/// The windows of a stored observation. An observation without any usage figure is
+/// stale, never fresh.
+fn windows(usage: &crate::server::engine::Usage) -> Observed {
     let parsed = usage
         .data
         .as_ref()
@@ -143,8 +160,36 @@ fn windows(usage: &crate::server::engine::Usage) -> (Window, Window, bool) {
     };
     let five = window(parsed.as_ref().and_then(|u| u.five_hour.as_ref()));
     let week = window(parsed.as_ref().and_then(|u| u.seven_day.as_ref()));
+    let fable = parsed
+        .as_ref()
+        .and_then(crate::api::UsageResponse::fable_weekly)
+        .map(|limit| Window {
+            used_percent: limit.percent.filter(|n| n.is_finite() && *n >= 0.0),
+            resets_at: None,
+        });
+    let models = parsed
+        .as_ref()
+        .map(crate::accounts::windows)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|w| matches!(w.name, "Opus" | "Sonnet"))
+        .collect();
+    // Partial usage is not stale: `accounts::state` reads it (a known full window stays a
+    // limit; otherwise it is unknown and never picked), as in the CLI.
     let empty = five.used_percent.is_none() && week.used_percent.is_none();
-    (five, week, usage.stale || empty)
+    let billed = parsed
+        .as_ref()
+        .and_then(|u| u.extra_usage.as_ref())
+        .and_then(|e| e.is_enabled)
+        != Some(false);
+    Observed {
+        five,
+        week,
+        fable,
+        models,
+        stale: usage.stale || empty,
+        billed,
+    }
 }
 
 fn document(content: &str, refresh: bool) -> Response {
@@ -204,6 +249,42 @@ pub(super) fn routes(router: Router<Arc<Server>>) -> Router<Arc<Server>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn partial_usage_is_unknown_but_a_known_full_window_stays_a_limit() {
+        let usage = |data| crate::server::engine::Usage {
+            data: Some(data),
+            ..Default::default()
+        };
+        let state = |data| {
+            let o = windows(&usage(data));
+            let mut all = vec![
+                crate::accounts::Window {
+                    name: "5h",
+                    used: o.five.used_percent,
+                    resets_at: o.five.resets_at,
+                },
+                crate::accounts::Window {
+                    name: "week",
+                    used: o.week.used_percent,
+                    resets_at: o.week.resets_at,
+                },
+            ];
+            all.extend(o.models);
+            (o.stale, crate::accounts::state(&all))
+        };
+        // The shared rule decides, not a stale flag: a partial response is unknown
+        // (never picked), and a confirmed full 5h window stays a visible limit.
+        let (stale, partial) = state(serde_json::json!({"seven_day": {"utilization": 1.0}}));
+        assert!(!stale);
+        assert_eq!(partial, crate::accounts::State::Unknown);
+        let (stale, full) = state(serde_json::json!({"five_hour": {"utilization": 100.0}}));
+        assert!(!stale);
+        assert!(
+            matches!(full, crate::accounts::State::Limit { window: "5h", .. }),
+            "{full:?}"
+        );
+    }
+
     #[tokio::test]
     async fn the_landing_badge_follows_readiness_and_goes_down_during_drain() {
         let root = tempfile::tempdir().unwrap();
@@ -251,15 +332,26 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({"five_hour": null, "seven_day": {"utilization": null}}),
         ] {
-            let (five, week, stale) = windows(&usage(data));
-            assert!(five.used_percent.is_none() && week.used_percent.is_none());
-            assert!(stale, "no usage figure must not read as fresh");
+            let o = windows(&usage(data));
+            assert!(o.five.used_percent.is_none() && o.week.used_percent.is_none());
+            assert!(o.stale, "no usage figure must not read as fresh");
         }
-        let (five, _, stale) = windows(&usage(serde_json::json!({
-            "five_hour": {"utilization": 12.0, "resets_at": "2099-01-01T00:00:00Z"}
+        let o = windows(&usage(serde_json::json!({
+            "five_hour": {"utilization": 12.0, "resets_at": "2099-01-01T00:00:00Z"},
+            "extra_usage": {"is_enabled": false},
+            "limits": [{"kind": "weekly_scoped", "percent": 100.0,
+                "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}]
         })));
-        assert_eq!(five.used_percent, Some(12.0));
-        assert!(!stale);
+        assert_eq!(o.five.used_percent, Some(12.0));
+        // No week figure: not stale; `accounts::state` reads the partial usage.
+        assert!(!o.stale);
+        assert_eq!(o.fable.as_ref().and_then(|w| w.used_percent), Some(100.0));
+        assert!(!o.billed, "extra usage known off");
+        // Missing extra-usage data is not proof: billed.
+        let missing = windows(&usage(
+            serde_json::json!({"five_hour": {"utilization": 1.0}}),
+        ));
+        assert!(missing.billed);
     }
 }
 
@@ -293,21 +385,32 @@ mod preview {
             migration: migration.into(),
             five_hour: window(five, 2),
             seven_day: window(week, 142),
+            fable: None,
+            model_windows: vec![],
             observed_at: Some(now - 42),
             usage_stale: false,
+            billed: false,
         };
-        let mut pending = account("amir4", 0.0, 0.0, "pending");
+        let mut pending = account("amir6@sawmills.ai", 0.0, 0.0, "pending");
         pending.five_hour.used_percent = None;
         pending.seven_day.used_percent = None;
         pending.observed_at = None;
         pending.usage_stale = true;
+        let with_fable = |mut a: Account, used: f64| {
+            a.fable = Some(Window {
+                used_percent: Some(used),
+                resets_at: None,
+            });
+            a
+        };
         let full = Snapshot {
             email: "amir@sawmills.ai".into(),
             server_time: now,
             accounts: vec![
-                account("amir", 12.0, 8.0, "rotated"),
-                account("amir3", 64.0, 31.0, "rotated"),
-                account("amir5", 93.0, 88.0, "unrotated"),
+                with_fable(account("amir3@sawmills.ai", 2.0, 1.0, "rotated"), 0.0),
+                with_fable(account("amir@sawmills.ai", 55.0, 76.0, "rotated"), 16.0),
+                with_fable(account("amir4@sawmills.ai", 0.0, 98.0, "rotated"), 100.0),
+                with_fable(account("amir5@sawmills.ai", 93.0, 88.0, "unrotated"), 40.0),
                 pending,
             ],
             machines: vec![

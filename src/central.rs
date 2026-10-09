@@ -284,15 +284,19 @@ impl Client {
         }
         Ok(accounts)
     }
-    pub fn account(&self, alias: &str) -> Result<Account> {
-        let alias = profile::validate_alias(alias)?;
-        let mut selected = self
-            .accounts()?
+    /// The server account `name` names: the full alias, its email local part (`amir2`),
+    /// or a unique prefix (`crate::accounts::resolve`).
+    pub fn account(&self, name: &str) -> Result<Account> {
+        let name = profile::validate_alias(name)?;
+        let accounts = self.accounts()?;
+        let aliases: Vec<&str> = accounts.iter().map(|a| a.alias.as_str()).collect();
+        let alias = crate::accounts::resolve(name, &aliases)?.to_owned();
+        let mut selected = accounts
             .into_iter()
-            .filter(|a| a.alias.eq_ignore_ascii_case(alias));
+            .filter(|a| a.alias.eq_ignore_ascii_case(&alias));
         let account = selected.next().context("server account not found")?;
         if selected.next().is_some() {
-            bail!("ambiguous server alias");
+            bail!("ambiguous server alias\nTry: claudectl status");
         }
         Ok(account)
     }
@@ -514,7 +518,9 @@ pub fn login(client: &Client, alias: &str, renew: bool, no_browser: bool) -> Res
     )?;
     let url = reqwest::Url::parse(&login.authorize_url)?;
     if !claude_authorize(&url) || login.expires_at <= now() {
-        bail!("invalid Claude login challenge");
+        bail!(
+            "invalid Claude login challenge from the account server\nTry: claudectl add <name> again in a minute; if it repeats, check claudectl status"
+        );
     }
     println!("Claude sign-in: {}", login.authorize_url);
     if !no_browser {
@@ -612,6 +618,11 @@ fn save_usage(paths: &Paths, client: &Client, account: &Account, usage: &Usage) 
 fn read_usage(paths: &Paths, alias: &str, cached: bool) -> Result<Usage> {
     let alias = profile::validate_alias(alias)?;
     if cached {
+        let aliases = server_aliases(paths, true);
+        let alias = match aliases.is_empty() {
+            true => alias,
+            false => crate::accounts::resolve(alias, &aliases)?,
+        };
         return Ok(cached_usage(paths, alias).unwrap_or(Usage {
             data: None,
             observed_at: None,
@@ -638,21 +649,9 @@ pub fn status(paths: &Paths, alias: &str, cached: bool, json: bool) -> Result<()
         .and_then(|data| serde_json::from_value(data).ok());
     let mut table = table(&["Window", "Used", "Resets"]);
     if let Some(windows) = &windows {
-        for (name, window) in [
-            ("5h", &windows.five_hour),
-            ("week", &windows.seven_day),
-            ("week Opus", &windows.seven_day_opus),
-            ("week Sonnet", &windows.seven_day_sonnet),
-        ] {
-            if let Some(window) = window {
-                table.add_row(vec![
-                    name.to_string(),
-                    window
-                        .utilization
-                        .map_or("-".into(), |used| format!("{used:.0}%")),
-                    window.resets_at.clone().unwrap_or_else(|| "-".into()),
-                ]);
-            }
+        // Every window the compact status shows (Fable included), with human reset times.
+        for row in crate::accounts::detail_rows(windows, now() / 1000) {
+            table.add_row(row.to_vec());
         }
     }
     println!("{alias} (account server)");
@@ -744,6 +743,78 @@ fn cached_rows(
 /// the provider at most once per 5 minutes, so the reads run in parallel. `cached` reads
 /// only this machine's saved copies of the `known` aliases and sends nothing. `only` limits
 /// every read to one alias.
+/// A server account as the picker sees it. Fresh only with current usage from an
+/// available account. Never billed only when the usage says extra usage is off: missing
+/// data is not proof.
+pub fn candidate(row: &ServerRow) -> crate::accounts::Candidate {
+    let usage = row.usage.as_ref().ok();
+    let parsed = usage
+        .and_then(|u| u.data.clone())
+        .and_then(|d| serde_json::from_value::<crate::api::UsageResponse>(d).ok());
+    crate::accounts::Candidate {
+        name: row.alias.clone(),
+        windows: parsed
+            .as_ref()
+            .map(crate::accounts::windows)
+            .unwrap_or_default(),
+        fresh: row.available && usage.is_some_and(|u| !u.stale) && parsed.is_some(),
+        billed: parsed
+            .as_ref()
+            .and_then(|u| u.extra_usage.as_ref())
+            .and_then(|e| e.is_enabled)
+            != Some(false),
+    }
+}
+
+const NOT_CONNECTED: &str = "this machine is not connected to an account server\nTry: claudectl server connect <server-url> --name <machine>";
+
+/// The server account `claudectl run` starts on when none is named: `accounts::best`
+/// over live usage. Refuses with the account list when none has room.
+pub fn pick_account(paths: &Paths) -> Result<String> {
+    let rows = match server_view(paths, false, &[], None) {
+        ServerView::Rows(rows) => rows,
+        ServerView::NotConnected => bail!(NOT_CONNECTED),
+        ServerView::Unreachable { error, .. } => {
+            bail!("the account server did not answer: {error}\nTry: claudectl status")
+        }
+    };
+    let candidates: Vec<_> = rows.iter().map(candidate).collect();
+    match crate::accounts::best(&candidates) {
+        Some(i) => Ok(candidates[i].name.clone()),
+        None if candidates.is_empty() => {
+            bail!("the account server has no accounts for you\nTry: claudectl add <name>")
+        }
+        None => bail!(
+            "no account has room now (every one is at a limit, billed, or without fresh usage): {}\nTry: claudectl status",
+            candidates
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The server account names, for name resolution: live, else this machine's saved copies.
+pub fn server_aliases(paths: &Paths, cached: bool) -> Vec<String> {
+    let Some(connection) = cached_connection(paths) else {
+        return vec![];
+    };
+    let saved = || {
+        cached_rows(paths, &connection, &[], &|_| true)
+            .into_iter()
+            .map(|row| row.alias)
+            .collect()
+    };
+    if cached {
+        return saved();
+    }
+    match Client::load(paths).and_then(|client| client.accounts()) {
+        Ok(accounts) => accounts.into_iter().map(|a| a.alias).collect(),
+        Err(_) => saved(),
+    }
+}
+
 pub fn server_view(
     paths: &Paths,
     cached: bool,
@@ -837,9 +908,12 @@ pub fn statusline(paths: &Paths, id: &str) -> Result<()> {
 pub enum Command {
     /// Enroll this machine with company SSO
     Connect {
+        /// Account server URL (shown on the server's home page)
         server: String,
+        /// Name for this machine, as it shows in `claudectl server devices`
         #[arg(long)]
         name: String,
+        /// Print the sign-in link instead of opening a browser
         #[arg(long)]
         no_browser: bool,
     },
@@ -851,41 +925,56 @@ pub enum Command {
     },
     /// Sign in directly on the server; refresh credentials never reach this client
     Login {
+        /// Name for the new account
         alias: String,
+        /// Print the sign-in link instead of opening a browser
         #[arg(long)]
         no_browser: bool,
     },
     /// Complete a browser login, or retry verification of its retained result
+    #[command(hide = true)]
     CompleteLogin {
+        /// Login ID that `server login` printed
         id: String,
+        /// Retry the verification of a sign-in the server already kept
         #[arg(long)]
         resume: bool,
     },
     /// Force a new access token; every running server session of this account loses its
     /// token (a refresh revokes the previous one) and must be relaunched with --resume
+    #[command(hide = true)]
     RefreshAccess { alias: String },
     /// Repair an existing server grant through identity-pinned sign-in
     Renew {
+        /// Account to repair: full name, email name, or a unique prefix
         alias: String,
+        /// Print the sign-in link instead of opening a browser
         #[arg(long)]
         no_browser: bool,
     },
     /// Run the tested Claude build with access-only credentials
     Run {
+        /// Account to use: full name, email name, or a unique prefix
         alias: String,
+        /// Claude executable to run (default: `claude` on PATH)
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
+        /// Arguments for Claude, after `--`
         #[arg(last = true)]
         args: Vec<std::ffi::OsString>,
     },
     /// Qualify a Claude build: run the synthetic renewal handoff check, record it only on a pass
+    #[command(hide = true)]
     Qualify {
+        /// Claude executable to check (default: `claude` on PATH)
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
     },
     /// Read subscription usage; --cached works entirely offline
     Status {
+        /// Account to show: full name, email name, or a unique prefix
         alias: String,
+        /// Use the saved usage only; no network
         #[arg(long)]
         cached: bool,
         /// Print the raw JSON instead of a table
@@ -893,6 +982,7 @@ pub enum Command {
         json: bool,
     },
     /// Read the local session usage cache without network access
+    #[command(hide = true)]
     Statusline { account_id: String },
     /// Record a Claude hook event for a running server session (internal; never fails)
     #[command(hide = true)]
@@ -900,6 +990,7 @@ pub enum Command {
     /// Transfer a profile, or every saved account with --all, after stopping every previous
     /// grant holder
     Migrate {
+        /// Saved profile to move to the server
         #[arg(required_unless_present_any = ["all", "abort"], conflicts_with_all = ["all", "abort"])]
         alias: Option<String>,
         /// Every saved account: inactive ones first, the live login last
@@ -920,12 +1011,66 @@ pub enum Command {
         json: bool,
     },
     /// Stop a machine from acquiring further access tokens
-    Revoke { machine_id: String },
+    Revoke {
+        /// Machine ID from `claudectl server devices`
+        machine_id: String,
+    },
     /// Delete a server account and its refresh grant; tokens already issued expire on their own
-    Remove { alias: String },
+    Remove {
+        /// Account to remove: full name, email name, or a unique prefix
+        alias: String,
+    },
     /// Remove this machine's local connection; does not revoke it on the server
     Disconnect,
 }
+/// `claudectl run`: `server run` on the named account, or on `pick_account` when none is
+/// named. The account name resolves like every other (`accounts::resolve`).
+pub fn run(account: Option<&str>, claude: PathBuf, args: Vec<std::ffi::OsString>) -> Result<()> {
+    let paths = crate::config::default_paths()?;
+    let alias = match account {
+        Some(name) => name.to_owned(),
+        None => {
+            let picked = pick_account(&paths)?;
+            eprintln!("claudectl: starting Claude on {picked} (most room)");
+            picked
+        }
+    };
+    dispatch(Command::Run {
+        alias,
+        claude,
+        args,
+    })
+}
+
+/// `claudectl rm`: `server remove` after a confirmation, or with `--yes`.
+pub fn remove_confirmed(account: &str, yes: bool) -> Result<()> {
+    use std::io::IsTerminal;
+    let paths = crate::config::default_paths()?;
+    if cached_connection(&paths).is_none() {
+        bail!(NOT_CONNECTED);
+    }
+    // The confirmation names the account a prefix or short name resolves to.
+    let account = Client::load(&paths)?.account(account)?.alias;
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            bail!(
+                "removing an account needs a confirmation\nTry: claudectl rm {} --yes",
+                crate::shell::arg(&account)
+            );
+        }
+        let confirmed = dialoguer::Confirm::new()
+            .with_prompt(format!(
+                "Remove {account} from the account server? Running sessions stop at their next token renewal."
+            ))
+            .default(false)
+            .interact()?;
+        if !confirmed {
+            bail!("not removed");
+        }
+    }
+    dispatch(Command::Remove { alias: account })
+}
+
 pub fn dispatch(command: Command) -> Result<()> {
     let paths = crate::config::default_paths()?;
     // Before any connection is loaded: a shim passed as Claude would run itself.
@@ -1003,7 +1148,10 @@ pub fn dispatch(command: Command) -> Result<()> {
                     Ok(())
                 }
                 Command::Login { alias, no_browser } => login(&client, &alias, false, no_browser),
-                Command::Renew { alias, no_browser } => login(&client, &alias, true, no_browser),
+                Command::Renew { alias, no_browser } => {
+                    let alias = client.account(&alias)?.alias;
+                    login(&client, &alias, true, no_browser)
+                }
                 Command::Migrate {
                     alias,
                     all,
@@ -1076,7 +1224,8 @@ pub fn dispatch(command: Command) -> Result<()> {
                             .map_err(|_| Unavailable)?,
                     )?;
                     println!(
-                        "Server account removed. Access tokens already issued stay valid until they expire."
+                        "Server account {} removed. Access tokens already issued stay valid until they expire.",
+                        account.alias
                     );
                     Ok(())
                 }
@@ -1088,6 +1237,65 @@ pub fn dispatch(command: Command) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::{ServerRow, Usage, candidate};
+
+    fn row(alias: &str, data: serde_json::Value, stale: bool) -> ServerRow {
+        ServerRow {
+            alias: alias.into(),
+            available: true,
+            usage: Ok(Usage {
+                data: Some(data),
+                observed_at: Some(1),
+                next_retry_at: i64::MAX,
+                stale,
+                error: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_server_account_is_picked_only_when_extra_usage_is_known_off() {
+        let off = serde_json::json!({"five_hour": {"utilization": 5.0},
+            "extra_usage": {"is_enabled": false}});
+        let on = serde_json::json!({"five_hour": {"utilization": 5.0},
+            "extra_usage": {"is_enabled": true}});
+        let missing = serde_json::json!({"five_hour": {"utilization": 5.0}});
+        assert!(!candidate(&row("a", off.clone(), false)).billed);
+        assert!(candidate(&row("a", on, false)).billed);
+        assert!(
+            candidate(&row("a", missing, false)).billed,
+            "unknown is not safe"
+        );
+        // Stale, unavailable, or failed usage is never fresh.
+        assert!(candidate(&row("a", off.clone(), false)).fresh);
+        assert!(!candidate(&row("a", off.clone(), true)).fresh);
+        let mut down = row("a", off, false);
+        down.available = false;
+        assert!(!candidate(&down).fresh);
+        let failed = ServerRow {
+            alias: "a".into(),
+            available: true,
+            usage: Err("429".into()),
+        };
+        assert!(!candidate(&failed).fresh);
+    }
+    #[test]
+    fn a_partial_usage_response_is_never_picked() {
+        let partial = serde_json::json!({"limits": [{"kind": "weekly_scoped", "percent": 1,
+            "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}],
+            "extra_usage": {"is_enabled": false}});
+        let full = serde_json::json!({"five_hour": {"utilization": 50.0},
+            "seven_day": {"utilization": 50.0}, "extra_usage": {"is_enabled": false}});
+        let candidates = [
+            candidate(&row("partial", partial, false)),
+            candidate(&row("full", full, false)),
+        ];
+        assert_eq!(crate::accounts::best(&candidates), Some(1));
+        assert_eq!(
+            crate::accounts::state(&candidates[0].windows),
+            crate::accounts::State::Unknown
+        );
+    }
     #[test]
     fn a_grant_that_expired_in_transit_is_refused() {
         // An observing read returns a grant valid at the server's read time; one that

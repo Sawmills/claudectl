@@ -242,19 +242,21 @@ fn preflight(paths: &Paths, cwd: &Path, args: &[OsString]) -> Result<()> {
             continue;
         }
         if name == exec::CONFIG_DIR_ENV || name.to_str().is_some_and(exec::is_scrubbed_env) {
+            let name = name.to_string_lossy();
             bail!(
-                "inherited credential or routing override: {}",
-                name.to_string_lossy()
+                "inherited credential or routing override: {name}\nTry: unset {name}; then run the command again"
             );
         }
     }
     for arg in args {
-        if arg.to_str().is_some_and(|a| {
+        if let Some(flag) = arg.to_str().and_then(|a| {
             ["--settings", "--setting-sources", "--bare"]
-                .iter()
-                .any(|flag| a == *flag || a.starts_with(&format!("{flag}=")))
+                .into_iter()
+                .find(|flag| a == *flag || a.starts_with(&format!("{flag}=")))
         }) {
-            bail!("launch argument overrides account isolation");
+            bail!(
+                "launch argument overrides account isolation: {flag}\nTry: run again without {flag} (server run sets the Claude settings itself)"
+            );
         }
     }
     exec::check_settings(cwd, &paths.home, &exec::managed_settings_dir())
@@ -273,7 +275,9 @@ pub(super) fn program(path: &Path) -> Result<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .map(|p| p.join(path))
         .find(|p| p.is_file())
-        .context("Claude executable not found")?
+        .context(
+            "Claude executable not found on PATH\nTry: claudectl run --claude /path/to/claude",
+        )?
         .canonicalize()
         .map_err(Into::into)
 }

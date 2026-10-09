@@ -23,7 +23,7 @@ pub fn run(alias: Option<&str>) -> Result<()> {
             let candidates: Vec<Candidate> = fetched.iter().map(candidate_from).collect();
             let Some(best) = select_most_available(&candidates) else {
                 bail!(
-                    "no accounts with fresh usage below the general limits; run claudectl status"
+                    "no saved profile has fresh usage below the general limits\nTry: claudectl run (server accounts), or claudectl status"
                 );
             };
             let best = best.to_string();

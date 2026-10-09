@@ -11,12 +11,55 @@ use claudectl::config;
     about = "Manage multiple Claude Code accounts"
 )]
 pub struct Cli {
+    /// Without a command: the account status and the next step
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
+
+const RUN_EXAMPLES: &str = "Examples:
+  claudectl run                 start Claude on the account with the most room
+  claudectl run amir2           start on amir2 (full name, email name, or a unique prefix)
+  claudectl run -- --resume ID  pass arguments to Claude after --";
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start Claude on a server account (the one with the most room if none is named)
+    #[command(after_help = RUN_EXAMPLES)]
+    Run {
+        /// Account to use: full name, email name (amir2), or a unique prefix
+        account: Option<String>,
+        /// Claude executable to run (default: `claude` on PATH)
+        #[arg(long, default_value = "claude")]
+        claude: std::path::PathBuf,
+        /// Arguments for Claude, after `--`
+        #[arg(last = true)]
+        args: Vec<std::ffi::OsString>,
+    },
+    /// Add a Claude account to the account server (opens the Claude sign-in)
+    #[command(after_help = "Example:\n  claudectl add work")]
+    Add {
+        /// Name for the new account
+        name: String,
+        /// Print the sign-in link instead of opening a browser
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Sign an account in again when its login needs attention
+    Renew {
+        /// Account to repair: full name, email name, or a unique prefix
+        account: String,
+        /// Print the sign-in link instead of opening a browser
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Remove an account from the account server
+    Rm {
+        /// Account to remove: full name, email name, or a unique prefix
+        account: String,
+        /// Remove without asking (for scripts)
+        #[arg(long)]
+        yes: bool,
+    },
     /// Use Claude accounts held by a company account server
     Server {
         #[command(subcommand)]
@@ -29,6 +72,7 @@ enum Commands {
         command: claudectl::central::shim::Command,
     },
     /// Show account status and what to do next
+    #[command(after_help = "Example:\n  claudectl status amir2")]
     Status {
         /// Check only this saved profile
         alias: Option<String>,
@@ -81,6 +125,7 @@ enum Commands {
         json: bool,
     },
     /// Print the active account's usage in one line for a prompt; silent on any doubt
+    #[command(hide = true)]
     Statusline,
     /// Set or clear a profile's display label
     Label {
@@ -157,8 +202,17 @@ fn main() {
     // Parse first so --help and --version work without a writable home.
     let cli = Cli::parse();
 
+    // No command: the status, as `claudectl status` would show it.
+    let command = cli.command.unwrap_or(Commands::Status {
+        alias: None,
+        cached: false,
+        refresh: false,
+        details: false,
+        json: false,
+    });
+
     // The prompt path reads one small file and never writes or waits.
-    if let Commands::Statusline = cli.command {
+    if let Commands::Statusline = command {
         commands::statusline::run();
         return;
     }
@@ -168,7 +222,25 @@ fn main() {
         std::process::exit(1);
     }
 
-    let result = match cli.command {
+    use claudectl::central::Command as ServerCommand;
+    let result = match command {
+        Commands::Run {
+            account,
+            claude,
+            args,
+        } => claudectl::central::run(account.as_deref(), claude, args),
+        Commands::Add { name, no_browser } => claudectl::central::dispatch(ServerCommand::Login {
+            alias: name,
+            no_browser,
+        }),
+        Commands::Renew {
+            account,
+            no_browser,
+        } => claudectl::central::dispatch(ServerCommand::Renew {
+            alias: account,
+            no_browser,
+        }),
+        Commands::Rm { account, yes } => claudectl::central::remove_confirmed(&account, yes),
         Commands::Server { command } => claudectl::central::dispatch(command),
         #[cfg(unix)]
         Commands::Shim { command } => claudectl::central::shim::dispatch(command),
