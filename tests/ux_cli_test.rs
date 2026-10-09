@@ -197,7 +197,18 @@ fn local_profile_commands_are_hidden_but_still_work() {
         let o = home.run(&[hidden, "--help"]);
         assert!(o.status.success(), "{hidden} --help: {}", out(&o));
     }
-    for visible in ["run", "status", "add", "renew", "rm", "server", "exec", "claude", "rate", "completions"] {
+    for visible in [
+        "run",
+        "status",
+        "add",
+        "renew",
+        "rm",
+        "server",
+        "exec",
+        "claude",
+        "rate",
+        "completions",
+    ] {
         assert!(
             commands.contains(&visible.to_string()),
             "{visible} missing: {commands:?}"
