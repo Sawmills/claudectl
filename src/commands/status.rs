@@ -122,6 +122,10 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
         })
         .chain(&remote)
         .collect();
+    if !details {
+        print!("{}", compact(&fetched, chrono::Utc::now().timestamp()));
+        return Ok(());
+    }
     if fetched.is_empty() {
         println!("no profiles saved. Use 'claudectl save' or 'claudectl login <alias>'.");
         return Ok(());
@@ -135,11 +139,7 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
     });
 
     print_fetched_at();
-    if details {
-        print_table(&accounts);
-    } else {
-        print_summary(&accounts);
-    }
+    print_table(&accounts);
     Ok(())
 }
 
@@ -1060,6 +1060,220 @@ fn with_label(mut row: Vec<Cell>, account: &AccountStatus, show_label: bool) -> 
     row
 }
 
+/// `5h in 12h 52m`-style time from now to `at`.
+fn until(at: i64, now: i64) -> String {
+    let secs = at.saturating_sub(now);
+    if secs <= 0 {
+        return "now".into();
+    }
+    let (d, h, m) = (secs / 86_400, secs % 86_400 / 3_600, secs % 3_600 / 60);
+    if d > 0 {
+        format!("in {d}d {h}h")
+    } else if h > 0 {
+        format!("in {h}h {m}m")
+    } else {
+        format!("in {}m", m.max(1))
+    }
+}
+
+/// An account as the shared picker (`claudectl::accounts`) sees it. A local profile is
+/// never billed only when it is `rate_limited`; a server account only when extra usage is
+/// known off.
+fn candidate_of(f: &FetchedUsage, now: i64) -> claudectl::accounts::Candidate {
+    claudectl::accounts::Candidate {
+        name: f.alias.clone(),
+        windows: f
+            .usage
+            .as_ref()
+            .map(claudectl::accounts::windows)
+            .unwrap_or_default(),
+        fresh: f.error.is_none() && f.usage.is_some() && f.snapshot.is_fresh_at(now),
+        billed: if f.on_server {
+            f.usage
+                .as_ref()
+                .and_then(|u| u.extra_usage.as_ref())
+                .and_then(|e| e.is_enabled)
+                != Some(false)
+        } else {
+            billing_class(f.usage.as_ref(), f.plan.as_deref()) != "rate_limited"
+        },
+    }
+}
+
+/// The default status: one line per account, `→` on the account to use, `*` on the active
+/// local login, and one `Next:` line. Details and disclaimers live in `--details`.
+fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
+    use claudectl::accounts::{self, State};
+    if fetched.is_empty() {
+        return "No accounts yet.\n\nNext: claudectl server connect <server-url> --name <machine>, then claudectl add <name>\n".into();
+    }
+    let candidates: Vec<_> = fetched.iter().map(|f| candidate_of(f, now)).collect();
+    let best = accounts::best(&candidates);
+    let names =
+        accounts::short_names(&fetched.iter().map(|f| f.alias.as_str()).collect::<Vec<_>>());
+    let show_fable = candidates
+        .iter()
+        .any(|c| c.windows.iter().any(|w| w.name == "Fable"));
+    let pct = |c: &accounts::Candidate, name: &str| {
+        c.windows
+            .iter()
+            .find(|w| w.name == name)
+            .and_then(|w| w.used)
+            .map_or_else(|| "-".to_string(), |p| format!("{p:.0}%"))
+    };
+    let reset_of = |c: &accounts::Candidate, name: &str| {
+        c.windows
+            .iter()
+            .find(|w| w.name == name)
+            .and_then(|w| w.resets_at)
+            .map(|at| format!("{name} {}", until(at, now)))
+    };
+    // Usable accounts first (best first), then low, limits, and unknown.
+    let rank = |i: usize| {
+        let c = &candidates[i];
+        let state = accounts::state(&c.windows);
+        let order = match (Some(i) == best, &state, c.fresh) {
+            (true, ..) => 0,
+            (_, State::Ready, true) => 1,
+            (_, State::Low { .. }, true) => 2,
+            (_, State::Limit { .. }, _) => 4,
+            _ => 3,
+        };
+        let highest = c
+            .windows
+            .iter()
+            .filter_map(|w| w.used)
+            .fold(0.0_f64, f64::max);
+        (order, (highest * 100.0) as i64, names[i].clone())
+    };
+    let mut order: Vec<usize> = (0..fetched.len()).collect();
+    order.sort_by_key(|&i| rank(i));
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut header = vec!["Account", "5h", "Week"];
+    if show_fable {
+        header.push("Fable");
+    }
+    header.extend(["Resets", "State"]);
+    rows.push(header.iter().map(|h| h.to_string()).collect());
+    let mut markers = vec!["  ".to_string()];
+    // The first error row's fix, for the Next line when no account is usable.
+    let mut fix: Option<String> = None;
+    for &i in &order {
+        let (f, c) = (fetched[i], &candidates[i]);
+        let state = accounts::state(&c.windows);
+        let (resets, mut text) = match (&f.error, &state) {
+            (Some(_), _) => {
+                // The same label and fix as `--details` (`next_step`).
+                let (label, action) = next_step(&to_account_status(f));
+                if action.starts_with("claudectl ") && fix.is_none() {
+                    fix = Some(action);
+                }
+                ("-".to_string(), label.to_lowercase())
+            }
+            (None, State::Limit { window, .. }) => (
+                reset_of(c, window)
+                    .or_else(|| reset_of(c, "week"))
+                    .unwrap_or_else(|| "-".into()),
+                format!("{window} limit"),
+            ),
+            (None, State::Low { window }) => (
+                reset_of(c, window).unwrap_or_else(|| "-".into()),
+                format!("low ({window})"),
+            ),
+            (None, State::Ready) => (
+                reset_of(c, "5h").unwrap_or_else(|| "-".into()),
+                "ready".into(),
+            ),
+            (None, State::Unknown) => ("-".into(), "no usage data".into()),
+        };
+        if f.error.is_none() && !c.fresh && !matches!(state, State::Unknown) {
+            text.push_str(" (old data)");
+        }
+        if c.billed && !f.on_server && f.error.is_none() {
+            text.push_str(" (may bill)");
+        }
+        if f.is_active {
+            text.push_str(" (local, active)");
+        }
+        let mut row = vec![names[i].clone(), pct(c, "5h"), pct(c, "week")];
+        if show_fable {
+            row.push(pct(c, "Fable"));
+        }
+        row.extend([resets, text]);
+        rows.push(row);
+        markers.push(
+            if Some(i) == best {
+                "→ "
+            } else if f.is_active {
+                "* "
+            } else {
+                "  "
+            }
+            .into(),
+        );
+    }
+    let widths: Vec<usize> = (0..rows[0].len())
+        .map(|col| {
+            rows.iter()
+                .map(|r| r[col].chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut out = String::new();
+    for (marker, row) in markers.iter().zip(&rows) {
+        let last = row.len() - 1;
+        let line: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(col, cell)| {
+                if col == last {
+                    cell.clone()
+                } else {
+                    format!("{cell:<w$}", w = widths[col])
+                }
+            })
+            .collect();
+        out.push_str(marker);
+        out.push_str(line.join("  ").trim_end());
+        out.push('\n');
+    }
+    out.push('\n');
+    match best {
+        Some(i) if fetched[i].on_server => {
+            out.push_str(&format!("Next: claudectl run   (picks {})\n", names[i]));
+        }
+        Some(i) => out.push_str(&format!("Next: claudectl use {}\n", fetched[i].alias)),
+        None => {
+            // Room, but not provably free of billing: name one; never pick it silently.
+            let unpicked = order.iter().copied().find(|&i| {
+                let c = &candidates[i];
+                c.fresh
+                    && matches!(
+                        accounts::state(&c.windows),
+                        State::Ready | State::Low { .. }
+                    )
+            });
+            match unpicked {
+                Some(i) if fetched[i].on_server => out.push_str(&format!(
+                    "Next: claudectl run {}   (not picked automatically: it may bill)\n",
+                    names[i]
+                )),
+                Some(i) => out.push_str(&format!(
+                    "Next: claudectl use {}   (not picked automatically: it may bill)\n",
+                    fetched[i].alias
+                )),
+                None => match fix {
+                    Some(command) => out.push_str(&format!("Next: {command}\n")),
+                    None => out
+                        .push_str("Next: claudectl status --details   (no account has room now)\n"),
+                },
+            }
+        }
+    }
+    out
+}
+
 fn print_summary(accounts: &[AccountStatus]) {
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
     let table = summary_table(accounts, no_color);
@@ -1857,6 +2071,107 @@ mod tests {
             },
             ..FetchedUsage::default()
         }
+    }
+
+    fn server(alias: &str, usage: &str) -> FetchedUsage {
+        FetchedUsage {
+            on_server: true,
+            ..fetched_json(alias, usage, None)
+        }
+    }
+
+    #[test]
+    fn compact_status_is_one_line_per_account_with_the_best_marked_and_one_next_line() {
+        let now = 1_500;
+        let off = r#""extra_usage":{"is_enabled":false}"#;
+        let rows = [
+            server(
+                "amir3@sawmills.ai",
+                &format!(
+                    r#"{{"five_hour":{{"utilization":2,"resets_at":"1970-01-01T13:17:00Z"}},"seven_day":{{"utilization":0}},{off}}}"#
+                ),
+            ),
+            server(
+                "amir4@sawmills.ai",
+                &format!(
+                    r#"{{"five_hour":{{"utilization":0}},"seven_day":{{"utilization":98,"resets_at":"1970-01-05T00:00:00Z"}},"limits":[{{"kind":"weekly_scoped","percent":100,"scope":{{"model":{{"id":null,"display_name":"Fable"}},"surface":null}}}}],{off}}}"#
+                ),
+            ),
+            FetchedUsage {
+                is_active: true,
+                ..fetched_json(
+                    "amir7@sawmills.ai",
+                    r#"{"five_hour":{"utilization":4},"seven_day":{"utilization":93,"resets_at":"1970-01-02T03:25:00Z"},"extra_usage":{"is_enabled":false}}"#,
+                    Some("max"),
+                )
+            },
+        ];
+        let refs: Vec<&FetchedUsage> = rows.iter().collect();
+        let text = compact(&refs, now);
+        let lines: Vec<&str> = text.lines().collect();
+        // Header, three accounts, a blank line, one Next line.
+        assert_eq!(lines.len(), 6, "{text}");
+        assert!(
+            lines[0].contains("Account") && lines[0].contains("Fable"),
+            "{text}"
+        );
+        // Short names: the shared domain is dropped.
+        let amir3 = lines.iter().find(|l| l.contains("amir3")).unwrap();
+        assert!(amir3.starts_with("→ "), "{text}");
+        assert!(!amir3.contains("@sawmills.ai"), "{text}");
+        assert!(amir3.contains("ready"), "{text}");
+        assert!(amir3.contains("5h in 12h 52m"), "{text}");
+        let amir4 = lines.iter().find(|l| l.contains("amir4")).unwrap();
+        assert!(amir4.contains("Fable limit"), "{text}");
+        let amir7 = lines.iter().find(|l| l.contains("amir7")).unwrap();
+        assert!(amir7.starts_with("* "), "{text}");
+        assert!(
+            amir7.contains("low (week)") && amir7.contains("week in 1d 3h"),
+            "{text}"
+        );
+        assert_eq!(
+            *lines.last().unwrap(),
+            "Next: claudectl run   (picks amir3)"
+        );
+        // No repeated commands, no disclaimer footer, no box drawing.
+        assert_eq!(text.matches("claudectl").count(), 1, "{text}");
+        assert!(!text.contains('│'), "{text}");
+    }
+
+    #[test]
+    fn compact_status_without_a_usable_account_says_what_to_do() {
+        let now = 1_500;
+        let full = server(
+            "a@x.io",
+            r#"{"five_hour":{"utilization":100},"seven_day":{"utilization":1},"extra_usage":{"is_enabled":false}}"#,
+        );
+        let text = compact(&[&full], now);
+        assert!(text.contains("5h limit"), "{text}");
+        assert!(
+            text.lines()
+                .last()
+                .unwrap()
+                .starts_with("Next: claudectl status --details"),
+            "{text}"
+        );
+        assert_eq!(
+            compact(&[], now).lines().last().unwrap(),
+            "Next: claudectl server connect <server-url> --name <machine>, then claudectl add <name>"
+        );
+    }
+
+    #[test]
+    fn compact_status_points_a_local_best_account_at_use() {
+        let now = 1_500;
+        let local = fetched_json(
+            "work",
+            r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":1},"extra_usage":{"is_enabled":false}}"#,
+            Some("max"),
+        );
+        assert_eq!(
+            compact(&[&local], now).lines().last().unwrap(),
+            "Next: claudectl use work"
+        );
     }
 
     #[test]
