@@ -949,8 +949,9 @@ pub fn run(
         session.set_renewal("renewing")?;
         match kind {
             RestartKind::Renew(access) => {
-                launch_args = super::renew::relaunch_args(args, &session_id)
-                    .context("renewal of a one-shot run")?;
+                launch_args =
+                    super::failover::prompted_resume(args, &session_id, super::renew::CRON_NOTE)
+                        .context("renewal of a one-shot run")?;
                 session.renew(access)?;
                 restarts.push(now());
                 eprintln!("claudectl: server token renewed; resuming session {session_id}");

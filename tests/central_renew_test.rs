@@ -274,7 +274,13 @@ impl Env {
         let settings = args.iter().position(|a| a == "--settings").unwrap();
         let mut user: Vec<&str> = args.iter().map(String::as_str).collect();
         user.drain(settings..settings + 2);
+        // Only the renewal resume carries the note that re-creates the session's crons:
+        // Claude Code can keep them listed but stop firing them after a resume (SAW-12610).
+        let note = user.pop().unwrap();
+        assert!(note.contains("CronList") && note.contains("stop"), "{note}");
         assert_eq!(user, ["--model", "opus", "--resume", "sess-1"]);
+        let first: Vec<String> = serde_json::from_value(runs[0]["args"].clone()).unwrap();
+        assert!(first.iter().all(|a| !a.contains("CronList")), "{first:?}");
         // No request ever forced a refresh (SAW-12610 root cause).
         let requests = self.fake.lock().unwrap().requests.clone();
         assert!(requests.iter().all(Value::is_null), "{requests:?}");

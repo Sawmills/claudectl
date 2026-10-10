@@ -174,7 +174,11 @@ pending (between its admission and its first refresh), the server refreshes for 
 do not migrate an account while `server run` sessions use it. When the
 revision changed (a refresh revoked the held token), it restarts Claude with
 `--resume <latest session>` on the new token, in the same folder and terminal, from the same
-checked build, and prints `claudectl: server token renewed; resuming session <id>`. It
+checked build, and prints `claudectl: server token renewed; resuming session <id>`. That
+resume, and only that one, adds a first prompt (unless the user's arguments already hold a
+prompt): Claude Code can keep session cron jobs listed after a resume but stop firing them, so
+the prompt tells the session to delete and create each listed job again with the same schedule
+and prompt, then stop. It
 restarts only when all hold: the new token outlives the held one, the last turn ended at
 least 60 s ago with no prompt since (a turn that failed, for example on a revoked token,
 ends with `StopFailure` and counts too), no terminal input for 5 min (the terminal device's

@@ -190,12 +190,21 @@ const VALUE_FLAGS: &[&str] = &[
     "--system-prompt-snapshot",
 ];
 
-/// The arguments of a moved session: the user's arguments resumed on `session`
-/// (`renew::relaunch_args`), plus the recovery prompt so the failed turn continues. Claude
-/// takes one prompt, so the recovery prompt is added only when no argument can be a prompt:
-/// every argument that does not start with `-` follows a flag of `VALUE_FLAGS`. Otherwise the
-/// arguments stay as they are, as on a renewal. None for a one-shot run.
+/// The arguments of a moved session: the user's arguments resumed on `session`, plus the
+/// recovery prompt so the failed turn continues. None for a one-shot run.
 pub(super) fn resume_args(args: &[OsString], session: &str) -> Option<Vec<OsString>> {
+    prompted_resume(args, session, RECOVERY_PROMPT)
+}
+
+/// The user's arguments resumed on `session` (`renew::relaunch_args`), plus `prompt`. Claude
+/// takes one prompt, so `prompt` is added only when no argument can be a prompt: every
+/// argument that does not start with `-` follows a flag of `VALUE_FLAGS`. Otherwise the
+/// arguments stay as they are. None for a one-shot run.
+pub(super) fn prompted_resume(
+    args: &[OsString],
+    session: &str,
+    prompt: &str,
+) -> Option<Vec<OsString>> {
     let mut resumed = super::renew::relaunch_args(args, session)?;
     // `relaunch_args` ends with `--resume <session>`.
     let user = &resumed[..resumed.len() - 2];
@@ -211,7 +220,7 @@ pub(super) fn resume_args(args: &[OsString], session: &str) -> Option<Vec<OsStri
         }
     }
     if !maybe_prompt {
-        resumed.push(RECOVERY_PROMPT.into());
+        resumed.push(prompt.into());
     }
     Some(resumed)
 }
