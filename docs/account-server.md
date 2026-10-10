@@ -174,8 +174,29 @@ pending (between its admission and its first refresh), the server refreshes for 
 do not migrate an account while `server run` sessions use it. When the
 revision changed (a refresh revoked the held token), it restarts Claude with
 `--resume <latest session>` on the new token, in the same folder and terminal, from the same
-checked build, and prints `claudectl: server token renewed; resuming session <id>`. It
-restarts only when all hold: the new token outlives the held one, the last turn ended at
+checked build, and prints `claudectl: server token renewed; resuming session <id>`. That
+resume, and only that one, adds a first prompt (unless the user's arguments already hold a
+prompt): Claude Code can keep session cron jobs listed after a resume but stop firing them, so
+the prompt tells the session to delete and create each listed job again with the same schedule
+and prompt, then stop. This is a best-effort workaround for Claude Code's resume behavior, with
+these accepted limits:
+
+- Every listed job is reset on each renewal resume, not only a silent one: neither claudectl nor
+  the session can tell a silent job from a live one.
+- A reset can shift a job's fire time. Claude Code delays each recurring fire by an offset it
+  derives from the job ID, and a re-created job gets a new ID, so the same cron expression can
+  fire at a different minute ([how late a recurring task runs](https://code.claude.com/docs/en/scheduled-tasks#how-late-a-recurring-task-runs)).
+  A watchdog that looks for a silent job must use the re-created job's timing, not the old
+  job's fire times.
+- claudectl does not check that each `CronDelete` and `CronCreate` succeeded; the session's
+  transcript shows the result. If a call fails, a job stays as the resume left it (listed, and
+  maybe silent), or is gone.
+- Recovery: run `CronList` in the tab and create a missing job again by hand. Fleet Operators
+  keep their own watchdog for a silent cron.
+- The defect belongs to Claude Code; an upstream report waits on the owner's decision. Remove
+  the note once Claude Code fires restored jobs reliably.
+
+`server run` restarts Claude only when all hold: the new token outlives the held one, the last turn ended at
 least 60 s ago with no prompt since (a turn that failed, for example on a revoked token,
 ends with `StopFailure` and counts too), no terminal input for 5 min (the terminal device's
 access time), and fewer than 3 restarts in the last hour. Once the held token is dead (it

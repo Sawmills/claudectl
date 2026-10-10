@@ -7,6 +7,14 @@ use std::ffi::{OsStr, OsString};
 pub(super) const IDLE_AFTER_STOP_MS: i64 = 60_000;
 /// No terminal input for this long before a restart (ms): protects a draft being typed.
 pub(super) const TTY_IDLE_MS: i64 = 5 * 60_000;
+/// The first prompt of a renewal resume only (never a first launch, a manual resume or a
+/// failover). Claude Code can keep session cron jobs listed after a resume but stop firing
+/// them (SAW-12610, 10-09): the session creates them again, then stops. Best effort: every
+/// listed job is reset and claudectl does not verify the tool calls (docs/account-server.md).
+pub(super) const CRON_NOTE: &str = "claudectl restarted this session on a renewed server \
+token. Claude Code can keep session cron jobs listed after a resume but stop firing them. Run \
+CronList. If it lists jobs, delete each one with CronDelete and create it again with CronCreate, \
+with the same schedule and the same prompt. Then stop: do no other work.";
 /// At most this many restarts in one hour.
 pub(super) const RESTARTS_PER_HOUR: usize = 3;
 
