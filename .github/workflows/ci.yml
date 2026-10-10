@@ -138,14 +138,18 @@ jobs:
           if [[ "$TRUNK_FORK" == true ]]; then
             annotations=("--github-annotate-file=$RUNNER_TEMP/annotations.bin")
           fi
+          trunk_started=$SECONDS
           if timeout --kill-after=5s 590s "$TRUNK_PATH" check --ci \
             "${baseline[@]}" --github-commit "$TRUNK_HEAD_SHA" \
             "${annotations[@]}"; then
             exit 0
           else
             status=$?
-            if [[ "$status" == 124 || "$status" == 137 ]]; then
+            if [[ "$status" == 124 ||
+              ( "$status" == 137 && $((SECONDS - trunk_started)) -ge 590 ) ]]; then
               echo "::error::Trunk Check exceeded its 10-minute limit; the check process was terminated."
+            elif [[ "$status" == 137 ]]; then
+              echo "::error::Trunk Check was forcibly terminated (SIGKILL)."
             fi
             exit "$status"
           fi
