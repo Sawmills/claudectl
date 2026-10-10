@@ -87,11 +87,16 @@ jobs:
             echo "::error::Trunk Check requires a valid baseline commit."
             exit 1
           fi
-          history=()
-          if [[ "$(git rev-parse --is-shallow-repository)" == true ]]; then
-            history=(--unshallow)
-          fi
-          git fetch --no-tags --no-recurse-submodules "${history[@]}" origin "$base" "$GITHUB_SHA"
+          git fetch --no-tags --no-recurse-submodules --depth=2 origin "$base" "$GITHUB_SHA"
+          depth=16
+          while ! git merge-base "$base" "$GITHUB_SHA" >/dev/null; do
+            if [[ "$(git rev-parse --is-shallow-repository)" != true ]]; then
+              echo "::error::Trunk baseline and head have no common Git ancestor."
+              exit 1
+            fi
+            git fetch --no-tags --no-recurse-submodules --deepen="$depth" origin "$base" "$GITHUB_SHA"
+            depth=$((depth * 2))
+          done
           echo "base=$base" >> "$GITHUB_OUTPUT"
 
       - name: Cache Trunk and Rust artifacts
