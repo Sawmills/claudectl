@@ -62,11 +62,49 @@ jobs:
         run: cargo build --release --features server --bin claudectl-server
 
   trunk:
+    permissions:
+      contents: read
+      checks: write
     name: Trunk Check
     # trunk-ignore(actionlint/runner-label): Namespace profile
     runs-on: namespace-profile-sawmills-runner-large
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Fetch Trunk baseline
+        id: baseline
+        timeout-minutes: 2
+        env:
+          TRUNK_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        shell: bash
+        run: |
+          base="$TRUNK_BASE_SHA"
+          if [[ "$GITHUB_EVENT_NAME" == push &&
+            "$base" == 0000000000000000000000000000000000000000 ]]; then
+            echo "all=true" >> "$GITHUB_OUTPUT"
+            echo "base=$(git hash-object -w -t tree /dev/null)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            base="$(git rev-parse HEAD^1)"
+          fi
+          if [[ -z "$base" || "$base" == 0000000000000000000000000000000000000000 ]]; then
+            echo "::error::Trunk Check requires a valid baseline commit."
+            exit 1
+          fi
+          git fetch --no-tags --no-recurse-submodules --depth=2 origin "$base" "$GITHUB_SHA"
+          depth=16
+          while ! git merge-base "$base" "$GITHUB_SHA" >/dev/null; do
+            if [[ "$(git rev-parse --is-shallow-repository)" != true ]]; then
+              echo "::error::Trunk baseline and head have no common Git ancestor."
+              exit 1
+            fi
+            git fetch --no-tags --no-recurse-submodules --deepen="$depth" origin "$base" "$GITHUB_SHA"
+            depth=$((depth * 2))
+          done
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
       - name: Cache Trunk and Rust artifacts
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         # yamllint disable-line rule:line-length
@@ -78,11 +116,63 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Set up Trunk
+        timeout-minutes: 2
+        uses: trunk-io/trunk-action/setup@04ba50e7658c81db7356da96657e6e77f220bfa3 # v1
+
       - name: Trunk Check
-        uses: trunk-io/trunk-action@v1
+        timeout-minutes: 10
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TRUNK_BASE_SHA: ${{ steps.baseline.outputs.base }}
+          TRUNK_ALL: ${{ steps.baseline.outputs.all == 'true' }}
+          TRUNK_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+          TRUNK_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          baseline=(--upstream "$TRUNK_BASE_SHA")
+          if [[ "$TRUNK_ALL" == true ]]; then
+            baseline=(--all)
+          fi
+          annotations=(--github-annotate)
+          if [[ "$TRUNK_FORK" == true ]]; then
+            annotations=("--github-annotate-file=$RUNNER_TEMP/annotations.bin")
+          fi
+          trunk_started=$SECONDS
+          if timeout --kill-after=5s 590s "$TRUNK_PATH" check --ci \
+            "${baseline[@]}" --github-commit "$TRUNK_HEAD_SHA" \
+            "${annotations[@]}"; then
+            exit 0
+          else
+            status=$?
+            if [[ "$status" == 124 ||
+              ( "$status" == 137 && $((SECONDS - trunk_started)) -ge 590 ) ]]; then
+              echo "::error::Trunk Check exceeded its 10-minute limit; the check process was terminated."
+            elif [[ "$status" == 137 ]]; then
+              echo "::error::Trunk Check was forcibly terminated (SIGKILL)."
+            fi
+            exit "$status"
+          fi
+
+      - name: Save fork annotations
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          cache: false
-          check-mode: ${{ github.event_name == 'pull_request' && 'pull_request' || 'all' }}
+          name: trunk-annotations
+          overwrite: true
+          path: ${{ runner.temp }}/annotations.bin
+
+      - name: Trunk failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          for log in .trunk/logs/cli.log .trunk/logs/daemon.log; do
+            if [[ -f "$log" ]]; then
+              echo "::group::$log (last 200 lines)"
+              tail -n 200 "$log"
+              echo "::endgroup::"
+            fi
+          done
 
   build-macos:
     name: Build (macOS)
