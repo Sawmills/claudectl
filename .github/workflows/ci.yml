@@ -80,6 +80,12 @@ jobs:
         shell: bash
         run: |
           base="$TRUNK_BASE_SHA"
+          if [[ "$GITHUB_EVENT_NAME" == push &&
+            "$base" == 0000000000000000000000000000000000000000 ]]; then
+            echo "all=true" >> "$GITHUB_OUTPUT"
+            echo "base=$(git hash-object -w -t tree /dev/null)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
             base="$(git rev-parse HEAD^1)"
           fi
@@ -119,16 +125,21 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TRUNK_BASE_SHA: ${{ steps.baseline.outputs.base }}
+          TRUNK_ALL: ${{ steps.baseline.outputs.all == 'true' }}
           TRUNK_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
           TRUNK_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         shell: bash
         run: |
+          baseline=(--upstream "$TRUNK_BASE_SHA")
+          if [[ "$TRUNK_ALL" == true ]]; then
+            baseline=(--all)
+          fi
           annotations=(--github-annotate)
           if [[ "$TRUNK_FORK" == true ]]; then
             annotations=("--github-annotate-file=$RUNNER_TEMP/annotations.bin")
           fi
           if timeout --kill-after=5s 590s "$TRUNK_PATH" check --ci \
-            --upstream "$TRUNK_BASE_SHA" --github-commit "$TRUNK_HEAD_SHA" \
+            "${baseline[@]}" --github-commit "$TRUNK_HEAD_SHA" \
             "${annotations[@]}"; then
             exit 0
           else
