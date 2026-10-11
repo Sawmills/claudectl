@@ -183,6 +183,7 @@ If a job missed one or more fires, it tells the session to run that job's prompt
 regardless of how many fires were missed, then stop. This is a best-effort workaround for
 Claude Code's resume behavior, with these accepted limits:
 
+- Missed one-shot crons and exact jitter are outside this workaround; a non-idempotent job can replay up to once per renewal.
 - Every listed job is reset on each renewal resume, not only a silent one: neither claudectl nor
   the session can tell a silent job from a live one.
 - A reset can shift a job's fire time. Claude Code delays each recurring fire by an offset it
