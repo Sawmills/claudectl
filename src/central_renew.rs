@@ -9,12 +9,16 @@ pub(super) const IDLE_AFTER_STOP_MS: i64 = 60_000;
 pub(super) const TTY_IDLE_MS: i64 = 5 * 60_000;
 /// The first prompt of a renewal resume only (never a first launch, a manual resume or a
 /// failover). Claude Code can keep session cron jobs listed after a resume but stop firing
-/// them (SAW-12610, 10-09): the session creates them again, then stops. Best effort: every
-/// listed job is reset and claudectl does not verify the tool calls (docs/account-server.md).
+/// them (SAW-12610, 10-09): the session creates them again, catches up each missed job once,
+/// then stops. Best effort: every listed job is reset and claudectl does not verify the tool
+/// calls (docs/account-server.md).
 pub(super) const CRON_NOTE: &str = "claudectl restarted this session on a renewed server \
 token. Claude Code can keep session cron jobs listed after a resume but stop firing them. Run \
 CronList. If it lists jobs, delete each one with CronDelete and create it again with CronCreate, \
-with the same schedule and the same prompt. Then stop: do no other work.";
+with the same schedule and the same prompt. After re-creating the jobs, compare each job's \
+schedule with the time since this session's last turn. If one or more fires were missed for a \
+job, run that job's prompt ONCE now, regardless of how many fires were missed. Then stop: do \
+no other work.";
 /// At most this many restarts in one hour.
 pub(super) const RESTARTS_PER_HOUR: usize = 3;
 
