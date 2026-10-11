@@ -178,10 +178,10 @@ checked build, and prints `claudectl: server token renewed; resuming session <id
 resume, and only that one, adds a first prompt (unless the user's arguments already hold a
 prompt): Claude Code can keep session cron jobs listed after a resume but stop firing them, so
 the prompt tells the session to delete and create each listed job again with the same schedule
-and prompt. After re-creating them, compare each job's schedule with the time since the
-session's last turn. If a job missed one or more fires, run its prompt once now, regardless of
-how many fires were missed, then stop. This is a best-effort workaround for Claude Code's
-resume behavior, with these accepted limits:
+and prompt, then to compare each job's schedule with the time since the session's last turn.
+If a job missed one or more fires, it tells the session to run that job's prompt once now,
+regardless of how many fires were missed, then stop. This is a best-effort workaround for
+Claude Code's resume behavior, with these accepted limits:
 
 - Every listed job is reset on each renewal resume, not only a silent one: neither claudectl nor
   the session can tell a silent job from a live one.
@@ -193,6 +193,8 @@ resume behavior, with these accepted limits:
 - claudectl does not check that each `CronDelete` and `CronCreate` succeeded; the session's
   transcript shows the result. If a call fails, a job stays as the resume left it (listed, and
   maybe silent), or is gone.
+  The session decides whether fires were missed from the schedule and its last turn;
+  claudectl does not verify that judgment or the catch-up run.
 - Recovery: run `CronList` in the tab and create a missing job again by hand. Fleet Operators
   keep their own watchdog for a silent cron.
 - The defect belongs to Claude Code; an upstream report waits on the owner's decision. Remove
