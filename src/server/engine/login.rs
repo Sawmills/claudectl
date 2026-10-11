@@ -194,15 +194,33 @@ impl Engine {
             expires_at: expiry,
             scopes: token.scope.split_whitespace().map(str::to_owned).collect(),
         };
-        self.admit_with(
-            user,
-            &row.alias,
-            id,
-            grant,
-            flow.expected.as_ref(),
-            false,
-            Some(id),
-        )
-        .await
+        let receipt = self
+            .admit_with(
+                user,
+                &row.alias,
+                id,
+                grant,
+                flow.expected.as_ref(),
+                false,
+                Some(id),
+            )
+            .await?;
+        // A retry returns the kept receipt above, so each login writes one line.
+        self.audit(&audit::Event {
+            operation: if flow.expected.is_some() {
+                "renew"
+            } else {
+                "login"
+            },
+            machine,
+            account: &receipt.account_id,
+            result: "ok",
+            rotated: None,
+            target: None,
+            reason: None,
+            actor: None,
+        })
+        .await?;
+        Ok(receipt)
     }
 }

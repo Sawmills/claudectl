@@ -129,7 +129,10 @@ Reasons and what they mean:
   server never replays an uncertain exchange. Run `claudectl server renew <alias>`.
 - `refresh_in_progress`: another replica holds the account's lease. Machines retry; it clears
   within 2 minutes even if that replica died.
-- `usage_login_required`, `usage_failed`: usage reads failed; tokens still work.
+- `usage_login_required`, `usage_failed`: usage reads failed; tokens still work. The log line
+  names the `account`. A usage read refreshes an expired token itself, so
+  `usage_login_required` means a refresh failed or is uncertain: check the audit for a
+  `refresh` line with result `failed` before you run `claudectl server renew <alias>`.
 - `registry_unavailable`, `persistence_failed`, `audit_unavailable`: the database is unreachable
   or refused a write. Check the RDS instance and the `claudectl-postgres` secret.
 

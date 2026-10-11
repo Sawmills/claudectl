@@ -52,9 +52,38 @@ impl Engine {
             })
             .collect())
     }
-    /// A cached read never contacts the provider. A fresh read uses the current access token
-    /// and never refreshes: without a usable token it reports `login_required`.
+    /// A cached read never contacts the provider. A fresh read uses the current access token.
+    /// It refreshes only an expired token of a Ready account: that token is dead for every
+    /// holder, so no session loses it (SAW-12610), and an idle account would otherwise report
+    /// `login_required` with a good refresh grant (SAW-12870). It never refreshes a token that
+    /// running sessions still use. Without a usable token it reports `login_required`.
+    pub async fn usage_for(
+        &self,
+        user: &str,
+        machine: &str,
+        id: &str,
+        cached: bool,
+    ) -> Result<Usage> {
+        if !cached {
+            let loaded = self.selected(user, id).await?;
+            if loaded.record.phase == Phase::Ready
+                && !matches!(loaded.record.rotation, Rotation::Pending { .. })
+                && loaded.record.grant.expires_at <= now()
+                && let Err(error) = self.observe_for(user, machine, id).await
+            {
+                // The refresh audit line has the outcome; the read then reports login_required.
+                eprintln!(
+                    "{}",
+                    json!({"operation":"usage","stage":"refresh","reason":"refresh_failed","account":id,"error":error.to_string()})
+                );
+            }
+        }
+        self.read_usage(user, id, cached).await
+    }
     pub async fn usage(&self, user: &str, id: &str, cached: bool) -> Result<Usage> {
+        self.usage_for(user, "server", id, cached).await
+    }
+    async fn read_usage(&self, user: &str, id: &str, cached: bool) -> Result<Usage> {
         let loaded = self.selected(user, id).await?;
         let _poll = self.usage_poll.lock().await;
         let mut result: Usage = self.stored(id).await?;
