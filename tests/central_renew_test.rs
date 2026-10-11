@@ -278,6 +278,18 @@ impl Env {
         // Claude Code can keep them listed but stop firing them after a resume (SAW-12610).
         let note = user.pop().unwrap();
         assert!(note.contains("CronList") && note.contains("stop"), "{note}");
+        assert!(
+            note.contains("compare each job's schedule")
+                && note.contains("time since this session's last turn"),
+            "{note}"
+        );
+        assert!(
+            note.contains("one or more fires were missed")
+                && note.contains("run that job's prompt ONCE now")
+                && note.contains("regardless of how many fires were missed"),
+            "{note}"
+        );
+        assert!(note.ends_with("Then stop: do no other work."), "{note}");
         assert_eq!(user, ["--model", "opus", "--resume", "sess-1"]);
         let first: Vec<String> = serde_json::from_value(runs[0]["args"].clone()).unwrap();
         assert!(first.iter().all(|a| !a.contains("CronList")), "{first:?}");
