@@ -320,7 +320,8 @@ claudectl-server audit --key-file /keys/vault-key
   or when less than five minutes remain. A fresh usage read refreshes only an expired token
   of a Ready account (that token is dead for every holder). It never refreshes a token that
   sessions still use, so an idle account does not report `login_required` while its refresh
-  grant is good. A cached usage read never contacts the provider.
+  grant is good. If that refresh fails, or its audit row cannot be stored, the read fails.
+  A cached usage read never contacts the provider.
 - **Revoke.** `server revoke` stops a machine, also during a refresh in progress.
   `server remove` deletes the account, its grant, and every pending login or admission for
   its alias in one step; later token requests get HTTP 410, and work that started before the
@@ -331,7 +332,9 @@ claudectl-server audit --key-file /keys/vault-key
 - **Audit.** Every migrate, issue, refresh, revoke, finished login (`login`), and finished
   login renewal (`renew`) writes one line to stderr and one
   sealed row to the store: operation, machine, account digest, result, and for a refresh
-  whether the provider rotated the refresh token. No line holds a token.
+  whether the provider rotated the refresh token. No line holds a token. A login retry that
+  returns the kept receipt writes one more `login` or `renew` line with `reason: retry`, so a
+  first line lost to an audit failure is recovered.
   Dashboard actions (`account_remove`, `machine_revoke`) and every Google sign-in that the
   provider answered (`dashboard_sign_in`, `enroll_sign_in`) also write one line, with the
   person as `actor` (`dashboard:<email>` or `enrollment:<email>`; a refusal names the person

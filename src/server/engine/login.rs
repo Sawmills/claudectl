@@ -102,6 +102,13 @@ impl Engine {
             bail!("invalid login identifier");
         }
         if let Some(receipt) = self.receipt(user, id).await? {
+            // The first call may have failed on its audit append after the admission
+            // committed. The retry writes a line marked retry, so the login stays audited.
+            if let Some(row) = self.store.flow(user, id).await? {
+                let flow: Flow = self.unseal(&row.sealed)?;
+                self.audit_login(&flow, machine, &receipt, Some("retry"))
+                    .await?;
+            }
             return Ok(receipt);
         }
         let row = self
@@ -205,7 +212,17 @@ impl Engine {
                 Some(id),
             )
             .await?;
-        // A retry returns the kept receipt above, so each login writes one line.
+        self.audit_login(&flow, machine, &receipt, None).await?;
+        Ok(receipt)
+    }
+    /// One audit line for a finished login (`login`) or login renewal (`renew`).
+    async fn audit_login(
+        &self,
+        flow: &Flow,
+        machine: &str,
+        receipt: &Receipt,
+        reason: Option<&'static str>,
+    ) -> Result<()> {
         self.audit(&audit::Event {
             operation: if flow.expected.is_some() {
                 "renew"
@@ -217,10 +234,9 @@ impl Engine {
             result: "ok",
             rotated: None,
             target: None,
-            reason: None,
+            reason,
             actor: None,
         })
-        .await?;
-        Ok(receipt)
+        .await
     }
 }

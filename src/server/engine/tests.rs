@@ -2685,7 +2685,7 @@ async fn a_fresh_usage_read_never_refreshes_an_unexpired_token() {
 }
 
 #[tokio::test]
-async fn login_and_renewal_are_audited_once() {
+async fn login_and_renewal_are_audited_and_a_retry_is_labelled() {
     let (f, engine, _refreshes) = synthetic(3600).await;
     let login = engine
         .start_login("person", "machine", "work", false)
@@ -2695,7 +2695,8 @@ async fn login_and_renewal_are_audited_once() {
         .finish_login("person", "machine", &login.id, &pasted(&login))
         .await
         .unwrap();
-    // A retry returns the kept receipt and writes no second line.
+    // A retry returns the kept receipt. It writes one line marked retry, so a first line
+    // lost to an audit failure is recovered and a repeat is told apart.
     engine
         .finish_login("person", "machine", &login.id, &pasted(&login))
         .await
@@ -2709,26 +2710,221 @@ async fn login_and_renewal_are_audited_once() {
         .await
         .unwrap();
     assert_eq!(first.account_id, second.account_id);
+    let id = first.account_id.as_str();
+    assert_eq!(
+        login_lines(&engine, &f).await,
+        [
+            (
+                "login".to_owned(),
+                "ok".to_owned(),
+                "machine".to_owned(),
+                id.to_owned(),
+                None
+            ),
+            (
+                "login".to_owned(),
+                "ok".to_owned(),
+                "machine".to_owned(),
+                id.to_owned(),
+                Some("retry".to_owned())
+            ),
+            (
+                "renew".to_owned(),
+                "ok".to_owned(),
+                "machine".to_owned(),
+                id.to_owned(),
+                None
+            ),
+        ]
+    );
+}
+
+type Line = (String, String, String, String, Option<String>);
+async fn login_lines(engine: &Engine, f: &Fixture) -> Vec<Line> {
+    crate::server::audit::read(engine.store(), &f.key)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| e["operation"] == "login" || e["operation"] == "renew")
+        .map(|e| {
+            (
+                e["operation"].as_str().unwrap().to_owned(),
+                e["result"].as_str().unwrap().to_owned(),
+                e["machine"].as_str().unwrap().to_owned(),
+                e["account"].as_str().unwrap().to_owned(),
+                e["reason"].as_str().map(str::to_owned),
+            )
+        })
+        .collect()
+}
+
+/// Make every audit append fail in this fixture's PostgreSQL database, or restore it.
+async fn audit_down(f: &Fixture, down: bool) {
+    if down {
+        f.sql(
+            "CREATE FUNCTION audit_down() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'audit down'; END $$; \
+             CREATE TRIGGER audit_down BEFORE INSERT ON audit_events \
+             FOR EACH ROW EXECUTE FUNCTION audit_down();",
+        )
+        .await;
+    } else {
+        f.sql("DROP TRIGGER audit_down ON audit_events; DROP FUNCTION audit_down();")
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn a_login_whose_audit_append_failed_is_audited_by_its_retry() {
+    let (f, engine, _refreshes) = synthetic(3600).await;
+    if f.postgres().is_none() {
+        return;
+    }
+    let login = engine
+        .start_login("person", "machine", "work", false)
+        .await
+        .unwrap();
+    audit_down(&f, true).await;
+    let failed = engine
+        .finish_login("person", "machine", &login.id, &pasted(&login))
+        .await
+        .err()
+        .expect("the call must fail");
+    assert!(
+        failed
+            .downcast_ref::<crate::server::audit::AuditUnavailable>()
+            .is_some(),
+        "{failed:#}"
+    );
+    audit_down(&f, false).await;
+    let receipt = engine
+        .finish_login("person", "machine", &login.id, &pasted(&login))
+        .await
+        .unwrap();
+    assert_eq!(
+        login_lines(&engine, &f).await,
+        [(
+            "login".to_owned(),
+            "ok".to_owned(),
+            "machine".to_owned(),
+            receipt.account_id.clone(),
+            Some("retry".to_owned())
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_usage_read_never_hides_a_failed_refresh_audit() {
+    // The refresh stores the successor before its audit append. If the append fails, the
+    // read fails too: no 200 without a stored refresh event.
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let bearer = Arc::new(std::sync::Mutex::new(None));
+    let f = Fixture::new(usage_provider(refreshes.clone(), bearer.clone(), 1)).await;
+    if f.postgres().is_none() {
+        return;
+    }
+    let engine = f.engine().await;
+    let receipt = engine
+        .admit(
+            "person",
+            "idle",
+            "m",
+            grant_until("idle", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let held = engine
+        .acquire("person", &receipt.account_id, None)
+        .await
+        .unwrap();
+    engine
+        .acquire("person", &receipt.account_id, Some(&held.revision))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    audit_down(&f, true).await;
+    let failed = engine
+        .usage_for("person", "mac", &receipt.account_id, false)
+        .await
+        .err()
+        .expect("the call must fail");
+    assert!(
+        failed
+            .downcast_ref::<crate::server::audit::AuditUnavailable>()
+            .is_some(),
+        "{failed:#}"
+    );
+    assert!(
+        bearer.lock().unwrap().is_none(),
+        "no usage poll after a failed audit"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_refresh_on_a_usage_read_is_an_error_then_login_required() {
+    // The first successor lives one second; every later exchange is rejected.
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let counted = refreshes.clone();
+    let app = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/token",
+            post(move || {
+                let n = counted.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        token_body(n, 1).into_response()
+                    } else {
+                        axum::http::StatusCode::BAD_REQUEST.into_response()
+                    }
+                }
+            }),
+        );
+    let f = Fixture::new(app).await;
+    let engine = f.engine().await;
+    let receipt = engine
+        .admit(
+            "person",
+            "idle",
+            "m",
+            grant_until("idle", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let held = engine
+        .acquire("person", &receipt.account_id, None)
+        .await
+        .unwrap();
+    engine
+        .acquire("person", &receipt.account_id, Some(&held.revision))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    let failed = engine
+        .usage_for("person", "mac", &receipt.account_id, false)
+        .await
+        .err()
+        .expect("the call must fail");
+    assert!(
+        failed.downcast_ref::<ExpiredRefreshFailed>().is_some(),
+        "{failed:#}"
+    );
     let events = crate::server::audit::read(engine.store(), &f.key)
         .await
         .unwrap();
-    let lines: Vec<_> = events
+    let refresh = events
         .iter()
-        .map(|e| {
-            (
-                e["operation"].as_str().unwrap(),
-                e["result"].as_str().unwrap(),
-                e["machine"].as_str().unwrap(),
-                e["account"].as_str().unwrap(),
-            )
-        })
-        .collect();
-    let id = first.account_id.as_str();
-    assert_eq!(
-        lines,
-        [
-            ("login", "ok", "machine", id),
-            ("renew", "ok", "machine", id)
-        ]
-    );
+        .rfind(|e| e["operation"] == "refresh")
+        .unwrap();
+    assert_eq!(refresh["result"], "failed");
+    assert_eq!(refresh["reason"], "expired");
+    // The account now waits for login renewal: later reads report it, with no new exchange.
+    let usage = engine
+        .usage_for("person", "mac", &receipt.account_id, false)
+        .await
+        .unwrap();
+    assert_eq!(usage.error.as_deref(), Some("login_required"));
+    assert_eq!(refreshes.load(Ordering::SeqCst), 2);
 }

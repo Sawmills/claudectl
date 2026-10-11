@@ -1,7 +1,10 @@
 //! HTTP contract, machine authorization, and the company-user allow list.
 use super::{
     audit, dashboard,
-    engine::{self, Endpoints, Engine, Gone, NotFound, RefreshInProgress, Superseded, Unrotated},
+    engine::{
+        self, Endpoints, Engine, ExpiredRefreshFailed, Gone, NotFound, RefreshInProgress,
+        Superseded, Unrotated,
+    },
     enrollment,
     store::{self, Machine, Store},
     vault,
@@ -334,7 +337,9 @@ impl Server {
         });
     }
     fn engine_error(&self, error: &anyhow::Error, fallback: &'static str) -> HttpError {
-        if error.downcast_ref::<Gone>().is_some() {
+        if error.downcast_ref::<audit::AuditUnavailable>().is_some() {
+            self.error(StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable")
+        } else if error.downcast_ref::<Gone>().is_some() {
             self.error(StatusCode::GONE, "account_deleted")
         } else if error.downcast_ref::<RefreshInProgress>().is_some() {
             self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress")
@@ -344,6 +349,11 @@ impl Server {
             self.error(StatusCode::CONFLICT, "migration_superseded")
         } else if error.downcast_ref::<NotFound>().is_some() {
             self.error(StatusCode::NOT_FOUND, "account_not_found")
+        } else if error.downcast_ref::<ExpiredRefreshFailed>().is_some() {
+            self.error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "account_unavailable_or_login_required",
+            )
         } else {
             self.error(StatusCode::SERVICE_UNAVAILABLE, fallback)
         }
