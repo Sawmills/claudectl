@@ -1,12 +1,23 @@
-//! Audit trail: one line per migrate, issue, refresh, revoke, dashboard action, and Google
-//! sign-in the provider answered.
+//! Audit trail: one line per migrate, issue, refresh, revoke, finished login or renewal,
+//! dashboard action, and Google sign-in the provider answered.
 //! A line names the operation, machine, account digest, and result, never a token.
 //! Each line goes to stderr and, sealed with the vault key, to the store.
 use super::{store::Store, vault};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
+
+/// The audit row could not be stored. Callers report it as `audit_unavailable` and never
+/// answer success without the row.
+#[derive(Debug)]
+pub struct AuditUnavailable;
+impl std::fmt::Display for AuditUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("audit log unavailable")
+    }
+}
+impl std::error::Error for AuditUnavailable {}
 
 #[derive(Serialize)]
 pub struct Event<'a> {
@@ -21,7 +32,8 @@ pub struct Event<'a> {
     pub target: Option<&'a str>,
     /// Why a refresh ran (`forced`, `expired`, `migration`, `margin`), or why a sign-in was
     /// refused (`sso_denied`, `company_identity_required`, `user_not_allowed`,
-    /// `user_unavailable`, `persistence_failed`).
+    /// `user_unavailable`, `persistence_failed`), or `retry` for a login or renewal line
+    /// written by a retry that returned the kept receipt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
     /// Who acted in the browser dashboard (`dashboard:<email>`); machine requests have none.
@@ -37,6 +49,7 @@ pub async fn record(store: &Store, key: &Path, event: &Event<'_>) -> Result<()> 
     store
         .append_audit(&vault::encrypt(key, &serde_json::to_vec(&line)?)?)
         .await
+        .context(AuditUnavailable)
 }
 
 /// Decrypt every audit line, oldest first.

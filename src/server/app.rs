@@ -1,7 +1,10 @@
 //! HTTP contract, machine authorization, and the company-user allow list.
 use super::{
     audit, dashboard,
-    engine::{self, Endpoints, Engine, Gone, NotFound, RefreshInProgress, Superseded, Unrotated},
+    engine::{
+        self, Endpoints, Engine, ExpiredRefreshFailed, Gone, NotFound, RefreshInProgress,
+        Superseded, Unrotated,
+    },
     enrollment,
     store::{self, Machine, Store},
     vault,
@@ -15,7 +18,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -254,16 +257,17 @@ impl Server {
     }
     /// Count one failed attempt and log it. The request itself may still succeed.
     fn record_failure(&self, status: StatusCode, reason: &'static str) {
+        self.record_failure_for(status, reason, None);
+    }
+    /// As `record_failure`, with the account ID in the log line (never in the metric label).
+    fn record_failure_for(&self, status: StatusCode, reason: &'static str, account: Option<&str>) {
         {
             let mut failures = self.failures.lock().expect("metrics lock");
             let failure = failures.entry(reason).or_default();
             failure.0 += 1;
             failure.1 = chrono::Utc::now().timestamp();
         }
-        eprintln!(
-            "{}",
-            json!({"operation":"request","stage":"http","reason":reason,"status":status.as_u16()})
-        );
+        eprintln!("{}", failure_line(status, reason, account));
     }
     pub(super) fn allowed(&self, email: &str) -> bool {
         self.allowed.iter().any(|a| a.eq_ignore_ascii_case(email))
@@ -333,7 +337,9 @@ impl Server {
         });
     }
     fn engine_error(&self, error: &anyhow::Error, fallback: &'static str) -> HttpError {
-        if error.downcast_ref::<Gone>().is_some() {
+        if error.downcast_ref::<audit::AuditUnavailable>().is_some() {
+            self.error(StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable")
+        } else if error.downcast_ref::<Gone>().is_some() {
             self.error(StatusCode::GONE, "account_deleted")
         } else if error.downcast_ref::<RefreshInProgress>().is_some() {
             self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress")
@@ -343,6 +349,11 @@ impl Server {
             self.error(StatusCode::CONFLICT, "migration_superseded")
         } else if error.downcast_ref::<NotFound>().is_some() {
             self.error(StatusCode::NOT_FOUND, "account_not_found")
+        } else if error.downcast_ref::<ExpiredRefreshFailed>().is_some() {
+            self.error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "account_unavailable_or_login_required",
+            )
         } else {
             self.error(StatusCode::SERVICE_UNAVAILABLE, fallback)
         }
@@ -382,6 +393,15 @@ type Body<T> = Result<Json<T>, axum::extract::rejection::JsonRejection>;
 
 fn private<T: serde::Serialize>(value: T) -> Response {
     ([("cache-control", "no-store")], Json(value)).into_response()
+}
+/// One failed-request log line. The account ID, when known, says which account failed.
+fn failure_line(status: StatusCode, reason: &str, account: Option<&str>) -> Value {
+    let mut line =
+        json!({"operation":"request","stage":"http","reason":reason,"status":status.as_u16()});
+    if let Some(account) = account {
+        line["account"] = json!(account);
+    }
+    line
 }
 fn body<T>(server: &Server, body: Body<T>) -> Result<T, HttpError> {
     body.map(|Json(v)| v)
@@ -641,16 +661,17 @@ async fn usage(
 ) -> Result<Response, HttpError> {
     let machine = server.authorize(&headers).await?;
     let engine = server.engine.clone();
+    let account = input.account_id.clone();
     let result = server
         .run(async move {
             engine
-                .usage(&machine.user, &input.account_id, input.cached)
+                .usage_for(&machine.user, &machine.id, &input.account_id, input.cached)
                 .await
         })
         .await?
         .map_err(|e| server.engine_error(&e, "usage_unavailable"))?;
     if let Some(reason) = result.failure {
-        server.record_failure(StatusCode::SERVICE_UNAVAILABLE, reason);
+        server.record_failure_for(StatusCode::SERVICE_UNAVAILABLE, reason, Some(&account));
     }
     server.authorize(&headers).await?;
     Ok(private(result))
@@ -857,5 +878,20 @@ mod tests {
             pending.begin("mac-1").is_some(),
             "free again after the write"
         );
+    }
+
+    #[test]
+    fn a_usage_failure_log_line_names_the_account() {
+        let line = failure_line(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "usage_login_required",
+            Some("acct-1"),
+        );
+        assert_eq!(
+            line,
+            json!({"operation":"request","stage":"http","reason":"usage_login_required","status":503,"account":"acct-1"})
+        );
+        let plain = failure_line(StatusCode::BAD_REQUEST, "invalid_request", None);
+        assert!(plain.get("account").is_none());
     }
 }

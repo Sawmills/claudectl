@@ -259,6 +259,10 @@ macro_rules! marker_error {
 }
 marker_error!(Gone, "server account was deleted");
 marker_error!(
+    ExpiredRefreshFailed,
+    "refreshing the expired token failed; login renewal may be required"
+);
+marker_error!(
     AdmissionCancelled,
     "this admission was cancelled (by a delete or an abort); start again"
 );
