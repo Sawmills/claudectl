@@ -506,6 +506,19 @@ fn read_new_events(path: &Path, activity: &mut Activity) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Whether the Claude that wrote `events` reported any session (its start or a turn).
+#[cfg(unix)]
+fn session_started(events: &Path) -> bool {
+    std::fs::read_to_string(events).is_ok_and(|text| {
+        super::renew::parse_events(&text).iter().any(|(_, e)| {
+            matches!(
+                e,
+                super::renew::Event::SessionStart(_) | super::renew::Event::Session(_)
+            )
+        })
+    })
+}
+
 /// What the monitor knows about Claude's activity, read incrementally.
 #[cfg(unix)]
 #[derive(Default)]
@@ -849,6 +862,8 @@ pub fn run(
     // Failovers have their own budget; they never use up renewals (and the reverse).
     let mut failovers: Vec<i64> = Vec::new();
     let mut tried: Vec<String> = Vec::new();
+    // The session the running Claude was relaunched to resume, until its result is known.
+    let mut resumed: Option<String> = None;
     let mut first = true;
     loop {
         let mut command = session.command(&snapshot, &launch_args)?;
@@ -936,8 +951,30 @@ pub fn run(
             if let Some(notice) = &outcome.notice {
                 eprintln!("claudectl: {notice}");
             }
+            // A relaunch whose resume failed (Claude exited with an error before any session
+            // started, as with "No conversation found") must not leave the pane at a shell:
+            // say so and start a new session on the same token, once (SAW-12882).
+            if let Some(id) = resumed.take()
+                && !status.success()
+                && !session_started(&session.directory().join("events"))
+            {
+                if let Some(terminal) = &terminal {
+                    terminal.restore();
+                }
+                eprintln!(
+                    "claudectl: ERROR: Claude could not resume session {id} (exit code {}). \
+                     Starting a new session in this pane on the same token; open the old \
+                     conversation with /resume {id}.",
+                    exec::exit_code_of(&status)
+                );
+                launch_args =
+                    super::renew::fresh_args(args).context("fresh start of a one-shot run")?;
+                session.set_renewal("renewing")?;
+                continue;
+            }
             return Ok(exec::exit_code_of(&status));
         };
+        resumed = Some(session_id.clone());
         if let Some(terminal) = &terminal {
             terminal.restore();
         }

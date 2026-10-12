@@ -173,8 +173,13 @@ token is dead for every session then. One case remains: while a migration's rota
 pending (between its admission and its first refresh), the server refreshes for any request;
 do not migrate an account while `server run` sessions use it. When the
 revision changed (a refresh revoked the held token), it restarts Claude with
-`--resume <latest session>` on the new token, in the same folder and terminal, from the same
-checked build, and prints `claudectl: server token renewed; resuming session <id>`. That
+`--resume <current session>` on the new token, in the same folder and terminal, from the same
+checked build, and prints `claudectl: server token renewed; resuming session <id>`. The current
+session is the one of Claude's latest hook event: a fork, or a resume that continues under a new
+ID, sends no session start of its own, but its turns carry the new ID. If the resumed Claude
+exits with an error before any session starts (for example `No conversation found`), `server
+run` prints `claudectl: ERROR: Claude could not resume session <id>` and starts a new session in
+the same terminal on the same token, once; open the old conversation with `/resume <id>`. That
 resume, and only that one, adds a first prompt (unless the user's arguments already hold a
 prompt): Claude Code can keep session cron jobs listed after a resume but stop firing them, so
 the prompt tells the session to delete and create each listed job again with the same schedule

@@ -63,6 +63,9 @@ pub(super) fn timing() -> Timing {
 #[derive(Debug, PartialEq)]
 pub(super) enum Event {
     SessionStart(String),
+    /// A hook event of another session than the last one seen: Claude continues under this
+    /// ID (a fork, or a resume under a new ID) without a SessionStart for it (SAW-12882).
+    Session(String),
     Prompt,
     Stop,
     IdlePrompt,
@@ -77,12 +80,17 @@ pub(super) enum Event {
 }
 
 /// One event per line: `{"at": <ms>, "event": "<hook event>", "session_id": "..",
-/// "notification_type": ".."}`. Unknown or damaged lines are skipped.
+/// "notification_type": ".."}`. Unknown or damaged lines are skipped. A known event whose
+/// session differs from the last one seen in `text` is preceded by `Event::Session`.
 pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
-    text.lines()
+    let mut last: Option<String> = None;
+    let mut out = Vec::new();
+    for (at, event, session) in text
+        .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter_map(|v| {
             let at = v["at"].as_i64()?;
+            let session = v["session_id"].as_str().map(str::to_owned);
             let event = match v["event"].as_str()? {
                 "SessionStart" => Event::SessionStart(v["session_id"].as_str()?.to_string()),
                 "UserPromptSubmit" => Event::Prompt,
@@ -100,14 +108,26 @@ pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
                 "SessionEnd" => Event::SessionEnd,
                 _ => return None,
             };
-            Some((at, event))
+            Some((at, event, session))
         })
-        .collect()
+    {
+        if let Some(session) = session
+            && last.as_deref() != Some(session.as_str())
+        {
+            if !matches!(event, Event::SessionStart(_)) {
+                out.push((at, Event::Session(session.clone())));
+            }
+            last = Some(session);
+        }
+        out.push((at, event));
+    }
+    out
 }
 
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct Idle {
-    /// The session of the latest SessionStart.
+    /// The current session: the latest SessionStart, or a later hook event of another
+    /// session (a fork).
     pub session: Option<String>,
     /// Since when Claude waits for input; None while a turn runs.
     pub since: Option<i64>,
@@ -139,6 +159,8 @@ pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
                 idle.limited = None;
                 idle.ended = None;
             }
+            // The session goes on under another ID: only the resume target changes.
+            Event::Session(session) => idle.session = Some(session.clone()),
             Event::SessionEnd => idle.ended = Some(*at),
             Event::Prompt => {
                 idle.since = None;
@@ -194,6 +216,15 @@ pub(super) fn relaunch_args(args: &[OsString], session: &str) -> Option<Vec<OsSt
     }
     out.push("--resume".into());
     out.push(session.into());
+    Some(out)
+}
+
+/// The user's arguments without resume, continue, session-id and fork forms: a new session
+/// after a failed resume. None for a one-shot `-p`/`--print` run.
+pub(super) fn fresh_args(args: &[OsString]) -> Option<Vec<OsString>> {
+    let mut out = relaunch_args(args, "")?;
+    // `relaunch_args` ends with `--resume <session>`.
+    out.truncate(out.len() - 2);
     Some(out)
 }
 
@@ -418,6 +449,29 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_current_session_follows_a_fork_without_its_own_session_start() {
+        // A fork continues under a new ID with no SessionStart for it; its turns carry the
+        // new ID, so a renewal must resume that one (SAW-12882).
+        let text = concat!(
+            r#"{"at":1,"event":"SessionStart","session_id":"s-1"}"#,
+            "\n",
+            r#"{"at":2,"event":"UserPromptSubmit","session_id":"s-fork"}"#,
+            "\n",
+            r#"{"at":3,"event":"Stop","session_id":"s-fork"}"#,
+        );
+        let idle = idle_state(&parse_events(text));
+        assert_eq!(idle.session.as_deref(), Some("s-fork"));
+        assert_eq!(idle.since, Some(3));
+        // Read in two chunks (the monitor reads incrementally): the same answer.
+        let mut split = idle_state(&parse_events(&text[..text.find("\n{\"at\":3").unwrap()]));
+        fold(
+            &mut split,
+            &parse_events(r#"{"at":3,"event":"Stop","session_id":"s-fork"}"#),
+        );
+        assert_eq!(split, idle);
+    }
 
     #[test]
     fn a_rate_limited_turn_failure_is_a_limit_event_that_also_ends_the_turn() {
@@ -805,7 +859,11 @@ mod tests {
         );
         assert_eq!(
             parse_events(&text),
-            vec![(42, Event::Stop), (43, Event::IdlePrompt)]
+            vec![
+                (42, Event::Session("s-1".into())),
+                (42, Event::Stop),
+                (43, Event::IdlePrompt)
+            ]
         );
         #[cfg(unix)]
         {

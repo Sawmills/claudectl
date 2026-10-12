@@ -120,7 +120,9 @@ fn private_write(path: &Path, contents: &str) {
 
 /// A fake Claude: one process (no children), logs its token and arguments, reports a
 /// session and a finished turn through the renewal hook, then waits for SIGTERM. With the
-/// renewed token it exits 7 at once.
+/// renewed token it reports its session start and exits 7. `FAKE_FORK`: the turn runs in a
+/// fork (`sess-fork`) that never sent its own SessionStart. `FAKE_GONE=<id>`: a resume of
+/// that session fails as Claude's does ("No conversation found", exit 1, no hook event).
 const FAKE_CLAUDE: &str = r#"#!/usr/bin/env python3
 import json, os, signal, subprocess, sys, time
 args = sys.argv[1:]
@@ -129,13 +131,22 @@ tty = os.isatty(0)
 foreground = tty and os.tcgetpgrp(0) == os.getpgrp()
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps({"token": token, "args": args, "tty": tty, "foreground": foreground}) + "\n")
-if token != "token-1":
-    sys.exit(7)
 settings = args[args.index("--settings") + 1]
 command = json.load(open(settings))["hooks"]["Stop"][0]["hooks"][0]["command"]
-for event in ({"hook_event_name": "SessionStart", "session_id": "sess-1"},
-              {"hook_event_name": "Stop", "session_id": "sess-1"}):
+def hook(event):
     subprocess.run(["/bin/sh", "-c", command], input=json.dumps(event).encode(), check=True)
+if token != "token-1":
+    resumed = args[args.index("--resume") + 1] if "--resume" in args else None
+    if resumed is not None and resumed == os.environ.get("FAKE_GONE"):
+        print("No conversation found with session ID: " + resumed, file=sys.stderr)
+        sys.exit(1)
+    hook({"hook_event_name": "SessionStart", "session_id": resumed or "sess-new"})
+    sys.exit(7)
+turn = "sess-fork" if os.environ.get("FAKE_FORK") else "sess-1"
+for event in ({"hook_event_name": "SessionStart", "session_id": "sess-1"},
+              {"hook_event_name": "UserPromptSubmit", "session_id": turn},
+              {"hook_event_name": "Stop", "session_id": turn}):
+    hook(event)
 def term(*_):
     status = json.load(open(os.path.join(os.path.dirname(settings), "session.json")))
     with open(os.environ["FAKE_LOG"] + ".term", "w") as out:
@@ -399,8 +410,8 @@ fn a_busy_claude_never_triggers_a_token_request() {
     std::fs::write(
         &env.claude,
         FAKE_CLAUDE.replace(
-            r#"{"hook_event_name": "Stop", "session_id": "sess-1"}"#,
-            r#"{"hook_event_name": "UserPromptSubmit", "session_id": "sess-1"}"#,
+            r#"{"hook_event_name": "Stop", "session_id": turn}"#,
+            r#"{"hook_event_name": "UserPromptSubmit", "session_id": turn}"#,
         ),
     )
     .unwrap();
@@ -585,4 +596,71 @@ fn a_clean_exit_ends_server_run_without_a_resume() {
     let fake = env.fake.lock().unwrap();
     assert!(fake.requests.len() >= 2, "{:?}", fake.requests);
     assert_eq!(fake.generation, 2);
+}
+
+/// A fork (or a resume that continues under a new ID) sends no SessionStart of its own; its
+/// turns carry the new ID. The renewal resumes that current session, never the stale one
+/// (SAW-12882).
+#[test]
+fn a_renewal_resumes_the_current_session_after_a_fork() {
+    let env = Env::new();
+    let refresher = env.refresh_when_idle();
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+    env.env(&mut command);
+    command
+        .env("FAKE_FORK", "1")
+        .args(["server", "run", "work", "--claude"])
+        .arg(&env.claude)
+        .args(["--", "--model", "opus"]);
+    let output = Command::from_std(command)
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    refresher.join().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(7), "{stderr}");
+    assert!(
+        stderr.contains("server token renewed; resuming session sess-fork"),
+        "{stderr}"
+    );
+    let runs = env.runs();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    let args: Vec<String> = serde_json::from_value(runs[1]["args"].clone()).unwrap();
+    let resume = args.iter().position(|a| a == "--resume").unwrap();
+    assert_eq!(args[resume + 1], "sess-fork");
+}
+
+/// A resume that fails before Claude starts a session never leaves the pane at a shell:
+/// `server run` says so loudly and starts a new session on the renewed token (SAW-12882).
+#[test]
+fn a_failed_resume_is_reported_and_a_new_session_starts() {
+    let env = Env::new();
+    let refresher = env.refresh_when_idle();
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+    env.env(&mut command);
+    command
+        .env("FAKE_GONE", "sess-1")
+        .args(["server", "run", "work", "--claude"])
+        .arg(&env.claude)
+        .args(["--", "--model", "opus"]);
+    let output = Command::from_std(command)
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    refresher.join().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The new session's own exit code ends `server run`.
+    assert_eq!(output.status.code(), Some(7), "{stderr}");
+    assert!(
+        stderr.contains("could not resume session sess-1"),
+        "{stderr}"
+    );
+    let runs = env.runs();
+    assert_eq!(runs.len(), 3, "{runs:?}");
+    assert_eq!(runs[2]["token"], "token-2");
+    let args: Vec<String> = serde_json::from_value(runs[2]["args"].clone()).unwrap();
+    let settings = args.iter().position(|a| a == "--settings").unwrap();
+    let mut user: Vec<&str> = args.iter().map(String::as_str).collect();
+    user.drain(settings..settings + 2);
+    assert_eq!(user, ["--model", "opus"]);
 }

@@ -103,17 +103,22 @@ fn private_write(path: &Path, contents: &str) {
 }
 
 /// A fake Claude: logs its token and arguments. On `work` it reports a session, a prompt and
-/// a turn that failed with `rate_limit`, then waits for SIGTERM. On any other token it exits 7.
+/// a turn that failed with `rate_limit`, then waits for SIGTERM. On any other token it reports
+/// its session start and exits 7.
 const FAKE_CLAUDE: &str = r#"#!/usr/bin/env python3
 import json, os, signal, subprocess, sys, time
 args = sys.argv[1:]
 token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps({"token": token, "args": args}) + "\n")
-if token != "token-work":
-    sys.exit(7)
 settings = args[args.index("--settings") + 1]
 command = json.load(open(settings))["hooks"]["StopFailure"][0]["hooks"][0]["command"]
+if token != "token-work":
+    # A resumed Claude reports its session start, then this fake exits 7.
+    resumed = args[args.index("--resume") + 1] if "--resume" in args else "sess-new"
+    subprocess.run(["/bin/sh", "-c", command], check=True, input=json.dumps(
+        {"hook_event_name": "SessionStart", "session_id": resumed}).encode())
+    sys.exit(7)
 for event in ({"hook_event_name": "SessionStart", "session_id": "sess-1"},
               {"hook_event_name": "UserPromptSubmit", "session_id": "sess-1"},
               {"hook_event_name": "StopFailure", "session_id": "sess-1", "error": "rate_limit",
