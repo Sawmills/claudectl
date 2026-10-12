@@ -63,6 +63,9 @@ pub(super) fn timing() -> Timing {
 #[derive(Debug, PartialEq)]
 pub(super) enum Event {
     SessionStart(String),
+    /// A hook event of another session than the last one seen: Claude continues under this
+    /// ID (a fork, or a resume under a new ID) without a SessionStart for it (SAW-12882).
+    Session(String),
     Prompt,
     Stop,
     IdlePrompt,
@@ -72,17 +75,23 @@ pub(super) enum Event {
     /// turn.
     AuthFailed,
     /// Claude ended the session (/exit, /clear, logout): it is shutting down unless a new
-    /// session starts.
-    SessionEnd,
+    /// session starts. It names the session that ended, when Claude gave one.
+    SessionEnd(Option<String>),
 }
 
 /// One event per line: `{"at": <ms>, "event": "<hook event>", "session_id": "..",
-/// "notification_type": ".."}`. Unknown or damaged lines are skipped.
+/// "notification_type": ".."}`. Unknown or damaged lines are skipped. A known event other than
+/// SessionEnd whose session differs from the last one seen in `text` is preceded by
+/// `Event::Session`.
 pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
-    text.lines()
+    let mut last: Option<String> = None;
+    let mut out = Vec::new();
+    for (at, event, session) in text
+        .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter_map(|v| {
             let at = v["at"].as_i64()?;
+            let session = v["session_id"].as_str().map(str::to_owned);
             let event = match v["event"].as_str()? {
                 "SessionStart" => Event::SessionStart(v["session_id"].as_str()?.to_string()),
                 "UserPromptSubmit" => Event::Prompt,
@@ -97,17 +106,32 @@ pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
                 // StopFailure: it ended all the same.
                 "Stop" | "StopFailure" => Event::Stop,
                 "Notification" if v["notification_type"] == "idle_prompt" => Event::IdlePrompt,
-                "SessionEnd" => Event::SessionEnd,
+                "SessionEnd" => Event::SessionEnd(v["session_id"].as_str().map(str::to_owned)),
                 _ => return None,
             };
-            Some((at, event))
+            Some((at, event, session))
         })
-        .collect()
+    {
+        // A SessionEnd names the session that ended: it can arrive after the next one started
+        // (/clear), so it never moves the current session.
+        if let Some(session) = session
+            && !matches!(event, Event::SessionEnd(_))
+            && last.as_deref() != Some(session.as_str())
+        {
+            if !matches!(event, Event::SessionStart(_)) {
+                out.push((at, Event::Session(session.clone())));
+            }
+            last = Some(session);
+        }
+        out.push((at, event));
+    }
+    out
 }
 
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct Idle {
-    /// The session of the latest SessionStart.
+    /// The current session: the latest SessionStart, or a later hook event of another
+    /// session (a fork).
     pub session: Option<String>,
     /// Since when Claude waits for input; None while a turn runs.
     pub since: Option<i64>,
@@ -139,7 +163,18 @@ pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
                 idle.limited = None;
                 idle.ended = None;
             }
-            Event::SessionEnd => idle.ended = Some(*at),
+            // The session goes on under another ID: Claude is not exiting.
+            Event::Session(session) => {
+                idle.session = Some(session.clone());
+                idle.ended = None;
+            }
+            // Only the end of the current session (or of an unnamed one) means Claude is
+            // exiting: after /clear, the old session's end can arrive after the new start.
+            Event::SessionEnd(ended) => {
+                if ended.is_none() || idle.session.is_none() || *ended == idle.session {
+                    idle.ended = Some(*at);
+                }
+            }
             Event::Prompt => {
                 idle.since = None;
                 idle.limited = None;
@@ -194,6 +229,15 @@ pub(super) fn relaunch_args(args: &[OsString], session: &str) -> Option<Vec<OsSt
     }
     out.push("--resume".into());
     out.push(session.into());
+    Some(out)
+}
+
+/// The user's arguments without resume, continue, session-id and fork forms: a new session
+/// after a failed resume. None for a one-shot `-p`/`--print` run.
+pub(super) fn fresh_args(args: &[OsString]) -> Option<Vec<OsString>> {
+    let mut out = relaunch_args(args, "")?;
+    // `relaunch_args` ends with `--resume <session>`.
+    out.truncate(out.len() - 2);
     Some(out)
 }
 
@@ -411,13 +455,78 @@ mod tests {
         // /clear ends the session and starts a new one: that one may follow a new token.
         let cleared = [
             (1, Event::SessionStart("s".into())),
-            (3, Event::SessionEnd),
+            (3, Event::SessionEnd(Some("s".into()))),
             (4, Event::SessionStart("t".into())),
         ];
         assert_eq!(idle_state(&cleared).ended, None);
     }
 
     use super::*;
+
+    #[test]
+    fn the_current_session_follows_a_fork_without_its_own_session_start() {
+        // A fork continues under a new ID with no SessionStart for it; its turns carry the
+        // new ID, so a renewal must resume that one (SAW-12882).
+        let text = concat!(
+            r#"{"at":1,"event":"SessionStart","session_id":"s-1"}"#,
+            "\n",
+            r#"{"at":2,"event":"UserPromptSubmit","session_id":"s-fork"}"#,
+            "\n",
+            r#"{"at":3,"event":"Stop","session_id":"s-fork"}"#,
+        );
+        let idle = idle_state(&parse_events(text));
+        assert_eq!(idle.session.as_deref(), Some("s-fork"));
+        assert_eq!(idle.since, Some(3));
+        // Read in two chunks (the monitor reads incrementally): the same answer.
+        let mut split = idle_state(&parse_events(&text[..text.find("\n{\"at\":3").unwrap()]));
+        fold(
+            &mut split,
+            &parse_events(r#"{"at":3,"event":"Stop","session_id":"s-fork"}"#),
+        );
+        assert_eq!(split, idle);
+    }
+
+    #[test]
+    fn a_late_session_end_of_the_old_session_never_moves_the_resume_back() {
+        // /clear ends s-1 and starts s-2; a SessionEnd of s-1 that lands after s-2 started
+        // must keep s-2 current: s-1 is gone (SAW-12882 review).
+        let text = concat!(
+            r#"{"at":1,"event":"SessionStart","session_id":"s-1"}"#,
+            "\n",
+            r#"{"at":2,"event":"SessionStart","session_id":"s-2"}"#,
+            "\n",
+            r#"{"at":3,"event":"SessionEnd","session_id":"s-1","reason":"clear"}"#,
+        );
+        let idle = idle_state(&parse_events(text));
+        assert_eq!(idle.session.as_deref(), Some("s-2"));
+        // The end of a session that is no longer current does not end the current one.
+        assert_eq!(idle.ended, None);
+        // Read alone (a new chunk), it does not move the session either.
+        let mut idle = idle_state(&parse_events(&text[..text.rfind('\n').unwrap()]));
+        fold(
+            &mut idle,
+            &parse_events(r#"{"at":3,"event":"SessionEnd","session_id":"s-1"}"#),
+        );
+        assert_eq!(idle.session.as_deref(), Some("s-2"));
+        assert_eq!(idle.ended, None);
+    }
+
+    #[test]
+    fn a_new_session_id_after_an_end_clears_the_end() {
+        // A session that ended, then Claude goes on under a new ID with no SessionStart (a
+        // fork or an ID-changing resume): Claude is not exiting, so renewal stays possible
+        // (SAW-12882 Architect review).
+        let text = concat!(
+            r#"{"at":1,"event":"SessionStart","session_id":"s-1"}"#,
+            "\n",
+            r#"{"at":2,"event":"SessionEnd","session_id":"s-1","reason":"other"}"#,
+            "\n",
+            r#"{"at":3,"event":"UserPromptSubmit","session_id":"s-fork"}"#,
+        );
+        let idle = idle_state(&parse_events(text));
+        assert_eq!(idle.session.as_deref(), Some("s-fork"));
+        assert_eq!(idle.ended, None);
+    }
 
     #[test]
     fn a_rate_limited_turn_failure_is_a_limit_event_that_also_ends_the_turn() {
@@ -805,7 +914,11 @@ mod tests {
         );
         assert_eq!(
             parse_events(&text),
-            vec![(42, Event::Stop), (43, Event::IdlePrompt)]
+            vec![
+                (42, Event::Session("s-1".into())),
+                (42, Event::Stop),
+                (43, Event::IdlePrompt)
+            ]
         );
         #[cfg(unix)]
         {
