@@ -80,8 +80,9 @@ pub(super) enum Event {
 }
 
 /// One event per line: `{"at": <ms>, "event": "<hook event>", "session_id": "..",
-/// "notification_type": ".."}`. Unknown or damaged lines are skipped. A known event whose
-/// session differs from the last one seen in `text` is preceded by `Event::Session`.
+/// "notification_type": ".."}`. Unknown or damaged lines are skipped. A known event other than
+/// SessionEnd whose session differs from the last one seen in `text` is preceded by
+/// `Event::Session`.
 pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
     let mut last: Option<String> = None;
     let mut out = Vec::new();
@@ -111,7 +112,10 @@ pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
             Some((at, event, session))
         })
     {
+        // A SessionEnd names the session that ended: it can arrive after the next one started
+        // (/clear), so it never moves the current session.
         if let Some(session) = session
+            && !matches!(event, Event::SessionEnd)
             && last.as_deref() != Some(session.as_str())
         {
             if !matches!(event, Event::SessionStart(_)) {
@@ -471,6 +475,30 @@ mod tests {
             &parse_events(r#"{"at":3,"event":"Stop","session_id":"s-fork"}"#),
         );
         assert_eq!(split, idle);
+    }
+
+    #[test]
+    fn a_late_session_end_of_the_old_session_never_moves_the_resume_back() {
+        // /clear ends s-1 and starts s-2; a SessionEnd of s-1 that lands after s-2 started
+        // must keep s-2 current: s-1 is gone (SAW-12882 review).
+        let text = concat!(
+            r#"{"at":1,"event":"SessionStart","session_id":"s-1"}"#,
+            "\n",
+            r#"{"at":2,"event":"SessionStart","session_id":"s-2"}"#,
+            "\n",
+            r#"{"at":3,"event":"SessionEnd","session_id":"s-1","reason":"clear"}"#,
+        );
+        assert_eq!(
+            idle_state(&parse_events(text)).session.as_deref(),
+            Some("s-2")
+        );
+        // Read alone (a new chunk), it does not move the session either.
+        let mut idle = idle_state(&parse_events(&text[..text.rfind('\n').unwrap()]));
+        fold(
+            &mut idle,
+            &parse_events(r#"{"at":3,"event":"SessionEnd","session_id":"s-1"}"#),
+        );
+        assert_eq!(idle.session.as_deref(), Some("s-2"));
     }
 
     #[test]
