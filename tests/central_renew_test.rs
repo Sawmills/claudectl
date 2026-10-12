@@ -137,6 +137,10 @@ def hook(event):
     subprocess.run(["/bin/sh", "-c", command], input=json.dumps(event).encode(), check=True)
 if token != "token-1":
     resumed = args[args.index("--resume") + 1] if "--resume" in args else None
+    if os.environ.get("FAKE_INTERRUPT"):
+        # Ctrl-C before the first hook: Claude dies by SIGINT.
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
     if resumed is not None and resumed == os.environ.get("FAKE_GONE"):
         print("No conversation found with session ID: " + resumed, file=sys.stderr)
         sys.exit(1)
@@ -663,4 +667,28 @@ fn a_failed_resume_is_reported_and_a_new_session_starts() {
     let mut user: Vec<&str> = args.iter().map(String::as_str).collect();
     user.drain(settings..settings + 2);
     assert_eq!(user, ["--model", "opus"]);
+}
+
+/// A stop by signal (Ctrl-C) before the resumed Claude's first hook is the user's stop, not
+/// a failed resume: `server run` ends with it and starts nothing (SAW-12882 review).
+#[test]
+fn an_interrupt_before_the_first_hook_ends_server_run() {
+    let env = Env::new();
+    let refresher = env.refresh_when_idle();
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+    env.env(&mut command);
+    command
+        .env("FAKE_INTERRUPT", "1")
+        .args(["server", "run", "work", "--claude"])
+        .arg(&env.claude)
+        .args(["--", "--model", "opus"]);
+    let output = Command::from_std(command)
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    refresher.join().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(130), "{stderr}");
+    assert!(!stderr.contains("could not resume"), "{stderr}");
+    assert_eq!(env.runs().len(), 2, "{:?}", env.runs());
 }

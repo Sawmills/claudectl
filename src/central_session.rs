@@ -953,9 +953,11 @@ pub fn run(
             }
             // A relaunch whose resume failed (Claude exited with an error before any session
             // started, as with "No conversation found") must not leave the pane at a shell:
-            // say so and start a new session on the same token, once (SAW-12882).
+            // say so and start a new session on the same token, once (SAW-12882). A stop by
+            // signal, or a code from 128 up (130 is Ctrl-C), is the user's stop: it ends the
+            // run as before.
             if let Some(id) = resumed.take()
-                && !status.success()
+                && status.code().is_some_and(|code| (1..128).contains(&code))
                 && !session_started(&session.directory().join("events"))
             {
                 if let Some(terminal) = &terminal {

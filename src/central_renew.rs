@@ -75,8 +75,8 @@ pub(super) enum Event {
     /// turn.
     AuthFailed,
     /// Claude ended the session (/exit, /clear, logout): it is shutting down unless a new
-    /// session starts.
-    SessionEnd,
+    /// session starts. It names the session that ended, when Claude gave one.
+    SessionEnd(Option<String>),
 }
 
 /// One event per line: `{"at": <ms>, "event": "<hook event>", "session_id": "..",
@@ -106,7 +106,7 @@ pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
                 // StopFailure: it ended all the same.
                 "Stop" | "StopFailure" => Event::Stop,
                 "Notification" if v["notification_type"] == "idle_prompt" => Event::IdlePrompt,
-                "SessionEnd" => Event::SessionEnd,
+                "SessionEnd" => Event::SessionEnd(v["session_id"].as_str().map(str::to_owned)),
                 _ => return None,
             };
             Some((at, event, session))
@@ -115,7 +115,7 @@ pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
         // A SessionEnd names the session that ended: it can arrive after the next one started
         // (/clear), so it never moves the current session.
         if let Some(session) = session
-            && !matches!(event, Event::SessionEnd)
+            && !matches!(event, Event::SessionEnd(_))
             && last.as_deref() != Some(session.as_str())
         {
             if !matches!(event, Event::SessionStart(_)) {
@@ -163,9 +163,18 @@ pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
                 idle.limited = None;
                 idle.ended = None;
             }
-            // The session goes on under another ID: only the resume target changes.
-            Event::Session(session) => idle.session = Some(session.clone()),
-            Event::SessionEnd => idle.ended = Some(*at),
+            // The session goes on under another ID: Claude is not exiting.
+            Event::Session(session) => {
+                idle.session = Some(session.clone());
+                idle.ended = None;
+            }
+            // Only the end of the current session (or of an unnamed one) means Claude is
+            // exiting: after /clear, the old session's end can arrive after the new start.
+            Event::SessionEnd(ended) => {
+                if ended.is_none() || idle.session.is_none() || *ended == idle.session {
+                    idle.ended = Some(*at);
+                }
+            }
             Event::Prompt => {
                 idle.since = None;
                 idle.limited = None;
@@ -446,7 +455,7 @@ mod tests {
         // /clear ends the session and starts a new one: that one may follow a new token.
         let cleared = [
             (1, Event::SessionStart("s".into())),
-            (3, Event::SessionEnd),
+            (3, Event::SessionEnd(Some("s".into()))),
             (4, Event::SessionStart("t".into())),
         ];
         assert_eq!(idle_state(&cleared).ended, None);
@@ -488,10 +497,10 @@ mod tests {
             "\n",
             r#"{"at":3,"event":"SessionEnd","session_id":"s-1","reason":"clear"}"#,
         );
-        assert_eq!(
-            idle_state(&parse_events(text)).session.as_deref(),
-            Some("s-2")
-        );
+        let idle = idle_state(&parse_events(text));
+        assert_eq!(idle.session.as_deref(), Some("s-2"));
+        // The end of a session that is no longer current does not end the current one.
+        assert_eq!(idle.ended, None);
         // Read alone (a new chunk), it does not move the session either.
         let mut idle = idle_state(&parse_events(&text[..text.rfind('\n').unwrap()]));
         fold(
@@ -499,6 +508,24 @@ mod tests {
             &parse_events(r#"{"at":3,"event":"SessionEnd","session_id":"s-1"}"#),
         );
         assert_eq!(idle.session.as_deref(), Some("s-2"));
+        assert_eq!(idle.ended, None);
+    }
+
+    #[test]
+    fn a_new_session_id_after_an_end_clears_the_end() {
+        // A session that ended, then Claude goes on under a new ID with no SessionStart (a
+        // fork or an ID-changing resume): Claude is not exiting, so renewal stays possible
+        // (SAW-12882 Architect review).
+        let text = concat!(
+            r#"{"at":1,"event":"SessionStart","session_id":"s-1"}"#,
+            "\n",
+            r#"{"at":2,"event":"SessionEnd","session_id":"s-1","reason":"other"}"#,
+            "\n",
+            r#"{"at":3,"event":"UserPromptSubmit","session_id":"s-fork"}"#,
+        );
+        let idle = idle_state(&parse_events(text));
+        assert_eq!(idle.session.as_deref(), Some("s-fork"));
+        assert_eq!(idle.ended, None);
     }
 
     #[test]
