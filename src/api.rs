@@ -94,6 +94,12 @@ pub struct UsageResponse {
     pub seven_day_sonnet: Option<UsageWindow>,
     pub extra_usage: Option<ExtraUsage>,
     pub limits: Option<Vec<UsageLimit>>,
+    #[serde(
+        default,
+        deserialize_with = "crate::limit_resets::optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cedar_ember: Option<crate::limit_resets::Offers>,
 }
 
 impl UsageResponse {

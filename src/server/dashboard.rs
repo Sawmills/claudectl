@@ -131,6 +131,7 @@ async fn snapshot(
             seven_day: observed.week,
             fable: observed.fable,
             model_windows: observed.models,
+            limit_reset_offers: observed.limit_reset_offers,
             observed_at: usage.observed_at.map(|ms| ms / 1000),
             usage_stale: observed.stale,
             billed: observed.billed,
@@ -486,6 +487,7 @@ async fn revoke(
 
 /// What the dashboard shows of a stored observation.
 struct Observed {
+    limit_reset_offers: Option<crate::limit_resets::Offers>,
     five: Window,
     week: Window,
     /// The weekly Fable limit, when the account has one.
@@ -536,6 +538,7 @@ fn windows(usage: &crate::server::engine::Usage) -> Observed {
         .and_then(|e| e.is_enabled)
         != Some(false);
     Observed {
+        limit_reset_offers: parsed.and_then(|usage| usage.cedar_ember),
         five,
         week,
         fable,
@@ -780,6 +783,7 @@ mod preview {
             seven_day: window(week, 142),
             fable: None,
             model_windows: vec![],
+            limit_reset_offers: None,
             observed_at: Some(now - 42),
             usage_stale: false,
             billed: false,

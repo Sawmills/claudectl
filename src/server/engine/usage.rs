@@ -123,6 +123,7 @@ impl Engine {
         let response = self
             .http
             .get(format!("{}/api/oauth/usage", self.endpoints.api))
+            .query(&[("cedar_ember", "1")])
             .bearer_auth(&loaded.record.grant.access_token)
             .header("anthropic-beta", BETA)
             .send()
@@ -136,7 +137,28 @@ impl Engine {
                 let body = capped_body(response).await.ok();
                 match body.and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
                     Some(Value::Object(value)) => {
-                        let data: serde_json::Map<String, Value> = value
+                        let offers = value
+                            .get("cedar_ember")
+                            .filter(|value| value.is_object())
+                            .and_then(|value| {
+                                serde_json::from_value::<crate::limit_resets::Offers>(value.clone())
+                                    .ok()
+                            });
+                        let count = offers
+                            .as_ref()
+                            .map_or(0, |offers| offers.count(now() / 1000));
+                        if self
+                            .usage_offers_logged
+                            .lock()
+                            .unwrap()
+                            .insert(id.to_owned())
+                        {
+                            eprintln!(
+                                "{}",
+                                json!({"operation":"limit_reset_offers", "present":offers.is_some(), "count":count})
+                            );
+                        }
+                        let mut data: serde_json::Map<String, Value> = value
                             .into_iter()
                             .filter(|(k, _)| {
                                 k.as_str() == "five_hour"
@@ -144,6 +166,9 @@ impl Engine {
                                     || matches!(k.as_str(), "limits" | "extra_usage")
                             })
                             .collect();
+                        if let Some(offers) = offers {
+                            data.insert("cedar_ember".into(), serde_json::to_value(offers)?);
+                        }
                         for window in ["five_hour", "seven_day"] {
                             if let Some(reset) = data
                                 .get(window)

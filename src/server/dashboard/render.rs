@@ -25,6 +25,7 @@ pub(super) struct Account {
     pub fable: Option<Window>,
     /// The weekly Opus and Sonnet windows, when the account has them.
     pub model_windows: Vec<crate::accounts::Window>,
+    pub limit_reset_offers: Option<crate::limit_resets::Offers>,
     /// Unix seconds of the server's last usage observation.
     pub observed_at: Option<i64>,
     pub usage_stale: bool,
@@ -297,8 +298,27 @@ fn ledger(accounts: &[Account], names: &[String], now: i64) -> String {
         } else {
             format!(r#"<span class="note">{note}</span>"#)
         };
+        let offers = a
+            .limit_reset_offers
+            .as_ref()
+            .map(|offers| offers.active(now))
+            .unwrap_or_default();
+        let reset_note = if offers.is_empty() {
+            String::new()
+        } else {
+            let old = if a.usage_stale { " (old data)" } else { "" };
+            let summaries = offers
+                .iter()
+                .map(|offer| escape(&offer.summary(now)))
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                r#"<span class="note">Limit resets{old}: {summaries}</span><span class="note">{}</span>"#,
+                escape(crate::limit_resets::HINT)
+            )
+        };
         rows += &format!(
-            r#"<tr role="row" class="{}"><td role="cell" class="cell-account"><div class="account-name"><strong translate="no">{}</strong>{note}<a class="manage" href="/accounts/manage?account={}">Manage</a></div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td>{fable}<td role="cell" class="cell-state"><div class="status"><span class="state {class}">{state}</span><span class="status-detail">{}</span></div></td></tr>"#,
+            r#"<tr role="row" class="{}"><td role="cell" class="cell-account"><div class="account-name"><strong translate="no">{}</strong>{note}{reset_note}<a class="manage" href="/accounts/manage?account={}">Manage</a></div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td>{fable}<td role="cell" class="cell-state"><div class="status"><span class="state {class}">{state}</span><span class="status-detail">{}</span></div></td></tr>"#,
             if a.usage_stale { "stale" } else { "" },
             escape(&names[i]),
             escape(&a.id),
@@ -509,6 +529,7 @@ mod tests {
             },
             fable: None,
             model_windows: vec![],
+            limit_reset_offers: None,
             observed_at: Some(NOW - 30),
             usage_stale: false,
             billed: false,

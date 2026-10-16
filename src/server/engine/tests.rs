@@ -263,6 +263,71 @@ async fn cached_usage_never_contacts_the_provider_and_reads_share_polling() {
 }
 
 #[tokio::test]
+async fn usage_reset_offers_are_requested_and_retained_without_provider_identifiers() {
+    let request = Arc::new(StdMutex::new(None));
+    let seen = request.clone();
+    let provider = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/api/oauth/usage",
+            get(
+                move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
+                    let seen = seen.clone();
+                    async move {
+                        *seen.lock().unwrap() = Some((uri.query().map(str::to_owned), headers));
+                        Json(
+                            serde_json::from_str::<Value>(include_str!(
+                                "../../../tests/fixtures/limit-reset-offers.json"
+                            ))
+                            .unwrap(),
+                        )
+                    }
+                },
+            ),
+        );
+    let fixture = Fixture::new(provider).await;
+    let engine = fixture.engine().await;
+    let account = engine
+        .admit(
+            "person",
+            "machine",
+            "first",
+            grant_until("a", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let usage = engine
+        .usage("person", &account.account_id, false)
+        .await
+        .unwrap();
+    let (query, headers) = request.lock().unwrap().take().unwrap();
+    assert_eq!(query.as_deref(), Some("cedar_ember=1"));
+    assert_eq!(headers["anthropic-beta"], "oauth-2025-04-20");
+    assert!(!headers.contains_key("user-agent"));
+    let data = usage.data.unwrap();
+    assert_eq!(data["five_hour"]["utilization"], 100);
+    assert_eq!(data["cedar_ember"]["grants"][0]["resets_left"], 2);
+    assert_eq!(
+        data["cedar_ember"]["grants"][0]["clears"],
+        json!(["five_hour", "seven_day"])
+    );
+    let encoded = serde_json::to_string(&data).unwrap();
+    assert!(!encoded.contains("synthetic-grant-not-for-display"));
+    assert!(!encoded.contains("provider-label-not-for-display"));
+    assert!(!encoded.contains("event_props"));
+    assert_eq!(
+        engine
+            .usage("person", &account.account_id, true)
+            .await
+            .unwrap()
+            .data
+            .unwrap(),
+        data
+    );
+}
+
+#[tokio::test]
 async fn concurrent_rejections_refresh_once_and_restart_preserves_the_successor() {
     let (f, engine, refreshes) = synthetic(3600).await;
     let receipt = engine

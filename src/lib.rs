@@ -4,6 +4,7 @@ pub mod auth_store;
 pub mod config;
 pub mod exec;
 pub mod lane;
+pub mod limit_resets;
 pub mod oauth;
 pub mod profile;
 pub mod rate;

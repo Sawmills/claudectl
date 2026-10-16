@@ -33,6 +33,21 @@ claudectl server disconnect
 `accounts`, `status` and `devices` print tables; add `--json` for the raw JSON.
 `claudectl status` (without `server`) shows local and server accounts in one table.
 
+The server's existing usage read requests optional limit-reset offers. When present,
+`claudectl status` (including `--details` and `--json`) and the `/accounts` dashboard
+show the remaining count, affected limits and expiry. Paused offers, future starts
+and offers that cannot currently be used are labeled. Empty offers are hidden;
+unknown expiry is labeled, and old observations remain marked as old data. The
+dashboard uses cached usage and makes no additional provider request. These are
+read-only hints: use `/limit-reset` in Claude Code or Settings > Usage on claude.ai
+to apply a reset. No reset is redeemed by claudectl.
+
+On the first successful usage poll for each account in a server process, the
+`limit_reset_offers` log records only `present` (the provider returned an offer
+block) and `count` (remaining unexpired resets), without account or
+grant identifiers. Optional offer metadata can be absent or malformed without
+failing the ordinary usage read.
+
 `connect` opens company SSO; `--no-browser` prints the URL for another browser.
 `login` opens Claude sign-in, but the server exchanges the authorization code and
 retains the refresh grant. `renew` performs sign-in again for an existing alias and
