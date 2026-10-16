@@ -9,7 +9,7 @@ resources:
   - sso.yaml
   - monitoring.yaml
 images:
-  # The digest the Server image workflow published for main a6daa7e (run 38186710587).
+  # The Server image manifest for main 36a98af5 (#92, run 38976850027).
   - name: claudectl-server
     newName: 767398060436.dkr.ecr.us-east-1.amazonaws.com/claudectl-server
-    digest: sha256:256cb5dec1b4ef184fde19b689fe4e61dd3067e1fe1be6cb5f3661bc934ad129
+    digest: sha256:c616279167633830d192417146c3e9244a904a6a05decb6ce6a302f156cde6b9
