@@ -62,14 +62,24 @@ struct Env {
 
 impl Env {
     fn new() -> Self {
+        Self::with_usage(None)
+    }
+    fn with_usage(observation: Option<Value>) -> Self {
         let home = tempfile::tempdir().unwrap();
         let logins = Logins::default();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
+        let usage_route = match observation {
+            Some(body) => get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+            None => get(usage),
+        };
         let app = Router::new()
             .route("/v2/anthropic/accounts", get(accounts))
-            .route("/v2/anthropic/usage", get(usage))
+            .route("/v2/anthropic/usage", usage_route)
             .route("/v2/anthropic/login/start", post(login_start))
             .route("/v2/anthropic/accounts/{id}", axum::routing::delete(remove))
             .with_state(logins.clone());
@@ -103,6 +113,95 @@ impl Env {
             .args(args)
             .output()
             .unwrap()
+    }
+}
+
+#[test]
+fn status_shows_read_only_limit_reset_offers_from_the_server() {
+    let data: Value =
+        serde_json::from_str(include_str!("fixtures/limit-reset-offers.json")).unwrap();
+    let env = Env::with_usage(Some(json!({
+        "data": data,
+        "observed_at": chrono::Utc::now().timestamp_millis(),
+        "next_retry_at": 0, "stale": false, "error": null
+    })));
+    for args in [&["status"][..], &["status", "--details"]] {
+        let output = env.claudectl(args);
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("2 resets"), "{text}");
+        assert!(text.contains("5-hour + weekly"), "{text}");
+        assert!(text.contains("2099-10-22"), "{text}");
+        assert!(text.contains("/limit-reset"), "{text}");
+        assert!(!text.contains("synthetic-grant-not-for-display"));
+        assert!(!text.contains("provider-label-not-for-display"));
+    }
+    let output = env.claudectl(&["status", "--json"]);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!report["next"].as_str().unwrap().is_empty());
+    assert_eq!(
+        report["server"]["accounts"][0]["limit_reset_offers"][0]["resets_left"],
+        2
+    );
+}
+
+#[test]
+fn status_labels_paused_future_and_currently_unusable_reset_offers() {
+    let mut data: Value =
+        serde_json::from_str(include_str!("fixtures/limit-reset-offers.json")).unwrap();
+    data["cedar_ember"]["grants"][0]["paused"] = json!(true);
+    data["cedar_ember"]["grants"][0]["usable_now"] = json!(false);
+    data["cedar_ember"]["grants"][0]["starts_at"] = json!("2099-01-01T00:00:00Z");
+    let env = Env::with_usage(Some(
+        json!({"data":data,"observed_at":chrono::Utc::now().timestamp_millis(),"next_retry_at":0,"stale":false,"error":null}),
+    ));
+    for args in [&["status"][..], &["status", "--details"]] {
+        let output = env.claudectl(args);
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        for label in ["2 resets", "paused", "not usable now", "starts 2099-01-01"] {
+            assert!(text.contains(label), "missing {label}: {text}");
+        }
+    }
+}
+
+#[test]
+fn status_ignores_absent_empty_malformed_and_expired_reset_metadata() {
+    for cedar in [
+        None,
+        Some(Value::Null),
+        Some(json!("unexpected")),
+        Some(json!({"grants": "unexpected"})),
+        Some(json!({"eligible": false, "grants": [{"resets_left": 2}]})),
+        Some(json!({"grants": [{"resets_left": 0}, {"resets_left": "two"}, null]})),
+        Some(json!({"grants": [{"resets_left": 2, "ends_at": "2000-01-01T00:00:00Z"}]})),
+    ] {
+        let mut data = json!({"five_hour": {"utilization": 3}, "seven_day": {"utilization": 1}, "extra_usage": {"is_enabled": false}});
+        if let Some(cedar) = cedar {
+            data["cedar_ember"] = cedar;
+        }
+        let env = Env::with_usage(Some(
+            json!({"data":data, "observed_at":chrono::Utc::now().timestamp_millis(), "next_retry_at":0, "stale":false, "error":null}),
+        ));
+        let output = env.claudectl(&["status"]);
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("ready"), "{text}");
+        assert!(!text.contains("Limit resets"), "{text}");
+        assert!(!text.contains("/limit-reset"), "{text}");
+        let output = env.claudectl(&["status", "--json"]);
+        assert!(output.status.success());
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            report["server"]["accounts"][0]
+                .get("limit_reset_offers")
+                .is_none()
+        );
+        assert_eq!(
+            report["server"]["accounts"][0]["windows"]["five_hour"]["used_percent"],
+            3.0
+        );
     }
 }
 

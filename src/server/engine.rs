@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
@@ -321,6 +321,8 @@ pub struct Engine {
     /// One task per account in this process; the lease covers other replicas.
     local: StdMutex<BTreeMap<String, Arc<Mutex<()>>>>,
     usage_poll: Mutex<()>,
+    /// Offer-shape diagnostics, once per account in this process; IDs stay in memory.
+    usage_offers_logged: StdMutex<BTreeSet<String>>,
     /// Refreshes run by this process, by reason: count and last time in seconds (for
     /// `/metrics`). Process memory only: a rotation followed by a restart before the next
     /// scrape (30 s) is not exported. The audit log (operation refresh, `reason`) is the
@@ -364,6 +366,7 @@ impl Engine {
                 .build()?,
             local: StdMutex::new(BTreeMap::new()),
             usage_poll: Mutex::new(()),
+            usage_offers_logged: StdMutex::new(BTreeSet::new()),
             rotations: StdMutex::new(ROTATION_REASONS.iter().map(|r| (*r, (0, 0))).collect()),
         })
     }

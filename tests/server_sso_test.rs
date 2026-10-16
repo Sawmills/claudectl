@@ -81,6 +81,8 @@ struct Issuer {
     next: Arc<Mutex<Option<String>>>,
     /// Discovery names a token endpoint nobody listens on: the provider is unreachable.
     dead_token: Arc<std::sync::atomic::AtomicBool>,
+    usage: Arc<Mutex<Option<Value>>>,
+    usage_reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Issuer {
     /// Sign the next ID token for the pending login with `nonce`.
@@ -125,6 +127,8 @@ async fn issuer() -> (Issuer, tokio::task::JoinHandle<()>) {
         rogue: Arc::new(key()),
         next: Arc::default(),
         dead_token: Arc::default(),
+        usage: Arc::default(),
+        usage_reads: Arc::default(),
     };
     let app = Router::new()
         .route(
@@ -164,6 +168,13 @@ async fn issuer() -> (Issuer, tokio::task::JoinHandle<()>) {
             get(|headers: axum::http::HeaderMap| async move {
                 let token = headers["authorization"].to_str().unwrap().trim_start_matches("Bearer ");
                 Json(json!({"account":{"uuid":format!("acct-{token}")},"organization":{"uuid":"org"}}))
+            }),
+        )
+        .route(
+            "/api/oauth/usage",
+            get(|State(i): State<Issuer>| async move {
+                i.usage_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                i.usage.lock().unwrap().clone().map(Json).ok_or(axum::http::StatusCode::NOT_FOUND)
             }),
         )
         .with_state(issuer.clone());
@@ -639,6 +650,45 @@ async fn a_dashboard_sign_in_never_offers_a_machine_approval() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn dashboard_shows_cached_read_only_limit_reset_offers_without_polling() {
+    let f = Fixture::new().await;
+    let user = f.user_id("amir@sawmills.ai");
+    f.seed(&user, "work").await;
+    *f.issuer.usage.lock().unwrap() =
+        Some(serde_json::from_str(include_str!("fixtures/limit-reset-offers.json")).unwrap());
+    let account = f.server.engine().accounts(&user).await.unwrap().remove(0);
+    f.server
+        .engine()
+        .usage(&user, &account.account_id, false)
+        .await
+        .unwrap();
+    let reads = f
+        .issuer
+        .usage_reads
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let session = f.session("amir@sawmills.ai").await;
+    let response = f.get("/accounts", Some(&session)).await;
+    assert_eq!(response.status().as_u16(), 200);
+    let body = response.text().await.unwrap();
+    for expected in ["2 resets", "5-hour + weekly", "2099-10-22", "/limit-reset"] {
+        assert!(body.contains(expected), "missing {expected}");
+    }
+    for hidden in [
+        "synthetic-grant-not-for-display",
+        "provider-label-not-for-display",
+        "event_props",
+    ] {
+        assert!(!body.contains(hidden));
+    }
+    assert_eq!(
+        f.issuer
+            .usage_reads
+            .load(std::sync::atomic::Ordering::SeqCst),
+        reads
     );
 }
 

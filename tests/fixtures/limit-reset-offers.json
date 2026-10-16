@@ -1,0 +1,24 @@
+{
+  "five_hour": { "utilization": 100, "resets_at": "2099-01-01T00:00:00Z" },
+  "seven_day": { "utilization": 50 },
+  "extra_usage": { "is_enabled": false },
+  "cedar_ember": {
+    "eligible": true,
+    "at_limit": true,
+    "next_grant_id": "synthetic-grant-not-for-display",
+    "event_props": { "surface": "claude_code_cli" },
+    "grants": [
+      {
+        "id": "synthetic-grant-not-for-display",
+        "label": "provider-label-not-for-display",
+        "resets_total": 3,
+        "resets_left": 2,
+        "starts_at": "2020-01-01T00:00:00Z",
+        "ends_at": "2099-10-22T00:00:00Z",
+        "clears": ["five_hour", "seven_day"],
+        "paused": false,
+        "usable_now": true
+      }
+    ]
+  }
+}

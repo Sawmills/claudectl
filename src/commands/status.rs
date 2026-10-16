@@ -135,6 +135,7 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
         return Ok(());
     }
 
+    let reset_notes = limit_reset_notes(&fetched, chrono::Utc::now().timestamp());
     let mut accounts: Vec<AccountStatus> = fetched.into_iter().map(to_account_status).collect();
     accounts.sort_by(|a, b| {
         a.availability_score()
@@ -144,6 +145,7 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
 
     print_fetched_at();
     print_table(&accounts);
+    print!("{reset_notes}");
     Ok(())
 }
 
@@ -363,7 +365,7 @@ pub fn status_json(fetched: &[FetchedUsage], now: i64) -> serde_json::Value {
         .into_iter()
         .map(|f| {
             let usage = f.usage.as_ref();
-            serde_json::json!({
+            let mut account = serde_json::json!({
                 "alias": f.alias,
                 "label": f.label,
                 "active": f.is_active,
@@ -397,7 +399,13 @@ pub fn status_json(fetched: &[FetchedUsage], now: i64) -> serde_json::Value {
                 "billed": candidate_of(f, now).billed,
                 "fresh": candidate_of(f, now).fresh,
                 "on_server": f.on_server,
-            })
+            });
+            let offers = usage.and_then(|usage| usage.cedar_ember.as_ref())
+                .map(|offers| offers.active(now)).unwrap_or_default();
+            if !offers.is_empty() {
+                account["limit_reset_offers"] = serde_json::json!(offers);
+            }
+            account
         })
         .collect();
     serde_json::json!({ "version": STATUS_JSON_VERSION, "accounts": accounts })
@@ -1162,8 +1170,33 @@ fn candidate_of(f: &FetchedUsage, now: i64) -> claudectl::accounts::Candidate {
     }
 }
 
-/// The default status: one line per account, `→` on the account to use, `*` on the active
-/// local login, and one `Next:` line. Details and disclaimers live in `--details`.
+fn limit_reset_notes(fetched: &[&FetchedUsage], now: i64) -> String {
+    let mut notes = String::new();
+    for account in fetched {
+        let offers = account
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.cedar_ember.as_ref())
+            .map(|offers| offers.active(now))
+            .unwrap_or_default();
+        if offers.is_empty() {
+            continue;
+        }
+        let old = if account.snapshot.is_fresh_at(now) {
+            ""
+        } else {
+            " (old data)"
+        };
+        notes.push_str(&format!("Limit resets for {}{old}:\n", account.alias));
+        for offer in offers {
+            notes.push_str(&format!("  {}\n", offer.summary(now)));
+        }
+        notes.push_str(&format!("  {}\n", claudectl::limit_resets::HINT));
+    }
+    notes
+}
+
+/// One line per account and one final `Next:` recommendation, with optional reset notes.
 fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
     use claudectl::accounts::{self, State};
     if fetched.is_empty() {
@@ -1301,6 +1334,7 @@ fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
         out.push('\n');
     }
     out.push('\n');
+    out.push_str(&limit_reset_notes(fetched, now));
     match best {
         Some(i) if fetched[i].on_server => {
             out.push_str(&format!("Next: claudectl run   (picks {})\n", names[i]));
