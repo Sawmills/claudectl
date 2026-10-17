@@ -391,6 +391,12 @@ async fn a_browser_reset_retry_reuses_the_sealed_request_id() {
             .await
             .is_err()
     );
+    assert!(
+        engine
+            .remove("person", "machine", &account.account_id)
+            .await
+            .is_err()
+    );
     assert_eq!(
         engine
             .apply_reset(

@@ -1090,6 +1090,17 @@ impl Engine {
         let Some(lease) = self.store.acquire_lease(id, LEASE_TTL).await? else {
             bail!("account is already in progress");
         };
+        let loaded = match self.selected(user, id).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                let _ = self.store.release_lease(&lease, id).await;
+                return Err(error);
+            }
+        };
+        if loaded.record.pending_reset.is_some() {
+            self.store.release_lease(&lease, id).await?;
+            bail!("account reset is pending");
+        }
         match self.store.delete(user, id).await {
             Ok(deleted) => {
                 if !deleted {

@@ -252,7 +252,9 @@ impl PostgresStore {
         client
             .execute(
                 "INSERT INTO schema_info (id, version, min_reader) VALUES (1, $1, $2)
-                 ON CONFLICT (id) DO UPDATE SET version = GREATEST(schema_info.version, EXCLUDED.version)",
+                 ON CONFLICT (id) DO UPDATE SET
+                    version = GREATEST(schema_info.version, EXCLUDED.version),
+                    min_reader = GREATEST(schema_info.min_reader, EXCLUDED.min_reader)",
                 &[&SCHEMA_VERSION, &REQUIRED_SCHEMA],
             )
             .await?;
