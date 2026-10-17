@@ -145,6 +145,7 @@ async fn subscription_plan_is_projected_into_usage_and_survives_cached_restart()
         assert_eq!(data["five_hour"]["utilization"], 12);
         assert!(data.get("organization").is_none());
         let before = calls.load(Ordering::SeqCst);
+        drop(engine);
         let restarted = f.engine().await;
         let cached = restarted
             .usage("person", &receipt.account_id, true)
