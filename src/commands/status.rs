@@ -212,6 +212,7 @@ pub fn server_rows(view: &claudectl::central::ServerView) -> Vec<FetchedUsage> {
                             .data
                             .clone()
                             .and_then(|data| serde_json::from_value(data).ok());
+                        fetched.plan = parsed.as_ref().and_then(|u| u.subscription_type.clone());
                         let observed = usage.observed_at.map(|ms| ms / 1000);
                         fetched.snapshot = Snapshot {
                             usage: parsed.clone(),
@@ -386,6 +387,7 @@ pub fn status_json(fetched: &[FetchedUsage], now: i64) -> serde_json::Value {
                 "label": f.label,
                 "active": f.is_active,
                 "plan": f.plan,
+                "pace_points": pace_points(f, now),
                 "billing_class": billing_class(usage, f.plan.as_deref()),
                 "exhausted": usage.map(exhausted),
                 "windows": {
@@ -1124,18 +1126,41 @@ fn summary_row(s: &AccountStatus) -> Vec<Cell> {
 }
 
 fn display_plan(f: &FetchedUsage) -> String {
-    if !f.on_server {
-        return "local".into();
-    }
     f.plan
         .as_deref()
+        .map(str::trim)
+        .filter(|plan| !plan.is_empty())
         .map(|plan| match plan.trim().to_ascii_lowercase().as_str() {
             "pro" => "Pro".into(),
             "max" => "Max".into(),
             "team" => "Team".into(),
+            "enterprise" => "Enterprise".into(),
             _ => plan.trim().to_owned(),
         })
         .unwrap_or_else(|| "-".into())
+}
+
+/// Percentage points above the straight-line weekly budget, as in codexctl status.
+fn pace_points(f: &FetchedUsage, now: i64) -> Option<f64> {
+    if f.error.is_some() || !f.snapshot.is_fresh_at(now) {
+        return None;
+    }
+    let window = f.usage.as_ref()?.seven_day.as_ref()?;
+    let used = window.utilization?;
+    let remaining = window.reset_timestamp()?.checked_sub(now)?;
+    if !(0..=604800).contains(&remaining) || !used.is_finite() || !(0.0..=100.0).contains(&used) {
+        return None;
+    }
+    Some(used - (1.0 - remaining as f64 / 604800.0) * 100.0)
+}
+
+fn display_pace(points: Option<f64>) -> String {
+    match points.map(f64::round) {
+        Some(points) if points > 0.0 => format!("+{points:.0} ahead"),
+        Some(points) if points < 0.0 => format!("{points:.0} behind"),
+        Some(_) => "0 on pace".into(),
+        None => "-".into(),
+    }
 }
 
 fn offer_count(f: &FetchedUsage, now: i64) -> String {
@@ -1297,6 +1322,10 @@ fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
     order.sort_by_key(|&i| rank(i));
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut header = vec!["Account", "Plan", "5h", "Week"];
+    let show_pace = fetched.iter().any(|f| pace_points(f, now).is_some());
+    if show_pace {
+        header.push("Pace");
+    }
     if show_fable {
         header.push("Fable");
     }
@@ -1348,6 +1377,9 @@ fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
             pct(c, "5h"),
             pct(c, "week"),
         ];
+        if show_pace {
+            row.push(display_pace(pace_points(f, now)));
+        }
         if show_fable {
             row.push(pct(c, "Fable"));
         }

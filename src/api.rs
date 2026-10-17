@@ -42,6 +42,20 @@ pub fn reset_rate_limits_url(
 pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 pub const OAUTH_BETA_HEADER: (&str, &str) = ("anthropic-beta", "oauth-2025-04-20");
 
+/// The same organization-to-subscription mapping used by Claude Code.
+pub fn subscription_type(profile: &serde_json::Value) -> Option<&'static str> {
+    match profile
+        .pointer("/organization/organization_type")?
+        .as_str()?
+    {
+        "claude_max" => Some("max"),
+        "claude_pro" => Some("pro"),
+        "claude_team" => Some("team"),
+        "claude_enterprise" => Some("enterprise"),
+        _ => None,
+    }
+}
+
 /// The `claudeAiOauth` blob Claude Code stores in the macOS Keychain and
 /// ~/.claude/.credentials.json. Tokens are opaque (not JWTs); expiry comes from
 /// `expiresAt` (ms epoch). Unknown fields are preserved round-trip so claudectl
@@ -105,6 +119,9 @@ impl UsageWindow {
 /// experiment fields we ignore; serde skips unknown keys by default.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct UsageResponse {
+    /// Subscription metadata added by the account server from the provider profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_type: Option<String>,
     pub five_hour: Option<UsageWindow>,
     pub seven_day: Option<UsageWindow>,
     pub seven_day_opus: Option<UsageWindow>,

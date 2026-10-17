@@ -214,6 +214,28 @@ impl Engine {
                                     || matches!(k.as_str(), "limits" | "extra_usage")
                             })
                             .collect();
+                        // Metadata shares the usage poll/cache lifetime. Never expose the raw
+                        // profile, or label this account with a different identity's plan.
+                        let plan = match self
+                            .provider_profile(&loaded.record.grant.access_token)
+                            .await
+                        {
+                            Ok(profile)
+                                if Self::profile_identity(&profile).ok().as_ref()
+                                    == Some(&loaded.identity()) =>
+                            {
+                                crate::api::subscription_type(&profile)
+                            }
+                            Ok(_) => {
+                                result.failure = Some("subscription_plan_identity_mismatch");
+                                None
+                            }
+                            Err(_) => {
+                                result.failure = Some("subscription_plan_unavailable");
+                                None
+                            }
+                        };
+                        data.insert("subscription_type".into(), json!(plan));
                         if let Some(offers) = offers {
                             data.insert("cedar_ember".into(), serde_json::to_value(offers)?);
                         }
