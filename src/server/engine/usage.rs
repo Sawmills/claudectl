@@ -216,23 +216,33 @@ impl Engine {
                             .collect();
                         // Metadata shares the usage poll/cache lifetime. Never expose the raw
                         // profile, or label this account with a different identity's plan.
-                        let plan = match self
-                            .provider_profile(&loaded.record.grant.access_token)
-                            .await
-                        {
-                            Ok(profile)
+                        let previous_plan = result
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("subscription_type"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        // The usage request has a 30 s deadline and the poll lease is 60 s.
+                        // Optional metadata must not exhaust the remaining lease budget.
+                        let profile = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            self.provider_profile(&loaded.record.grant.access_token),
+                        )
+                        .await;
+                        let plan = match profile {
+                            Ok(Ok(profile))
                                 if Self::profile_identity(&profile).ok().as_ref()
                                     == Some(&loaded.identity()) =>
                             {
-                                crate::api::subscription_type(&profile)
+                                crate::api::subscription_type(&profile).map(str::to_owned)
                             }
-                            Ok(_) => {
+                            Ok(Ok(_)) => {
                                 result.failure = Some("subscription_plan_identity_mismatch");
                                 None
                             }
-                            Err(_) => {
+                            Ok(Err(_)) | Err(_) => {
                                 result.failure = Some("subscription_plan_unavailable");
-                                None
+                                previous_plan
                             }
                         };
                         data.insert("subscription_type".into(), json!(plan));

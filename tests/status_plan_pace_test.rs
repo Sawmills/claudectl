@@ -99,6 +99,21 @@ fn local_plan_is_the_subscription_type_instead_of_storage_location() {
     assert!(row.split_whitespace().any(|w| w == "Team"), "{table}");
     let report: Value = serde_json::from_str(&status(home.path(), true)).unwrap();
     assert_eq!(report["accounts"][0]["plan"], "team");
+    let now = chrono::Utc::now();
+    let key = claudectl::usage_cache::UsageCache::key("synthetic");
+    write_json(
+        &home.path().join(".claudectl/usage/cache-v1.json"),
+        json!({
+        "entries":{(key):{"usage":{"seven_day":{"utilization":75,
+                "resets_at":(now+chrono::Duration::hours(84)).to_rfc3339()}},
+                "fetched_at":now.timestamp(),"next_attempt":0,"failures":0,"error":null}},
+            "rate_until":0,"rate_failures":0,"next_request_ms":0
+        }),
+    );
+    let table = status(home.path(), false);
+    assert!(table.contains("+25 ahead"), "{table}");
+    let report: Value = serde_json::from_str(&status(home.path(), true)).unwrap();
+    assert!((report["accounts"][0]["pace_points"].as_f64().unwrap() - 25.0).abs() < 0.01);
 }
 
 #[test]
@@ -185,4 +200,26 @@ fn pace_keeps_unknown_cells_when_another_account_has_weekly_data() {
     assert!(table.contains("0 on pace"), "{table}");
     let report: Value = serde_json::from_str(&status(home.path(), true)).unwrap();
     assert!(report["server"]["accounts"][1]["pace_points"].is_null());
+}
+
+#[test]
+fn an_error_row_with_fresh_weekly_numbers_has_no_pace() {
+    let home = tempfile::tempdir().unwrap();
+    server(
+        home.path(),
+        "work",
+        json!({"seven_day":{"utilization":75,
+        "resets_at":(chrono::Utc::now()+chrono::Duration::hours(84)).to_rfc3339()}}),
+    );
+    let path = home
+        .path()
+        .join(".claudectl/server/status")
+        .join(format!("{:x}.json", Sha256::digest(b"work")));
+    let mut observation: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    observation["account"]["available"] = json!(false);
+    write_json(&path, observation);
+    let table = status(home.path(), false);
+    assert!(!table.lines().next().unwrap().contains("Pace"), "{table}");
+    let report: Value = serde_json::from_str(&status(home.path(), true)).unwrap();
+    assert!(report["server"]["accounts"][0]["pace_points"].is_null());
 }

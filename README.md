@@ -192,6 +192,8 @@ server and local accounts, the `Window resets` time, and an `Offers` count. A
 server plan comes from the provider profile and is cached with usage; a local
 plan comes from the saved credentials. Unknown plans show `-` (JSON `plan: null`).
 Cached status sends no provider request.
+If a later profile lookup fails, the server keeps that account's last known plan
+and records a diagnostic. A mismatched identity clears the plan.
 
 `Pace` compares weekly consumption with elapsed time in the seven-day window:
 `+25 ahead` means 25 percentage points above that budget, `-25 behind` means

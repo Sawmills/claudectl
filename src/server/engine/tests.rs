@@ -169,6 +169,7 @@ async fn subscription_plan_is_projected_into_usage_and_survives_cached_restart()
 async fn subscription_plan_refuses_unavailable_or_mismatched_profile_metadata() {
     for (mode, reason) in [
         ("unavailable", "subscription_plan_unavailable"),
+        ("slow", "subscription_plan_unavailable"),
         ("mismatch", "subscription_plan_identity_mismatch"),
     ] {
         let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -179,6 +180,9 @@ async fn subscription_plan_refuses_unavailable_or_mismatched_profile_metadata() 
                 async move {
                     if flag.load(Ordering::SeqCst) && mode == "unavailable" {
                         return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    if flag.load(Ordering::SeqCst) && mode == "slow" {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
                     }
                     let account = if flag.load(Ordering::SeqCst) { "someone-else" } else { "a" };
                     Json(json!({"account":{"uuid":account},"organization":{"uuid":"o","organization_type":"claude_max"}})).into_response()
@@ -199,13 +203,33 @@ async fn subscription_plan_refuses_unavailable_or_mismatched_profile_metadata() 
             )
             .await
             .unwrap();
-        broken.store(true, Ordering::SeqCst);
-        let usage = engine
+        let first = engine
             .usage("person", &receipt.account_id, false)
             .await
             .unwrap();
+        assert_eq!(first.data.as_ref().unwrap()["subscription_type"], "max");
+        // Seed the next due observation, as after the normal five-minute cache expires.
+        let mut due = first;
+        due.next_retry_at = 0;
+        engine
+            .store
+            .put_usage(&receipt.account_id, &engine.seal(&due).unwrap())
+            .await
+            .unwrap();
+        broken.store(true, Ordering::SeqCst);
+        let usage = tokio::time::timeout(
+            Duration::from_secs(6),
+            engine.usage("person", &receipt.account_id, false),
+        )
+        .await
+        .expect("optional metadata blocked the usage poll")
+        .unwrap();
         let data = usage.data.unwrap();
-        assert!(data["subscription_type"].is_null());
+        if mode != "mismatch" {
+            assert_eq!(data["subscription_type"], "max");
+        } else {
+            assert!(data["subscription_type"].is_null());
+        }
         assert_eq!(data["five_hour"]["utilization"], 12);
         assert!(!usage.stale && usage.error.is_none());
         assert_eq!(usage.failure, Some(reason));
