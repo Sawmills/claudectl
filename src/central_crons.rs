@@ -41,6 +41,7 @@ impl Recovery {
             Err(error) => return Err(error.into()),
         };
         let mut owned = None;
+        let mut found_owner = false;
         for directory in directories {
             let directory = directory?;
             if !directory.file_type()?.is_dir() {
@@ -75,14 +76,18 @@ impl Recovery {
             {
                 continue;
             }
-            if owners.len() != 1 || owned.is_some() {
+            if owners.len() != 1 || found_owner {
                 bail!("cron recovery: ambiguous Operator card ownership");
             }
+            found_owner = true;
             let mut jobs = Vec::new();
             for line in text
                 .lines()
                 .filter_map(|line| line.strip_prefix("cron_prompts:"))
             {
+                if line.trim().is_empty() {
+                    continue;
+                }
                 for entry in line.split(';') {
                     let words = shell_words::split(entry).map_err(|_| {
                         anyhow::anyhow!("cron recovery: invalid cron_prompts quoting")
@@ -90,8 +95,10 @@ impl Recovery {
                     if words.len() != 6 {
                         bail!("cron recovery: cron_prompts needs a file and five schedule fields");
                     }
-                    let file = saved_path(home, &card, &words[0]);
-                    let prompt = std::fs::read_to_string(&file)?;
+                    let file = saved_path(home, &card, &words[0])?;
+                    let prompt = std::fs::read_to_string(&file).with_context(|| {
+                        format!("cron recovery: saved prompt unreadable: {}", file.display())
+                    })?;
                     if prompt.trim().is_empty() {
                         bail!("cron recovery: saved prompt is empty: {}", file.display());
                     }
@@ -103,7 +110,7 @@ impl Recovery {
                 }
             }
             if jobs.is_empty() {
-                bail!("cron recovery: owned Operator card has no cron_prompts");
+                continue;
             }
             let previous = text
                 .lines()
@@ -111,6 +118,7 @@ impl Recovery {
                 .and_then(|value| shell_words::split(value).ok())
                 .filter(|words| words.len() == 1)
                 .map(|words| saved_path(home, &card, &words[0]))
+                .transpose()?
                 .and_then(|path| path.canonicalize().ok())
                 .and_then(|path| std::fs::metadata(&path).ok().map(|info| (path, info.len())));
             owned = Some(Self {
@@ -313,17 +321,22 @@ impl Recovery {
     }
 }
 
-fn saved_path(home: &Path, card: &Path, value: &str) -> PathBuf {
+fn saved_path(home: &Path, card: &Path, value: &str) -> Result<PathBuf> {
     for prefix in ["~/", "$HOME/", "${HOME}/"] {
         if let Some(relative) = value.strip_prefix(prefix) {
-            return home.join(relative);
+            return Ok(home.join(relative));
         }
+    }
+    if value.starts_with('~') || value.contains('$') {
+        bail!(
+            "cron recovery: unsupported saved cron path: {value}; use an absolute or relative path, ~/ or $HOME/"
+        );
     }
     let path = PathBuf::from(value);
     if path.is_absolute() {
-        path
+        Ok(path)
     } else {
-        card.parent().unwrap().join(path)
+        Ok(card.parent().unwrap().join(path))
     }
 }
 

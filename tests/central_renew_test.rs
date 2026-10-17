@@ -533,6 +533,48 @@ fn an_unreadable_unrelated_card_does_not_abort_an_ordinary_renewal() {
 }
 
 #[test]
+fn an_operator_card_without_saved_crons_keeps_the_existing_renewal() {
+    for fields in ["", "cron_ids:\ncron_prompts:\n"] {
+        let env = Env::new();
+        private_write(
+            &env.home.path().join("Code/.fleet/new/operator.md"),
+            &format!("hq: new  operator_tab: w9C:tF\n{fields}"),
+        );
+        let output = env.operator_restart(json!([]), "w9C:tF", false);
+        env.assert_followed(&env.runs(), "token-2");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("cron recovery verified"));
+    }
+}
+
+#[test]
+fn unsupported_operator_prompt_paths_are_named_clearly() {
+    for path in ["$FLEET/check.txt", "~another-user/check.txt"] {
+        let env = Env::new();
+        private_write(
+            &env.home.path().join("Code/.fleet/example/operator.md"),
+            &format!("operator_tab: w9C:tF\ncron_prompts: {path} */5 * * * *\n"),
+        );
+        let refresher = env.refresh_when_idle();
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+        env.env(&mut command);
+        command
+            .env("HERDR_TAB_ID", "w9C:tF")
+            .args(["server", "run", "work", "--claude"])
+            .arg(&env.claude)
+            .args(["--", "--model", "opus"]);
+        let output = Command::from_std(command)
+            .timeout(std::time::Duration::from_secs(60))
+            .output()
+            .unwrap();
+        refresher.join().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("unsupported saved cron path"), "{stderr}");
+        assert!(stderr.contains(path), "{stderr}");
+    }
+}
+
+#[test]
 fn another_tabs_operator_card_does_not_change_the_renewal_note() {
     let env = Env::new();
     env.operator_card();

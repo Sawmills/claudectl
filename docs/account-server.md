@@ -284,6 +284,10 @@ The transcript read is limited to 8 MiB after the previous recorded position. An
 card, an unreadable saved prompt, or a malformed entry fails the renewal instead of silently
 resuming without its jobs. Sessions with no matching card keep the existing note; first
 launches, manual resumes, and account failovers do not use this recovery.
+Cards with no saved crons also keep the existing note. Unreadable unrelated cards produce a
+discovery warning and do not stop ordinary renewal. Saved paths support absolute paths,
+paths relative to the card, `~/`, `$HOME/`, and `${HOME}/`; other variables and `~user`
+are refused with an explicit unsupported-path error.
 
 This remains a best-effort workaround for Claude Code's resume behavior, with these limits:
 
