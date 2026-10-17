@@ -290,6 +290,30 @@ async fn only_an_enrolled_machine_of_an_allowed_user_gets_access() {
 }
 
 #[tokio::test]
+async fn machine_reset_listing_is_hidden_when_the_reset_gate_is_off() {
+    let f = Fixture::new(None).await;
+    let (_id, mac) = f.register(AMIR, "mac").await;
+    let (status, body) = f
+        .call(
+            reqwest::Method::GET,
+            "/v2/anthropic/resets",
+            Some(&mac),
+            None,
+        )
+        .await;
+    assert_eq!((status, body["error"].as_str()), (404, Some("not_found")));
+    let (status, body) = f
+        .call(
+            reqwest::Method::POST,
+            "/v2/anthropic/resets/redeem",
+            Some(&mac),
+            Some(json!({"account_id":"missing"})),
+        )
+        .await;
+    assert_eq!((status, body["error"].as_str()), (404, Some("not_found")));
+}
+
+#[tokio::test]
 async fn a_deleted_account_answers_gone_and_a_revoked_machine_is_refused() {
     let f = Fixture::new(None).await;
     let (mac_id, mac) = f.register(AMIR, "mac").await;

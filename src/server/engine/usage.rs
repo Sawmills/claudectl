@@ -185,7 +185,7 @@ impl Engine {
                                 }
                             }
                             offers
-                                .next_usable_grant_id(&exhausted, now() / 1000)
+                                .closest_usable_grant_id(&exhausted, now() / 1000)
                                 .map(str::to_owned)
                         });
                         if self

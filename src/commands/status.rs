@@ -178,7 +178,7 @@ const PENDING: &str = "server migration pending";
 
 /// Server accounts as status rows. When the server does not answer, the accounts this
 /// machine knows stand in for them.
-fn server_rows(view: &claudectl::central::ServerView) -> Vec<FetchedUsage> {
+pub fn server_rows(view: &claudectl::central::ServerView) -> Vec<FetchedUsage> {
     use claudectl::central::ServerView;
     match view {
         ServerView::NotConnected => vec![],
@@ -457,6 +457,10 @@ pub fn fetch_alias(alias: &str, mode: FetchMode) -> Result<Option<FetchedUsage>>
 
 pub fn fetch_all_usages() -> Result<Vec<FetchedUsage>> {
     fetch_usages(None, FetchMode::Normal)
+}
+
+pub fn fetch_usages_for_resets() -> Result<Vec<FetchedUsage>> {
+    fetch_usages(None, FetchMode::Refresh)
 }
 
 /// The local or server account `name` names (`claudectl::accounts::resolve`). With no

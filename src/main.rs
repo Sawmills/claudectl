@@ -96,6 +96,20 @@ enum Commands {
         #[arg(long, conflicts_with = "details")]
         json: bool,
     },
+    /// List usable limit-reset offers for local and server accounts
+    Resets {
+        /// Print a JSON document instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply one limit reset to an explicit account
+    Reset {
+        /// Account alias (full name or unique prefix)
+        account: String,
+        /// Apply without an interactive confirmation
+        #[arg(long)]
+        yes: bool,
+    },
     /// Log into a Claude account via OAuth and save it as a profile
     #[command(hide = true)]
     Login {
@@ -284,6 +298,8 @@ fn main() {
             details,
             json,
         ),
+        Commands::Resets { json } => commands::resets::list(json),
+        Commands::Reset { ref account, yes } => commands::resets::reset(account, yes),
         Commands::Login { ref alias } => commands::login::run(alias),
         Commands::Save { ref alias } => commands::save::run(alias.as_deref()),
         Commands::Use { ref alias } => commands::use_profile::run(alias.as_deref()),
