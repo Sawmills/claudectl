@@ -333,6 +333,8 @@ pub struct Engine {
     endpoints: Endpoints,
     /// One task per account in this process; the lease covers other replicas.
     local: StdMutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    /// Reset and account removal share a process-local fence separate from refreshes.
+    reset_local: StdMutex<BTreeMap<String, Arc<Mutex<()>>>>,
     usage_poll: Mutex<()>,
     /// Offer-shape diagnostics, once per account in this process; IDs stay in memory.
     usage_offers_logged: StdMutex<BTreeSet<String>>,
@@ -378,6 +380,7 @@ impl Engine {
                 .no_proxy()
                 .build()?,
             local: StdMutex::new(BTreeMap::new()),
+            reset_local: StdMutex::new(BTreeMap::new()),
             usage_poll: Mutex::new(()),
             usage_offers_logged: StdMutex::new(BTreeSet::new()),
             rotations: StdMutex::new(ROTATION_REASONS.iter().map(|r| (*r, (0, 0))).collect()),
@@ -397,6 +400,14 @@ impl Engine {
         self.local
             .lock()
             .expect("local locks")
+            .entry(id.into())
+            .or_default()
+            .clone()
+    }
+    fn reset_lock(&self, id: &str) -> Arc<Mutex<()>> {
+        self.reset_local
+            .lock()
+            .expect("reset locks")
             .entry(id.into())
             .or_default()
             .clone()
@@ -1074,7 +1085,7 @@ impl Engine {
     /// Delete an account and its sealed grant. Access tokens already given out stay valid
     /// until they expire; the server stops renewing them now.
     async fn delete_account(&self, user: &str, id: &str) -> Result<bool> {
-        let local = self.local_lock(id);
+        let local = self.reset_lock(id);
         let _local = local.lock().await;
         let Some(lease) = self.store.acquire_lease(id, LEASE_TTL).await? else {
             bail!("account is already in progress");
@@ -1119,7 +1130,7 @@ impl Engine {
     /// so a timeout or replica restart retries the same provider operation. No store
     /// transaction is held while the network request runs.
     pub async fn apply_reset(&self, user: &str, actor: &str, id: &str) -> Result<String> {
-        let local = self.local_lock(id);
+        let local = self.reset_lock(id);
         let _local = local.lock().await;
         let mut lease = self
             .store
