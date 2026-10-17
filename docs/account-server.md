@@ -216,8 +216,19 @@ folder trust, so `--resume <session>` finds a conversation started on the host l
 child receives only the server access token, in `CLAUDE_CODE_OAUTH_TOKEN`; credential and
 routing overrides (`ANTHROPIC_API_KEY` and the like) are removed from its environment, and
 the client never holds a refresh token. Existing project and managed credential overrides
-are refused at startup, and user-supplied `--settings`, `--setting-sources` and `--bare` are
-refused.
+are refused at startup. Explicit `--settings <JSON-or-file>` values are checked with the
+same rules, then merged in argument order into the private session settings file. Objects
+merge recursively, later non-hook values win, and hook arrays append to claudectl's hooks.
+Claude receives exactly one `--settings`; unreadable files or invalid JSON stop the launch.
+`--setting-sources` and `--bare` remain refused.
+
+This merge checks JSON syntax, credential/routing isolation and hook-array structure; it
+is not a full Claude settings-schema validator. On Claude 2.1.302, a schema error such as
+`"model": 5` makes the whole merged file inactive, including the generated supervision
+hooks. Token renewal and account failover then lack their hook events. Supply settings
+valid for the installed Claude version and fix its startup warnings before using the
+session. The valid A2A settings `crossSessionInbound: "accept"` and
+`isolatePeerMachines: true` retain the hooks. No native validation subprocess is added.
 
 The synthetic check `experiments/settings-renewal/host-config.py` (Claude 2.1.280, Linux)
 shows, with a host login present in the config dir: the server token is used, the host token

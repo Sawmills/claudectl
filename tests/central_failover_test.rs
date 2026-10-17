@@ -109,10 +109,11 @@ const FAKE_CLAUDE: &str = r#"#!/usr/bin/env python3
 import json, os, signal, subprocess, sys, time
 args = sys.argv[1:]
 token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
-with open(os.environ["FAKE_LOG"], "a") as log:
-    log.write(json.dumps({"token": token, "args": args}) + "\n")
 settings = args[args.index("--settings") + 1]
-command = json.load(open(settings))["hooks"]["StopFailure"][0]["hooks"][0]["command"]
+config = json.load(open(settings))
+with open(os.environ["FAKE_LOG"], "a") as log:
+    log.write(json.dumps({"token": token, "args": args, "settings": config}) + "\n")
+command = config["hooks"]["StopFailure"][0]["hooks"][0]["command"]
 if token != "token-work":
     # A resumed Claude reports its session start, then this fake exits 7.
     resumed = args[args.index("--resume") + 1] if "--resume" in args else "sess-new"
@@ -190,6 +191,9 @@ impl Env {
         }
     }
     fn run(&self, args: &[&str], watchdog_s: &str) -> std::process::Output {
+        self.run_with(args, watchdog_s, &[])
+    }
+    fn run_with(&self, args: &[&str], watchdog_s: &str, settings: &[&str]) -> std::process::Output {
         let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
         command
             .env_clear()
@@ -203,7 +207,8 @@ impl Env {
             .args(args)
             .arg("--claude")
             .arg(&self.claude)
-            .args(["--", "--model", "opus"]);
+            .args(["--", "--model", "opus"])
+            .args(settings);
         Command::from_std(command)
             .timeout(std::time::Duration::from_secs(60))
             .output()
@@ -228,7 +233,7 @@ impl Env {
 #[test]
 fn a_usage_limit_moves_the_session_to_the_account_with_room() {
     let env = Env::new();
-    let output = env.run(&["run"], "20");
+    let output = env.run_with(&["run"], "20", &["--settings", r#"{"crossSessionInbound":"accept","isolatePeerMachines":true,"hooks":{"StopFailure":[{"hooks":[{"type":"command","command":"echo user-hook"}]}]}}"#]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     // The second Claude's own exit code ends the run.
     assert_eq!(output.status.code(), Some(7), "{stderr}");
@@ -236,6 +241,28 @@ fn a_usage_limit_moves_the_session_to_the_account_with_room() {
     assert_eq!(runs.len(), 2, "{runs:?}");
     assert_eq!(runs[0]["token"], "token-work");
     assert_eq!(runs[1]["token"], "token-spare");
+    for run in &runs {
+        assert_eq!(run["settings"]["crossSessionInbound"], "accept");
+        assert_eq!(run["settings"]["isolatePeerMachines"], true);
+        let hooks = run["settings"]["hooks"]["StopFailure"].as_array().unwrap();
+        assert_eq!(hooks.len(), 2);
+        assert!(
+            hooks[0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains(" server hook ")
+        );
+        assert_eq!(hooks[1]["hooks"][0]["command"], "echo user-hook");
+        assert_eq!(
+            run["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|arg| *arg == "--settings")
+                .count(),
+            1
+        );
+    }
     let args: Vec<String> = serde_json::from_value(runs[1]["args"].clone()).unwrap();
     let settings = args.iter().position(|a| a == "--settings").unwrap();
     let mut user: Vec<&str> = args.iter().map(String::as_str).collect();

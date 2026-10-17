@@ -129,10 +129,11 @@ args = sys.argv[1:]
 token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
 tty = os.isatty(0)
 foreground = tty and os.tcgetpgrp(0) == os.getpgrp()
-with open(os.environ["FAKE_LOG"], "a") as log:
-    log.write(json.dumps({"token": token, "args": args, "tty": tty, "foreground": foreground}) + "\n")
 settings = args[args.index("--settings") + 1]
-command = json.load(open(settings))["hooks"]["Stop"][0]["hooks"][0]["command"]
+config = json.load(open(settings))
+with open(os.environ["FAKE_LOG"], "a") as log:
+    log.write(json.dumps({"token": token, "args": args, "tty": tty, "foreground": foreground, "settings": config}) + "\n")
+command = config["hooks"]["Stop"][0]["hooks"][0]["command"]
 def hook(event):
     subprocess.run(["/bin/sh", "-c", command], input=json.dumps(event).encode(), check=True)
 if token != "token-1":
@@ -323,7 +324,15 @@ fn a_revoked_token_restarts_an_idle_claude_with_resume_on_the_new_token() {
     command
         .args(["server", "run", "work", "--claude"])
         .arg(&env.claude)
-        .args(["--", "--model", "opus", "--resume", "old"]);
+        .args([
+            "--",
+            "--model",
+            "opus",
+            "--resume",
+            "old",
+            "--settings",
+            r#"{"crossSessionInbound":"accept","isolatePeerMachines":true}"#,
+        ]);
     let output = Command::from_std(command)
         .timeout(std::time::Duration::from_secs(60))
         .output()
@@ -336,7 +345,25 @@ fn a_revoked_token_restarts_an_idle_claude_with_resume_on_the_new_token() {
         stderr.contains("server token renewed; resuming session sess-1"),
         "{stderr}"
     );
-    env.assert_followed(&env.runs(), "token-2");
+    let runs = env.runs();
+    env.assert_followed(&runs, "token-2");
+    for run in runs {
+        assert_eq!(run["settings"]["crossSessionInbound"], "accept");
+        assert_eq!(run["settings"]["isolatePeerMachines"], true);
+        assert_eq!(
+            run["settings"]["hooks"]["Stop"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            run["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|arg| *arg == "--settings")
+                .count(),
+            1
+        );
+    }
 }
 
 /// Under a terminal, the relaunched Claude gets the terminal and its foreground again.

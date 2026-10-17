@@ -261,7 +261,7 @@ fn preflight(paths: &Paths, cwd: &Path, args: &[OsString]) -> Result<()> {
     }
     for arg in args {
         if let Some(flag) = arg.to_str().and_then(|a| {
-            ["--settings", "--setting-sources", "--bare"]
+            ["--setting-sources", "--bare"]
                 .into_iter()
                 .find(|flag| a == *flag || a.starts_with(&format!("{flag}=")))
         }) {
@@ -828,6 +828,8 @@ pub fn run(
     failover: bool,
 ) -> Result<i32> {
     let _slot = exec::RunSlot::take().map_err(|error| anyhow::anyhow!("{error}"))?;
+    let user_settings = super::settings::LaunchSettings::parse(args)?;
+    let args = user_settings.args.as_slice();
     preflight(paths, &std::env::current_dir()?, args)?;
     let service_account = super::service_account::account(client, alias)?;
     let build = qualified_build(paths, &program(binary)?, super::qualify::harness)?;
@@ -852,6 +854,7 @@ pub fn run(
         session.set_renewal("off: one-shot run")?;
         None
     };
+    let mut settings = user_settings.write(session.directory(), hooks.as_deref())?;
     let terminal = Terminal::save();
     struct Signals;
     impl Drop for Signals {
@@ -870,10 +873,11 @@ pub fn run(
     let mut resumed: Option<String> = None;
     let mut first = true;
     loop {
-        let mut command = session.command(&snapshot, &launch_args)?;
-        if let Some(hooks) = &hooks {
-            command.arg("--settings").arg(hooks);
+        let mut command = session.command(&snapshot, &[])?;
+        if let Some(settings) = &settings {
+            command.arg("--settings").arg(settings);
         }
+        command.args(&launch_args);
         exec::set_process_group(&mut command);
         // Whether claudectl holds the terminal foreground now (the group to give it back to).
         // SAFETY: tcgetpgrp and getpgrp only read process state.
@@ -1011,6 +1015,7 @@ pub fn run(
                 std::fs::rename(&snapshot, &moved)?;
                 snapshot = moved;
                 hooks = Some(next.adopt_hook(&session)?);
+                settings = user_settings.write(next.directory(), hooks.as_deref())?;
                 session = next;
                 tried.push(from.clone());
                 failovers.push(now());

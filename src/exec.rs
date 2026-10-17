@@ -124,31 +124,43 @@ fn check_files(files: Vec<std::path::PathBuf>) -> Result<(), ExecError> {
                 file.display()
             ))
         })?;
-        let overrides = settings
-            .get("env")
-            .and_then(|env| env.as_object())
-            .into_iter()
-            .flat_map(|env| env.keys())
-            // exec sets these two for the child itself; a settings value
-            // would replace them after the spawn.
-            .filter(|name| {
-                is_scrubbed_env(name) || *name == CONFIG_DIR_ENV || *name == TOKEN_FD_ENV
-            })
-            .map(String::as_str)
-            .chain(
-                SETTINGS_CREDENTIAL_KEYS
-                    .iter()
-                    .copied()
-                    .filter(|key| settings.get(key).is_some()),
-            )
-            .collect::<Vec<_>>();
-        if !overrides.is_empty() {
-            return Err(ExecError::Refused(format!(
-                "{} sets {}, which can change the login or the endpoint; run from another directory",
-                file.display(),
-                overrides.join(", ")
-            )));
-        }
+        check_settings_value(&settings, &file).map_err(|error| match error {
+            ExecError::Refused(message) => {
+                ExecError::Refused(format!("{message}; run from another directory"))
+            }
+            error => error,
+        })?;
+    }
+    Ok(())
+}
+
+/// Apply the same login and endpoint checks to explicit launch settings.
+pub(crate) fn check_settings_value(
+    settings: &serde_json::Value,
+    file: &Path,
+) -> Result<(), ExecError> {
+    let overrides = settings
+        .get("env")
+        .and_then(|env| env.as_object())
+        .into_iter()
+        .flat_map(|env| env.keys())
+        // exec sets these two for the child itself; a settings value
+        // would replace them after the spawn.
+        .filter(|name| is_scrubbed_env(name) || *name == CONFIG_DIR_ENV || *name == TOKEN_FD_ENV)
+        .map(String::as_str)
+        .chain(
+            SETTINGS_CREDENTIAL_KEYS
+                .iter()
+                .copied()
+                .filter(|key| settings.get(key).is_some()),
+        )
+        .collect::<Vec<_>>();
+    if !overrides.is_empty() {
+        return Err(ExecError::Refused(format!(
+            "{} sets {}, which can change the login or the endpoint",
+            file.display(),
+            overrides.join(", ")
+        )));
     }
     Ok(())
 }

@@ -25,7 +25,7 @@ const RUN_EXAMPLES: &str = "Examples:
 #[derive(Subcommand)]
 enum Commands {
     /// Start Claude on a server account (the one with the most room if none is named)
-    #[command(after_help = RUN_EXAMPLES)]
+    #[command(after_help = format!("{RUN_EXAMPLES}\n\n{}", claudectl::central::RUN_SETTINGS_HELP))]
     Run {
         /// Account to use: full name, email name (amir2), or a unique prefix
         account: Option<String>,

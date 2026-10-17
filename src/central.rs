@@ -10,6 +10,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Shared help for explicit settings in both run commands.
+pub const RUN_SETTINGS_HELP: &str =
+    "Pass settings after -- with --settings <JSON-or-file> (repeatable).
+Objects merge in argument order; hooks append to claudectl's generated hooks.
+Claude validates the settings schema. An invalid value such as model: 5 can make
+Claude ignore the WHOLE settings file, including claudectl's renewal/failover hooks.
+Test settings with your installed Claude version before rollout.";
+
 #[path = "central_failover.rs"]
 mod failover;
 #[path = "central_migration.rs"]
@@ -22,6 +30,9 @@ mod renew;
 pub mod service_account;
 #[path = "central_session.rs"]
 pub mod session;
+#[cfg(unix)]
+#[path = "central_settings.rs"]
+mod settings;
 #[cfg(unix)]
 #[path = "central_shim.rs"]
 pub mod shim;
@@ -1096,6 +1107,7 @@ pub enum Command {
         no_browser: bool,
     },
     /// Run the tested Claude build with access-only credentials
+    #[command(after_help = RUN_SETTINGS_HELP)]
     Run {
         /// Account to use: full name, email name, or a unique prefix
         alias: String,
