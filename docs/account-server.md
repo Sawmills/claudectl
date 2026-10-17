@@ -96,7 +96,7 @@ store transaction, and the action writes an `account_reset` audit row without to
 
 Enable the browser action only after every staging replica runs the release that
 contains this field and all older writers have drained. Older binaries fail closed
-when they read the newer sealed account record, so the image rollout and replica
+when they read the newer version-2 sealed account record, so the image rollout and replica
 readiness check come before enabling the flag. Verify the synthetic timeout replay
 on the new image before any live staging use.
 
