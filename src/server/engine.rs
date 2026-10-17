@@ -1073,10 +1073,29 @@ impl Engine {
     }
     /// Delete an account and its sealed grant. Access tokens already given out stay valid
     /// until they expire; the server stops renewing them now.
+    async fn delete_account(&self, user: &str, id: &str) -> Result<bool> {
+        let local = self.local_lock(id);
+        let _local = local.lock().await;
+        let Some(lease) = self.store.acquire_lease(id, LEASE_TTL).await? else {
+            bail!("account is already in progress");
+        };
+        match self.store.delete(user, id).await {
+            Ok(deleted) => {
+                if !deleted {
+                    self.store.release_lease(&lease, id).await?;
+                }
+                Ok(deleted)
+            }
+            Err(error) => {
+                let _ = self.store.release_lease(&lease, id).await;
+                Err(error)
+            }
+        }
+    }
     /// Remove an account from the browser dashboard: audited as `account_remove` with the
     /// signed-in person as actor (`dashboard:<email>`).
     pub async fn remove_from_dashboard(&self, user: &str, actor: &str, id: &str) -> Result<()> {
-        if !self.store.delete(user, id).await? {
+        if !self.delete_account(user, id).await? {
             return if self.store.deleted(user, id).await? {
                 Err(Gone.into())
             } else {
@@ -1220,7 +1239,12 @@ impl Engine {
             };
             let mut record = loaded.record.clone();
             record.pending_reset = Some(pending.clone());
-            self.put(&mut loaded, record, Fence::Held(lease)).await?;
+            if let Err(error) = self.put(&mut loaded, record, Fence::Held(lease)).await {
+                eprintln!(
+                    "{}",
+                    json!({"operation":"account_reset","stage":"result","reason":"persistence_failed","error":error.to_string()})
+                );
+            }
             reply.result
         };
 
@@ -1299,7 +1323,7 @@ impl Engine {
         Ok(provider_result)
     }
     pub async fn remove(&self, user: &str, machine: &str, id: &str) -> Result<()> {
-        if !self.store.delete(user, id).await? {
+        if !self.delete_account(user, id).await? {
             return if self.store.deleted(user, id).await? {
                 Err(Gone.into())
             } else {

@@ -457,6 +457,80 @@ async fn a_browser_reset_retry_reuses_the_sealed_request_id() {
 }
 
 #[tokio::test]
+async fn account_removal_waits_for_a_reset_to_settle() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let reset_started = started.clone();
+    let reset_release = release.clone();
+    let provider = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/api/oauth/usage",
+            get(|| async {
+                Json(
+                    serde_json::from_str::<Value>(include_str!(
+                        "../../../tests/fixtures/limit-reset-offers.json"
+                    ))
+                    .unwrap(),
+                )
+            }),
+        )
+        .route(
+            "/api/organizations/o/reset_rate_limits",
+            post(move || {
+                let (reset_started, reset_release) = (reset_started.clone(), reset_release.clone());
+                async move {
+                    reset_started.notify_one();
+                    reset_release.notified().await;
+                    Json(json!({"result":"reset"}))
+                }
+            }),
+        );
+    let fixture = Fixture::new(provider).await;
+    let engine = Arc::new(fixture.engine().await);
+    let account = engine
+        .admit(
+            "person",
+            "machine",
+            "first",
+            grant_until("a", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    engine
+        .usage("person", &account.account_id, false)
+        .await
+        .unwrap();
+    let reset_engine = engine.clone();
+    let account_id = account.account_id.clone();
+    let reset_task = tokio::spawn(async move {
+        reset_engine
+            .apply_reset("person", "dashboard:person@example.com", &account_id)
+            .await
+    });
+    started.notified().await;
+    let remove_engine = engine.clone();
+    let remove_id = account.account_id.clone();
+    let mut remove_task =
+        tokio::spawn(async move { remove_engine.remove("person", "machine", &remove_id).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut remove_task)
+            .await
+            .is_err()
+    );
+    release.notify_one();
+    assert_eq!(reset_task.await.unwrap().unwrap(), "reset");
+    assert!(remove_task.await.unwrap().is_ok());
+    assert!(
+        engine
+            .remove("person", "machine", &account.account_id)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn concurrent_rejections_refresh_once_and_restart_preserves_the_successor() {
     let (f, engine, refreshes) = synthetic(3600).await;
     let receipt = engine
