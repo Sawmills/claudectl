@@ -7,9 +7,10 @@ use std::time::Duration;
 use tokio_postgres::{Row, error::SqlState};
 
 /// Schema this binary writes, and the oldest schema it can read.
-/// 2: `machines.last_seen_at` (SAW-12696). A server of this version reads it, so it needs it.
-pub const SCHEMA_VERSION: i32 = 2;
-const REQUIRED_SCHEMA: i32 = 2;
+/// 2: `machines.last_seen_at` (SAW-12696).
+/// 3: scoped, idempotent account-reset audit markers.
+pub const SCHEMA_VERSION: i32 = 3;
+const REQUIRED_SCHEMA: i32 = 3;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_info (
@@ -87,8 +88,20 @@ CREATE TABLE IF NOT EXISTS usage_cache (
 );
 CREATE TABLE IF NOT EXISTS audit_events (
     id BIGSERIAL PRIMARY KEY,
-    sealed BYTEA NOT NULL
+    sealed BYTEA NOT NULL,
+    operation TEXT NOT NULL DEFAULT 'legacy',
+    user_id TEXT,
+    organization_uuid TEXT,
+    account_id TEXT,
+    request_id_hash TEXT
 );
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS operation TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS organization_uuid TEXT;
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS account_id TEXT;
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS request_id_hash TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS audit_reset_request
+    ON audit_events (operation, user_id, organization_uuid, account_id, request_id_hash);
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL,
@@ -239,7 +252,9 @@ impl PostgresStore {
         client
             .execute(
                 "INSERT INTO schema_info (id, version, min_reader) VALUES (1, $1, $2)
-                 ON CONFLICT (id) DO UPDATE SET version = GREATEST(schema_info.version, EXCLUDED.version)",
+                 ON CONFLICT (id) DO UPDATE SET
+                    version = GREATEST(schema_info.version, EXCLUDED.version),
+                    min_reader = GREATEST(schema_info.min_reader, EXCLUDED.min_reader)",
                 &[&SCHEMA_VERSION, &REQUIRED_SCHEMA],
             )
             .await?;
@@ -859,6 +874,28 @@ impl PostgresStore {
             .execute("INSERT INTO audit_events (sealed) VALUES ($1)", &[&sealed])
             .await?;
         Ok(())
+    }
+    pub async fn append_audit_idempotent(
+        &self,
+        sealed: &[u8],
+        user: &str,
+        organization: &str,
+        account: &str,
+        request_id: &str,
+    ) -> Result<bool> {
+        let request_hash = crate::server::vault::digest(request_id.as_bytes());
+        let client = self.pool.get().await?;
+        let rows = client
+            .execute(
+                "INSERT INTO audit_events
+                    (sealed, operation, user_id, organization_uuid, account_id, request_id_hash)
+                 VALUES ($1, 'account_reset', $2, $3, $4, $5)
+                 ON CONFLICT (operation, user_id, organization_uuid, account_id, request_id_hash)
+                 DO NOTHING",
+                &[&sealed, &user, &organization, &account, &request_hash],
+            )
+            .await?;
+        Ok(rows == 1)
     }
     pub async fn audit(&self) -> Result<Vec<Vec<u8>>> {
         let client = self.pool.get().await?;

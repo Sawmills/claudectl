@@ -43,13 +43,51 @@ pub struct Event<'a> {
 
 /// An audit write failure fails the operation it records.
 pub async fn record(store: &Store, key: &Path, event: &Event<'_>) -> Result<()> {
-    let mut line = serde_json::to_value(event)?;
-    line["at"] = chrono::Utc::now().to_rfc3339().into();
+    let line = line(event)?;
     eprintln!("{}", serde_json::json!({"audit": line}));
     store
         .append_audit(&vault::encrypt(key, &serde_json::to_vec(&line)?)?)
         .await
         .context(AuditUnavailable)
+}
+
+/// Append an audit row once for a pending reset request. The store owns the scoped atomic
+/// dedupe marker, so this path never scans or decrypts another user's audit rows.
+pub async fn record_idempotent(
+    store: &Store,
+    key: &Path,
+    event: &Event<'_>,
+    user: &str,
+    organization: &str,
+    request_id: &str,
+) -> Result<()> {
+    let mut stored = line(event)?;
+    stored["request_id"] = request_id.into();
+    let mut displayed = stored.clone();
+    displayed
+        .as_object_mut()
+        .expect("audit event is an object")
+        .remove("request_id");
+    let inserted = store
+        .append_audit_idempotent(
+            &vault::encrypt(key, &serde_json::to_vec(&stored)?)?,
+            user,
+            organization,
+            event.account,
+            request_id,
+        )
+        .await
+        .context(AuditUnavailable)?;
+    if inserted {
+        eprintln!("{}", serde_json::json!({"audit": displayed}));
+    }
+    Ok(())
+}
+
+fn line(event: &Event<'_>) -> Result<Value> {
+    let mut line = serde_json::to_value(event)?;
+    line["at"] = chrono::Utc::now().to_rfc3339().into();
+    Ok(line)
 }
 
 /// Decrypt every audit line, oldest first.

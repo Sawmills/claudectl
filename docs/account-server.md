@@ -86,8 +86,18 @@ show the remaining count, affected limits and expiry. Paused offers, future star
 and offers that cannot currently be used are labeled. Empty offers are hidden;
 unknown expiry is labeled, and old observations remain marked as old data. The
 dashboard uses cached usage and makes no additional provider request. These are
-read-only hints: use `/limit-reset` in Claude Code or Settings > Usage on claude.ai
-to apply a reset. No reset is redeemed by claudectl.
+read-only hints by default: use `/limit-reset` in Claude Code or Settings > Usage on
+claude.ai to apply a reset. The browser dashboard Apply reset action is an explicit
+staging opt-in (`CLAUDECTL_CENTRAL_BROWSER_RESETS=1`). It requires a recent company
+sign-in, the dashboard session and form token, and the exact configured Origin. It
+only enables for a fresh exhausted window and keeps the provider request ID sealed in
+the account record so a timeout retry reuses it. The provider call is outside the
+store transaction, and the action writes an `account_reset` audit row without tokens.
+
+Mixed server versions are unsupported during this rollout. Enable the browser action only
+after every staging replica runs this release and the image rollout and replica readiness
+check are complete. Do not apply a reset during the roughly one-minute rollout. Verify the
+synthetic timeout replay on the new image before any live staging use.
 
 On the first successful usage poll for each account in a server process, the
 `limit_reset_offers` log records only `present` (the provider returned an offer
@@ -403,7 +413,7 @@ claudectl-server audit --key-file /keys/vault-key
   whether the provider rotated the refresh token. No line holds a token. A login retry that
   returns the kept receipt writes one more `login` or `renew` line with `reason: retry`, so a
   first line lost to an audit failure is recovered.
-  Dashboard actions (`account_remove`, `machine_revoke`) and every Google sign-in that the
+  Dashboard actions (`account_remove`, `machine_revoke`, `account_reset`) and every Google sign-in that the
   provider answered (`dashboard_sign_in`, `enroll_sign_in`) also write one line, with the
   person as `actor` (`dashboard:<email>` or `enrollment:<email>`; a refusal names the person
   only once the email is a verified company email, as for `user_not_allowed`) and, for a refused

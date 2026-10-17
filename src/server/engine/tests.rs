@@ -86,6 +86,13 @@ fn grant_until(access: &str, expires_at: i64) -> Grant {
         scopes: vec!["user:inference".into(), "user:profile".into()],
     }
 }
+
+#[test]
+fn a_pre_reset_reader_rejects_the_new_file_record_version() {
+    assert_eq!(RECORD_VERSION, 2);
+    assert_ne!(RECORD_VERSION, 1);
+}
+
 fn profile() -> Json<Value> {
     Json(json!({"account":{"uuid":"a"},"organization":{"uuid":"o"}}))
 }
@@ -324,6 +331,215 @@ async fn usage_reset_offers_are_requested_and_retained_without_provider_identifi
             .data
             .unwrap(),
         data
+    );
+}
+
+#[tokio::test]
+async fn a_browser_reset_retry_reuses_the_sealed_request_id() {
+    let requests = Arc::new(StdMutex::new(Vec::<Value>::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let seen_requests = requests.clone();
+    let seen_attempts = attempts.clone();
+    let provider = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/api/oauth/usage",
+            get(|| async {
+                Json(
+                    serde_json::from_str::<Value>(include_str!(
+                        "../../../tests/fixtures/limit-reset-offers.json"
+                    ))
+                    .unwrap(),
+                )
+            }),
+        )
+        .route(
+            "/api/organizations/o/reset_rate_limits",
+            post(move |Json(body): Json<Value>| {
+                let seen_requests = seen_requests.clone();
+                let seen_attempts = seen_attempts.clone();
+                async move {
+                    seen_requests.lock().unwrap().push(body);
+                    if seen_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            axum::http::StatusCode::BAD_GATEWAY,
+                            Json(json!({"error":"synthetic timeout"})),
+                        )
+                            .into_response()
+                    } else {
+                        Json(json!({"result":"reset"})).into_response()
+                    }
+                }
+            }),
+        );
+    let fixture = Fixture::new(provider).await;
+    let engine = fixture.engine().await;
+    let account = engine
+        .admit(
+            "person",
+            "machine",
+            "first",
+            grant_until("a", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    engine
+        .usage("person", &account.account_id, false)
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .apply_reset(
+                "person",
+                "dashboard:person@example.com",
+                &account.account_id
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .remove("person", "machine", &account.account_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        engine
+            .apply_reset(
+                "person",
+                "dashboard:person@example.com",
+                &account.account_id
+            )
+            .await
+            .unwrap(),
+        "reset"
+    );
+    let request_id = {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["program"], "cedar_ember");
+        assert_eq!(requests[0]["grant_id"], "synthetic-grant-not-for-display");
+        assert_eq!(requests[0]["request_id"], requests[1]["request_id"]);
+        assert!(
+            !serde_json::to_string(&requests[..])
+                .unwrap()
+                .contains("access_token")
+        );
+        requests[0]["request_id"].clone()
+    };
+    let audit = crate::server::audit::read(engine.store(), &fixture.key)
+        .await
+        .unwrap();
+    let reset_rows: Vec<_> = audit
+        .iter()
+        .filter(|line| line["operation"] == "account_reset")
+        .collect();
+    assert_eq!(reset_rows.len(), 1, "{audit:?}");
+    assert_eq!(reset_rows[0]["request_id"], request_id);
+    crate::server::audit::record_idempotent(
+        engine.store(),
+        &fixture.key,
+        &crate::server::audit::Event {
+            operation: "account_reset",
+            machine: DASHBOARD_MACHINE,
+            account: &account.account_id,
+            result: "ok",
+            rotated: None,
+            target: None,
+            reason: None,
+            actor: Some("dashboard:person@example.com"),
+        },
+        "person",
+        "o",
+        request_id.as_str().expect("request ID string"),
+    )
+    .await
+    .unwrap();
+    let audit = crate::server::audit::read(engine.store(), &fixture.key)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit
+            .iter()
+            .filter(|line| line["operation"] == "account_reset")
+            .count(),
+        1,
+        "{audit:?}"
+    );
+}
+
+#[tokio::test]
+async fn account_removal_waits_for_a_reset_to_settle() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let reset_started = started.clone();
+    let reset_release = release.clone();
+    let provider = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/api/oauth/usage",
+            get(|| async {
+                Json(
+                    serde_json::from_str::<Value>(include_str!(
+                        "../../../tests/fixtures/limit-reset-offers.json"
+                    ))
+                    .unwrap(),
+                )
+            }),
+        )
+        .route(
+            "/api/organizations/o/reset_rate_limits",
+            post(move || {
+                let (reset_started, reset_release) = (reset_started.clone(), reset_release.clone());
+                async move {
+                    reset_started.notify_one();
+                    reset_release.notified().await;
+                    Json(json!({"result":"reset"}))
+                }
+            }),
+        );
+    let fixture = Fixture::new(provider).await;
+    let engine = Arc::new(fixture.engine().await);
+    let account = engine
+        .admit(
+            "person",
+            "machine",
+            "first",
+            grant_until("a", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    engine
+        .usage("person", &account.account_id, false)
+        .await
+        .unwrap();
+    let reset_engine = engine.clone();
+    let account_id = account.account_id.clone();
+    let reset_task = tokio::spawn(async move {
+        reset_engine
+            .apply_reset("person", "dashboard:person@example.com", &account_id)
+            .await
+    });
+    started.notified().await;
+    let remove_engine = engine.clone();
+    let remove_id = account.account_id.clone();
+    let mut remove_task =
+        tokio::spawn(async move { remove_engine.remove("person", "machine", &remove_id).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut remove_task)
+            .await
+            .is_err()
+    );
+    release.notify_one();
+    assert_eq!(reset_task.await.unwrap().unwrap(), "reset");
+    assert!(remove_task.await.unwrap().is_ok());
+    assert!(
+        engine
+            .remove("person", "machine", &account.account_id)
+            .await
+            .is_err()
     );
 }
 

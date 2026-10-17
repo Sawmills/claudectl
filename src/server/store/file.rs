@@ -3,7 +3,7 @@
 use super::*;
 use crate::server::{fs, vault};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -25,6 +25,9 @@ struct Tables {
     flows: BTreeMap<String, FlowRow>,
     usage: BTreeMap<String, Vec<u8>>,
     audit: Vec<Vec<u8>>,
+    /// Scoped account-reset audit request hashes already appended.
+    #[serde(default)]
+    audit_reset_keys: BTreeSet<String>,
     users: Vec<User>,
     machines: Vec<Machine>,
     /// "kind\u{1f}key" -> row
@@ -446,6 +449,24 @@ impl FileStore {
     }
     pub fn append_audit(&self, sealed: &[u8]) -> Result<()> {
         self.write(|t| t.audit.push(sealed.to_vec()))
+    }
+    pub fn append_audit_idempotent(
+        &self,
+        sealed: &[u8],
+        user: &str,
+        organization: &str,
+        account: &str,
+        request_id: &str,
+    ) -> Result<bool> {
+        let request_hash = crate::server::vault::digest(request_id.as_bytes());
+        let key = format!("{user}\u{1f}{organization}\u{1f}{account}\u{1f}{request_hash}");
+        self.transact(|t| {
+            if !t.audit_reset_keys.insert(key) {
+                return (false, false);
+            }
+            t.audit.push(sealed.to_vec());
+            (true, true)
+        })
     }
     pub fn audit(&self) -> Result<Vec<Vec<u8>>> {
         Ok(self.read(|t| t.audit.clone()))

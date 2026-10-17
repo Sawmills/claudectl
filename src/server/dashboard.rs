@@ -57,6 +57,10 @@ fn done_text(done: Option<&str>) -> Option<&'static str> {
         "saved" => "Account saved.",
         "removed" => "Account removed.",
         "revoked" => "Machine revoked. Its access tokens stay valid until they expire.",
+        "reset" => "Limit reset applied.",
+        "reset_already_used" => "The limit reset was already used; no reset was spent.",
+        "reset_not_limited" => "The limit was no longer exhausted; no reset was used.",
+        "reset_pending" => "Reset accepted; refresh the dashboard to confirm settlement.",
         _ => return None,
     })
 }
@@ -122,6 +126,11 @@ async fn snapshot(
             None => Default::default(),
         };
         let observed = windows(&usage);
+        let reset_grant = if server.browser_resets_enabled() {
+            reset_grant(&usage, observed.limit_reset_offers.as_ref())
+        } else {
+            None
+        };
         accounts.push(Account {
             id: account.account_id.clone(),
             alias: account.alias,
@@ -132,6 +141,7 @@ async fn snapshot(
             fable: observed.fable,
             model_windows: observed.models,
             limit_reset_offers: observed.limit_reset_offers,
+            reset_grant,
             observed_at: usage.observed_at.map(|ms| ms / 1000),
             usage_stale: observed.stale,
             billed: observed.billed,
@@ -160,6 +170,7 @@ async fn snapshot(
         machines,
         csrf,
         done,
+        browser_resets: server.browser_resets_enabled(),
     }))
 }
 
@@ -313,6 +324,53 @@ async fn add(State(server): Shared, headers: HeaderMap, Form(form): Form<AddForm
 struct AccountForm {
     csrf: String,
     account: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ResetForm {
+    csrf: String,
+    account: String,
+}
+
+async fn reset(State(server): Shared, headers: HeaderMap, Form(form): Form<ResetForm>) -> Response {
+    if !server.browser_resets_enabled() {
+        return refuse(&server, StatusCode::NOT_FOUND, "not_found");
+    }
+    let browser = match signed_in(&server, &headers).await {
+        Ok(browser) => browser,
+        Err(response) => return *response,
+    };
+    if let Err(error) = enrollment::check_form(&server, &headers, &browser, &form.csrf) {
+        return enrollment::dashboard_error(error);
+    }
+    if let Err(response) = fresh_sign_in(&browser) {
+        return *response;
+    }
+    if let Err(response) = own_account(&server, &browser.user, &form.account).await {
+        return *response;
+    }
+    let actor = format!("dashboard:{}", browser.email);
+    match server
+        .engine()
+        .apply_reset(&browser.user, &actor, &form.account)
+        .await
+    {
+        Ok(result) if result == "not_limited" => after("reset_not_limited"),
+        Ok(result) if result == "already_used" => after("reset_already_used"),
+        Ok(result) if result == "pending" => after("reset_pending"),
+        Ok(_) => after("reset"),
+        Err(error) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({"operation":"account_reset","stage":"dashboard","reason":"reset_unavailable","error":error.to_string()})
+            );
+            refuse(
+                &server,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "reset_unavailable",
+            )
+        }
+    }
 }
 async fn renew(
     State(server): Shared,
@@ -500,6 +558,30 @@ struct Observed {
     billed: bool,
 }
 
+fn reset_grant(
+    usage: &crate::server::engine::Usage,
+    offers: Option<&crate::limit_resets::Offers>,
+) -> Option<String> {
+    if usage.stale {
+        return None;
+    }
+    let parsed = usage
+        .data
+        .as_ref()
+        .and_then(|data| serde_json::from_value::<crate::api::UsageResponse>(data.clone()).ok())?;
+    let mut exhausted = crate::limit_resets::exhausted_windows(&parsed);
+    for window in &usage.reset_windows {
+        if !exhausted.contains(&window.as_str()) {
+            exhausted.push(window.as_str());
+        }
+    }
+    let offers = offers?;
+    (usage.reset_grant_id.is_some()
+        && usage.reset_at_limit.is_none_or(|at_limit| at_limit)
+        && offers.has_usable_offer(&exhausted, chrono::Utc::now().timestamp()))
+    .then(|| "available".into())
+}
+
 /// The windows of a stored observation. An observation without any usage figure is
 /// stale, never fresh.
 fn windows(usage: &crate::server::engine::Usage) -> Observed {
@@ -595,6 +677,7 @@ pub(super) fn routes(router: Router<Arc<Server>>) -> Router<Arc<Server>> {
         .route("/accounts/add", get(add_form).post(add))
         .route("/accounts/manage", get(manage))
         .route("/accounts/renew", post(renew))
+        .route("/accounts/reset", post(reset))
         .route("/accounts/login", post(finish_login))
         .route("/accounts/remove", post(remove))
         .route("/machines/revoke", post(revoke))
@@ -635,6 +718,108 @@ mod tests {
         let body = futures_body(page);
         assert!(body.contains(r#"content="60; url=/accounts""#), "{body}");
     }
+    #[test]
+    fn finished_reset_messages_distinguish_an_already_used_reset() {
+        assert_eq!(
+            done_text(Some("reset_already_used")),
+            Some("The limit reset was already used; no reset was spent.")
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_reset_is_not_found_when_the_flag_is_off() {
+        let previous = std::env::var_os("CLAUDECTL_CENTRAL_BROWSER_RESETS");
+        unsafe { std::env::set_var("CLAUDECTL_CENTRAL_BROWSER_RESETS", "0") };
+        let root = tempfile::tempdir().unwrap();
+        let (state, key) = (root.path().join("state"), root.path().join("key"));
+        crate::server::app::setup(&state, &key).unwrap();
+        let server = Server::open(crate::server::app::Config {
+            store: crate::server::app::StoreConfig::File(state),
+            key,
+            allowed_users: vec!["amir@sawmills.ai".into()],
+            sso: None,
+            metrics_token_hash: None,
+            endpoints: crate::server::engine::Endpoints {
+                api: "http://127.0.0.1:9".into(),
+                token: "http://127.0.0.1:9/token".into(),
+            },
+        })
+        .await
+        .unwrap();
+        let response = reset(
+            State(server),
+            HeaderMap::new(),
+            Form(ResetForm {
+                csrf: "unused".into(),
+                account: "foreign".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("CLAUDECTL_CENTRAL_BROWSER_RESETS", value),
+                None => std::env::remove_var("CLAUDECTL_CENTRAL_BROWSER_RESETS"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_owner_check_rejects_another_users_account() {
+        let root = tempfile::tempdir().unwrap();
+        let (state, key) = (root.path().join("state"), root.path().join("key"));
+        crate::server::app::setup(&state, &key).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let provider = axum::Router::new().route(
+            "/api/oauth/profile",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "account": {"uuid": "a"},
+                    "organization": {"uuid": "o"}
+                }))
+            }),
+        );
+        let provider_task = tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+        let server = Server::open(crate::server::app::Config {
+            store: crate::server::app::StoreConfig::File(state),
+            key,
+            allowed_users: vec!["amir@sawmills.ai".into()],
+            sso: None,
+            metrics_token_hash: None,
+            endpoints: crate::server::engine::Endpoints {
+                api: endpoint,
+                token: "http://127.0.0.1:9/token".into(),
+            },
+        })
+        .await
+        .unwrap();
+        let account = server
+            .engine()
+            .admit(
+                "other-user",
+                "foreign",
+                "seed-foreign",
+                crate::server::engine::Grant {
+                    access_token: "access".into(),
+                    refresh_token: "refresh".into(),
+                    expires_at: chrono::Utc::now().timestamp_millis() + 3_600_000,
+                    scopes: vec!["user:inference".into(), "user:profile".into()],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let response = match own_account(server.as_ref(), "amir", &account.account_id).await {
+            Ok(_) => panic!("foreign account was accepted"),
+            Err(response) => *response,
+        };
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        provider_task.abort();
+    }
+
     fn futures_body(response: Response) -> String {
         let bytes = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -784,6 +969,7 @@ mod preview {
             fable: None,
             model_windows: vec![],
             limit_reset_offers: None,
+            reset_grant: None,
             observed_at: Some(now - 42),
             usage_stale: false,
             billed: false,
@@ -829,6 +1015,7 @@ mod preview {
             ],
             csrf: "preview".into(),
             done: None,
+            browser_resets: false,
         };
         let empty = Snapshot {
             email: full.email.clone(),
@@ -837,6 +1024,7 @@ mod preview {
             machines: vec![],
             csrf: "preview".into(),
             done: None,
+            browser_resets: false,
         };
         let landing = include_str!("dashboard/landing.html")
             .replace(
