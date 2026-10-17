@@ -1013,8 +1013,17 @@ pub fn run(
         session.set_renewal("renewing")?;
         match kind {
             RestartKind::Renew(access) => {
-                let recovery =
-                    super::crons::Recovery::prepare(&paths.home, session.directory(), &session_id)?;
+                let recovery = match super::crons::Recovery::prepare(
+                    &paths.home,
+                    session.directory(),
+                    &session_id,
+                ) {
+                    Ok(recovery) => recovery,
+                    Err(error) => {
+                        eprintln!("claudectl: cron recovery skipped: {error:#}");
+                        None
+                    }
+                };
                 let prompt = recovery.as_ref().map(super::crons::Recovery::prompt);
                 cron_recovery = recovery;
                 launch_args = super::failover::prompted_resume(

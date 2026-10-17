@@ -275,19 +275,27 @@ For a Fleet Operator, `HERDR_TAB_ID` selects the matching `operator_tab` in
 `~/Code/.fleet/*/operator.md`. Its `cron_prompts` entries (a prompt file and five schedule
 fields, separated by semicolons) are the source of truth, even when the resumed session's
 CronList is empty. The renewal prompt names every file and schedule, asks Claude to read
-each prompt verbatim and create the recurring jobs, run CronList again, and update the
+each prompt verbatim, delete only matching card-owned IDs from `cron_ids` while preserving
+other session jobs, create the recurring jobs, run CronList again, and update the
 card's `cron_ids` and `claude_session_file`. claudectl reads that final inventory from the
 renewed session transcript, matched to its tool call and renewal prompt. It prints
 `cron recovery verified: N/N saved jobs`, `missing cron: <file> (<schedule>)`, or an explicit
 unverified notice if evidence is absent or unreadable. Prompt contents are not printed.
+Extra copies of saved jobs prevent a verified result; unrelated jobs are preserved and are
+outside the saved-job count.
 The transcript read is limited to 8 MiB after the previous recorded position. An ambiguous
-card, an unreadable saved prompt, or a malformed entry fails the renewal instead of silently
-resuming without its jobs. Sessions with no matching card keep the existing note; first
+card, an unreadable saved prompt, a malformed entry, or a recovery-arm failure prints
+`cron recovery skipped: <reason>` and falls back to the existing renewal note. Optional
+cron recovery never aborts token renewal. Sessions with no matching card keep the existing note; first
 launches, manual resumes, and account failovers do not use this recovery.
 Cards with no saved crons also keep the existing note. Unreadable unrelated cards produce a
 discovery warning and do not stop ordinary renewal. Saved paths support absolute paths,
 paths relative to the card, `~/`, `$HOME/`, and `${HOME}/`; other variables and `~user`
 are refused with an explicit unsupported-path error.
+If the resumed conversation is missing, the existing `No conversation found` fallback
+starts a fresh session without this cron-restoration prompt. The failed resume reports
+unverified recovery; restore its jobs from the card in the fresh session. This limitation
+does not change the normal renewal-resume path.
 
 This remains a best-effort workaround for Claude Code's resume behavior, with these limits:
 

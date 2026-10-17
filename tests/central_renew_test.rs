@@ -447,6 +447,45 @@ fn operator_renewal_verifies_both_saved_crons_from_the_new_inventory() {
 }
 
 #[test]
+fn operator_renewal_does_not_verify_an_old_duplicate_beside_the_recreated_jobs() {
+    let env = Env::new();
+    env.operator_card();
+    let output = env.operator_restart(json!([
+        {"id":"old-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.","recurring":true,"durable":false},
+        {"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.","recurring":true,"durable":false},
+        {"id":"new-two","cron":"24 8 * * *","prompt":"Read the daily evidence.","recurring":true,"durable":false}
+    ]), "w9C:tF", false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("duplicate saved cron:"), "{stderr}");
+    assert!(!stderr.contains("cron recovery verified"), "{stderr}");
+}
+
+#[test]
+fn operator_renewal_prompt_preserves_non_card_jobs_and_checks_only_saved_jobs() {
+    let env = Env::new();
+    env.operator_card();
+    let output = env.operator_restart(json!([
+        {"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.","recurring":true,"durable":false},
+        {"id":"new-two","cron":"24 8 * * *","prompt":"Read the daily evidence.","recurring":true,"durable":false},
+        {"id":"manual","cron":"0 9 * * *","prompt":"Manual reminder.","recurring":true,"durable":false}
+    ]), "w9C:tF", false);
+    let runs = env.runs();
+    let note = runs[1]["args"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert!(note.contains("Delete only card-owned IDs"), "{note}");
+    assert!(note.contains("card's cron_ids"), "{note}");
+    assert!(note.contains("Preserve every other listed job"), "{note}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cron recovery verified: 2/2 saved jobs")
+    );
+}
+
+#[test]
 fn operator_renewal_does_not_trust_cron_results_without_the_restart_prompt() {
     let env = Env::new();
     env.operator_card();
@@ -547,6 +586,19 @@ fn an_operator_card_without_saved_crons_keeps_the_existing_renewal() {
 }
 
 #[test]
+fn an_unreadable_saved_prompt_does_not_abort_operator_token_renewal() {
+    let env = Env::new();
+    let [first, _] = env.operator_card();
+    std::fs::remove_file(&first).unwrap();
+    let output = env.operator_restart(json!([]), "w9C:tF", false);
+    env.assert_followed(&env.runs(), "token-2");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cron recovery skipped:"), "{stderr}");
+    assert!(stderr.contains(first.to_str().unwrap()), "{stderr}");
+    assert!(!stderr.contains("cron recovery verified"), "{stderr}");
+}
+
+#[test]
 fn unsupported_operator_prompt_paths_are_named_clearly() {
     for path in ["$FLEET/check.txt", "~another-user/check.txt"] {
         let env = Env::new();
@@ -554,21 +606,10 @@ fn unsupported_operator_prompt_paths_are_named_clearly() {
             &env.home.path().join("Code/.fleet/example/operator.md"),
             &format!("operator_tab: w9C:tF\ncron_prompts: {path} */5 * * * *\n"),
         );
-        let refresher = env.refresh_when_idle();
-        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-        env.env(&mut command);
-        command
-            .env("HERDR_TAB_ID", "w9C:tF")
-            .args(["server", "run", "work", "--claude"])
-            .arg(&env.claude)
-            .args(["--", "--model", "opus"]);
-        let output = Command::from_std(command)
-            .timeout(std::time::Duration::from_secs(60))
-            .output()
-            .unwrap();
-        refresher.join().unwrap();
-        assert_eq!(output.status.code(), Some(1));
+        let output = env.operator_restart(json!([]), "w9C:tF", false);
+        env.assert_followed(&env.runs(), "token-2");
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("cron recovery skipped:"), "{stderr}");
         assert!(stderr.contains("unsupported saved cron path"), "{stderr}");
         assert!(stderr.contains(path), "{stderr}");
     }

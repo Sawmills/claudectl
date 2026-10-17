@@ -12,6 +12,17 @@ struct Job {
     schedule: String,
     prompt: String,
 }
+impl Job {
+    fn matches(&self, value: &Value) -> bool {
+        value["cron"] == self.schedule
+            && value["prompt"]
+                .as_str()
+                .is_some_and(|prompt| prompt.trim() == self.prompt.trim())
+            && value["recurring"] == true
+            && value["durable"] == false
+            && value["id"].as_str().is_some_and(|id| !id.is_empty())
+    }
+}
 
 pub(super) struct Recovery {
     card: PathBuf,
@@ -195,20 +206,21 @@ impl Recovery {
         };
         let mut missing = Vec::new();
         for job in &self.jobs {
-            let found = actual.iter().position(|value| {
-                value["cron"] == job.schedule
-                    && value["prompt"]
-                        .as_str()
-                        .is_some_and(|prompt| prompt.trim() == job.prompt.trim())
-                    && value["recurring"] == true
-                    && value["durable"] == false
-                    && value["id"].as_str().is_some_and(|id| !id.is_empty())
-            });
+            let found = actual.iter().position(|value| job.matches(value));
             if let Some(index) = found {
                 actual.remove(index);
             } else {
                 missing.push(format!(
                     "missing cron: {} ({})",
+                    job.file.display(),
+                    job.schedule
+                ));
+            }
+        }
+        for job in &self.jobs {
+            if actual.iter().any(|value| job.matches(value)) {
+                missing.push(format!(
+                    "duplicate saved cron: {} ({})",
                     job.file.display(),
                     job.schedule
                 ));
@@ -295,7 +307,9 @@ impl Recovery {
         let mut prompt = format!(
             "claudectl cron recovery attempt {}. claudectl restarted this session on a renewed server token. Restore the saved \
              session crons from Operator card {} even if CronList is empty. Run CronList \
-             first; delete listed session jobs with CronDelete, then use CronCreate for \
+             first. Delete only card-owned IDs from the card's cron_ids, and only when \
+             their schedule and prompt match the saved jobs. Preserve every other listed job. \
+             Then use CronCreate for \
              EACH saved job below, recurring=true, using its exact five-field schedule and \
              the prompt read verbatim from its file (not a summary):\n",
             self.attempt,
