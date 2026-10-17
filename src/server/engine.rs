@@ -454,6 +454,9 @@ impl Engine {
         Ok(())
     }
     async fn identify(&self, access: &str) -> Result<Identity> {
+        Self::profile_identity(&self.provider_profile(access).await?)
+    }
+    async fn provider_profile(&self, access: &str) -> Result<Value> {
         let response = self
             .http
             .get(format!("{}/api/oauth/profile", self.endpoints.api))
@@ -468,10 +471,12 @@ impl Engine {
                 "Claude identity lookup rejected",
             ));
         }
-        let value: Value = response
+        response
             .json()
             .await
-            .map_err(|_| anyhow::anyhow!("invalid Claude identity response"))?;
+            .map_err(|_| anyhow::anyhow!("invalid Claude identity response"))
+    }
+    fn profile_identity(value: &Value) -> Result<Identity> {
         let field = |path| {
             value
                 .pointer(path)

@@ -505,9 +505,11 @@ fn status_is_one_table_of_local_and_server_accounts() {
                 "fresh",
                 "on_server",
                 "limit_reset_offers",
+                "pace_points",
             ]),
             "{text}"
         );
+        assert!(account["pace_points"].is_null() || account["pace_points"].is_number());
         if account["alias"] != "loc" {
             assert_eq!(account["error"], "migrated to the account server", "{text}");
         }

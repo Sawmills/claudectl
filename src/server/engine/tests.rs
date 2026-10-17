@@ -96,6 +96,146 @@ fn a_pre_reset_reader_rejects_the_new_file_record_version() {
 fn profile() -> Json<Value> {
     Json(json!({"account":{"uuid":"a"},"organization":{"uuid":"o"}}))
 }
+
+#[tokio::test]
+async fn subscription_plan_is_projected_into_usage_and_survives_cached_restart() {
+    for (organization_type, expected) in [
+        ("claude_max", Some("max")),
+        ("claude_pro", Some("pro")),
+        ("claude_team", Some("team")),
+        ("claude_enterprise", Some("enterprise")),
+        ("unknown_future_plan", None),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let app = Router::new()
+            .route("/api/oauth/profile", get(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"account":{"uuid":"a"},"organization":{
+                        "uuid":"o","organization_type":organization_type,"name":"not-for-the-usage-payload"}}))
+                }
+            }))
+            .route("/api/oauth/usage", get(|| async {
+                Json(json!({"five_hour":{"utilization":12}}))
+            }));
+        let f = Fixture::new(app).await;
+        let engine = f.engine().await;
+        let receipt = engine
+            .admit(
+                "person",
+                "work",
+                "m",
+                grant_until("a", now() + 3_600_000),
+                None,
+            )
+            .await
+            .unwrap();
+        let fresh = engine
+            .usage("person", &receipt.account_id, false)
+            .await
+            .unwrap();
+        let data = fresh.data.unwrap();
+        assert_eq!(
+            data["subscription_type"].as_str(),
+            expected,
+            "{organization_type}"
+        );
+        assert_eq!(data["five_hour"]["utilization"], 12);
+        assert!(data.get("organization").is_none());
+        let before = calls.load(Ordering::SeqCst);
+        drop(engine);
+        let restarted = f.engine().await;
+        let cached = restarted
+            .usage("person", &receipt.account_id, true)
+            .await
+            .unwrap();
+        assert_eq!(cached.data.unwrap()["subscription_type"].as_str(), expected);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            before,
+            "cached status contacted provider"
+        );
+        assert!(
+            restarted
+                .usage("someone-else", &receipt.account_id, true)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn subscription_plan_refuses_unavailable_or_mismatched_profile_metadata() {
+    for (mode, reason) in [
+        ("unavailable", "subscription_plan_unavailable"),
+        ("slow", "subscription_plan_unavailable"),
+        ("mismatch", "subscription_plan_identity_mismatch"),
+    ] {
+        let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = broken.clone();
+        let app = Router::new()
+            .route("/api/oauth/profile", get(move || {
+                let flag = flag.clone();
+                async move {
+                    if flag.load(Ordering::SeqCst) && mode == "unavailable" {
+                        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    if flag.load(Ordering::SeqCst) && mode == "slow" {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                    }
+                    let account = if flag.load(Ordering::SeqCst) { "someone-else" } else { "a" };
+                    Json(json!({"account":{"uuid":account},"organization":{"uuid":"o","organization_type":"claude_max"}})).into_response()
+                }
+            }))
+            .route("/api/oauth/usage", get(|| async {
+                Json(json!({"five_hour":{"utilization":12}}))
+            }));
+        let f = Fixture::new(app).await;
+        let engine = f.engine().await;
+        let receipt = engine
+            .admit(
+                "person",
+                "work",
+                "m",
+                grant_until("a", now() + 3_600_000),
+                None,
+            )
+            .await
+            .unwrap();
+        let first = engine
+            .usage("person", &receipt.account_id, false)
+            .await
+            .unwrap();
+        assert_eq!(first.data.as_ref().unwrap()["subscription_type"], "max");
+        // Seed the next due observation, as after the normal five-minute cache expires.
+        let mut due = first;
+        due.next_retry_at = 0;
+        engine
+            .store
+            .put_usage(&receipt.account_id, &engine.seal(&due).unwrap())
+            .await
+            .unwrap();
+        broken.store(true, Ordering::SeqCst);
+        let usage = tokio::time::timeout(
+            Duration::from_secs(6),
+            engine.usage("person", &receipt.account_id, false),
+        )
+        .await
+        .expect("optional metadata blocked the usage poll")
+        .unwrap();
+        let data = usage.data.unwrap();
+        if mode != "mismatch" {
+            assert_eq!(data["subscription_type"], "max");
+        } else {
+            assert!(data["subscription_type"].is_null());
+        }
+        assert_eq!(data["five_hour"]["utilization"], 12);
+        assert!(!usage.stale && usage.error.is_none());
+        assert_eq!(usage.failure, Some(reason));
+    }
+}
 fn token_body(n: usize, expires_in: i64) -> Json<Value> {
     Json(
         json!({"access_token":format!("successor-{n}"),"refresh_token":format!("successor-refresh-{n}"),"expires_in":expires_in,"scope":"user:inference user:profile"}),

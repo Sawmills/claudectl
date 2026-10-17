@@ -144,7 +144,7 @@ Apply path; local profiles call the provider directly. The command never runs as
 part of billing or Claude session recovery, and service-account tokens cannot redeem.
 
 `status --json` prints `{"version": 1, "accounts": [...]}`, sorted by alias. Each
-account has `alias`, `label`, `active`, `plan`, `billing_class`, `exhausted`,
+account has `alias`, `label`, `active`, `plan`, `pace_points`, `billing_class`, `exhausted`,
 `windows` (`five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet` with
 `used_percent` and `resets_at`; `fable_weekly` with `used_percent`),
 `limit_reset_offers` (an array, empty when no offers are available),
@@ -187,9 +187,22 @@ does not answer, local rows still print and server rows say `Server unreachable`
 
 The default table shows each account's status and next step:
 
-It also shows the account `Plan` (`Pro`, `Max`, or `Team`; `local` for a
-non-server profile), the `Window resets` time, and an `Offers` count. The offers
-count is zero when no usable reset offer is available. JSON always includes
+It also shows the account `Plan` (`Pro`, `Max`, `Team`, or `Enterprise`) for both
+server and local accounts, the `Window resets` time, and an `Offers` count. A
+server plan comes from the provider profile and is cached with usage; a local
+plan comes from the saved credentials. Unknown plans show `-` (JSON `plan: null`).
+Cached status sends no provider request.
+If a later profile lookup fails, the server keeps that account's last known plan
+and records a diagnostic. A mismatched identity clears the plan.
+
+`Pace` compares weekly consumption with elapsed time in the seven-day window:
+`+25 ahead` means 25 percentage points above that budget, `-25 behind` means
+25 points below, and `0 on pace` means they match after rounding. Only fresh
+usage with a valid weekly percentage and reset time contributes. Missing or
+stale values show `-`; the column is hidden when every account is unknown.
+JSON always includes `pace_points`, using `null` for unknown values.
+
+The offers count is zero when no usable reset offer is available. JSON always includes
 `limit_reset_offers`, using an empty list when the server returned no offers.
 
 - `Login needed`: the login is missing or authentication was rejected. Follow the
