@@ -327,7 +327,7 @@ pub fn reset(alias: &str, yes: bool) -> Result<()> {
     let migrated = local
         .as_ref()
         .is_some_and(|profile| central::is_migrated(&paths, &profile.meta.alias));
-    if local.is_some() && !migrated {
+    if !central::service_account::configured() && local.is_some() && !migrated {
         let fetched =
             super::status::fetch_alias(&alias, claudectl::usage_cache::FetchMode::Refresh)?
                 .context("account usage unavailable")?;
