@@ -1140,8 +1140,12 @@ fn offer_count(f: &FetchedUsage, now: i64) -> String {
     }
     f.usage
         .as_ref()
-        .and_then(|usage| usage.cedar_ember.as_ref())
-        .map(|offers| offers.count(now))
+        .and_then(|usage| {
+            usage.cedar_ember.as_ref().map(|offers| {
+                let exhausted = claudectl::limit_resets::exhausted_windows(usage);
+                offers.usable_count(&exhausted, now)
+            })
+        })
         .unwrap_or(0)
         .to_string()
 }

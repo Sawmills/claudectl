@@ -177,6 +177,14 @@ impl Offers {
             .fold(0, |count, offer| count.saturating_add(offer.resets_left))
     }
 
+    /// Total resets currently usable for the supplied exhausted windows.
+    pub fn usable_count(&self, exhausted: &[&str], now: i64) -> u64 {
+        self.grants
+            .iter()
+            .filter(|offer| Self::eligible(offer, exhausted, now))
+            .fold(0, |count, offer| count.saturating_add(offer.resets_left))
+    }
+
     /// Return the server-selected grant only when it can clear one of the
     /// exhausted windows. The dashboard never guesses a grant order.
     pub fn next_usable_grant_id(&self, exhausted: &[&str], now: i64) -> Option<&str> {
@@ -292,5 +300,19 @@ mod tests {
             offers.next_usable_grant_id(&["five_hour"], 1_800_000_000),
             None
         );
+    }
+
+    #[test]
+    fn usable_count_excludes_paused_future_and_wrong_window_grants() {
+        let offers: Offers = serde_json::from_value(serde_json::json!({
+            "grants": [
+                {"resets_left": 2, "clears": ["five_hour"], "ends_at": "2099-01-01T00:00:00Z"},
+                {"resets_left": 3, "clears": ["five_hour"], "paused": true},
+                {"resets_left": 4, "clears": ["five_hour"], "starts_at": "2099-01-01T00:00:00Z"},
+                {"resets_left": 5, "clears": ["seven_day"]}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(offers.usable_count(&["five_hour"], 1_800_000_000), 2);
     }
 }
