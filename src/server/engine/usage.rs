@@ -14,6 +14,10 @@ pub struct Usage {
     pub reset_windows: Vec<String>,
     #[serde(default)]
     pub reset_at_limit: Option<bool>,
+    /// Summaries derived while provider IDs are present, before the display projection
+    /// removes them. This sealed cache keeps missing-ID grants out of machine listings.
+    #[serde(default)]
+    pub reset_offers: Vec<crate::limit_resets::OfferSummary>,
     /// Set only on the response to a fresh attempt that failed; never stored.
     #[serde(skip)]
     pub failure: Option<&'static str>,
@@ -170,7 +174,7 @@ impl Engine {
                         result.reset_at_limit = offers
                             .as_ref()
                             .and_then(crate::limit_resets::Offers::at_limit);
-                        result.reset_grant_id = offers.as_ref().and_then(|offers| {
+                        let selection = offers.as_ref().and_then(|offers| {
                             if offers.at_limit() == Some(false) {
                                 return None;
                             }
@@ -184,10 +188,13 @@ impl Engine {
                                     exhausted.push(window.as_str());
                                 }
                             }
-                            offers
-                                .next_usable_grant_id(&exhausted, now() / 1000)
-                                .map(str::to_owned)
+                            let grant = offers
+                                .closest_usable_grant_id(&exhausted, now() / 1000)
+                                .map(str::to_owned);
+                            Some((grant, offers.usable_summaries(&exhausted, now() / 1000)))
                         });
+                        (result.reset_grant_id, result.reset_offers) =
+                            selection.unwrap_or_default();
                         if self
                             .usage_offers_logged
                             .lock()

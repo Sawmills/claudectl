@@ -22,6 +22,23 @@ pub fn usage_url() -> String {
     }
     USAGE_URL.into()
 }
+/// The direct provider reset endpoint. Tests may point it at a synthetic endpoint.
+pub fn reset_rate_limits_url(
+    organization: &str,
+    _grant_id: &str,
+    _request_id: &str,
+) -> Result<String> {
+    #[cfg(debug_assertions)]
+    if let Ok(url) = std::env::var("CLAUDECTL_TEST_RESET_URL") {
+        return Ok(url);
+    }
+    let origin = reqwest::Url::parse(&usage_url())?;
+    Ok(format!(
+        "{}/api/organizations/{}/reset_rate_limits",
+        origin.origin().ascii_serialization(),
+        urlencoding::encode(organization)
+    ))
+}
 pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 pub const OAUTH_BETA_HEADER: (&str, &str) = ("anthropic-beta", "oauth-2025-04-20");
 
@@ -156,6 +173,7 @@ pub(crate) async fn fetch_usage_at(
 ) -> Result<UsageResponse> {
     let resp = client
         .get(url)
+        .query(&[("cedar_ember", "1")])
         .bearer_auth(access_token)
         .header(OAUTH_BETA_HEADER.0, OAUTH_BETA_HEADER.1)
         .send()

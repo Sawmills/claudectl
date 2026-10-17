@@ -189,6 +189,11 @@ struct Record {
 struct PendingReset {
     request_id: String,
     grant_id: String,
+    /// Authority that started this request, retained when a different caller resumes it.
+    #[serde(default)]
+    machine: Option<String>,
+    #[serde(default)]
+    actor: Option<String>,
     #[serde(default)]
     audit_recorded: bool,
     /// Filled after the provider accepts the request, before the audit is written.
@@ -1143,6 +1148,29 @@ impl Engine {
     /// so a timeout or replica restart retries the same provider operation. No store
     /// transaction is held while the network request runs.
     pub async fn apply_reset(&self, user: &str, actor: &str, id: &str) -> Result<String> {
+        self.apply_reset_as(user, DASHBOARD_MACHINE, actor, id)
+            .await
+    }
+
+    /// Apply a reset through a machine API. The machine identity is retained in the audit
+    /// event while the request journal and provider idempotency remain shared with the dashboard.
+    pub async fn apply_reset_for_machine(
+        &self,
+        user: &str,
+        machine: &str,
+        actor: &str,
+        id: &str,
+    ) -> Result<String> {
+        self.apply_reset_as(user, machine, actor, id).await
+    }
+
+    async fn apply_reset_as(
+        &self,
+        user: &str,
+        machine: &str,
+        actor: &str,
+        id: &str,
+    ) -> Result<String> {
         let local = self.reset_lock(id);
         let _local = local.lock().await;
         let mut lease = self
@@ -1150,7 +1178,9 @@ impl Engine {
             .acquire_lease(id, LEASE_TTL)
             .await?
             .context("reset is already in progress")?;
-        let result = self.apply_reset_held(user, actor, id, &mut lease).await;
+        let result = self
+            .apply_reset_held(user, machine, actor, id, &mut lease)
+            .await;
         if let Err(error) = self.store.release_lease(&lease, id).await {
             eprintln!(
                 "{}",
@@ -1163,6 +1193,7 @@ impl Engine {
     async fn apply_reset_held(
         &self,
         user: &str,
+        machine: &str,
         actor: &str,
         id: &str,
         lease: &mut Lease,
@@ -1204,6 +1235,8 @@ impl Engine {
             let pending = PendingReset {
                 request_id: vault::secret(),
                 grant_id: grant_id.to_owned(),
+                machine: Some(machine.to_owned()),
+                actor: Some(actor.to_owned()),
                 audit_recorded: false,
                 result: None,
             };
@@ -1282,13 +1315,13 @@ impl Engine {
                 &self.key,
                 &audit::Event {
                     operation: "account_reset",
-                    machine: DASHBOARD_MACHINE,
+                    machine: pending.machine.as_deref().unwrap_or("legacy-reset"),
                     account: id,
                     result: audit_result,
                     rotated: None,
                     target: None,
                     reason: None,
-                    actor: Some(actor),
+                    actor: pending.actor.as_deref(),
                 },
                 &loaded.row.user,
                 &loaded.row.organization_uuid,

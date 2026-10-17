@@ -65,6 +65,15 @@ pub struct Usage {
     pub stale: bool,
     pub error: Option<String>,
 }
+#[derive(Clone, Deserialize, Serialize)]
+pub struct ResetAccount {
+    pub alias: String,
+    pub account_id: String,
+    pub available: bool,
+    pub stale: bool,
+    pub exhausted: Vec<String>,
+    pub offers: Vec<crate::limit_resets::OfferSummary>,
+}
 #[derive(Deserialize, Serialize)]
 pub struct Receipt {
     pub account_id: String,
@@ -338,6 +347,22 @@ impl Client {
             "/v2/anthropic/usage?account_id={}&cached={cached}",
             urlencoding::encode(id)
         ))
+    }
+    pub fn resets(&self) -> Result<Vec<ResetAccount>> {
+        #[derive(Deserialize)]
+        struct Reply {
+            accounts: Vec<ResetAccount>,
+        }
+        Ok(self.get::<Reply>("/v2/anthropic/resets")?.accounts)
+    }
+    pub fn redeem_reset(&self, id: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Reply {
+            result: String,
+        }
+        Ok(self
+            .post::<Reply>("/v2/anthropic/resets/redeem", &json!({"account_id": id}))?
+            .result)
     }
     /// The machine's company user; a preflight that the server is reachable and accepts us.
     pub fn me(&self) -> Result<String> {

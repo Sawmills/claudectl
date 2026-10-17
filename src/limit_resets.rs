@@ -94,7 +94,11 @@ impl<'de> Deserialize<'de> for Offers {
                     .map(str::to_owned)
                     .collect();
                 Some(Offer {
-                    id: grant.get("id").and_then(Value::as_str).map(str::to_owned),
+                    id: grant
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .map(str::to_owned),
                     resets_left,
                     clears,
                     ends_at: date(grant.get("ends_at")),
@@ -185,8 +189,35 @@ impl Offers {
             .fold(0, |count, offer| count.saturating_add(offer.resets_left))
     }
 
-    /// Return the server-selected grant only when it can clear one of the
-    /// exhausted windows. The dashboard never guesses a grant order.
+    /// The usable grant closest to expiry. The provider ID stays inside the reset
+    /// execution module and is never serialized for display.
+    pub fn closest_usable_grant_id(&self, exhausted: &[&str], now: i64) -> Option<&str> {
+        self.grants
+            .iter()
+            .filter(|offer| offer.id.is_some() && Self::eligible(offer, exhausted, now))
+            .min_by_key(|offer| offer.expiry().unwrap_or(i64::MAX))
+            .and_then(|offer| offer.id.as_deref())
+    }
+
+    /// Safe display rows for the CLI and dashboard. Provider identifiers are omitted.
+    pub fn usable_summaries(&self, exhausted: &[&str], now: i64) -> Vec<OfferSummary> {
+        let mut rows: Vec<_> = self
+            .grants
+            .iter()
+            .filter(|offer| offer.id.is_some() && Self::eligible(offer, exhausted, now))
+            .map(OfferSummary::from_offer)
+            .collect();
+        rows.sort_by(|a, b| match (&a.ends_at, &b.ends_at) {
+            (Some(a), Some(b)) => a.cmp(b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+        rows
+    }
+
+    /// Return the provider-selected grant only when it can clear one of the
+    /// exhausted windows. Kept for compatibility with older callers.
     pub fn next_usable_grant_id(&self, exhausted: &[&str], now: i64) -> Option<&str> {
         let id = self.next_grant_id.as_deref()?;
         self.grants
@@ -201,6 +232,23 @@ impl Offers {
         self.grants
             .iter()
             .any(|offer| Self::eligible(offer, exhausted, now))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OfferSummary {
+    pub resets_left: u64,
+    pub clears: Vec<String>,
+    pub ends_at: Option<String>,
+}
+
+impl OfferSummary {
+    fn from_offer(offer: &Offer) -> Self {
+        Self {
+            resets_left: offer.resets_left,
+            clears: offer.clears.clone(),
+            ends_at: offer.ends_at.clone(),
+        }
     }
 }
 
@@ -314,5 +362,40 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(offers.usable_count(&["five_hour"], 1_800_000_000), 2);
+    }
+
+    #[test]
+    fn closest_usable_grant_prefers_the_earliest_expiry() {
+        let offers: Offers = serde_json::from_value(serde_json::json!({
+            "grants": [
+                {"id": "later", "resets_left": 1, "clears": ["five_hour"], "ends_at": "2099-01-02T00:00:00Z"},
+                {"id": "sooner", "resets_left": 1, "clears": ["five_hour"], "ends_at": "2099-01-01T00:00:00Z"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            offers.closest_usable_grant_id(&["five_hour"], 1_800_000_000),
+            Some("sooner")
+        );
+    }
+
+    #[test]
+    fn reset_summaries_exclude_grants_without_a_redeemable_id() {
+        let offers: Offers = serde_json::from_value(serde_json::json!({
+            "grants": [
+                {"resets_left": 7, "clears": ["five_hour"]},
+                {"id": "", "resets_left": 3, "clears": ["five_hour"]},
+                {"id": "valid", "resets_left": 2, "clears": ["five_hour"]}
+            ]
+        }))
+        .unwrap();
+        let summaries = offers.usable_summaries(&["five_hour"], 1_800_000_000);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].resets_left, 2);
+        assert_eq!(
+            offers.closest_usable_grant_id(&["five_hour"], 1_800_000_000),
+            Some("valid")
+        );
+        assert!(!serde_json::to_string(&summaries).unwrap().contains("valid"));
     }
 }

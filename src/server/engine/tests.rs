@@ -335,7 +335,7 @@ async fn usage_reset_offers_are_requested_and_retained_without_provider_identifi
 }
 
 #[tokio::test]
-async fn a_browser_reset_retry_reuses_the_sealed_request_id() {
+async fn a_reset_resumed_by_another_machine_keeps_the_initiator_and_request_id() {
     let requests = Arc::new(StdMutex::new(Vec::<Value>::new()));
     let attempts = Arc::new(AtomicUsize::new(0));
     let seen_requests = requests.clone();
@@ -390,9 +390,10 @@ async fn a_browser_reset_retry_reuses_the_sealed_request_id() {
         .unwrap();
     assert!(
         engine
-            .apply_reset(
+            .apply_reset_for_machine(
                 "person",
-                "dashboard:person@example.com",
+                "initiating-machine",
+                "machine:initiating-machine",
                 &account.account_id
             )
             .await
@@ -404,11 +405,14 @@ async fn a_browser_reset_retry_reuses_the_sealed_request_id() {
             .await
             .is_err()
     );
+    drop(engine);
+    let engine = fixture.engine().await;
     assert_eq!(
         engine
-            .apply_reset(
+            .apply_reset_for_machine(
                 "person",
-                "dashboard:person@example.com",
+                "resuming-machine",
+                "machine:resuming-machine",
                 &account.account_id
             )
             .await
@@ -437,6 +441,8 @@ async fn a_browser_reset_retry_reuses_the_sealed_request_id() {
         .collect();
     assert_eq!(reset_rows.len(), 1, "{audit:?}");
     assert_eq!(reset_rows[0]["request_id"], request_id);
+    assert_eq!(reset_rows[0]["machine"], "initiating-machine");
+    assert_eq!(reset_rows[0]["actor"], "machine:initiating-machine");
     crate::server::audit::record_idempotent(
         engine.store(),
         &fixture.key,

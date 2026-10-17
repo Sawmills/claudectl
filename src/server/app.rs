@@ -478,6 +478,149 @@ async fn accounts(State(server): Shared, headers: HeaderMap) -> Result<Response,
         .map_err(|e| server.engine_error(&e, "registry_unavailable"))?;
     Ok(private(accounts))
 }
+
+#[derive(serde::Serialize)]
+struct ResetAccount {
+    alias: String,
+    account_id: String,
+    available: bool,
+    stale: bool,
+    exhausted: Vec<String>,
+    offers: Vec<crate::limit_resets::OfferSummary>,
+}
+
+/// Read the same cached usage projection used by the dashboard. Redemption remains a
+/// separate endpoint so a listing can never spend an offer.
+async fn resets(State(server): Shared, headers: HeaderMap) -> Result<Response, HttpError> {
+    if !server.browser_resets_enabled() {
+        return Err(server.error(StatusCode::NOT_FOUND, "not_found"));
+    }
+    let machine = server.authorize(&headers).await?;
+    if machine.id == "shared-service-account" {
+        return Err(server.error(StatusCode::FORBIDDEN, "service_account_reset_refused"));
+    }
+    let accounts = server
+        .engine
+        .accounts(&machine.user)
+        .await
+        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
+    let usages = server
+        .engine
+        .cached_usages(&machine.user)
+        .await
+        .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "usage_unavailable"))?;
+    let now = chrono::Utc::now().timestamp();
+    let rows = accounts
+        .into_iter()
+        .map(|account| {
+            let usage = usages
+                .get(&account.account_id)
+                .and_then(|result| result.as_ref().ok());
+            let parsed = usage
+                .and_then(|usage| usage.data.as_ref())
+                .and_then(|data| {
+                    serde_json::from_value::<crate::api::UsageResponse>(data.clone()).ok()
+                });
+            let mut exhausted = parsed
+                .as_ref()
+                .map(crate::limit_resets::exhausted_windows)
+                .unwrap_or_default()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if let Some(stored) = usage {
+                for window in &stored.reset_windows {
+                    if !exhausted.iter().any(|current| current == window) {
+                        exhausted.push(window.clone());
+                    }
+                }
+            }
+            let offers = usage
+                .filter(|stored| {
+                    stored.reset_at_limit != Some(false) && stored.reset_grant_id.is_some()
+                })
+                .map(|stored| {
+                    stored
+                        .reset_offers
+                        .iter()
+                        .filter(|offer| {
+                            offer.ends_at.as_deref().is_none_or(|expiry| {
+                                chrono::DateTime::parse_from_rfc3339(expiry)
+                                    .is_ok_and(|at| at.timestamp() > now)
+                            })
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            ResetAccount {
+                alias: account.alias,
+                account_id: account.account_id,
+                available: account.available,
+                stale: usage.is_none_or(|usage| {
+                    usage.stale
+                        || usage.error.is_some()
+                        || now.saturating_mul(1000) >= usage.next_retry_at
+                        || usage
+                            .observed_at
+                            .is_some_and(|at| at > now.saturating_mul(1000).saturating_add(300_000))
+                }),
+                exhausted,
+                offers,
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(private(json!({"accounts": rows})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResetRedeem {
+    account_id: String,
+}
+
+async fn redeem_reset(
+    State(server): Shared,
+    headers: HeaderMap,
+    input: Body<ResetRedeem>,
+) -> Result<Response, HttpError> {
+    if !server.browser_resets_enabled() {
+        return Err(server.error(StatusCode::NOT_FOUND, "not_found"));
+    }
+    let machine = server.authorize(&headers).await?;
+    if machine.id == "shared-service-account" {
+        return Err(server.error(StatusCode::FORBIDDEN, "service_account_reset_refused"));
+    }
+    let input = body(&server, input)?;
+    let engine = server.engine.clone();
+    let user = machine.user.clone();
+    let machine_id = machine.id.clone();
+    let account_id = input.account_id.clone();
+    let log_machine = machine_id.clone();
+    let log_account = account_id.clone();
+    let result = server
+        .run(async move {
+            engine
+                .apply_reset_for_machine(
+                    &user,
+                    &machine_id,
+                    &format!("machine:{machine_id}"),
+                    &account_id,
+                )
+                .await
+        })
+        .await?
+        .map_err(|error| {
+            eprintln!(
+                "{}",
+                json!({"operation":"account_reset","stage":"machine","reason":"reset_unavailable",
+                    "machine": log_machine, "account": log_account, "error": error.to_string()})
+            );
+            server.engine_error(&error, "reset_unavailable")
+        })?;
+    server.authorize(&headers).await?;
+    Ok(private(json!({"result": result})))
+}
 async fn delete_account(
     State(server): Shared,
     headers: HeaderMap,
@@ -808,6 +951,8 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/v1/devices", get(machines))
         .route("/v1/devices/revoke", post(revoke_machine))
         .route("/v2/anthropic/accounts", get(accounts))
+        .route("/v2/anthropic/resets", get(resets))
+        .route("/v2/anthropic/resets/redeem", post(redeem_reset))
         .route("/v2/anthropic/accounts/{id}", delete(delete_account))
         .route("/v2/anthropic/token", post(token))
         .route("/v2/anthropic/usage", get(usage))

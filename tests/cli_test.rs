@@ -85,6 +85,8 @@ fn help_shows_all_subcommands() {
     for subcommand in [
         "run",
         "status",
+        "resets",
+        "reset",
         "add",
         "renew",
         "rm",
