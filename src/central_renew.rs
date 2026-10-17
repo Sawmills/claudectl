@@ -387,6 +387,8 @@ pub(super) fn hook_from(
 /// Append one hook event to `<session dir>/events`. Only the event name, session id,
 /// notification type and time are kept; the hook input is never stored. The directory must
 /// be a session directory under this machine's sessions root.
+/// An armed Operator cron recovery also keeps the Stop/idle transcript location in a
+/// separate private file so its monitor can verify the new inventory.
 pub(super) fn record_hook(
     sessions: &std::path::Path,
     dir: &std::path::Path,
@@ -418,6 +420,11 @@ pub(super) fn record_hook(
         "notification_type": v["notification_type"],
         "error": error,
     });
+    #[cfg(unix)]
+    if let Err(error) = super::crons::record_transcript(&dir, &v) {
+        mark_hook_error(&dir);
+        return Err(error);
+    }
     let path = dir.join("events");
     let mut options = std::fs::OpenOptions::new();
     options.append(true).create(true);

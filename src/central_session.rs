@@ -466,6 +466,7 @@ struct Monitor {
     /// The account's alias, and the failover state when this run may move accounts.
     alias: String,
     failover: Option<Failover>,
+    crons: Option<super::crons::Recovery>,
 }
 /// Where the monitor is with the latest `rate_limit` turn failure.
 #[cfg(unix)]
@@ -564,7 +565,19 @@ impl Monitor {
 }
 #[cfg(unix)]
 impl Monitor {
-    fn watch(self, stopped: std::sync::mpsc::Receiver<()>) -> Outcome {
+    fn check_crons(&mut self, finished: bool) {
+        if let Some(recovery) = &self.crons {
+            match recovery.check(&self.directory, finished) {
+                Ok(None) => return,
+                Ok(Some(report)) => eprintln!("claudectl: {report}"),
+                Err(_) => eprintln!(
+                    "claudectl: cron recovery unverified: transcript evidence unavailable"
+                ),
+            }
+            self.crons = None;
+        }
+    }
+    fn watch(mut self, stopped: std::sync::mpsc::Receiver<()>) -> Outcome {
         use super::renew;
         struct StopChild(u32);
         impl Drop for StopChild {
@@ -588,6 +601,7 @@ impl Monitor {
         while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
             stopped.recv_timeout(Duration::from_millis(timing.tick_ms))
         {
+            self.check_crons(false);
             if now() - last_usage >= 300_000 {
                 if let Ok(usage) = self.client.usage(&self.account_id, false) {
                     let _ = atomic(
@@ -715,6 +729,7 @@ impl Monitor {
         // request ran): that exit is the user's, never a renewal (CX-0119).
         let ended_first = self.read_events(&mut activity).is_ok()
             && matches!((&sent, activity.idle.ended), (Some((at, _)), Some(end)) if end <= *at);
+        self.check_crons(true);
         outcome.restart = sent.filter(|_| !ended_first).map(|(_, restart)| restart);
         outcome.notice = pending.notice.take();
         outcome
@@ -872,6 +887,7 @@ pub fn run(
     // The session the running Claude was relaunched to resume, until its result is known.
     let mut resumed: Option<String> = None;
     let mut first = true;
+    let mut cron_recovery = None;
     loop {
         let mut command = session.command(&snapshot, &[])?;
         if let Some(settings) = &settings {
@@ -926,6 +942,7 @@ pub fn run(
                     .filter(|&&at| now() - at < 3_600_000)
                     .count(),
             }),
+            crons: cron_recovery.take(),
         };
         let watcher = std::thread::spawn(move || monitor.watch(stopped));
         let waited = exec::wait_exit_no_reap(pid, terminal.is_some());
@@ -996,9 +1013,25 @@ pub fn run(
         session.set_renewal("renewing")?;
         match kind {
             RestartKind::Renew(access) => {
-                launch_args =
-                    super::failover::prompted_resume(args, &session_id, super::renew::CRON_NOTE)
-                        .context("renewal of a one-shot run")?;
+                let recovery = match super::crons::Recovery::prepare(
+                    &paths.home,
+                    session.directory(),
+                    &session_id,
+                ) {
+                    Ok(recovery) => recovery,
+                    Err(error) => {
+                        eprintln!("claudectl: cron recovery skipped: {error:#}");
+                        None
+                    }
+                };
+                let prompt = recovery.as_ref().map(super::crons::Recovery::prompt);
+                cron_recovery = recovery;
+                launch_args = super::failover::prompted_resume(
+                    args,
+                    &session_id,
+                    prompt.as_deref().unwrap_or(super::renew::CRON_NOTE),
+                )
+                .context("renewal of a one-shot run")?;
                 session.renew(access)?;
                 restarts.push(now());
                 eprintln!("claudectl: server token renewed; resuming session {session_id}");
