@@ -33,6 +33,45 @@ claudectl server disconnect
 `accounts`, `status` and `devices` print tables; add `--json` for the raw JSON.
 `claudectl status` (without `server`) shows local and server accounts in one table.
 
+### Shared credential for unattended jobs
+
+An administrator can issue one shared machine credential for an existing enabled
+company user. Find its ID with `claudectl-server users`, then run:
+
+```sh
+claudectl-server service-account issue COMPANY_USER_ID \
+  --database-url DATABASE_URL --key-file KEY_FILE
+```
+
+The command prints the credential once to stdout after the write commits. Deliver
+it directly to the job's secret store; do not send it to logs. The server stores
+only its hash. Repeating the command rotates the single shared credential: the
+old one is refused on every replica, and other enrolled machines keep working.
+For file storage, use `--state STATE` instead of `--database-url` and stop the
+file-mode server during administration, as its ordinary store lock requires.
+
+Inject `CLAUDECTL_SERVICE_TOKEN` and the nonsecret `CLAUDECTL_SERVER_URL` (an HTTPS
+origin) into the job. With those variables set, no `server connect`, saved profile,
+machine file or human login is needed:
+
+```sh
+claudectl run -- --print 'Perform the scheduled task.'
+claudectl run work -- --print 'Perform the scheduled task.'
+claudectl status --json
+```
+
+The unnamed run uses the existing account picker. Both forms require current
+included capacity, with extra usage explicitly off, before executing any Claude
+build. Missing configuration, rejected credentials, stale usage and unavailable
+capacity refuse the job; they never fall back to a human machine credential.
+Service status requires a live connection, so omit `--cached`. One-shot `--print`
+runs keep the existing rule: no renewal or failover replay after the child starts.
+
+This is an ordinary machine bearer, shared by trusted jobs, with the same account
+authority as that machine. The environment remains visible to Claude and its
+tools; keep task code trusted and never echo the credential. This adds no pools,
+leases, scopes, billing permission or automatic reset redemption.
+
 The server's existing usage read requests optional limit-reset offers. When present,
 `claudectl status` (including `--details` and `--json`) and the `/accounts` dashboard
 show the remaining count, affected limits and expiry. Paused offers, future starts
@@ -93,8 +132,9 @@ this Claude binary hash is built in, with synthetic evidence for the host-config
 | ----------- | -------------- | ------------------------------------------------------------------ |
 | Linux ARM64 | 2.1.280        | `92f2b4fd05d0bdcf7b9a0d4e0ecef4a1e4b368b290cd8fd07cff9a50013f45a2` |
 
-`server run` copies the build once, before any server call, and hashes that copy; the
-same copy is checked, recorded and run. A build that is not built in or qualified is
+For human machine credentials, `server run` copies the build before any server call.
+Service jobs authenticate and check included capacity first. The launcher hashes
+the single copy; that same copy is checked, recorded and run. A build that is not built in or qualified is
 checked on first use: `server run` prints `qualifying Claude build <digest> (first use,
 about 15 s)`, and only on a pass does it ask the server for a token. One check runs at a
 time per machine (`~/.claudectl/server/qualify.lock`); another launch waits up to 90 s and

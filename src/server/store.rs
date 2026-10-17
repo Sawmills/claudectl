@@ -362,6 +362,10 @@ impl Store {
     pub async fn add_machine(&self, machine: &Machine) -> Result<()> {
         dispatch!(self, add_machine(machine))
     }
+    /// Atomically replace one machine for an enabled company user; false changes nothing.
+    pub async fn replace_machine(&self, machine: &Machine) -> Result<bool> {
+        dispatch!(self, replace_machine(machine))
+    }
     /// Revoke a machine; with `user`, only a machine of that user.
     pub async fn revoke_machine(&self, id: &str, user: Option<&str>) -> Result<bool> {
         dispatch!(self, revoke_machine(id, user))

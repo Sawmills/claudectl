@@ -530,6 +530,20 @@ impl FileStore {
     pub fn add_machine(&self, machine: &Machine) -> Result<()> {
         self.write(|t| t.machines.push(machine.clone()))
     }
+    pub fn replace_machine(&self, machine: &Machine) -> Result<bool> {
+        self.transact(|t| {
+            if !t
+                .users
+                .iter()
+                .any(|user| user.id == machine.user && user.enabled)
+            {
+                return (false, false);
+            }
+            t.machines.retain(|prior| prior.id != machine.id);
+            t.machines.push(machine.clone());
+            (true, true)
+        })
+    }
     pub fn revoke_machine(&self, id: &str, user: Option<&str>) -> Result<bool> {
         self.transact(|t| {
             let mut found = false;

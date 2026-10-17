@@ -18,6 +18,8 @@ mod migration;
 mod qualify;
 #[path = "central_renew.rs"]
 mod renew;
+#[path = "service_account.rs"]
+pub mod service_account;
 #[path = "central_session.rs"]
 pub mod session;
 #[cfg(unix)]
@@ -74,7 +76,7 @@ pub struct Receipt {
 pub struct Connection {
     pub server: String,
     pub user_id: String,
-    token_file: PathBuf,
+    token_file: Option<PathBuf>,
 }
 #[derive(Clone)]
 pub struct Client {
@@ -234,14 +236,21 @@ fn checked(response: reqwest::blocking::Response) -> Result<reqwest::blocking::R
 }
 impl Client {
     pub fn load(paths: &Paths) -> Result<Self> {
+        if let Some(client) = service_account::client()? {
+            return Ok(client);
+        }
         let dir = root(paths);
         let connection: Connection =
             serde_json::from_slice(&private_read(&dir.join("connection.json"))?)
                 .map_err(|_| anyhow::anyhow!("invalid account-server connection"))?;
-        if connection.token_file != dir.join("machine.json") {
+        let token_file = connection
+            .token_file
+            .as_deref()
+            .context("service machine credentials are environment-only")?;
+        if token_file != dir.join("machine.json") {
             bail!("unexpected machine credential path");
         }
-        let token: String = serde_json::from_slice(&private_read(&connection.token_file)?)
+        let token: String = serde_json::from_slice(&private_read(token_file)?)
             .map_err(|_| anyhow::anyhow!("invalid machine credential"))?;
         origin(&connection.server)?;
         Ok(Self {
@@ -452,9 +461,9 @@ pub fn connect(paths: &Paths, server: &str, name: &str, no_browser: bool) -> Res
     let connection = Connection {
         server: server.into(),
         user_id: user.into(),
-        token_file: dir.join("machine.json"),
+        token_file: Some(dir.join("machine.json")),
     };
-    atomic(&connection.token_file, &token)?;
+    atomic(&dir.join("machine.json"), &token)?;
     atomic(&dir.join("connection.json"), &connection)?;
     println!("Machine connected for Claude accounts.");
     Ok(())
@@ -623,6 +632,9 @@ fn cache_path(paths: &Paths, alias: &str) -> PathBuf {
     root(paths).join("status").join(format!("{hash}.json"))
 }
 fn cached_connection(paths: &Paths) -> Option<Connection> {
+    if service_account::configured() {
+        return None;
+    }
     private_read(&root(paths).join("connection.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -864,6 +876,16 @@ pub fn pick_account(paths: &Paths) -> Result<String> {
 
 /// The server account names, for name resolution: live, else this machine's saved copies.
 pub fn server_aliases(paths: &Paths, cached: bool) -> Vec<String> {
+    if service_account::configured() {
+        return if cached {
+            vec![]
+        } else {
+            Client::load(paths)
+                .and_then(|client| client.accounts())
+                .map(|accounts| accounts.into_iter().map(|account| account.alias).collect())
+                .unwrap_or_default()
+        };
+    }
     let Some(connection) = cached_connection(paths) else {
         return vec![];
     };
@@ -889,7 +911,30 @@ pub fn server_view(
     only: Option<&str>,
 ) -> ServerView {
     let wanted = |alias: &str| only.is_none_or(|only| only.eq_ignore_ascii_case(alias));
-    let Some(connection) = cached_connection(paths) else {
+    if cached && service_account::configured() {
+        return ServerView::Unreachable {
+            error: "service jobs require live authentication; omit --cached".into(),
+            rejected: false,
+            aliases: vec![],
+        };
+    }
+    let service_client = match service_account::client() {
+        Ok(client) => client,
+        Err(error) => {
+            return ServerView::Unreachable {
+                rejected: error
+                    .downcast_ref::<ServerError>()
+                    .is_some_and(|e| (400..500).contains(&e.status)),
+                error: format!("{error:#}"),
+                aliases: vec![],
+            };
+        }
+    };
+    let Some(connection) = service_client
+        .as_ref()
+        .map(|client| client.connection.clone())
+        .or_else(|| cached_connection(paths))
+    else {
         return ServerView::NotConnected;
     };
     if cached {
@@ -905,9 +950,12 @@ pub fn server_view(
             .map(|row| row.alias)
             .collect(),
     };
-    let client = match Client::load(paths) {
-        Ok(client) => client,
-        Err(error) => return unreachable(error),
+    let client = match service_client {
+        Some(client) => client,
+        None => match Client::load(paths) {
+            Ok(client) => client,
+            Err(error) => return unreachable(error),
+        },
     };
     let accounts: Vec<Account> = match client.accounts() {
         Ok(accounts) => accounts.into_iter().filter(|a| wanted(&a.alias)).collect(),

@@ -132,6 +132,103 @@ fn ok(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn shared_service_issue_rotates_the_only_job_credential_without_a_token_file() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let key = root.path().join("key");
+    app::setup(&state, &key).unwrap();
+    let server = start(&state, &key);
+    let (_, human) = server.register("human-machine");
+    let me: serde_json::Value = reqwest::blocking::Client::new()
+        .get(format!("{}/v1/me", server.origin))
+        .bearer_auth(&human)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let user = me["id"].as_str().unwrap().to_owned();
+    drop(server); // File-store administration holds the ordinary exclusive process lock.
+    let issue = |user: &str| {
+        Command::cargo_bin("claudectl-server")
+            .unwrap()
+            .args(["service-account", "issue", user, "--state"])
+            .arg(&state)
+            .arg("--key-file")
+            .arg(&key)
+            .env_remove("DATABASE_URL")
+            .output()
+            .unwrap()
+    };
+    let first = issue(&user);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(
+        first
+            .stdout
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .count(),
+        1
+    );
+    let first = String::from_utf8(first.stdout).unwrap().trim().to_owned();
+    assert_eq!(first.len(), 64);
+    let refused = issue("missing-company-user");
+    assert!(!refused.status.success());
+    assert!(
+        refused.stdout.is_empty(),
+        "failed issuance emitted a credential"
+    );
+    let server = start(&state, &key);
+    let status = |server: &Running, token: &str| {
+        reqwest::blocking::Client::new()
+            .get(format!("{}/v1/me", server.origin))
+            .bearer_auth(token)
+            .send()
+            .unwrap()
+            .status()
+    };
+    assert_eq!(status(&server, &first), 200);
+    assert_eq!(server.refreshes.load(Ordering::SeqCst), 0);
+    drop(server);
+    let second = issue(&user);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        second
+            .stdout
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .count(),
+        1
+    );
+    let second = String::from_utf8(second.stdout).unwrap().trim().to_owned();
+    assert_eq!(second.len(), 64);
+    assert!(
+        first != second,
+        "rotation retained the old shared credential"
+    );
+    let server = start(&state, &key);
+    assert_eq!(status(&server, &first), 401);
+    assert_eq!(status(&server, &second), 200);
+    assert_eq!(status(&server, &human), 200);
+    assert_eq!(server.refreshes.load(Ordering::SeqCst), 0);
+    let sealed = std::fs::read(state.join("state.enc")).unwrap();
+    for token in [&first, &second] {
+        assert!(
+            !sealed
+                .windows(token.len())
+                .any(|bytes| bytes == token.as_bytes())
+        );
+    }
+}
+
+#[test]
 fn a_machine_lists_refreshes_removes_and_revokes_through_the_server() {
     let root = tempfile::tempdir().unwrap();
     let state = root.path().join("state");

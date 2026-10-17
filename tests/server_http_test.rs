@@ -52,6 +52,7 @@ async fn provider(release: Option<Arc<Notify>>) -> (Endpoints, tokio::task::Join
 struct Fixture {
     _root: tempfile::TempDir,
     state: PathBuf,
+    database_url: Option<String>,
     server: Arc<app::Server>,
     origin: String,
     http: reqwest::Client,
@@ -74,7 +75,8 @@ impl Fixture {
         let state = root.path().join("state");
         let key = root.path().join("key");
         app::setup(&state, &key).unwrap();
-        let store = match claudectl::server::testing::fresh_database().await.unwrap() {
+        let database_url = claudectl::server::testing::fresh_database().await.unwrap();
+        let store = match database_url.clone() {
             Some(url) => app::StoreConfig::Postgres(url),
             None => app::StoreConfig::File(state.clone()),
         };
@@ -93,6 +95,7 @@ impl Fixture {
         Self {
             _root: root,
             state,
+            database_url,
             server,
             origin,
             http: reqwest::Client::new(),
@@ -136,6 +139,101 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.tasks.iter().for_each(|t| t.abort());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_cli_rotation_revokes_the_old_token_on_both_postgres_replicas() {
+    let mut f = Fixture::new(None).await;
+    let Some(url) = f.database_url.as_ref() else {
+        eprintln!("PostgreSQL rotation coverage requires CLAUDECTL_TEST_DATABASE_URL");
+        return;
+    };
+    let (_, human) = f.register(AMIR, "human-machine").await;
+    let (_, me) = f
+        .call(reqwest::Method::GET, "/v1/me", Some(&human), None)
+        .await;
+    let user = me["id"].as_str().unwrap();
+    let replica = app::Server::open(app::Config {
+        store: app::StoreConfig::Postgres(url.clone()),
+        key: f._root.path().join("key"),
+        allowed_users: vec![AMIR.into()],
+        sso: None,
+        metrics_token_hash: None,
+        endpoints: Endpoints {
+            api: "http://127.0.0.1:1".into(),
+            token: "http://127.0.0.1:1/token".into(),
+        },
+    })
+    .await
+    .unwrap();
+    let (second_origin, task) = serve(app::router(replica)).await;
+    f.tasks.push(task);
+    let issue = || {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_claudectl-server"))
+            .args(["service-account", "issue", user, "--database-url", url])
+            .arg("--key-file")
+            .arg(f._root.path().join("key"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let token = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(token.lines().count(), 1);
+        assert_eq!(token.trim().len(), 64);
+        token.trim().to_owned()
+    };
+    let first = issue();
+    for origin in [&f.origin, &second_origin] {
+        assert_eq!(
+            f.http
+                .get(format!("{origin}/v1/me"))
+                .bearer_auth(&first)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+    let second = issue();
+    assert_ne!(first, second);
+    for origin in [&f.origin, &second_origin] {
+        for (token, expected) in [(&first, 401), (&second, 200), (&human, 200)] {
+            assert_eq!(
+                f.http
+                    .get(format!("{origin}/v1/me"))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                expected
+            );
+        }
+        let machines: Value = f
+            .http
+            .get(format!("{origin}/v1/devices"))
+            .bearer_auth(&second)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            machines
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["id"] == "shared-service-account")
+                .count(),
+            1
+        );
     }
 }
 

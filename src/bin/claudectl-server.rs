@@ -40,6 +40,11 @@ impl Location {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Administer the shared machine credential for unattended jobs.
+    ServiceAccount {
+        #[command(subcommand)]
+        command: ServiceAccountCommand,
+    },
     /// Create a file store and, when absent, a new vault key
     Setup {
         #[arg(long)]
@@ -112,6 +117,19 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum ServiceAccountCommand {
+    /// Issue or rotate the shared token for an existing enabled company user.
+    Issue {
+        /// Company-user ID from `claudectl-server users`.
+        user: String,
+        #[command(flatten)]
+        location: Location,
+        #[arg(long)]
+        key_file: PathBuf,
+    },
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     if let Err(error) = run(Cli::parse()).await {
@@ -122,6 +140,18 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Commands::ServiceAccount {
+            command:
+                ServiceAccountCommand::Issue {
+                    user,
+                    location,
+                    key_file,
+                },
+        } => {
+            let store = app::open_store(&location.store()?, &key_file).await?;
+            let token = claudectl::central::service_account::issue(&store, &user).await?;
+            println!("{token}");
+        }
         Commands::Setup {
             state,
             key_file,

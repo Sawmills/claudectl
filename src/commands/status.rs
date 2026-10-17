@@ -71,13 +71,26 @@ impl AccountStatus {
 
 pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> Result<()> {
     let paths = config::default_paths()?;
+    let service = claudectl::central::service_account::configured();
     // The short names the compact view shows (`amir2`) name accounts here too.
     let resolved = alias
-        .map(|name| resolve_name(&paths, name, mode == FetchMode::Cached))
+        .map(|name| {
+            if service {
+                claudectl::central::Client::load(&paths)?
+                    .account(name)
+                    .map(|a| a.alias)
+            } else {
+                resolve_name(&paths, name, mode == FetchMode::Cached)
+            }
+        })
         .transpose()?;
     let alias = resolved.as_deref();
     // An alias may exist only on the server.
-    let (mut local, local_error) = match fetch_usages(alias, mode) {
+    let (mut local, local_error) = match if service {
+        Ok(vec![])
+    } else {
+        fetch_usages(alias, mode)
+    } {
         Ok(fetched) => (fetched, None),
         Err(error) if alias.is_some() => (vec![], Some(error)),
         Err(error) => return Err(error),
@@ -88,6 +101,9 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
         .map(|f| f.alias.clone())
         .collect();
     let view = claudectl::central::server_view(&paths, mode == FetchMode::Cached, &known, alias);
+    if service && let claudectl::central::ServerView::Unreachable { error, .. } = &view {
+        anyhow::bail!("{error}");
+    }
     let mut remote = server_rows(&view);
     if let Some(alias) = alias {
         remote.retain(|f| f.alias.eq_ignore_ascii_case(alias));

@@ -962,6 +962,20 @@ impl PostgresStore {
             .await?;
         Ok(())
     }
+    pub async fn replace_machine(&self, m: &Machine) -> Result<bool> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute(
+                "INSERT INTO machines (id, user_id, token_hash, revoked, last_seen_at)
+             SELECT $1, $2, $3, $4::boolean, $5::bigint FROM users WHERE id = $2 AND enabled
+             ON CONFLICT (id) DO UPDATE SET user_id = EXCLUDED.user_id,
+                 token_hash = EXCLUDED.token_hash, revoked = EXCLUDED.revoked,
+                 last_seen_at = EXCLUDED.last_seen_at",
+                &[&m.id, &m.user, &m.token_hash, &m.revoked, &m.last_seen_at],
+            )
+            .await?
+            == 1)
+    }
     pub async fn revoke_machine(&self, id: &str, user: Option<&str>) -> Result<bool> {
         let client = self.pool.get().await?;
         Ok(client
