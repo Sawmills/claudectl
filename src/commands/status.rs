@@ -2586,6 +2586,7 @@ mod tests {
             ("label", "string|null"),
             ("active", "bool"),
             ("plan", "string|null"),
+            ("pace_points", "number|null"),
             ("billing_class", "string"),
             ("exhausted", "bool|null"),
             ("windows", "object"),
