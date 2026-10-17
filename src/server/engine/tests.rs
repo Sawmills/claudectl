@@ -86,6 +86,13 @@ fn grant_until(access: &str, expires_at: i64) -> Grant {
         scopes: vec!["user:inference".into(), "user:profile".into()],
     }
 }
+
+#[test]
+fn a_pre_reset_reader_rejects_the_new_file_record_version() {
+    assert_eq!(RECORD_VERSION, 2);
+    assert_ne!(RECORD_VERSION, 1);
+}
+
 fn profile() -> Json<Value> {
     Json(json!({"account":{"uuid":"a"},"organization":{"uuid":"o"}}))
 }

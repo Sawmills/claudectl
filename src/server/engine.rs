@@ -318,7 +318,7 @@ async fn capped_body(mut response: reqwest::Response) -> Result<Vec<u8>, Body> {
     }
     Ok(body)
 }
-const RECORD_VERSION: u32 = 1;
+const RECORD_VERSION: u32 = 2;
 /// The usage poll lease: one replica polls the provider at a time.
 const USAGE_LEASE: &str = "__usage";
 
@@ -417,7 +417,7 @@ impl Engine {
             bail!("sealed account record is too large");
         }
         let record: Record = self.unseal(&row.sealed)?;
-        if record.v != RECORD_VERSION {
+        if record.v != 1 && record.v != RECORD_VERSION {
             bail!("unknown account record version {}", record.v);
         }
         record.grant.validate()?;
@@ -432,6 +432,8 @@ impl Engine {
     }
     /// Write `record` over `loaded` under the lease. False when the fence or revision moved.
     async fn put(&self, loaded: &mut Loaded, record: Record, fence: Fence<'_>) -> Result<()> {
+        let mut record = record;
+        record.v = RECORD_VERSION;
         let mut row = loaded.row.clone();
         row.revision = loaded.row.revision + 1;
         row.sealed = self.seal(&record)?;
