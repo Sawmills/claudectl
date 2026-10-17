@@ -8,8 +8,24 @@ resources:
   - externalsecret.yaml
   - sso.yaml
   - monitoring.yaml
+patches:
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: claudectl
+    patch: |-
+      - op: add
+        path: /spec/strategy
+        value:
+          type: Recreate
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: CLAUDECTL_CENTRAL_BROWSER_RESETS
+          value: "1"
 images:
-  # The Server image manifest for main 36a98af5 (#92, run 38976850027).
+  # The Server image manifest for main a96df1f6 (#96, run 39001190001).
   - name: claudectl-server
     newName: 767398060436.dkr.ecr.us-east-1.amazonaws.com/claudectl-server
-    digest: sha256:c616279167633830d192417146c3e9244a904a6a05decb6ce6a302f156cde6b9
+    digest: sha256:cc3e0cbd1896c7253aaf5b31134e413078486427af17993fbef85978a21a297b
