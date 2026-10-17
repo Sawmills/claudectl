@@ -1,11 +1,14 @@
-#![cfg(all(feature = "server", target_os = "linux"))]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 //! Settings observed by the actual child launched through both public run commands.
-use axum::{
-    Json, Router,
-    routing::{get, post},
-};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{
+    io::{BufRead, Read, Write},
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 const ACCOUNT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -20,7 +23,8 @@ struct Env {
     home: tempfile::TempDir,
     claude: std::path::PathBuf,
     log: std::path::PathBuf,
-    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown: Arc<AtomicBool>,
+    server: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Env {
@@ -30,33 +34,61 @@ impl Env {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
-        let app = Router::new()
-            .route("/v2/anthropic/accounts", get(|| async {
-                Json(json!([{"provider":"anthropic", "account_id":ACCOUNT,
-                    "alias":"work", "identity":{"account_uuid":"test", "organization_uuid":"test"},
-                    "available":true}]))
-            }))
-            .route("/v2/anthropic/token", post(|| async {
-                Json(json!({"provider":"anthropic", "account_id":ACCOUNT, "user_id":"person",
-                    "identity":{"account_uuid":"test", "organization_uuid":"test"},
-                    "access_token":"synthetic", "expires_at":chrono::Utc::now().timestamp_millis()+3_600_000,
-                    "scopes":["user:inference","user:profile"], "revision":"one", "generation":1}))
-            }));
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                    axum::serve(listener, app)
-                        .with_graceful_shutdown(async {
-                            let _ = stopped.await;
-                        })
-                        .await
-                        .unwrap();
-                });
+        // Use the same small HTTP fixture pattern as central_cli_test so these client
+        // tests also run in the default-feature Darwin CI job, without server dependencies.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stopped = shutdown.clone();
+        let server_thread = std::thread::spawn(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("fake account server: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut input = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                input.read_line(&mut first).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    input.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                input.read_exact(&mut vec![0; length]).unwrap();
+                let (status, body) = if first.starts_with("GET /v2/anthropic/accounts ") {
+                    (
+                        "200 OK",
+                        json!([{"provider":"anthropic", "account_id":ACCOUNT,
+                        "alias":"work", "identity":{"account_uuid":"test", "organization_uuid":"test"},
+                        "available":true}]),
+                    )
+                } else if first.starts_with("POST /v2/anthropic/token ") {
+                    (
+                        "200 OK",
+                        json!({"provider":"anthropic", "account_id":ACCOUNT, "user_id":"person",
+                        "identity":{"account_uuid":"test", "organization_uuid":"test"},
+                        "access_token":"synthetic", "expires_at":chrono::Utc::now().timestamp_millis()+3_600_000,
+                        "scopes":["user:inference","user:profile"], "revision":"one", "generation":1}),
+                    )
+                } else {
+                    ("404 Not Found", json!({}))
+                };
+                let body = body.to_string();
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
         });
         let server = home.path().join(".claudectl/server");
         private_write(
@@ -84,14 +116,15 @@ sys.exit(7)
         let digest = claudectl::exec::sha256_file(&claude).unwrap();
         private_write(
             &server.join("qualified-host-config-builds.json"),
-            &json!([{"sha256":digest,"platform":"linux","qualified_at":"test","check":"supervised_host_config"}]),
+            &json!([{"sha256":digest,"platform":std::env::consts::OS,"qualified_at":"test","check":"supervised_host_config"}]),
         );
         let log = home.path().join("child.json");
         Self {
             home,
             claude,
             log,
-            shutdown: Some(shutdown),
+            shutdown,
+            server: Some(server_thread),
         }
     }
 
@@ -123,8 +156,9 @@ sys.exit(7)
 
 impl Drop for Env {
     fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(server) = self.server.take() {
+            server.join().unwrap();
         }
     }
 }
