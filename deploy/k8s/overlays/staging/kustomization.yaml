@@ -25,7 +25,7 @@ patches:
           name: CLAUDECTL_CENTRAL_BROWSER_RESETS
           value: "1"
 images:
-  # The Server image manifest for main 80163da8 (#99, run 39015147917).
+  # The Server image manifest for main ca9d429c (#103, run 39046069953).
   - name: claudectl-server
     newName: 767398060436.dkr.ecr.us-east-1.amazonaws.com/claudectl-server
-    digest: sha256:a046977ff73149455168445efb659b542709dd1ac1ad27eec6841273b1eb6e67
+    digest: sha256:3d91f8a3e9642f969e128e9b96bdfefb250aab4f36dded39876fdffc07436ae3
