@@ -194,6 +194,11 @@ pub async fn set_user(store: &Store, email: &str, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// Company-email eligibility shared by machine authorization and local issuance.
+pub fn allowed_user(allowed: &[String], email: &str) -> bool {
+    allowed.iter().any(|a| a.eq_ignore_ascii_case(email))
+}
+
 impl Server {
     pub async fn open(config: Config) -> Result<Arc<Self>> {
         if config.allowed_users.is_empty()
@@ -270,7 +275,7 @@ impl Server {
         eprintln!("{}", failure_line(status, reason, account));
     }
     pub(super) fn allowed(&self, email: &str) -> bool {
-        self.allowed.iter().any(|a| a.eq_ignore_ascii_case(email))
+        allowed_user(&self.allowed, email)
     }
     async fn authorize(&self, headers: &HeaderMap) -> Result<Machine, HttpError> {
         let bearer = headers

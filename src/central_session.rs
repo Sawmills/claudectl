@@ -829,8 +829,12 @@ pub fn run(
 ) -> Result<i32> {
     let _slot = exec::RunSlot::take().map_err(|error| anyhow::anyhow!("{error}"))?;
     preflight(paths, &std::env::current_dir()?, args)?;
+    let service_account = super::service_account::account(client, alias)?;
     let build = qualified_build(paths, &program(binary)?, super::qualify::harness)?;
-    let account = client.account(alias)?;
+    let account = match service_account {
+        Some(account) => account,
+        None => client.account(alias)?,
+    };
     // Never force a refresh here: a provider refresh revokes the access token that every
     // other `server run` of this account is using (SAW-12610). The server refreshes on demand
     // near expiry.
