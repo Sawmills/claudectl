@@ -499,7 +499,13 @@ fn status_is_one_table_of_local_and_server_accounts() {
         assert!(keys.is_superset(&v1), "{text}");
         assert_eq!(
             keys.difference(&v1).copied().collect::<HashSet<_>>(),
-            HashSet::from(["state", "billed", "fresh", "on_server"]),
+            HashSet::from([
+                "state",
+                "billed",
+                "fresh",
+                "on_server",
+                "limit_reset_offers",
+            ]),
             "{text}"
         );
         if account["alias"] != "loc" {
