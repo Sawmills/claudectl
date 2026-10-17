@@ -51,22 +51,16 @@ pub async fn record(store: &Store, key: &Path, event: &Event<'_>) -> Result<()> 
         .context(AuditUnavailable)
 }
 
-/// Append an audit row once for a pending reset request. The reset account lease serializes
-/// retries, so the read-check-append keeps a marker write failure from creating a duplicate.
+/// Append an audit row once for a pending reset request. The store owns the scoped atomic
+/// dedupe marker, so this path never scans or decrypts another user's audit rows.
 pub async fn record_idempotent(
     store: &Store,
     key: &Path,
     event: &Event<'_>,
+    user: &str,
+    organization: &str,
     request_id: &str,
 ) -> Result<()> {
-    for sealed in store.audit().await? {
-        let existing: Value = serde_json::from_slice(&vault::decrypt(key, &sealed)?)?;
-        if existing.get("operation").and_then(Value::as_str) == Some("account_reset")
-            && existing.get("request_id").and_then(Value::as_str) == Some(request_id)
-        {
-            return Ok(());
-        }
-    }
     let mut stored = line(event)?;
     stored["request_id"] = request_id.into();
     let mut displayed = stored.clone();
@@ -74,11 +68,20 @@ pub async fn record_idempotent(
         .as_object_mut()
         .expect("audit event is an object")
         .remove("request_id");
-    eprintln!("{}", serde_json::json!({"audit": displayed}));
-    store
-        .append_audit(&vault::encrypt(key, &serde_json::to_vec(&stored)?)?)
+    let inserted = store
+        .append_audit_idempotent(
+            &vault::encrypt(key, &serde_json::to_vec(&stored)?)?,
+            user,
+            organization,
+            event.account,
+            request_id,
+        )
         .await
-        .context(AuditUnavailable)
+        .context(AuditUnavailable)?;
+    if inserted {
+        eprintln!("{}", serde_json::json!({"audit": displayed}));
+    }
+    Ok(())
 }
 
 fn line(event: &Event<'_>) -> Result<Value> {

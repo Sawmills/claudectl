@@ -1242,6 +1242,8 @@ impl Engine {
                     reason: None,
                     actor: Some(actor),
                 },
+                &loaded.row.user,
+                &loaded.row.organization_uuid,
                 &pending.request_id,
             )
             .await

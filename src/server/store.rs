@@ -329,6 +329,21 @@ impl Store {
     pub async fn append_audit(&self, sealed: &[u8]) -> Result<()> {
         dispatch!(self, append_audit(sealed))
     }
+    /// Append one account-reset audit row for this scoped request ID. The store owns the
+    /// atomic dedupe marker; callers never scan or decrypt another user's audit rows.
+    pub async fn append_audit_idempotent(
+        &self,
+        sealed: &[u8],
+        user: &str,
+        organization: &str,
+        account: &str,
+        request_id: &str,
+    ) -> Result<bool> {
+        dispatch!(
+            self,
+            append_audit_idempotent(sealed, user, organization, account, request_id)
+        )
+    }
     /// The whole audit log, for the operator.
     pub async fn audit(&self) -> Result<Vec<Vec<u8>>> {
         dispatch!(self, audit())

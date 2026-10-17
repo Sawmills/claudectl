@@ -437,6 +437,8 @@ async fn a_browser_reset_retry_reuses_the_sealed_request_id() {
             reason: None,
             actor: Some("dashboard:person@example.com"),
         },
+        "person",
+        "o",
         request_id.as_str().expect("request ID string"),
     )
     .await
