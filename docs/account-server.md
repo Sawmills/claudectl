@@ -216,8 +216,11 @@ folder trust, so `--resume <session>` finds a conversation started on the host l
 child receives only the server access token, in `CLAUDE_CODE_OAUTH_TOKEN`; credential and
 routing overrides (`ANTHROPIC_API_KEY` and the like) are removed from its environment, and
 the client never holds a refresh token. Existing project and managed credential overrides
-are refused at startup, and user-supplied `--settings`, `--setting-sources` and `--bare` are
-refused.
+are refused at startup. Explicit `--settings <JSON-or-file>` values are checked with the
+same rules, then merged in argument order into the private session settings file. Objects
+merge recursively, later non-hook values win, and hook arrays append to claudectl's hooks.
+Claude receives exactly one `--settings`; unreadable files or invalid JSON stop the launch.
+`--setting-sources` and `--bare` remain refused.
 
 The synthetic check `experiments/settings-renewal/host-config.py` (Claude 2.1.280, Linux)
 shows, with a host login present in the config dir: the server token is used, the host token

@@ -44,6 +44,21 @@ echo '<code#state>' | claudectl add amir8 --no-browser   # add from a script
 - The server's dashboard (its URL, signed in with Google) shows the same accounts and
   lets you add, renew, or remove an account and revoke a machine.
 
+Pass per-session Claude settings after `--`:
+
+```bash
+claudectl run work -- --settings '{"crossSessionInbound":"accept","isolatePeerMachines":true}'
+claudectl server run work -- --settings ./pilot-settings.json
+```
+
+Both run commands accept repeated `--settings <JSON-or-file>` or
+`--settings=<JSON-or-file>`. They merge objects in argument order; later values win,
+except hook arrays are appended to preserve claudectl's renewal hooks. Claude receives
+one private settings file, kept across token renewal and rebuilt after account failover.
+Unreadable files, invalid JSON, credential or routing overrides, and settings that disable
+supervision hooks stop the launch.
+Global `~/.claude` settings are not changed.
+
 Most failures name the next command on a last line that starts with `Try:`. Setup
 failures, such as a `~/.claudectl` directory that cannot be created, print only the
 error.

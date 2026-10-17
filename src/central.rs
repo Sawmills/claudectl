@@ -23,6 +23,9 @@ pub mod service_account;
 #[path = "central_session.rs"]
 pub mod session;
 #[cfg(unix)]
+#[path = "central_settings.rs"]
+mod settings;
+#[cfg(unix)]
 #[path = "central_shim.rs"]
 pub mod shim;
 pub use migration::{
