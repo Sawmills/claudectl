@@ -193,10 +193,12 @@ fn status_ignores_absent_empty_malformed_and_expired_reset_metadata() {
         let output = env.claudectl(&["status", "--json"]);
         assert!(output.status.success());
         let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(report["server"]["accounts"][0]["limit_reset_offers"].is_array());
         assert!(
-            report["server"]["accounts"][0]
-                .get("limit_reset_offers")
-                .is_none()
+            report["server"]["accounts"][0]["limit_reset_offers"]
+                .as_array()
+                .unwrap()
+                .is_empty()
         );
         assert_eq!(
             report["server"]["accounts"][0]["windows"]["five_hour"]["used_percent"],
