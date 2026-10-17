@@ -71,6 +71,12 @@ impl Fixture {
         )
     }
     async fn new(release: Option<Arc<Notify>>) -> Self {
+        Self::with_metrics_token(release, None).await
+    }
+    async fn with_metrics_token(
+        release: Option<Arc<Notify>>,
+        metrics_token_hash: Option<String>,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
         let key = root.path().join("key");
@@ -86,7 +92,7 @@ impl Fixture {
             key,
             allowed_users: vec![AMIR.into()],
             sso: None,
-            metrics_token_hash: None,
+            metrics_token_hash,
             endpoints,
         })
         .await
@@ -421,6 +427,46 @@ async fn a_machine_revoked_during_a_refresh_gets_no_token() {
     let (status, body) = token.await.unwrap();
     assert_eq!(status, 401, "{body}");
     assert!(!body.contains("successor"));
+}
+
+#[tokio::test]
+async fn metrics_scrapes_need_no_bearer_and_grant_no_machine_access() {
+    let retired_scrape_token = "synthetic-retired-scrape-token";
+    for configured in [false, true] {
+        let hash =
+            configured.then(|| claudectl::server::vault::digest(retired_scrape_token.as_bytes()));
+        let f = Fixture::with_metrics_token(None, hash).await;
+        for bearer in [None, Some("invalid"), Some(retired_scrape_token)] {
+            let mut scrape = f.http.get(format!("{}/metrics", f.origin));
+            if let Some(bearer) = bearer {
+                scrape = scrape.bearer_auth(bearer);
+            }
+            let response = scrape.send().await.unwrap();
+            assert_eq!(response.status(), 200, "configured={configured}");
+            assert_eq!(
+                response.headers()["content-type"],
+                "text/plain; version=0.0.4; charset=utf-8"
+            );
+            let text = response.text().await.unwrap();
+            assert!(!text.contains(retired_scrape_token));
+            assert!(!text.contains("metrics_unauthorized"));
+            assert_eq!(
+                f.call(reqwest::Method::GET, "/v1/me", bearer, None).await.0,
+                401
+            );
+            assert_eq!(
+                f.call(
+                    reqwest::Method::POST,
+                    "/v2/anthropic/token",
+                    bearer,
+                    Some(json!({}))
+                )
+                .await
+                .0,
+                401
+            );
+        }
+    }
 }
 
 #[tokio::test]
