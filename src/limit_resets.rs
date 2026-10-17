@@ -94,7 +94,11 @@ impl<'de> Deserialize<'de> for Offers {
                     .map(str::to_owned)
                     .collect();
                 Some(Offer {
-                    id: grant.get("id").and_then(Value::as_str).map(str::to_owned),
+                    id: grant
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .map(str::to_owned),
                     resets_left,
                     clears,
                     ends_at: date(grant.get("ends_at")),
@@ -200,7 +204,7 @@ impl Offers {
         let mut rows: Vec<_> = self
             .grants
             .iter()
-            .filter(|offer| Self::eligible(offer, exhausted, now))
+            .filter(|offer| offer.id.is_some() && Self::eligible(offer, exhausted, now))
             .map(OfferSummary::from_offer)
             .collect();
         rows.sort_by(|a, b| match (&a.ends_at, &b.ends_at) {
@@ -373,5 +377,25 @@ mod tests {
             offers.closest_usable_grant_id(&["five_hour"], 1_800_000_000),
             Some("sooner")
         );
+    }
+
+    #[test]
+    fn reset_summaries_exclude_grants_without_a_redeemable_id() {
+        let offers: Offers = serde_json::from_value(serde_json::json!({
+            "grants": [
+                {"resets_left": 7, "clears": ["five_hour"]},
+                {"id": "", "resets_left": 3, "clears": ["five_hour"]},
+                {"id": "valid", "resets_left": 2, "clears": ["five_hour"]}
+            ]
+        }))
+        .unwrap();
+        let summaries = offers.usable_summaries(&["five_hour"], 1_800_000_000);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].resets_left, 2);
+        assert_eq!(
+            offers.closest_usable_grant_id(&["five_hour"], 1_800_000_000),
+            Some("valid")
+        );
+        assert!(!serde_json::to_string(&summaries).unwrap().contains("valid"));
     }
 }

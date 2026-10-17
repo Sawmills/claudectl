@@ -539,10 +539,18 @@ async fn resets(State(server): Shared, headers: HeaderMap) -> Result<Response, H
                 .filter(|stored| {
                     stored.reset_at_limit != Some(false) && stored.reset_grant_id.is_some()
                 })
-                .and_then(|_| parsed.as_ref().and_then(|usage| usage.cedar_ember.as_ref()))
-                .map(|offers| {
-                    let usage_exhausted = exhausted.iter().map(String::as_str).collect::<Vec<_>>();
-                    offers.usable_summaries(&usage_exhausted, now)
+                .map(|stored| {
+                    stored
+                        .reset_offers
+                        .iter()
+                        .filter(|offer| {
+                            offer.ends_at.as_deref().is_none_or(|expiry| {
+                                chrono::DateTime::parse_from_rfc3339(expiry)
+                                    .is_ok_and(|at| at.timestamp() > now)
+                            })
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
             ResetAccount {

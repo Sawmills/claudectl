@@ -189,6 +189,11 @@ struct Record {
 struct PendingReset {
     request_id: String,
     grant_id: String,
+    /// Authority that started this request, retained when a different caller resumes it.
+    #[serde(default)]
+    machine: Option<String>,
+    #[serde(default)]
+    actor: Option<String>,
     #[serde(default)]
     audit_recorded: bool,
     /// Filled after the provider accepts the request, before the audit is written.
@@ -1230,6 +1235,8 @@ impl Engine {
             let pending = PendingReset {
                 request_id: vault::secret(),
                 grant_id: grant_id.to_owned(),
+                machine: Some(machine.to_owned()),
+                actor: Some(actor.to_owned()),
                 audit_recorded: false,
                 result: None,
             };
@@ -1308,13 +1315,13 @@ impl Engine {
                 &self.key,
                 &audit::Event {
                     operation: "account_reset",
-                    machine,
+                    machine: pending.machine.as_deref().unwrap_or("legacy-reset"),
                     account: id,
                     result: audit_result,
                     rotated: None,
                     target: None,
                     reason: None,
-                    actor: Some(actor),
+                    actor: pending.actor.as_deref(),
                 },
                 &loaded.row.user,
                 &loaded.row.organization_uuid,

@@ -141,23 +141,36 @@ pub fn list(json_output: bool) -> Result<()> {
     }
     let mut table = comfy_table::Table::new();
     table.load_preset(comfy_table::presets::UTF8_FULL);
-    table.set_header(["Account", "Source", "Exhausted", "Offers"]);
+    table.set_header(["Account", "Source", "Exhausted", "Offers", "Limit / expiry"]);
     for row in rows {
         let exhausted = if row.exhausted.is_empty() {
             "-".into()
         } else {
             row.exhausted.join(", ")
         };
-        let offers = if row.offers.is_empty() {
-            "0".into()
-        } else {
-            row.offers
-                .iter()
-                .map(|offer| offer.resets_left.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        table.add_row([row.alias, row.source.into(), exhausted, offers]);
+        let offers = row.offers.iter().fold(0_u64, |count, offer| {
+            count.saturating_add(offer.resets_left)
+        });
+        let details = row
+            .offers
+            .iter()
+            .map(|offer| {
+                format!(
+                    "{}: {} / {}",
+                    offer.resets_left,
+                    offer.clears.join(" + "),
+                    offer.ends_at.as_deref().unwrap_or("expiry unknown")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        table.add_row([
+            row.alias,
+            row.source.into(),
+            exhausted,
+            offers.to_string(),
+            details,
+        ]);
     }
     println!("{table}");
     Ok(())
