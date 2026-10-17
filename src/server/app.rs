@@ -246,6 +246,9 @@ impl Server {
     pub fn engine(&self) -> &Arc<Engine> {
         &self.engine
     }
+    pub(super) fn browser_resets_enabled(&self) -> bool {
+        std::env::var("CLAUDECTL_CENTRAL_BROWSER_RESETS").as_deref() == Ok("1")
+    }
     /// The public origin, when company SSO is configured.
     pub(super) fn public_url(&self) -> Option<&str> {
         self.sso.as_ref().map(enrollment::Sso::public_url)
@@ -679,7 +682,13 @@ async fn usage(
         server.record_failure_for(StatusCode::SERVICE_UNAVAILABLE, reason, Some(&account));
     }
     server.authorize(&headers).await?;
-    Ok(private(result))
+    Ok(private(json!({
+        "data": result.data,
+        "observed_at": result.observed_at,
+        "next_retry_at": result.next_retry_at,
+        "stale": result.stale,
+        "error": result.error,
+    })))
 }
 
 #[derive(Deserialize)]

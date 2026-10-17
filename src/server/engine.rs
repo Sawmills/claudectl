@@ -180,6 +180,19 @@ struct Record {
     attempt: Option<String>,
     /// A provider response kept before parsing, so a stop never forces a replay.
     retained: Option<Retained>,
+    /// A browser reset that has been reserved locally but not fully settled. Keeping the
+    /// request ID in the sealed record makes a timeout retry idempotent across replicas.
+    #[serde(default)]
+    pending_reset: Option<PendingReset>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingReset {
+    request_id: String,
+    grant_id: String,
+    #[serde(default)]
+    audit_recorded: bool,
+    /// Filled after the provider accepts the request, before the audit is written.
+    result: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Retained {
@@ -613,6 +626,7 @@ impl Engine {
             rotation,
             attempt: None,
             retained: None,
+            pending_reset: prior.as_ref().and_then(|p| p.record.pending_reset.clone()),
         };
         let row = StoredAccount {
             id: id.clone(),
@@ -1080,6 +1094,203 @@ impl Engine {
             actor: Some(actor),
         })
         .await
+    }
+
+    /// Apply one browser limit reset. The request ID is persisted before the provider call,
+    /// so a timeout or replica restart retries the same provider operation. No store
+    /// transaction is held while the network request runs.
+    pub async fn apply_reset(&self, user: &str, actor: &str, id: &str) -> Result<String> {
+        let local = self.local_lock(id);
+        let _local = local.lock().await;
+        let mut lease = self
+            .store
+            .acquire_lease(id, LEASE_TTL)
+            .await?
+            .context("reset is already in progress")?;
+        let result = self.apply_reset_held(user, actor, id, &mut lease).await;
+        if let Err(error) = self.store.release_lease(&lease, id).await {
+            eprintln!(
+                "{}",
+                json!({"operation":"release_lease","stage":"reset","reason":"store_error","error":error.to_string()})
+            );
+        }
+        result
+    }
+
+    async fn apply_reset_held(
+        &self,
+        user: &str,
+        actor: &str,
+        id: &str,
+        lease: &mut Lease,
+    ) -> Result<String> {
+        let mut loaded = self.selected(user, id).await?;
+        let pending = if let Some(pending) = loaded.record.pending_reset.clone() {
+            pending
+        } else {
+            let usage: Usage = self.stored(id).await?;
+            if usage.stale || usage.error.is_some() || now() >= usage.next_retry_at {
+                bail!("reset requires a fresh exhausted limit");
+            }
+            let parsed = usage
+                .data
+                .as_ref()
+                .and_then(|data| {
+                    serde_json::from_value::<crate::api::UsageResponse>(data.clone()).ok()
+                })
+                .context("reset requires a stored usage observation")?;
+            let mut exhausted = crate::limit_resets::exhausted_windows(&parsed);
+            for window in &usage.reset_windows {
+                if !exhausted.contains(&window.as_str()) {
+                    exhausted.push(window.as_str());
+                }
+            }
+            let offers = parsed
+                .cedar_ember
+                .as_ref()
+                .context("no usable reset offer")?;
+            if usage.reset_at_limit == Some(false) {
+                bail!("reset requires an exhausted limit");
+            }
+            let grant_id = usage
+                .reset_grant_id
+                .as_deref()
+                .filter(|_| usage.reset_at_limit != Some(false))
+                .filter(|_| offers.has_usable_offer(&exhausted, now() / 1000))
+                .context("no usable reset offer for an exhausted limit")?;
+            let pending = PendingReset {
+                request_id: vault::secret(),
+                grant_id: grant_id.to_owned(),
+                audit_recorded: false,
+                result: None,
+            };
+            let mut record = loaded.record.clone();
+            record.pending_reset = Some(pending.clone());
+            self.put(&mut loaded, record, Fence::Live(lease)).await?;
+            pending
+        };
+
+        let mut pending = pending;
+        let provider_result = if let Some(result) = pending.result.clone() {
+            result
+        } else {
+            let organization = urlencoding::encode(&loaded.row.organization_uuid);
+            let response = self
+                .http
+                .post(format!(
+                    "{}/api/organizations/{organization}/reset_rate_limits",
+                    self.endpoints.api
+                ))
+                .bearer_auth(&loaded.record.grant.access_token)
+                .header("anthropic-beta", BETA)
+                .json(&json!({
+                    "program": "cedar_ember",
+                    "grant_id": pending.grant_id,
+                    "request_id": pending.request_id,
+                }))
+                .send()
+                .await
+                .context("limit reset provider request failed")?;
+            if !response.status().is_success() {
+                if matches!(response.status().as_u16(), 400 | 401 | 403 | 404 | 422) {
+                    let mut record = loaded.record.clone();
+                    record.pending_reset = None;
+                    self.put(&mut loaded, record, Fence::Held(lease)).await?;
+                }
+                bail!("limit reset provider request rejected");
+            }
+            #[derive(Deserialize)]
+            struct ResetReply {
+                result: String,
+            }
+            let body = capped_body(response)
+                .await
+                .map_err(|_| anyhow::anyhow!("invalid limit reset provider response"))?;
+            let reply: ResetReply =
+                serde_json::from_slice(&body).context("invalid limit reset provider response")?;
+            if !matches!(
+                reply.result.as_str(),
+                "reset" | "already_used" | "not_limited"
+            ) {
+                bail!("limit reset provider did not settle");
+            }
+            pending = PendingReset {
+                result: Some(reply.result.clone()),
+                ..pending.clone()
+            };
+            let mut record = loaded.record.clone();
+            record.pending_reset = Some(pending.clone());
+            self.put(&mut loaded, record, Fence::Held(lease)).await?;
+            reply.result
+        };
+
+        let audit_result = match provider_result.as_str() {
+            "not_limited" => "not_limited",
+            _ => "ok",
+        };
+        if !pending.audit_recorded {
+            if let Err(error) = self
+                .audit(&audit::Event {
+                    operation: "account_reset",
+                    machine: DASHBOARD_MACHINE,
+                    account: id,
+                    result: audit_result,
+                    rotated: None,
+                    target: None,
+                    reason: None,
+                    actor: Some(actor),
+                })
+                .await
+            {
+                eprintln!(
+                    "{}",
+                    json!({"operation":"account_reset","stage":"audit","reason":"audit_unavailable","error":error.to_string()})
+                );
+                return Ok("pending".into());
+            }
+            let mut record = loaded.record.clone();
+            record.pending_reset = Some(PendingReset {
+                audit_recorded: true,
+                ..pending.clone()
+            });
+            if let Err(error) = self.put(&mut loaded, record, Fence::Held(lease)).await {
+                eprintln!(
+                    "{}",
+                    json!({"operation":"account_reset","stage":"audit","reason":"audit_marker_failed","error":error.to_string()})
+                );
+                return Ok("pending".into());
+            }
+        }
+        let sealed_usage = match self.seal(&Usage {
+            stale: true,
+            ..Usage::default()
+        }) {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    json!({"operation":"account_reset","stage":"cache","reason":"cache_invalidation_failed","error":error.to_string()})
+                );
+                return Ok("pending".into());
+            }
+        };
+        if let Err(error) = self.store.put_usage(id, &sealed_usage).await {
+            eprintln!(
+                "{}",
+                json!({"operation":"account_reset","stage":"cache","reason":"cache_invalidation_failed","error":error.to_string()})
+            );
+            return Ok("pending".into());
+        }
+        let mut record = loaded.record.clone();
+        record.pending_reset = None;
+        if let Err(error) = self.put(&mut loaded, record, Fence::Held(lease)).await {
+            eprintln!(
+                "{}",
+                json!({"operation":"account_reset","stage":"settle","reason":"persistence_failed","error":error.to_string()})
+            );
+            return Ok("pending".into());
+        }
+        Ok(provider_result)
     }
     pub async fn remove(&self, user: &str, machine: &str, id: &str) -> Result<()> {
         if !self.store.delete(user, id).await? {

@@ -328,6 +328,93 @@ async fn usage_reset_offers_are_requested_and_retained_without_provider_identifi
 }
 
 #[tokio::test]
+async fn a_browser_reset_retry_reuses_the_sealed_request_id() {
+    let requests = Arc::new(StdMutex::new(Vec::<Value>::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let seen_requests = requests.clone();
+    let seen_attempts = attempts.clone();
+    let provider = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/api/oauth/usage",
+            get(|| async {
+                Json(
+                    serde_json::from_str::<Value>(include_str!(
+                        "../../../tests/fixtures/limit-reset-offers.json"
+                    ))
+                    .unwrap(),
+                )
+            }),
+        )
+        .route(
+            "/api/organizations/o/reset_rate_limits",
+            post(move |Json(body): Json<Value>| {
+                let seen_requests = seen_requests.clone();
+                let seen_attempts = seen_attempts.clone();
+                async move {
+                    seen_requests.lock().unwrap().push(body);
+                    if seen_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            axum::http::StatusCode::BAD_GATEWAY,
+                            Json(json!({"error":"synthetic timeout"})),
+                        )
+                            .into_response()
+                    } else {
+                        Json(json!({"result":"reset"})).into_response()
+                    }
+                }
+            }),
+        );
+    let fixture = Fixture::new(provider).await;
+    let engine = fixture.engine().await;
+    let account = engine
+        .admit(
+            "person",
+            "machine",
+            "first",
+            grant_until("a", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    engine
+        .usage("person", &account.account_id, false)
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .apply_reset(
+                "person",
+                "dashboard:person@example.com",
+                &account.account_id
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        engine
+            .apply_reset(
+                "person",
+                "dashboard:person@example.com",
+                &account.account_id
+            )
+            .await
+            .unwrap(),
+        "reset"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["program"], "cedar_ember");
+    assert_eq!(requests[0]["grant_id"], "synthetic-grant-not-for-display");
+    assert_eq!(requests[0]["request_id"], requests[1]["request_id"]);
+    assert!(
+        !serde_json::to_string(&requests[..])
+            .unwrap()
+            .contains("access_token")
+    );
+}
+
+#[tokio::test]
 async fn concurrent_rejections_refresh_once_and_restart_preserves_the_successor() {
     let (f, engine, refreshes) = synthetic(3600).await;
     let receipt = engine

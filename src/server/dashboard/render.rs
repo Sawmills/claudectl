@@ -11,6 +11,7 @@ pub(super) struct Snapshot {
     pub csrf: String,
     /// The action that just finished, from the redirect after it.
     pub done: Option<&'static str>,
+    pub browser_resets: bool,
 }
 pub(super) struct Account {
     /// The server account ID: actions name the account by it.
@@ -26,6 +27,7 @@ pub(super) struct Account {
     /// The weekly Opus and Sonnet windows, when the account has them.
     pub model_windows: Vec<crate::accounts::Window>,
     pub limit_reset_offers: Option<crate::limit_resets::Offers>,
+    pub reset_grant: Option<String>,
     /// Unix seconds of the server's last usage observation.
     pub observed_at: Option<i64>,
     pub usage_stale: bool,
@@ -253,7 +255,8 @@ fn answer(accounts: &[Account], names: &[String], now: i64) -> String {
         ),
     )
 }
-fn ledger(accounts: &[Account], names: &[String], now: i64) -> String {
+fn ledger(snapshot: &Snapshot, names: &[String], now: i64) -> String {
+    let accounts = &snapshot.accounts;
     if accounts.is_empty() {
         return String::new();
     }
@@ -318,10 +321,25 @@ fn ledger(accounts: &[Account], names: &[String], now: i64) -> String {
             )
         };
         rows += &format!(
-            r#"<tr role="row" class="{}"><td role="cell" class="cell-account"><div class="account-name"><strong translate="no">{}</strong>{note}{reset_note}<a class="manage" href="/accounts/manage?account={}">Manage</a></div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td>{fable}<td role="cell" class="cell-state"><div class="status"><span class="state {class}">{state}</span><span class="status-detail">{}</span></div></td></tr>"#,
+            r#"<tr role="row" class="{}"><td role="cell" class="cell-account"><div class="account-name"><strong translate="no">{}</strong>{note}{reset_note}<a class="manage" href="/accounts/manage?account={}">Manage</a>{}</div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td>{fable}<td role="cell" class="cell-state"><div class="status"><span class="state {class}">{state}</span><span class="status-detail">{}</span></div></td></tr>"#,
             if a.usage_stale { "stale" } else { "" },
             escape(&names[i]),
             escape(&a.id),
+            if snapshot.browser_resets {
+                match &a.reset_grant {
+                    Some(_grant) => format!(
+                        r#"<form class="action" method="post" action="/accounts/reset"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="account" value="{}"><button class="link-button" type="submit">Apply reset</button></form>"#,
+                        escape(&snapshot.csrf),
+                        escape(&a.id),
+                    ),
+                    None => {
+                        r#"<button class="link-button" type="button" disabled>Apply reset</button>"#
+                            .into()
+                    }
+                }
+            } else {
+                String::new()
+            },
             window(&a.five_hour, "5-hour", now),
             window(&a.seven_day, "7-day", now),
             observed(a, now)
@@ -416,7 +434,7 @@ pub(super) fn overview(snapshot: &Snapshot) -> String {
         email = escape(&snapshot.email),
         has_accounts = !snapshot.accounts.is_empty(),
         answer = done + &answer(&snapshot.accounts, &names, snapshot.server_time),
-        ledger = ledger(&snapshot.accounts, &names, snapshot.server_time),
+        ledger = ledger(snapshot, &names, snapshot.server_time),
         machines = machines(snapshot)
     )
 }
@@ -530,6 +548,7 @@ mod tests {
             fable: None,
             model_windows: vec![],
             limit_reset_offers: None,
+            reset_grant: None,
             observed_at: Some(NOW - 30),
             usage_stale: false,
             billed: false,
@@ -543,6 +562,7 @@ mod tests {
             machines,
             csrf: "form-token".into(),
             done: None,
+            browser_resets: false,
         }
     }
 
@@ -570,6 +590,24 @@ mod tests {
         assert!(!html.contains(">Migrated<"), "{html}");
         assert!(html.contains("Updated 30 s ago"));
         assert!(html.contains("No usage data yet"));
+    }
+
+    #[test]
+    fn browser_reset_button_is_enabled_only_for_a_qualifying_offer() {
+        let mut eligible = account("amir5", Some(100.0), Some(30.0));
+        eligible.reset_grant = Some("grant-1".into());
+        let mut snapshot = snapshot(
+            vec![eligible, account("amir6", Some(20.0), Some(30.0))],
+            vec![],
+        );
+        snapshot.browser_resets = true;
+        let html = overview(&snapshot);
+        assert_eq!(html.matches("Apply reset").count(), 2, "{html}");
+        assert!(html.contains(r#"action="/accounts/reset""#), "{html}");
+        assert!(
+            html.contains(r#"type="button" disabled>Apply reset"#),
+            "{html}"
+        );
     }
 
     #[test]

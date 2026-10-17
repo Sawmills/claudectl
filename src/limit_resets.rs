@@ -6,17 +6,45 @@ pub const HINT: &str = "Use /limit-reset in Claude Code, or Settings > Usage on 
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Offers {
+    #[serde(skip_serializing)]
+    next_grant_id: Option<String>,
+    #[serde(skip_serializing)]
+    at_limit: Option<bool>,
+    #[serde(skip_serializing)]
+    exhausted: Vec<String>,
     grants: Vec<Offer>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Offer {
+    #[serde(skip_serializing)]
+    id: Option<String>,
     resets_left: u64,
     clears: Vec<String>,
     ends_at: Option<String>,
     starts_at: Option<String>,
     paused: bool,
     usable_now: Option<bool>,
+}
+
+pub fn exhausted_windows(usage: &crate::api::UsageResponse) -> Vec<&'static str> {
+    let mut windows = Vec::new();
+    let exhausted = |window: Option<&crate::api::UsageWindow>| {
+        window
+            .and_then(|window| window.utilization)
+            .is_some_and(|percent| percent.is_finite() && percent >= 100.0)
+    };
+    for (name, window) in [
+        ("five_hour", usage.five_hour.as_ref()),
+        ("seven_day", usage.seven_day.as_ref()),
+        ("seven_day_opus", usage.seven_day_opus.as_ref()),
+        ("seven_day_sonnet", usage.seven_day_sonnet.as_ref()),
+    ] {
+        if exhausted(window) {
+            windows.push(name);
+        }
+    }
+    windows
 }
 
 fn date(value: Option<&Value>) -> Option<String> {
@@ -66,6 +94,7 @@ impl<'de> Deserialize<'de> for Offers {
                     .map(str::to_owned)
                     .collect();
                 Some(Offer {
+                    id: grant.get("id").and_then(Value::as_str).map(str::to_owned),
                     resets_left,
                     clears,
                     ends_at: date(grant.get("ends_at")),
@@ -78,7 +107,23 @@ impl<'de> Deserialize<'de> for Offers {
                 })
             })
             .collect();
-        Ok(Self { grants })
+        Ok(Self {
+            next_grant_id: value
+                .get("next_grant_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            at_limit: value.get("at_limit").and_then(Value::as_bool),
+            exhausted: value
+                .get("exhausted")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|name| window(name).is_some())
+                .map(str::to_owned)
+                .collect(),
+            grants,
+        })
     }
 }
 
@@ -93,6 +138,30 @@ pub(crate) fn optional<'de, D: Deserializer<'de>>(
 }
 
 impl Offers {
+    fn eligible(offer: &Offer, exhausted: &[&str], now: i64) -> bool {
+        offer.resets_left > 0
+            && !offer.paused
+            && offer.usable_now != Some(false)
+            && offer.starts_at.as_deref().is_none_or(|at| {
+                chrono::DateTime::parse_from_rfc3339(at)
+                    .map(|date| date.timestamp() <= now)
+                    .unwrap_or(false)
+            })
+            && offer.expiry().is_none_or(|at| at > now)
+            && offer
+                .clears
+                .iter()
+                .any(|window| exhausted.contains(&window.as_str()))
+    }
+
+    pub fn provider_exhausted(&self) -> Vec<&str> {
+        self.exhausted.iter().map(String::as_str).collect()
+    }
+
+    pub fn at_limit(&self) -> Option<bool> {
+        self.at_limit
+    }
+
     pub fn active(&self, now: i64) -> Vec<Offer> {
         self.grants
             .iter()
@@ -106,6 +175,24 @@ impl Offers {
             .iter()
             .filter(|offer| offer.expiry().is_none_or(|at| at > now))
             .fold(0, |count, offer| count.saturating_add(offer.resets_left))
+    }
+
+    /// Return the server-selected grant only when it can clear one of the
+    /// exhausted windows. The dashboard never guesses a grant order.
+    pub fn next_usable_grant_id(&self, exhausted: &[&str], now: i64) -> Option<&str> {
+        let id = self.next_grant_id.as_deref()?;
+        self.grants
+            .iter()
+            .find(|offer| offer.id.as_deref() == Some(id) && Self::eligible(offer, exhausted, now))
+            .map(|_| id)
+    }
+
+    /// Display-only eligibility check. Provider grant identifiers are deliberately omitted
+    /// from the stored usage projection; the action obtains them in its fresh provider read.
+    pub fn has_usable_offer(&self, exhausted: &[&str], now: i64) -> bool {
+        self.grants
+            .iter()
+            .any(|offer| Self::eligible(offer, exhausted, now))
     }
 }
 
@@ -152,5 +239,58 @@ impl Offer {
             summary.push_str(&format!(" · starts {}", start.format("%Y-%m-%d %H:%M UTC")));
         }
         summary
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_only_the_server_next_grant_for_an_exhausted_window() {
+        let offers: Offers = serde_json::from_value(serde_json::json!({
+            "eligible": true,
+            "next_grant_id": "grant-1",
+            "grants": [{
+                "id": "grant-1",
+                "resets_left": 1,
+                "clears": ["five_hour"],
+                "ends_at": "2099-01-01T00:00:00Z"
+            }, {
+                "id": "grant-2",
+                "resets_left": 1,
+                "clears": ["five_hour"],
+                "ends_at": "2099-01-01T00:00:00Z"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            offers.next_usable_grant_id(&["five_hour"], 1_800_000_000),
+            Some("grant-1")
+        );
+        assert_eq!(
+            offers.next_usable_grant_id(&["seven_day"], 1_800_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn paused_or_early_offers_do_not_enable_apply() {
+        let offers: Offers = serde_json::from_value(serde_json::json!({
+            "eligible": true,
+            "next_grant_id": "grant-1",
+            "grants": [{
+                "id": "grant-1",
+                "resets_left": 1,
+                "clears": ["five_hour"],
+                "paused": true,
+                "starts_at": "2099-01-01T00:00:00Z"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            offers.next_usable_grant_id(&["five_hour"], 1_800_000_000),
+            None
+        );
     }
 }

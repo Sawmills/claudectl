@@ -7,6 +7,13 @@ pub struct Usage {
     pub next_retry_at: i64,
     pub stale: bool,
     pub error: Option<String>,
+    /// The provider-selected reset grant is sealed separately from the display projection.
+    #[serde(default)]
+    pub reset_grant_id: Option<String>,
+    #[serde(default)]
+    pub reset_windows: Vec<String>,
+    #[serde(default)]
+    pub reset_at_limit: Option<bool>,
     /// Set only on the response to a fresh attempt that failed; never stored.
     #[serde(skip)]
     pub failure: Option<&'static str>,
@@ -21,7 +28,10 @@ struct Throttle {
 const THROTTLE: &str = "__throttle";
 
 impl Engine {
-    async fn stored<T: serde::de::DeserializeOwned + Default>(&self, id: &str) -> Result<T> {
+    pub(super) async fn stored<T: serde::de::DeserializeOwned + Default>(
+        &self,
+        id: &str,
+    ) -> Result<T> {
         match self.store.usage(id).await? {
             Some(sealed) => self.unseal(&sealed),
             None => Ok(T::default()),
@@ -147,6 +157,37 @@ impl Engine {
                         let count = offers
                             .as_ref()
                             .map_or(0, |offers| offers.count(now() / 1000));
+                        result.reset_windows = offers
+                            .as_ref()
+                            .map(|offers| {
+                                offers
+                                    .provider_exhausted()
+                                    .into_iter()
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        result.reset_at_limit = offers
+                            .as_ref()
+                            .and_then(crate::limit_resets::Offers::at_limit);
+                        result.reset_grant_id = offers.as_ref().and_then(|offers| {
+                            if offers.at_limit() == Some(false) {
+                                return None;
+                            }
+                            let parsed = serde_json::from_value::<crate::api::UsageResponse>(
+                                Value::Object(value.clone()),
+                            )
+                            .ok()?;
+                            let mut exhausted = crate::limit_resets::exhausted_windows(&parsed);
+                            for window in &result.reset_windows {
+                                if !exhausted.contains(&window.as_str()) {
+                                    exhausted.push(window.as_str());
+                                }
+                            }
+                            offers
+                                .next_usable_grant_id(&exhausted, now() / 1000)
+                                .map(str::to_owned)
+                        });
                         if self
                             .usage_offers_logged
                             .lock()
