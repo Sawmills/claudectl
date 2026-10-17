@@ -7,9 +7,10 @@ use std::time::Duration;
 use tokio_postgres::{Row, error::SqlState};
 
 /// Schema this binary writes, and the oldest schema it can read.
-/// 2: `machines.last_seen_at` (SAW-12696). A server of this version reads it, so it needs it.
-pub const SCHEMA_VERSION: i32 = 2;
-const REQUIRED_SCHEMA: i32 = 2;
+/// 2: `machines.last_seen_at` (SAW-12696).
+/// 3: scoped, idempotent account-reset audit markers.
+pub const SCHEMA_VERSION: i32 = 3;
+const REQUIRED_SCHEMA: i32 = 3;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_info (
