@@ -94,6 +94,12 @@ only enables for a fresh exhausted window and keeps the provider request ID seal
 the account record so a timeout retry reuses it. The provider call is outside the
 store transaction, and the action writes an `account_reset` audit row without tokens.
 
+Enable the browser action only after every staging replica runs the release that
+contains this field and all older writers have drained. Older binaries fail closed
+when they read the newer sealed account record, so the image rollout and replica
+readiness check come before enabling the flag. Verify the synthetic timeout replay
+on the new image before any live staging use.
+
 On the first successful usage poll for each account in a server process, the
 `limit_reset_offers` log records only `present` (the provider returned an offer
 block) and `count` (remaining unexpired resets), without account or
