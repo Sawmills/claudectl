@@ -49,7 +49,7 @@ pub struct Config {
     /// Company email addresses that may use this server. Nobody else gets access.
     pub allowed_users: Vec<String>,
     pub sso: Option<Sso>,
-    /// SHA-256 of the Prometheus scrape token. Without it, `/metrics` needs a machine token.
+    /// Legacy launch configuration; ignored by the unauthenticated `/metrics` route.
     pub metrics_token_hash: Option<String>,
     pub endpoints: Endpoints,
 }
@@ -59,7 +59,6 @@ pub struct Server {
     engine: Arc<Engine>,
     pub(super) sso: Option<enrollment::Sso>,
     allowed: Vec<String>,
-    metrics_token_hash: Option<String>,
     /// Per reason: failure count and the Unix time of the last one.
     failures: Arc<StdMutex<BTreeMap<&'static str, (u64, i64)>>>,
     seen_writes: SeenWrites,
@@ -224,7 +223,6 @@ impl Server {
                 .iter()
                 .map(|u| u.to_ascii_lowercase())
                 .collect(),
-            metrics_token_hash: config.metrics_token_hash,
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
             seen_writes: SeenWrites::default(),
             work: Arc::new(Semaphore::new(64)),
@@ -899,19 +897,7 @@ async fn ready(State(server): Shared) -> StatusCode {
         StatusCode::SERVICE_UNAVAILABLE
     }
 }
-async fn metrics(State(server): Shared, headers: HeaderMap) -> Result<Response, HttpError> {
-    if let Some(expected) = &server.metrics_token_hash {
-        let actual = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|v| vault::digest(v.as_bytes()));
-        if actual.as_ref() != Some(expected) {
-            return Err(server.error(StatusCode::UNAUTHORIZED, "metrics_unauthorized"));
-        }
-    } else {
-        server.authorize(&headers).await?;
-    }
+async fn metrics(State(server): Shared) -> Result<Response, HttpError> {
     let output: String = server
         .failures
         .lock()
