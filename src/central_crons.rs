@@ -50,13 +50,25 @@ impl Recovery {
             let text = match std::fs::read_to_string(&card) {
                 Ok(text) => text,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
+                Err(_) => {
+                    eprintln!(
+                        "claudectl: cron recovery discovery skipped unreadable Operator card: {}",
+                        card.display()
+                    );
+                    continue;
+                }
             };
-            let owners: Vec<_> = text
-                .lines()
-                .filter_map(|line| line.strip_prefix("operator_tab:"))
-                .filter_map(|value| value.split_whitespace().next())
-                .collect();
+            let mut owners = Vec::new();
+            for line in text.lines() {
+                let mut words = line.split_whitespace();
+                while let Some(word) = words.next() {
+                    if word == "operator_tab:"
+                        && let Some(owner) = words.next()
+                    {
+                        owners.push(owner);
+                    }
+                }
+            }
             if !owners
                 .iter()
                 .any(|owner| std::ffi::OsStr::new(owner) == tab)

@@ -495,6 +495,44 @@ fn operator_renewal_cannot_reuse_a_previous_identical_recovery_inventory() {
 }
 
 #[test]
+fn operator_renewal_accepts_the_canonical_inline_operator_header() {
+    let env = Env::new();
+    let [first, _] = env.operator_card();
+    let card = first.parent().unwrap().join("operator.md");
+    let text = std::fs::read_to_string(&card).unwrap();
+    std::fs::write(
+        &card,
+        text.replace(
+            "operator_tab: w9C:tF",
+            "hq: example  hq_pane: w5C:t41  operator_tab: w9C:tF",
+        ),
+    )
+    .unwrap();
+    env.operator_restart(json!([]), "w9C:tF", false);
+    let runs = env.runs();
+    let note = runs[1]["args"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert!(note.contains(first.to_str().unwrap()), "{note}");
+    assert!(note.contains("even if CronList is empty"), "{note}");
+}
+
+#[test]
+fn an_unreadable_unrelated_card_does_not_abort_an_ordinary_renewal() {
+    let env = Env::new();
+    let card = env.home.path().join("Code/.fleet/unrelated/operator.md");
+    std::fs::create_dir_all(card.parent().unwrap()).unwrap();
+    std::fs::write(card, b"hq: unrelated\noperator_tab: w9C:tOther\n\xff").unwrap();
+    let output = env.operator_restart(json!([]), "w9C:tF", false);
+    env.assert_followed(&env.runs(), "token-2");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("cron recovery verified"));
+}
+
+#[test]
 fn another_tabs_operator_card_does_not_change_the_renewal_note() {
     let env = Env::new();
     env.operator_card();
