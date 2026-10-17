@@ -416,11 +416,12 @@ pub fn status_json(fetched: &[FetchedUsage], now: i64) -> serde_json::Value {
                 "fresh": candidate_of(f, now).fresh,
                 "on_server": f.on_server,
             });
-            let offers = usage.and_then(|usage| usage.cedar_ember.as_ref())
-                .map(|offers| offers.active(now)).unwrap_or_default();
-            if !offers.is_empty() {
-                account["limit_reset_offers"] = serde_json::json!(offers);
-            }
+            let offers = usage
+                .and_then(|usage| usage.cedar_ember.as_ref())
+                .map(|offers| offers.active(now))
+                .unwrap_or_default();
+            // Keep the offer block stable for scripts, including empty or unavailable data.
+            account["limit_reset_offers"] = serde_json::json!(offers);
             account
         })
         .collect();
@@ -1118,6 +1119,37 @@ fn summary_row(s: &AccountStatus) -> Vec<Cell> {
     ]
 }
 
+fn display_plan(f: &FetchedUsage) -> String {
+    if !f.on_server {
+        return "local".into();
+    }
+    f.plan
+        .as_deref()
+        .map(|plan| match plan.trim().to_ascii_lowercase().as_str() {
+            "pro" => "Pro".into(),
+            "max" => "Max".into(),
+            "team" => "Team".into(),
+            _ => plan.trim().to_owned(),
+        })
+        .unwrap_or_else(|| "-".into())
+}
+
+fn offer_count(f: &FetchedUsage, now: i64) -> String {
+    if !f.on_server {
+        return "-".into();
+    }
+    f.usage
+        .as_ref()
+        .and_then(|usage| {
+            usage.cedar_ember.as_ref().map(|offers| {
+                let exhausted = claudectl::limit_resets::exhausted_windows(usage);
+                offers.usable_count(&exhausted, now)
+            })
+        })
+        .unwrap_or(0)
+        .to_string()
+}
+
 fn summary_table(accounts: &[AccountStatus], no_color: bool) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
@@ -1260,11 +1292,11 @@ fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
     let mut order: Vec<usize> = (0..fetched.len()).collect();
     order.sort_by_key(|&i| rank(i));
     let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut header = vec!["Account", "5h", "Week"];
+    let mut header = vec!["Account", "Plan", "5h", "Week"];
     if show_fable {
         header.push("Fable");
     }
-    header.extend(["Resets", "State"]);
+    header.extend(["Window resets", "Offers", "State"]);
     rows.push(header.iter().map(|h| h.to_string()).collect());
     let mut markers = vec!["  ".to_string()];
     // The first error row's fix, for the Next line when no account is usable.
@@ -1304,13 +1336,18 @@ fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
             text.push_str(" (may bill)");
         }
         if f.is_active {
-            text.push_str(" (local, active)");
+            text.push_str(" (local login, waiting for Claude Code to refresh)");
         }
-        let mut row = vec![names[i].clone(), pct(c, "5h"), pct(c, "week")];
+        let mut row = vec![
+            names[i].clone(),
+            display_plan(f),
+            pct(c, "5h"),
+            pct(c, "week"),
+        ];
         if show_fable {
             row.push(pct(c, "Fable"));
         }
-        row.extend([resets, text]);
+        row.extend([resets, offer_count(f, now), text]);
         rows.push(row);
         markers.push(
             if Some(i) == best {
@@ -2230,6 +2267,12 @@ mod tests {
             lines[0].contains("Account") && lines[0].contains("Fable"),
             "{text}"
         );
+        assert!(
+            lines[0].contains("Plan")
+                && lines[0].contains("Window resets")
+                && lines[0].contains("Offers"),
+            "{text}"
+        );
         // Short names: the shared domain is dropped.
         let amir3 = lines.iter().find(|l| l.contains("amir3")).unwrap();
         assert!(amir3.starts_with("→ "), "{text}");
@@ -2242,6 +2285,10 @@ mod tests {
         assert!(amir7.starts_with("* "), "{text}");
         assert!(
             amir7.contains("low (week)") && amir7.contains("week in 1d 3h"),
+            "{text}"
+        );
+        assert!(
+            amir7.contains("local login, waiting for Claude Code to refresh"),
             "{text}"
         );
         assert_eq!(
@@ -2506,6 +2553,7 @@ mod tests {
             ("billing_class", "string"),
             ("exhausted", "bool|null"),
             ("windows", "object"),
+            ("limit_reset_offers", "array"),
             ("extra_usage", "object|null"),
             ("token_expires_in_seconds", "number|null"),
             ("usage_age_seconds", "number|null"),
@@ -2673,6 +2721,7 @@ mod tests {
         assert_eq!(accounts[0]["exhausted"], serde_json::Value::Null);
         assert_eq!(accounts[0]["usage_stale"], true);
         assert_eq!(accounts[0]["error"], "credentials unavailable or invalid");
+        assert_eq!(accounts[0]["limit_reset_offers"], serde_json::json!([]));
         assert_eq!(accounts[0]["token_expires_in_seconds"], 0, "expired");
         let b = &accounts[1];
         assert_eq!(b["label"], "Team seat");
@@ -2690,6 +2739,7 @@ mod tests {
         assert_eq!(b["token_expires_in_seconds"], 600);
         assert_eq!(b["usage_age_seconds"], 500);
         assert_eq!(b["usage_stale"], false);
+        assert_eq!(b["limit_reset_offers"], serde_json::json!([]));
     }
 
     #[test]

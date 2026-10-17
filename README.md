@@ -119,6 +119,7 @@ claudectl status --json           # machine-readable report (version 1)
 account has `alias`, `label`, `active`, `plan`, `billing_class`, `exhausted`,
 `windows` (`five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet` with
 `used_percent` and `resets_at`; `fable_weekly` with `used_percent`),
+`limit_reset_offers` (an array, empty when no offers are available),
 `extra_usage`, `token_expires_in_seconds`, `usage_age_seconds`, `usage_stale`
 and `error`. `billing_class` is `usage_based` when extra usage is on (running past
 a plan window bills credits), `rate_limited` for a subscription plan with usage
@@ -157,6 +158,11 @@ the server's usage and the next step `claudectl server run <alias>`. If the serv
 does not answer, local rows still print and server rows say `Server unreachable`.
 
 The default table shows each account's status and next step:
+
+It also shows the account `Plan` (`Pro`, `Max`, or `Team`; `local` for a
+non-server profile), the `Window resets` time, and an `Offers` count. The offers
+count is zero when no usable reset offer is available. JSON always includes
+`limit_reset_offers`, using an empty list when the server returned no offers.
 
 - `Login needed`: the login is missing or authentication was rejected. Follow the
   command in `Next step`.
