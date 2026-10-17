@@ -269,8 +269,23 @@ prompt): Claude Code can keep session cron jobs listed after a resume but stop f
 the prompt tells the session to delete and create each listed job again with the same schedule
 and prompt, then to compare each job's schedule with the time since the session's last turn.
 If a job missed one or more fires, it tells the session to run that job's prompt once now,
-regardless of how many fires were missed, then stop. This is a best-effort workaround for
-Claude Code's resume behavior, with these accepted limits:
+regardless of how many fires were missed, then stop.
+
+For a Fleet Operator, `HERDR_TAB_ID` selects the matching `operator_tab` in
+`~/Code/.fleet/*/operator.md`. Its `cron_prompts` entries (a prompt file and five schedule
+fields, separated by semicolons) are the source of truth, even when the resumed session's
+CronList is empty. The renewal prompt names every file and schedule, asks Claude to read
+each prompt verbatim and create the recurring jobs, run CronList again, and update the
+card's `cron_ids` and `claude_session_file`. claudectl reads that final inventory from the
+renewed session transcript, matched to its tool call and renewal prompt. It prints
+`cron recovery verified: N/N saved jobs`, `missing cron: <file> (<schedule>)`, or an explicit
+unverified notice if evidence is absent or unreadable. Prompt contents are not printed.
+The transcript read is limited to 8 MiB after the previous recorded position. An ambiguous
+card, an unreadable saved prompt, or a malformed entry fails the renewal instead of silently
+resuming without its jobs. Sessions with no matching card keep the existing note; first
+launches, manual resumes, and account failovers do not use this recovery.
+
+This remains a best-effort workaround for Claude Code's resume behavior, with these limits:
 
 - Missed one-shot crons and exact jitter are outside this workaround; a non-idempotent job can replay up to once per renewal.
 - Every listed job is reset on each renewal resume, not only a silent one: neither claudectl nor
@@ -280,7 +295,7 @@ Claude Code's resume behavior, with these accepted limits:
   fire at a different minute ([how late a recurring task runs](https://code.claude.com/docs/en/scheduled-tasks#how-late-a-recurring-task-runs)).
   A watchdog that looks for a silent job must use the re-created job's timing, not the old
   job's fire times.
-- claudectl does not check that each `CronDelete` and `CronCreate` succeeded; the session's
+- Without an Operator card, claudectl does not check that each `CronDelete` and `CronCreate` succeeded; the session's
   transcript shows the result. If a call fails, a job stays as the resume left it (listed, and
   maybe silent), or is gone.
   The session decides whether fires were missed from the schedule and its last turn;

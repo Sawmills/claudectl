@@ -18,6 +18,9 @@ Claude validates the settings schema. An invalid value such as model: 5 can make
 Claude ignore the WHOLE settings file, including claudectl's renewal/failover hooks.
 Test settings with your installed Claude version before rollout.";
 
+#[cfg(unix)]
+#[path = "central_crons.rs"]
+mod crons;
 #[path = "central_failover.rs"]
 mod failover;
 #[path = "central_migration.rs"]

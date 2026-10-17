@@ -146,6 +146,26 @@ if token != "token-1":
         print("No conversation found with session ID: " + resumed, file=sys.stderr)
         sys.exit(1)
     hook({"hook_event_name": "SessionStart", "session_id": resumed or "sess-new"})
+    if "FAKE_CRON_JOBS" in os.environ:
+        # Native transcript tool evidence: an empty initial inventory, then the final one.
+        session = resumed or "sess-new"
+        transcript = os.path.join(os.environ["HOME"], "restarted.jsonl")
+        note = "earlier user turn" if os.environ.get("FAKE_CRON_STALE") else args[-1]
+        prior = os.path.join(os.environ["HOME"], "prior-prompt.txt")
+        if os.environ.get("FAKE_CRON_STALE") and os.path.exists(prior):
+            note = open(prior).read()
+        rows = [{"type": "user", "sessionId": session, "message": {"content": note}}]
+        for number, jobs in enumerate([[], json.loads(os.environ["FAKE_CRON_JOBS"])]):
+            call, uuid = "list-" + str(number), "assistant-" + str(number)
+            rows.append({"type": "assistant", "sessionId": session, "uuid": uuid,
+                         "message": {"content": [{"type": "tool_use", "name": "CronList", "id": call, "input": {}}]}})
+            rows.append({"type": "user", "sessionId": session, "sourceToolAssistantUUID": uuid,
+                         "message": {"content": [{"type": "tool_result", "tool_use_id": call, "content": "inventory"}]},
+                         "toolUseResult": {"jobs": jobs}})
+        with open(transcript, "w") as out:
+            out.write("\n".join(json.dumps(row) for row in rows) + "\n")
+        hook({"hook_event_name": "Stop", "session_id": session, "transcript_path": transcript})
+        time.sleep(0.5)
     sys.exit(7)
 turn = "sess-fork" if os.environ.get("FAKE_FORK") else "sess-1"
 for event in ({"hook_event_name": "SessionStart", "session_id": "sess-1"},
@@ -279,6 +299,50 @@ impl Env {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
     }
+    fn operator_card(&self) -> [std::path::PathBuf; 2] {
+        let card = self.home.path().join("Code/.fleet/example/operator.md");
+        let first = card.parent().unwrap().join("check prompt.txt");
+        let second = card.parent().unwrap().join("deep-dive.txt");
+        private_write(&first, "Check the owned lanes.\n");
+        private_write(&second, "Read the daily evidence.\n");
+        private_write(
+            &card,
+            &format!(
+                "operator_tab: w9C:tF\ncron_ids: old-one old-two\ncron_prompts: '{}' */5 * * * *; {} 24 8 * * *\nclaude_session_file: /old/session.jsonl\n",
+                first.display(),
+                second.display()
+            ),
+        );
+        // Non-directory fleet entries are not Operator cards.
+        private_write(&self.home.path().join("Code/.fleet/notes.txt"), "notes");
+        [first, second]
+    }
+    fn operator_restart(&self, jobs: Value, tab: &str, stale: bool) -> std::process::Output {
+        let refresher = self.refresh_when_idle();
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+        self.env(&mut command);
+        command
+            .env("HERDR_TAB_ID", tab)
+            .env("FAKE_CRON_JOBS", jobs.to_string())
+            .args(["server", "run", "work", "--claude"])
+            .arg(&self.claude)
+            .args(["--", "--model", "opus"]);
+        if stale {
+            command.env("FAKE_CRON_STALE", "1");
+        }
+        let output = Command::from_std(command)
+            .timeout(std::time::Duration::from_secs(60))
+            .output()
+            .unwrap();
+        refresher.join().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
     fn assert_followed(&self, runs: &[Value], token: &str) {
         assert_eq!(runs.len(), 2, "{runs:?}");
         assert_eq!(runs[0]["token"], "token-1");
@@ -313,6 +377,131 @@ impl Env {
         let requests = self.fake.lock().unwrap().requests.clone();
         assert!(requests.iter().all(Value::is_null), "{requests:?}");
     }
+}
+
+#[test]
+fn operator_renewal_names_saved_crons_even_when_the_session_list_is_empty() {
+    let env = Env::new();
+    let [first, second] = env.operator_card();
+    env.operator_restart(json!([]), "w9C:tF", false);
+    let runs = env.runs();
+    let arguments = runs[1]["args"].as_array().unwrap();
+    let note = arguments.last().unwrap().as_str().unwrap();
+    for expected in [
+        first.to_str().unwrap(),
+        second.to_str().unwrap(),
+        "*/5 * * * *",
+        "24 8 * * *",
+        "cron_ids",
+        "claude_session_file",
+    ] {
+        assert!(
+            note.contains(expected),
+            "restart prompt omitted {expected}: {note}"
+        );
+    }
+    assert!(note.contains("even if CronList is empty"), "{note}");
+    let first_args = runs[0]["args"].as_array().unwrap();
+    assert!(
+        first_args
+            .iter()
+            .all(|arg| !arg.as_str().unwrap().contains("CronCreate"))
+    );
+}
+
+#[test]
+fn operator_renewal_reports_the_saved_job_missing_from_the_final_cron_list() {
+    let env = Env::new();
+    let [first, missing] = env.operator_card();
+    let output = env.operator_restart(json!([{"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.\n","recurring":true,"durable":false}]), "w9C:tF", false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("missing cron: {}", missing.display())),
+        "{stderr}"
+    );
+    assert!(stderr.contains("24 8 * * *"), "{stderr}");
+    assert!(
+        !stderr.contains(&format!("missing cron: {}", first.display())),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn operator_renewal_verifies_both_saved_crons_from_the_new_inventory() {
+    let env = Env::new();
+    env.operator_card();
+    let output = env.operator_restart(json!([
+        {"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.\n","recurring":true,"durable":false},
+        {"id":"new-two","cron":"24 8 * * *","prompt":"Read the daily evidence.\n","recurring":true,"durable":false}
+    ]), "w9C:tF", false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("cron recovery verified: 2/2 saved jobs")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("missing cron"), "{stderr}");
+    assert!(!stderr.contains("Check the owned lanes."), "{stderr}");
+}
+
+#[test]
+fn operator_renewal_does_not_trust_cron_results_without_the_restart_prompt() {
+    let env = Env::new();
+    env.operator_card();
+    let output = env.operator_restart(json!([
+        {"id":"old-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.","recurring":true,"durable":false},
+        {"id":"old-two","cron":"24 8 * * *","prompt":"Read the daily evidence.","recurring":true,"durable":false}
+    ]), "w9C:tF", true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cron recovery unverified: no post-restart CronList"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("cron recovery verified"), "{stderr}");
+}
+
+#[test]
+fn operator_renewal_cannot_reuse_a_previous_identical_recovery_inventory() {
+    let env = Env::new();
+    env.operator_card();
+    let jobs = json!([
+        {"id":"old-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.","recurring":true,"durable":false},
+        {"id":"old-two","cron":"24 8 * * *","prompt":"Read the daily evidence.","recurring":true,"durable":false}
+    ]);
+    env.operator_restart(jobs.clone(), "w9C:tF", false);
+    let runs = env.runs();
+    let old_prompt = runs[1]["args"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .as_str()
+        .unwrap();
+    std::fs::write(env.home.path().join("prior-prompt.txt"), old_prompt).unwrap();
+    std::fs::remove_file(env.log.with_extension("log.ready")).unwrap();
+    *env.fake.lock().unwrap() = Fake {
+        generation: 1,
+        ..Default::default()
+    };
+    let output = env.operator_restart(jobs, "w9C:tF", true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cron recovery unverified: no post-restart CronList"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("cron recovery verified"), "{stderr}");
+}
+
+#[test]
+fn another_tabs_operator_card_does_not_change_the_renewal_note() {
+    let env = Env::new();
+    env.operator_card();
+    let output = env.operator_restart(json!([]), "w9C:tOther", false);
+    let runs = env.runs();
+    env.assert_followed(&runs, "token-2");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("cron recovery"));
 }
 
 #[test]

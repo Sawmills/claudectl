@@ -418,6 +418,11 @@ pub(super) fn record_hook(
         "notification_type": v["notification_type"],
         "error": error,
     });
+    #[cfg(unix)]
+    if let Err(error) = super::crons::record_transcript(&dir, &v) {
+        mark_hook_error(&dir);
+        return Err(error);
+    }
     let path = dir.join("events");
     let mut options = std::fs::OpenOptions::new();
     options.append(true).create(true);
