@@ -48,6 +48,8 @@ impl Env {
                     }
                     Err(error) => panic!("fake account server: {error}"),
                 };
+                // Darwin inherits the listener's nonblocking mode on accepted sockets.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                     .unwrap();
