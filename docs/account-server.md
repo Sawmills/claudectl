@@ -40,8 +40,13 @@ company user. Find its ID with `claudectl-server users`, then run:
 
 ```sh
 claudectl-server service-account issue COMPANY_USER_ID \
-  --database-url DATABASE_URL --key-file KEY_FILE
+  --database-url DATABASE_URL --key-file KEY_FILE --allow-user COMPANY_EMAIL
 ```
+
+Pass the same `--allow-user` list as `serve` (repeat the flag for more addresses).
+Issuance requires both an enabled company user and an email allowed by that list,
+using the same case-insensitive rule as `/v1/me`. A refusal prints no credential
+and leaves the current shared credential valid.
 
 The command prints the credential once to stdout after the write commits. Deliver
 it directly to the job's secret store; do not send it to logs. The server stores
@@ -68,9 +73,12 @@ Service status requires a live connection, so omit `--cached`. One-shot `--print
 runs keep the existing rule: no renewal or failover replay after the child starts.
 
 This is an ordinary machine bearer, shared by trusted jobs, with the same account
-authority as that machine. The environment remains visible to Claude and its
+authority as that machine, including machine revocation, account removal and
+`refresh-access`. The environment remains visible to Claude and its
 tools; keep task code trusted and never echo the credential. This adds no pools,
 leases, scopes, billing permission or automatic reset redemption.
+`server disconnect` refuses in service mode so it cannot delete a human machine's
+saved connection. Unset both service variables before disconnecting that machine.
 
 The server's existing usage read requests optional limit-reset offers. When present,
 `claudectl status` (including `--details` and `--json`) and the `/accounts` dashboard

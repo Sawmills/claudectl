@@ -484,6 +484,9 @@ pub fn retain_login(
     Ok(path)
 }
 pub fn disconnect(paths: &Paths) -> Result<()> {
+    if service_account::configured() {
+        bail!("service jobs cannot disconnect the human machine; unset service credentials first");
+    }
     let _lock = lock(paths)?;
     let dir = root(paths);
     for name in ["connection.json", "machine.json"] {

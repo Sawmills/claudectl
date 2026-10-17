@@ -68,8 +68,20 @@ pub(super) fn account(client: &Client, alias: &str) -> Result<Option<super::Acco
 /// Return the shared credential only after commit. Delivery belongs to the admin
 /// caller; this module never logs or persists its plaintext.
 #[cfg(feature = "server")]
-pub async fn issue(store: &crate::server::store::Store, user: &str) -> Result<String> {
-    use crate::server::{store::Machine, vault};
+pub async fn issue(
+    store: &crate::server::store::Store,
+    user: &str,
+    allowed_users: &[String],
+) -> Result<String> {
+    use crate::server::{app, store::Machine, vault};
+    let company_user = store
+        .user(user)
+        .await?
+        .filter(|u| u.enabled)
+        .context("enabled company user not found; list server users first")?;
+    if !app::allowed_user(allowed_users, &company_user.email) {
+        bail!("company user is not allowed by --allow-user; use the server's allow-user list");
+    }
     let token = vault::secret();
     if !store
         .replace_machine(&Machine {

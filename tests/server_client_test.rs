@@ -132,6 +132,100 @@ fn ok(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn service_issue_refuses_an_enabled_user_outside_the_server_allow_list() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let key = root.path().join("key");
+    app::setup(&state, &key).unwrap();
+    let server = start(&state, &key);
+    let (_, human) = server.register("human-machine");
+    let (_, other) = server
+        .runtime
+        .block_on(app::register(
+            server.server.store(),
+            "other@sawmills.ai",
+            "other-machine",
+        ))
+        .unwrap();
+    let http = reqwest::blocking::Client::new();
+    let me: serde_json::Value = http
+        .get(format!("{}/v1/me", server.origin))
+        .bearer_auth(&human)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let refused_access = http
+        .get(format!("{}/v1/devices", server.origin))
+        .bearer_auth(&other)
+        .send()
+        .unwrap()
+        .status();
+    assert_eq!(refused_access, 403);
+    // Registration returns the machine ID; company-user IDs come from the admin list.
+    drop(server);
+    let users = Command::cargo_bin("claudectl-server")
+        .unwrap()
+        .arg("users")
+        .arg("--state")
+        .arg(&state)
+        .arg("--key-file")
+        .arg(&key)
+        .env_remove("DATABASE_URL")
+        .output()
+        .unwrap();
+    let users = ok(&users);
+    let other_user = users
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            (fields.get(1) == Some(&"other@sawmills.ai")).then_some(fields)
+        })
+        .unwrap();
+    assert_eq!(other_user[2], "true");
+    let issue = |user: &str| {
+        Command::cargo_bin("claudectl-server")
+            .unwrap()
+            .args([
+                "service-account",
+                "issue",
+                user,
+                "--allow-user",
+                "AMIR@SAWMILLS.AI",
+                "--state",
+            ])
+            .arg(&state)
+            .arg("--key-file")
+            .arg(&key)
+            .env_remove("DATABASE_URL")
+            .output()
+            .unwrap()
+    };
+    let good = issue(me["id"].as_str().unwrap());
+    let token = ok(&good).trim().to_owned();
+    let refused = issue(other_user[0]);
+    assert!(!refused.status.success());
+    assert!(
+        refused.stdout.is_empty(),
+        "refused issuance emitted a bearer"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("company user is not allowed by --allow-user")
+    );
+    let server = start(&state, &key);
+    assert_eq!(
+        http.get(format!("{}/v1/me", server.origin))
+            .bearer_auth(token)
+            .send()
+            .unwrap()
+            .status(),
+        200,
+        "refused issuance rotated the valid shared bearer"
+    );
+}
+
+#[test]
 fn shared_service_issue_rotates_the_only_job_credential_without_a_token_file() {
     let root = tempfile::tempdir().unwrap();
     let state = root.path().join("state");
@@ -155,6 +249,7 @@ fn shared_service_issue_rotates_the_only_job_credential_without_a_token_file() {
             .arg(&state)
             .arg("--key-file")
             .arg(&key)
+            .args(["--allow-user", AMIR])
             .env_remove("DATABASE_URL")
             .output()
             .unwrap()

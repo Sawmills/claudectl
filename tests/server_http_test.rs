@@ -172,6 +172,7 @@ async fn service_cli_rotation_revokes_the_old_token_on_both_postgres_replicas() 
     let issue = || {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_claudectl-server"))
             .args(["service-account", "issue", user, "--database-url", url])
+            .args(["--allow-user", AMIR])
             .arg("--key-file")
             .arg(f._root.path().join("key"))
             .output()

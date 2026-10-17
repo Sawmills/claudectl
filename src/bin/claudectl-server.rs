@@ -127,6 +127,9 @@ enum ServiceAccountCommand {
         location: Location,
         #[arg(long)]
         key_file: PathBuf,
+        /// The same allowed company emails supplied to `serve`; repeat for more.
+        #[arg(long = "allow-user", required = true)]
+        allowed_users: Vec<String>,
     },
 }
 
@@ -146,10 +149,12 @@ async fn run(cli: Cli) -> Result<()> {
                     user,
                     location,
                     key_file,
+                    allowed_users,
                 },
         } => {
             let store = app::open_store(&location.store()?, &key_file).await?;
-            let token = claudectl::central::service_account::issue(&store, &user).await?;
+            let token =
+                claudectl::central::service_account::issue(&store, &user, &allowed_users).await?;
             println!("{token}");
         }
         Commands::Setup {

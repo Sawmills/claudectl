@@ -179,6 +179,28 @@ async fn service_job_rejection_never_falls_back_to_a_saved_human_machine_or_star
         std::fs::read_to_string(machine).unwrap(),
         json!("synthetic-human").to_string()
     );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_claudectl"))
+        .args(["server", "disconnect"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", home.path())
+        .env("CLAUDECTL_SERVICE_TOKEN", "synthetic-service")
+        .env("CLAUDECTL_SERVER_URL", &origin)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "service mode disconnected the human machine"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("service jobs cannot disconnect the human machine")
+    );
+    assert_eq!(
+        std::fs::read_to_string(saved.join("machine.json")).unwrap(),
+        json!("synthetic-human").to_string()
+    );
+    assert!(saved.join("connection.json").exists());
     server.abort();
 }
 
