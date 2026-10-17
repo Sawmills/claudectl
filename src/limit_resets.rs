@@ -187,8 +187,8 @@ impl Offers {
             .map(|_| id)
     }
 
-    /// Display-only eligibility check. Provider grant identifiers are deliberately omitted
-    /// from the stored usage projection; the action obtains them in its fresh provider read.
+    /// Display-only eligibility check. The provider-selected grant ID is kept in the sealed
+    /// usage cache for at most five minutes; provider identifiers never enter this display model.
     pub fn has_usable_offer(&self, exhausted: &[&str], now: i64) -> bool {
         self.grants
             .iter()

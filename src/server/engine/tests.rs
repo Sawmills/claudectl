@@ -402,15 +402,55 @@ async fn a_browser_reset_retry_reuses_the_sealed_request_id() {
             .unwrap(),
         "reset"
     );
-    let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0]["program"], "cedar_ember");
-    assert_eq!(requests[0]["grant_id"], "synthetic-grant-not-for-display");
-    assert_eq!(requests[0]["request_id"], requests[1]["request_id"]);
-    assert!(
-        !serde_json::to_string(&requests[..])
-            .unwrap()
-            .contains("access_token")
+    let request_id = {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["program"], "cedar_ember");
+        assert_eq!(requests[0]["grant_id"], "synthetic-grant-not-for-display");
+        assert_eq!(requests[0]["request_id"], requests[1]["request_id"]);
+        assert!(
+            !serde_json::to_string(&requests[..])
+                .unwrap()
+                .contains("access_token")
+        );
+        requests[0]["request_id"].clone()
+    };
+    let audit = crate::server::audit::read(engine.store(), &fixture.key)
+        .await
+        .unwrap();
+    let reset_rows: Vec<_> = audit
+        .iter()
+        .filter(|line| line["operation"] == "account_reset")
+        .collect();
+    assert_eq!(reset_rows.len(), 1, "{audit:?}");
+    assert_eq!(reset_rows[0]["request_id"], request_id);
+    crate::server::audit::record_idempotent(
+        engine.store(),
+        &fixture.key,
+        &crate::server::audit::Event {
+            operation: "account_reset",
+            machine: DASHBOARD_MACHINE,
+            account: &account.account_id,
+            result: "ok",
+            rotated: None,
+            target: None,
+            reason: None,
+            actor: Some("dashboard:person@example.com"),
+        },
+        request_id.as_str().expect("request ID string"),
+    )
+    .await
+    .unwrap();
+    let audit = crate::server::audit::read(engine.store(), &fixture.key)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit
+            .iter()
+            .filter(|line| line["operation"] == "account_reset")
+            .count(),
+        1,
+        "{audit:?}"
     );
 }
 

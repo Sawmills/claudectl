@@ -58,6 +58,7 @@ fn done_text(done: Option<&str>) -> Option<&'static str> {
         "removed" => "Account removed.",
         "revoked" => "Machine revoked. Its access tokens stay valid until they expire.",
         "reset" => "Limit reset applied.",
+        "reset_already_used" => "The limit reset was already used; no reset was spent.",
         "reset_not_limited" => "The limit was no longer exhausted; no reset was used.",
         "reset_pending" => "Reset accepted; refresh the dashboard to confirm settlement.",
         _ => return None,
@@ -355,6 +356,7 @@ async fn reset(State(server): Shared, headers: HeaderMap, Form(form): Form<Reset
         .await
     {
         Ok(result) if result == "not_limited" => after("reset_not_limited"),
+        Ok(result) if result == "already_used" => after("reset_already_used"),
         Ok(result) if result == "pending" => after("reset_pending"),
         Ok(_) => after("reset"),
         Err(error) => {
@@ -716,6 +718,108 @@ mod tests {
         let body = futures_body(page);
         assert!(body.contains(r#"content="60; url=/accounts""#), "{body}");
     }
+    #[test]
+    fn finished_reset_messages_distinguish_an_already_used_reset() {
+        assert_eq!(
+            done_text(Some("reset_already_used")),
+            Some("The limit reset was already used; no reset was spent.")
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_reset_is_not_found_when_the_flag_is_off() {
+        let previous = std::env::var_os("CLAUDECTL_CENTRAL_BROWSER_RESETS");
+        unsafe { std::env::set_var("CLAUDECTL_CENTRAL_BROWSER_RESETS", "0") };
+        let root = tempfile::tempdir().unwrap();
+        let (state, key) = (root.path().join("state"), root.path().join("key"));
+        crate::server::app::setup(&state, &key).unwrap();
+        let server = Server::open(crate::server::app::Config {
+            store: crate::server::app::StoreConfig::File(state),
+            key,
+            allowed_users: vec!["amir@sawmills.ai".into()],
+            sso: None,
+            metrics_token_hash: None,
+            endpoints: crate::server::engine::Endpoints {
+                api: "http://127.0.0.1:9".into(),
+                token: "http://127.0.0.1:9/token".into(),
+            },
+        })
+        .await
+        .unwrap();
+        let response = reset(
+            State(server),
+            HeaderMap::new(),
+            Form(ResetForm {
+                csrf: "unused".into(),
+                account: "foreign".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("CLAUDECTL_CENTRAL_BROWSER_RESETS", value),
+                None => std::env::remove_var("CLAUDECTL_CENTRAL_BROWSER_RESETS"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_owner_check_rejects_another_users_account() {
+        let root = tempfile::tempdir().unwrap();
+        let (state, key) = (root.path().join("state"), root.path().join("key"));
+        crate::server::app::setup(&state, &key).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let provider = axum::Router::new().route(
+            "/api/oauth/profile",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "account": {"uuid": "a"},
+                    "organization": {"uuid": "o"}
+                }))
+            }),
+        );
+        let provider_task = tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+        let server = Server::open(crate::server::app::Config {
+            store: crate::server::app::StoreConfig::File(state),
+            key,
+            allowed_users: vec!["amir@sawmills.ai".into()],
+            sso: None,
+            metrics_token_hash: None,
+            endpoints: crate::server::engine::Endpoints {
+                api: endpoint,
+                token: "http://127.0.0.1:9/token".into(),
+            },
+        })
+        .await
+        .unwrap();
+        let account = server
+            .engine()
+            .admit(
+                "other-user",
+                "foreign",
+                "seed-foreign",
+                crate::server::engine::Grant {
+                    access_token: "access".into(),
+                    refresh_token: "refresh".into(),
+                    expires_at: chrono::Utc::now().timestamp_millis() + 3_600_000,
+                    scopes: vec!["user:inference".into(), "user:profile".into()],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let response = match own_account(server.as_ref(), "amir", &account.account_id).await {
+            Ok(_) => panic!("foreign account was accepted"),
+            Err(response) => *response,
+        };
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        provider_task.abort();
+    }
+
     fn futures_body(response: Response) -> String {
         let bytes = tokio::runtime::Builder::new_current_thread()
             .build()
