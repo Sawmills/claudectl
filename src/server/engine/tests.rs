@@ -1809,7 +1809,13 @@ async fn a_usage_follower_preserves_a_shared_cooldown_after_waiting() {
     let release = Arc::new(tokio::sync::Notify::new());
     let count = Arc::new(AtomicUsize::new(0));
     let provider = Router::new()
-        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/api/oauth/profile",
+            get(|headers: axum::http::HeaderMap| async move {
+                let identity = headers["authorization"].to_str().unwrap();
+                Json(json!({"account":{"uuid":identity},"organization":{"uuid":"o"}}))
+            }),
+        )
         .route(
             "/api/oauth/usage",
             get({
