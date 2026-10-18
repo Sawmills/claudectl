@@ -1709,6 +1709,90 @@ async fn a_follower_never_returns_the_revision_the_caller_rejected() {
 }
 
 #[tokio::test]
+async fn live_usage_waits_for_another_replicas_refresh_of_an_expired_cache() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let count = Arc::new(AtomicUsize::new(0));
+    let provider = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/api/oauth/usage",
+            get({
+                let (entered, release, count) = (entered.clone(), release.clone(), count.clone());
+                move || {
+                    let (entered, release, count) =
+                        (entered.clone(), release.clone(), count.clone());
+                    async move {
+                        if count.fetch_add(1, Ordering::SeqCst) > 0 {
+                            entered.notify_one();
+                            release.notified().await;
+                        }
+                        Json(json!({"five_hour":{"utilization":0},"seven_day":{"utilization":98}}))
+                    }
+                }
+            }),
+        );
+    let Some((_fixture, owner, follower)) = replicas(provider).await else {
+        return;
+    };
+    let account = owner
+        .admit(
+            "person",
+            "idle",
+            "machine",
+            grant_until("idle", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut expired = owner
+        .usage("person", &account.account_id, false)
+        .await
+        .unwrap();
+    expired.observed_at = Some(now() - 300_001);
+    expired.next_retry_at = now() - 1;
+    owner
+        .store
+        .put_usage(&account.account_id, &owner.seal(&expired).unwrap())
+        .await
+        .unwrap();
+    let (left, right) = tokio::join!(
+        owner.usage_for("person", "machine", &account.account_id, false),
+        async {
+            tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                .await
+                .expect("the refresh did not reach the provider");
+            // Offline reads still answer immediately, and honestly mark the old cache stale.
+            let cached = tokio::time::timeout(
+                Duration::from_secs(1),
+                follower.usage("person", &account.account_id, true),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(cached.stale);
+            let read = follower.usage_for("person", "machine", &account.account_id, false);
+            tokio::pin!(read);
+            let early = tokio::time::timeout(Duration::from_millis(100), &mut read).await;
+            release.notify_one();
+            assert!(
+                early.is_err(),
+                "a live read returned the expired cache during refresh"
+            );
+            tokio::time::timeout(Duration::from_secs(2), read)
+                .await
+                .expect("the follower did not observe the completed refresh")
+        }
+    );
+    for usage in [left.unwrap(), right.unwrap()] {
+        assert!(!usage.stale && usage.error.is_none());
+        assert!(usage.next_retry_at > now());
+        assert_eq!(usage.data.unwrap()["seven_day"]["utilization"], 98);
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn two_replicas_reading_usage_poll_the_provider_once() {
     let count = Arc::new(AtomicUsize::new(0));
     let calls = count.clone();
