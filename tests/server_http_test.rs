@@ -320,6 +320,70 @@ async fn machine_reset_listing_is_hidden_when_the_reset_gate_is_off() {
 }
 
 #[tokio::test]
+async fn waiting_live_usage_reads_do_not_block_cached_usage_or_token_requests() {
+    let f = Fixture::new(None).await;
+    let Some(url) = f.database_url.as_ref() else {
+        eprintln!("Cross-replica usage admission coverage requires CLAUDECTL_TEST_DATABASE_URL");
+        return;
+    };
+    let (_, mac) = f.register(AMIR, "mac").await;
+    let id = f.migrate(&mac).await;
+    // Hold the shared poll lease, as when another replica is polling the provider.
+    let peer = claudectl::server::store::PostgresStore::connect(url)
+        .await
+        .unwrap();
+    let lease = peer
+        .acquire_lease("__usage", 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let start = Arc::new(tokio::sync::Barrier::new(129));
+    let mut readers = tokio::task::JoinSet::new();
+    for _ in 0..128 {
+        let (http, origin, mac, id, start) = (
+            f.http.clone(),
+            f.origin.clone(),
+            mac.clone(),
+            id.clone(),
+            start.clone(),
+        );
+        readers.spawn(async move {
+            start.wait().await;
+            http.get(format!("{origin}/v2/anthropic/usage?account_id={id}"))
+                .bearer_auth(mac)
+                .send()
+                .await
+        });
+    }
+    start.wait().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let cached = tokio::time::timeout(
+        Duration::from_secs(2),
+        f.call(
+            reqwest::Method::GET,
+            &format!("/v2/anthropic/usage?account_id={id}&cached=true"),
+            Some(&mac),
+            None,
+        ),
+    )
+    .await;
+    let token = tokio::time::timeout(
+        Duration::from_secs(2),
+        f.call(
+            reqwest::Method::POST,
+            "/v2/anthropic/token",
+            Some(&mac),
+            Some(json!({"account_id":id})),
+        ),
+    )
+    .await;
+    peer.release_lease(&lease, "__usage").await.unwrap();
+    readers.abort_all();
+    assert_eq!(cached.expect("live usage blocked a cached read").0, 200);
+    assert_eq!(token.expect("live usage blocked token issuance").0, 200);
+}
+
+#[tokio::test]
 async fn a_deleted_account_answers_gone_and_a_revoked_machine_is_refused() {
     let f = Fixture::new(None).await;
     let (mac_id, mac) = f.register(AMIR, "mac").await;

@@ -63,6 +63,8 @@ pub struct Server {
     failures: Arc<StdMutex<BTreeMap<&'static str, (u64, i64)>>>,
     seen_writes: SeenWrites,
     work: Arc<Semaphore>,
+    /// Queue live usage before shared work admission; the engine serializes polls anyway.
+    usage_work: Arc<Semaphore>,
     /// Set on shutdown: readiness fails while in-flight work finishes.
     draining: AtomicBool,
 }
@@ -226,6 +228,7 @@ impl Server {
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
             seen_writes: SeenWrites::default(),
             work: Arc::new(Semaphore::new(64)),
+            usage_work: Arc::new(Semaphore::new(1)),
             draining: AtomicBool::new(false),
         }))
     }
@@ -811,8 +814,22 @@ async fn usage(
     let machine = server.authorize(&headers).await?;
     let engine = server.engine.clone();
     let account = input.account_id.clone();
+    let usage_permit = if input.cached {
+        None
+    } else {
+        Some(
+            server
+                .usage_work
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?,
+        )
+    };
     let result = server
         .run(async move {
+            // Keep admission until the detached work ends, even if its HTTP caller leaves.
+            let _usage_permit = usage_permit;
             engine
                 .usage_for(&machine.user, &machine.id, &input.account_id, input.cached)
                 .await

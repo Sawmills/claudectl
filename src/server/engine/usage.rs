@@ -137,6 +137,10 @@ impl Engine {
                 return polled;
             }
             if tokio::time::Instant::now() >= deadline {
+                if result.data.is_some() {
+                    result.stale = true;
+                    return Ok(result);
+                }
                 return Err(RefreshInProgress.into());
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -166,6 +170,10 @@ impl Engine {
         }
         if deadline.saturating_duration_since(tokio::time::Instant::now()) < Duration::from_secs(30)
         {
+            if result.data.is_some() {
+                result.stale = true;
+                return Ok(result);
+            }
             return Err(RefreshInProgress.into());
         }
         throttle.last_request = now();

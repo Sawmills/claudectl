@@ -1891,6 +1891,101 @@ async fn a_usage_follower_preserves_a_shared_cooldown_after_waiting() {
 }
 
 #[tokio::test]
+async fn concurrent_live_usage_keeps_stored_data_when_the_poll_budget_runs_out() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let count = Arc::new(AtomicUsize::new(0));
+    let provider = Router::new()
+        .route(
+            "/api/oauth/profile",
+            get(|headers: axum::http::HeaderMap| async move {
+                let identity = headers["authorization"].to_str().unwrap();
+                Json(json!({"account":{"uuid":identity},"organization":{"uuid":"o"}}))
+            }),
+        )
+        .route(
+            "/api/oauth/usage",
+            get({
+                let (entered, release, count) = (entered.clone(), release.clone(), count.clone());
+                move || {
+                    let (entered, release, count) =
+                        (entered.clone(), release.clone(), count.clone());
+                    async move {
+                        if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                            entered.notify_one();
+                            release.notified().await;
+                        } else {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                        Json(json!({"seven_day":{"utilization":98}}))
+                    }
+                }
+            }),
+        );
+    let fixture = Fixture::new(provider).await;
+    let engine = Arc::new(fixture.engine().await);
+    let expired = Usage {
+        data: Some(json!({"seven_day":{"utilization":98}})),
+        observed_at: Some(now() - 300_001),
+        next_retry_at: now() - 1,
+        ..Usage::default()
+    };
+    let start = Arc::new(tokio::sync::Barrier::new(7));
+    let mut readers = tokio::task::JoinSet::new();
+    for index in 0..6 {
+        let alias = format!("account-{index}");
+        let account = engine
+            .admit(
+                "person",
+                &alias,
+                &alias,
+                grant_until(&alias, now() + 3_600_000),
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .store
+            .put_usage(&account.account_id, &engine.seal(&expired).unwrap())
+            .await
+            .unwrap();
+        let (engine, start) = (engine.clone(), start.clone());
+        readers.spawn(async move {
+            start.wait().await;
+            engine.usage("person", &account.account_id, false).await
+        });
+    }
+    start.wait().await;
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the live poll did not reach the provider");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    release.notify_one();
+    let mut stale = 0;
+    while let Some(result) = tokio::time::timeout(Duration::from_secs(10), readers.join_next())
+        .await
+        .expect("the queued live reads did not finish")
+    {
+        let usage = result
+            .unwrap()
+            .expect("poll contention turned stored usage into an error");
+        assert_eq!(usage.data.as_ref().unwrap()["seven_day"]["utilization"], 98);
+        assert!(usage.error.is_none() && usage.failure.is_none());
+        if usage.stale {
+            stale += 1;
+            assert_eq!(usage.observed_at, expired.observed_at);
+            assert_eq!(usage.next_retry_at, expired.next_retry_at);
+        }
+    }
+    assert!(
+        stale > 0,
+        "the queued reads did not exercise the late-claim exit"
+    );
+    assert!(stale < 6, "no live read refreshed its stored usage");
+    assert!(count.load(Ordering::SeqCst) < 6);
+}
+
+#[tokio::test]
 async fn two_replicas_reading_usage_poll_the_provider_once() {
     let count = Arc::new(AtomicUsize::new(0));
     let calls = count.clone();
