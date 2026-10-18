@@ -1,5 +1,5 @@
 //! Operator-card cron recovery for a server-token renewal. Ordinary sessions keep their
-//! existing renewal note; only the owning HerdR tab can select a card.
+//! existing renewal note; only the owning HerdR tab can select cards with saved jobs.
 use super::*;
 use std::io::{Read, Seek, SeekFrom};
 
@@ -25,9 +25,9 @@ impl Job {
 }
 
 pub(super) struct Recovery {
-    card: PathBuf,
+    cards: Vec<PathBuf>,
     jobs: Vec<Job>,
-    previous: Option<(PathBuf, u64)>,
+    previous: Vec<(PathBuf, u64)>,
     session_id: String,
     attempt: String,
 }
@@ -51,8 +51,13 @@ impl Recovery {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let mut owned = None;
-        let mut found_owner = false;
+        let mut owned = Self {
+            cards: Vec::new(),
+            jobs: Vec::new(),
+            previous: Vec::new(),
+            session_id: String::new(),
+            attempt: format!("{:032x}", rand::random::<u128>()),
+        };
         for directory in directories {
             let directory = directory?;
             if !directory.file_type()?.is_dir() {
@@ -87,11 +92,16 @@ impl Recovery {
             {
                 continue;
             }
-            if owners.len() != 1 || found_owner {
+            if !text.lines().any(|line| {
+                line.strip_prefix("cron_prompts:")
+                    .is_some_and(|value| !value.trim().is_empty())
+            }) {
+                continue;
+            }
+            if owners.len() != 1 {
                 bail!("cron recovery: ambiguous Operator card ownership");
             }
-            found_owner = true;
-            let mut jobs = Vec::new();
+            let earlier_cards = owned.jobs.len();
             for line in text
                 .lines()
                 .filter_map(|line| line.strip_prefix("cron_prompts:"))
@@ -107,21 +117,38 @@ impl Recovery {
                         bail!("cron recovery: cron_prompts needs a file and five schedule fields");
                     }
                     let file = saved_path(home, &card, &words[0])?;
+                    let file = file.canonicalize().with_context(|| {
+                        format!("cron recovery: saved prompt unreadable: {}", file.display())
+                    })?;
+                    let schedule = words[1..].join(" ");
+                    if owned.jobs[..earlier_cards]
+                        .iter()
+                        .any(|job| job.file == file && job.schedule != schedule)
+                    {
+                        bail!(
+                            "cron recovery: conflicting schedules for saved prompt: {}",
+                            file.display()
+                        );
+                    }
+                    if owned
+                        .jobs
+                        .iter()
+                        .any(|job| job.file == file && job.schedule == schedule)
+                    {
+                        continue;
+                    }
                     let prompt = std::fs::read_to_string(&file).with_context(|| {
                         format!("cron recovery: saved prompt unreadable: {}", file.display())
                     })?;
                     if prompt.trim().is_empty() {
                         bail!("cron recovery: saved prompt is empty: {}", file.display());
                     }
-                    jobs.push(Job {
+                    owned.jobs.push(Job {
                         file,
-                        schedule: words[1..].join(" "),
+                        schedule,
                         prompt,
                     });
                 }
-            }
-            if jobs.is_empty() {
-                continue;
             }
             let previous = text
                 .lines()
@@ -132,15 +159,10 @@ impl Recovery {
                 .transpose()?
                 .and_then(|path| path.canonicalize().ok())
                 .and_then(|path| std::fs::metadata(&path).ok().map(|info| (path, info.len())));
-            owned = Some(Self {
-                card,
-                jobs,
-                previous,
-                session_id: String::new(),
-                attempt: format!("{:032x}", rand::random::<u128>()),
-            });
+            owned.cards.push(card);
+            owned.previous.extend(previous);
         }
-        Ok(owned)
+        Ok((!owned.jobs.is_empty()).then_some(owned))
     }
 
     /// Arm only for the renewal launch. The hook records a transcript location, never its
@@ -187,9 +209,11 @@ impl Recovery {
         let mut file = File::open(&path)?;
         let offset = self
             .previous
-            .as_ref()
+            .iter()
             .filter(|(previous, _)| previous == &path)
-            .map_or(0, |(_, offset)| *offset);
+            .map(|(_, offset)| *offset)
+            .max()
+            .unwrap_or(0);
         if file.metadata()?.len() < offset {
             bail!("cron transcript was truncated");
         }
@@ -306,14 +330,18 @@ impl Recovery {
     pub(super) fn prompt(&self) -> String {
         let mut prompt = format!(
             "claudectl cron recovery attempt {}. claudectl restarted this session on a renewed server token. Restore the saved \
-             session crons from Operator card {} even if CronList is empty. Run CronList \
+             session crons from Operator cards {} even if CronList is empty. Run CronList \
              first. Delete only card-owned IDs from the card's cron_ids, and only when \
              their schedule and prompt match the saved jobs. Preserve every other listed job. \
              Then use CronCreate for \
              EACH saved job below, recurring=true, using its exact five-field schedule and \
              the prompt read verbatim from its file (not a summary):\n",
             self.attempt,
-            self.card.display()
+            self.cards
+                .iter()
+                .map(|card| card.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         for job in &self.jobs {
             prompt.push_str(&format!(
@@ -322,15 +350,16 @@ impl Recovery {
                 job.schedule
             ));
         }
-        prompt.push_str(&format!(
-            "Run CronList again after all creations. Update cron_ids on {} to the newly \
-             created IDs in the same order as cron_prompts, and update claude_session_file \
+        prompt.push_str(
+            "Run CronList again after all creations. Update cron_ids on EACH named Operator \
+             card to the newly created IDs for that card's cron_prompts, in the same order. \
+             A shared file and schedule uses the same new ID on every owning card. \
+             Update claude_session_file on each card \
              to this session's actual transcript path. After re-creating the jobs, compare \
              each job's schedule with the time since this session's last turn. If one or more \
              fires were missed for a job, run that job's prompt ONCE now, regardless of how \
              many fires were missed. Then stop: do no other work.",
-            self.card.display()
-        ));
+        );
         prompt
     }
 }

@@ -410,6 +410,117 @@ fn operator_renewal_names_saved_crons_even_when_the_session_list_is_empty() {
 }
 
 #[test]
+fn operator_renewal_uses_saved_crons_when_another_owned_card_has_none() {
+    for fields in ["", "cron_prompts:\n"] {
+        let env = Env::new();
+        let [first, second] = env.operator_card();
+        private_write(
+            &env.home.path().join("Code/.fleet/codexctl/operator.md"),
+            &format!("operator_tab: w9C:tF\n{fields}"),
+        );
+        let output = env.operator_restart(json!([]), "w9C:tF", false);
+        let runs = env.runs();
+        let note = runs[1]["args"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .as_str()
+            .unwrap();
+        for file in [&first, &second] {
+            assert!(note.contains(file.to_str().unwrap()), "{note}");
+        }
+        assert!(note.contains("even if CronList is empty"), "{note}");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("ambiguous"));
+    }
+}
+
+#[test]
+fn operator_renewal_merges_owned_cards_and_deduplicates_shared_prompt_files() {
+    let env = Env::new();
+    let [shared, _] = env.operator_card();
+    let card = env.home.path().join("Code/.fleet/another/operator.md");
+    let third = card.parent().unwrap().join("third.txt");
+    private_write(&third, "Check the other project.\n");
+    private_write(
+        &card,
+        "operator_tab: w9C:tF\ncron_ids: old-shared old-third\ncron_prompts: '../example/./check prompt.txt' */5 * * * *; third.txt 0 12 * * *\n",
+    );
+    let output = env.operator_restart(json!([
+        {"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.\n","recurring":true,"durable":false},
+        {"id":"new-two","cron":"24 8 * * *","prompt":"Read the daily evidence.\n","recurring":true,"durable":false},
+        {"id":"new-three","cron":"0 12 * * *","prompt":"Check the other project.\n","recurring":true,"durable":false}
+    ]), "w9C:tF", false);
+    let runs = env.runs();
+    let note = runs[1]["args"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        note.matches(&format!("file: {}\n", shared.display()))
+            .count(),
+        1,
+        "{note}"
+    );
+    assert!(note.contains(third.to_str().unwrap()), "{note}");
+    assert!(note.contains(card.to_str().unwrap()), "{note}");
+    assert!(note.contains("EACH named Operator card"), "{note}");
+    assert!(note.contains("same new ID on every owning card"), "{note}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cron recovery verified: 3/3 saved jobs"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("missing cron") && !stderr.contains("cron recovery skipped"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn operator_renewal_preserves_distinct_schedules_for_one_cards_prompt_file() {
+    let env = Env::new();
+    let [shared, _] = env.operator_card();
+    let card = shared.parent().unwrap().join("operator.md");
+    let text = std::fs::read_to_string(&card).unwrap();
+    private_write(
+        &card,
+        &format!("{text}cron_prompts: '{}' 0 12 * * *\n", shared.display()),
+    );
+    let output = env.operator_restart(json!([
+        {"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.\n","recurring":true,"durable":false},
+        {"id":"new-two","cron":"24 8 * * *","prompt":"Read the daily evidence.\n","recurring":true,"durable":false},
+        {"id":"new-three","cron":"0 12 * * *","prompt":"Check the owned lanes.\n","recurring":true,"durable":false}
+    ]), "w9C:tF", false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cron recovery verified: 3/3 saved jobs"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("cron recovery skipped"), "{stderr}");
+}
+
+#[test]
+fn operator_renewal_skips_conflicting_schedules_without_aborting_the_renewal() {
+    let env = Env::new();
+    let [shared, _] = env.operator_card();
+    private_write(
+        &env.home.path().join("Code/.fleet/another/operator.md"),
+        "operator_tab: w9C:tF\ncron_prompts: '../example/check prompt.txt' 0 12 * * *\n",
+    );
+    let output = env.operator_restart(json!([]), "w9C:tF", false);
+    env.assert_followed(&env.runs(), "token-2");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cron recovery skipped:"), "{stderr}");
+    assert!(stderr.contains("conflicting schedules"), "{stderr}");
+    assert!(stderr.contains(shared.to_str().unwrap()), "{stderr}");
+    assert!(!stderr.contains("cron recovery verified"), "{stderr}");
+}
+
+#[test]
 fn operator_renewal_reports_the_saved_job_missing_from_the_final_cron_list() {
     let env = Env::new();
     let [first, missing] = env.operator_card();
