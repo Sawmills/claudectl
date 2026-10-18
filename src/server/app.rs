@@ -391,6 +391,43 @@ impl Server {
         .await
         .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))
     }
+    async fn read_usage(
+        &self,
+        machine: &Machine,
+        id: &str,
+        cached: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<Result<engine::Usage>, HttpError> {
+        let usage_permit = if cached {
+            None
+        } else {
+            match tokio::time::timeout_at(deadline, self.usage_work.clone().acquire_owned()).await {
+                Ok(permit) => {
+                    Some(permit.map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping")
+                    })?)
+                }
+                Err(_) => return Ok(self.engine.usage_while_refreshing(&machine.user, id).await),
+            }
+        };
+        let engine = self.engine.clone();
+        let (user, machine_id, account) = (machine.user.clone(), machine.id.clone(), id.to_owned());
+        let work = self.run(async move {
+            // A dropped HTTP caller must not release admission or cancel grant persistence.
+            let _usage_permit = usage_permit;
+            engine
+                .usage_for_until(&user, &machine_id, &account, cached, deadline)
+                .await
+        });
+        if cached {
+            return work.await;
+        }
+        match tokio::time::timeout_at(deadline, work).await {
+            Ok(result) => result,
+            // Server::run keeps already-started work alive; this read only returns its cache.
+            Err(_) => Ok(self.engine.usage_while_refreshing(&machine.user, id).await),
+        }
+    }
     /// Wait until every running engine task has finished.
     async fn drain(&self) {
         let _all = self.work.acquire_many(64).await;
@@ -811,29 +848,11 @@ async fn usage(
     headers: HeaderMap,
     Query(input): Query<UsageQuery>,
 ) -> Result<Response, HttpError> {
+    let deadline = tokio::time::Instant::now() + engine::USAGE_BUDGET;
     let machine = server.authorize(&headers).await?;
-    let engine = server.engine.clone();
     let account = input.account_id.clone();
-    let usage_permit = if input.cached {
-        None
-    } else {
-        Some(
-            server
-                .usage_work
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| server.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?,
-        )
-    };
     let result = server
-        .run(async move {
-            // Keep admission until the detached work ends, even if its HTTP caller leaves.
-            let _usage_permit = usage_permit;
-            engine
-                .usage_for(&machine.user, &machine.id, &input.account_id, input.cached)
-                .await
-        })
+        .read_usage(&machine, &input.account_id, input.cached, deadline)
         .await?
         .map_err(|e| server.engine_error(&e, "usage_unavailable"))?;
     if let Some(reason) = result.failure {

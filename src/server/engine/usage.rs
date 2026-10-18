@@ -29,6 +29,13 @@ impl Usage {
             || at >= self.next_retry_at
             || self.observed_at.is_some_and(|t| t > at + USABLE)
     }
+    fn while_refreshing(mut self) -> Result<Self> {
+        if self.data.is_none() {
+            return Err(RefreshInProgress.into());
+        }
+        self.stale = true;
+        Ok(self)
+    }
 }
 /// Provider throttling shared by every account and replica.
 #[derive(Default, Serialize, Deserialize)]
@@ -84,7 +91,28 @@ impl Engine {
         id: &str,
         cached: bool,
     ) -> Result<Usage> {
+        self.usage_for_until(
+            user,
+            machine,
+            id,
+            cached,
+            tokio::time::Instant::now() + USAGE_BUDGET,
+        )
+        .await
+    }
+    /// Preserve the caller's budget through admission and engine work.
+    pub(in crate::server) async fn usage_for_until(
+        &self,
+        user: &str,
+        machine: &str,
+        id: &str,
+        cached: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<Usage> {
         if !cached {
+            if tokio::time::Instant::now() >= deadline {
+                return self.usage_while_refreshing(user, id).await;
+            }
             let loaded = self.selected(user, id).await?;
             if loaded.record.phase == Phase::Ready
                 && !matches!(loaded.record.rotation, Rotation::Pending { .. })
@@ -97,22 +125,40 @@ impl Engine {
                     .context(ExpiredRefreshFailed)?;
             }
         }
-        self.read_usage(user, id, cached).await
+        self.read_usage(user, id, cached, deadline).await
     }
     pub async fn usage(&self, user: &str, id: &str, cached: bool) -> Result<Usage> {
         self.usage_for(user, "server", id, cached).await
     }
-    async fn read_usage(&self, user: &str, id: &str, cached: bool) -> Result<Usage> {
-        // The client allows 40 s. Reserve 3 s for optional metadata and leave room for
-        // store reads/release. A late lease claim must not shorten the provider timeout.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(32);
+    /// Deadline fallback does no provider work and does not change the stored observation.
+    pub(in crate::server) async fn usage_while_refreshing(
+        &self,
+        user: &str,
+        id: &str,
+    ) -> Result<Usage> {
+        self.selected(user, id).await?;
+        self.stored::<Usage>(id).await?.while_refreshing()
+    }
+    async fn read_usage(
+        &self,
+        user: &str,
+        id: &str,
+        cached: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<Usage> {
         self.selected(user, id).await?;
         if cached {
             let mut result: Usage = self.stored(id).await?;
             result.stale = result.is_stale_at(now());
             return Ok(result);
         }
-        let _poll = self.usage_poll.lock().await;
+        if tokio::time::Instant::now() >= deadline {
+            return self.usage_while_refreshing(user, id).await;
+        }
+        let _poll = match tokio::time::timeout_at(deadline, self.usage_poll.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => return self.usage_while_refreshing(user, id).await,
+        };
         loop {
             let mut result: Usage = self.stored(id).await?;
             result.stale = result.is_stale_at(now());
@@ -137,11 +183,7 @@ impl Engine {
                 return polled;
             }
             if tokio::time::Instant::now() >= deadline {
-                if result.data.is_some() {
-                    result.stale = true;
-                    return Ok(result);
-                }
-                return Err(RefreshInProgress.into());
+                return result.while_refreshing();
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -170,11 +212,7 @@ impl Engine {
         }
         if deadline.saturating_duration_since(tokio::time::Instant::now()) < Duration::from_secs(30)
         {
-            if result.data.is_some() {
-                result.stale = true;
-                return Ok(result);
-            }
-            return Err(RefreshInProgress.into());
+            return result.while_refreshing();
         }
         throttle.last_request = now();
         let response = self

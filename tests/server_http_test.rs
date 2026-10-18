@@ -328,6 +328,19 @@ async fn waiting_live_usage_reads_do_not_block_cached_usage_or_token_requests() 
     };
     let (_, mac) = f.register(AMIR, "mac").await;
     let id = f.migrate(&mac).await;
+    let observed = chrono::Utc::now().timestamp_millis() - 300_001;
+    let stored = claudectl::server::engine::Usage {
+        data: Some(json!({"seven_day":{"utilization":98}})),
+        observed_at: Some(observed),
+        next_retry_at: 0,
+        ..Default::default()
+    };
+    let sealed = claudectl::server::vault::encrypt(
+        &f._root.path().join("key"),
+        &serde_json::to_vec(&stored).unwrap(),
+    )
+    .unwrap();
+    f.server.store().put_usage(&id, &sealed).await.unwrap();
     // Hold the shared poll lease, as when another replica is polling the provider.
     let peer = claudectl::server::store::PostgresStore::connect(url)
         .await
@@ -355,6 +368,7 @@ async fn waiting_live_usage_reads_do_not_block_cached_usage_or_token_requests() 
                 .await
         });
     }
+    let started = tokio::time::Instant::now();
     start.wait().await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let cached = tokio::time::timeout(
@@ -377,10 +391,32 @@ async fn waiting_live_usage_reads_do_not_block_cached_usage_or_token_requests() 
         ),
     )
     .await;
+    // Keep the peer's lease held: queued reads must share the first request's budget,
+    // rather than beginning a new 32-second wait when they finally gain admission.
+    let responses = tokio::time::timeout_at(started + Duration::from_secs(39), async {
+        let mut responses = Vec::new();
+        while let Some(result) = readers.join_next().await {
+            let response = result.unwrap().unwrap();
+            let status = response.status().as_u16();
+            responses.push((status, response.json::<Value>().await.unwrap()));
+        }
+        responses
+    })
+    .await;
     peer.release_lease(&lease, "__usage").await.unwrap();
-    readers.abort_all();
     assert_eq!(cached.expect("live usage blocked a cached read").0, 200);
     assert_eq!(token.expect("live usage blocked token issuance").0, 200);
+    let responses = responses.expect("a queued usage response exceeded the client window");
+    assert!(started.elapsed() < Duration::from_secs(40));
+    assert_eq!(responses.len(), 128);
+    for (status, body) in responses {
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["data"]["seven_day"]["utilization"], 98);
+        assert_eq!(body["stale"], true);
+        assert!(body["error"].is_null());
+        assert_eq!(body["observed_at"], observed);
+        assert_eq!(body["next_retry_at"], 0);
+    }
 }
 
 #[tokio::test]
