@@ -274,10 +274,15 @@ regardless of how many fires were missed, then stop.
 For a Fleet Operator, `HERDR_TAB_ID` selects the matching `operator_tab` in
 `~/Code/.fleet/*/operator.md`. Its `cron_prompts` entries (a prompt file and five schedule
 fields, separated by semicolons) are the source of truth, even when the resumed session's
-CronList is empty. The renewal prompt names every file and schedule, asks Claude to read
+CronList is empty. Cards without saved jobs do not participate in discovery. When one tab
+owns several populated cards, their jobs are merged: the same resolved prompt file and
+schedule is created once, with its new ID recorded on every owning card. Different schedules
+for the same file across cards skip recovery with a conflict reason; a single card can
+still schedule one file at several times. The renewal prompt names every
+participating card, file and schedule, asks Claude to read
 each prompt verbatim, delete only matching card-owned IDs from `cron_ids` while preserving
-other session jobs, create the recurring jobs, run CronList again, and update the
-card's `cron_ids` and `claude_session_file`. claudectl reads that final inventory from the
+other session jobs, create the recurring jobs, run CronList again, and update
+each card's `cron_ids` and `claude_session_file`. claudectl reads that final inventory from the
 renewed session transcript, matched to its tool call and renewal prompt. It prints
 `cron recovery verified: N/N saved jobs`, `missing cron: <file> (<schedule>)`, or an explicit
 unverified notice if evidence is absent or unreadable. Prompt contents are not printed.
