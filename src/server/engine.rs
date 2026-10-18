@@ -326,6 +326,8 @@ async fn capped_body(mut response: reqwest::Response) -> Result<Vec<u8>, Body> {
 const RECORD_VERSION: u32 = 2;
 /// The usage poll lease: one replica polls the provider at a time.
 const USAGE_LEASE: &str = "__usage";
+/// Leave room inside the client's 40-second window for a final stored read and response.
+pub(super) const USAGE_BUDGET: Duration = Duration::from_secs(32);
 
 /// The machine of a sign-in started in the browser dashboard. Machine IDs are
 /// `<name>-<12 hex>`, so no machine has this ID and no machine can finish such a sign-in.

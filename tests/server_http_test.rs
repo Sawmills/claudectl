@@ -320,6 +320,106 @@ async fn machine_reset_listing_is_hidden_when_the_reset_gate_is_off() {
 }
 
 #[tokio::test]
+async fn waiting_live_usage_reads_do_not_block_cached_usage_or_token_requests() {
+    let f = Fixture::new(None).await;
+    let Some(url) = f.database_url.as_ref() else {
+        eprintln!("Cross-replica usage admission coverage requires CLAUDECTL_TEST_DATABASE_URL");
+        return;
+    };
+    let (_, mac) = f.register(AMIR, "mac").await;
+    let id = f.migrate(&mac).await;
+    let observed = chrono::Utc::now().timestamp_millis() - 300_001;
+    let stored = claudectl::server::engine::Usage {
+        data: Some(json!({"seven_day":{"utilization":98}})),
+        observed_at: Some(observed),
+        next_retry_at: 0,
+        ..Default::default()
+    };
+    let sealed = claudectl::server::vault::encrypt(
+        &f._root.path().join("key"),
+        &serde_json::to_vec(&stored).unwrap(),
+    )
+    .unwrap();
+    f.server.store().put_usage(&id, &sealed).await.unwrap();
+    // Hold the shared poll lease, as when another replica is polling the provider.
+    let peer = claudectl::server::store::PostgresStore::connect(url)
+        .await
+        .unwrap();
+    let lease = peer
+        .acquire_lease("__usage", 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let start = Arc::new(tokio::sync::Barrier::new(129));
+    let mut readers = tokio::task::JoinSet::new();
+    for _ in 0..128 {
+        let (http, origin, mac, id, start) = (
+            f.http.clone(),
+            f.origin.clone(),
+            mac.clone(),
+            id.clone(),
+            start.clone(),
+        );
+        readers.spawn(async move {
+            start.wait().await;
+            http.get(format!("{origin}/v2/anthropic/usage?account_id={id}"))
+                .bearer_auth(mac)
+                .send()
+                .await
+        });
+    }
+    let started = tokio::time::Instant::now();
+    start.wait().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let cached = tokio::time::timeout(
+        Duration::from_secs(2),
+        f.call(
+            reqwest::Method::GET,
+            &format!("/v2/anthropic/usage?account_id={id}&cached=true"),
+            Some(&mac),
+            None,
+        ),
+    )
+    .await;
+    let token = tokio::time::timeout(
+        Duration::from_secs(2),
+        f.call(
+            reqwest::Method::POST,
+            "/v2/anthropic/token",
+            Some(&mac),
+            Some(json!({"account_id":id})),
+        ),
+    )
+    .await;
+    // Keep the peer's lease held: queued reads must share the first request's budget,
+    // rather than beginning a new 32-second wait when they finally gain admission.
+    let responses = tokio::time::timeout_at(started + Duration::from_secs(39), async {
+        let mut responses = Vec::new();
+        while let Some(result) = readers.join_next().await {
+            let response = result.unwrap().unwrap();
+            let status = response.status().as_u16();
+            responses.push((status, response.json::<Value>().await.unwrap()));
+        }
+        responses
+    })
+    .await;
+    peer.release_lease(&lease, "__usage").await.unwrap();
+    assert_eq!(cached.expect("live usage blocked a cached read").0, 200);
+    assert_eq!(token.expect("live usage blocked token issuance").0, 200);
+    let responses = responses.expect("a queued usage response exceeded the client window");
+    assert!(started.elapsed() < Duration::from_secs(40));
+    assert_eq!(responses.len(), 128);
+    for (status, body) in responses {
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["data"]["seven_day"]["utilization"], 98);
+        assert_eq!(body["stale"], true);
+        assert!(body["error"].is_null());
+        assert_eq!(body["observed_at"], observed);
+        assert_eq!(body["next_retry_at"], 0);
+    }
+}
+
+#[tokio::test]
 async fn a_deleted_account_answers_gone_and_a_revoked_machine_is_refused() {
     let f = Fixture::new(None).await;
     let (mac_id, mac) = f.register(AMIR, "mac").await;

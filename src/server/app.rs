@@ -63,6 +63,8 @@ pub struct Server {
     failures: Arc<StdMutex<BTreeMap<&'static str, (u64, i64)>>>,
     seen_writes: SeenWrites,
     work: Arc<Semaphore>,
+    /// Queue live usage before shared work admission; the engine serializes polls anyway.
+    usage_work: Arc<Semaphore>,
     /// Set on shutdown: readiness fails while in-flight work finishes.
     draining: AtomicBool,
 }
@@ -226,6 +228,7 @@ impl Server {
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
             seen_writes: SeenWrites::default(),
             work: Arc::new(Semaphore::new(64)),
+            usage_work: Arc::new(Semaphore::new(1)),
             draining: AtomicBool::new(false),
         }))
     }
@@ -387,6 +390,43 @@ impl Server {
         })
         .await
         .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))
+    }
+    async fn read_usage(
+        &self,
+        machine: &Machine,
+        id: &str,
+        cached: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<Result<engine::Usage>, HttpError> {
+        let usage_permit = if cached {
+            None
+        } else {
+            match tokio::time::timeout_at(deadline, self.usage_work.clone().acquire_owned()).await {
+                Ok(permit) => {
+                    Some(permit.map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping")
+                    })?)
+                }
+                Err(_) => return Ok(self.engine.usage_while_refreshing(&machine.user, id).await),
+            }
+        };
+        let engine = self.engine.clone();
+        let (user, machine_id, account) = (machine.user.clone(), machine.id.clone(), id.to_owned());
+        let work = self.run(async move {
+            // A dropped HTTP caller must not release admission or cancel grant persistence.
+            let _usage_permit = usage_permit;
+            engine
+                .usage_for_until(&user, &machine_id, &account, cached, deadline)
+                .await
+        });
+        if cached {
+            return work.await;
+        }
+        match tokio::time::timeout_at(deadline, work).await {
+            Ok(result) => result,
+            // Server::run keeps already-started work alive; this read only returns its cache.
+            Err(_) => Ok(self.engine.usage_while_refreshing(&machine.user, id).await),
+        }
     }
     /// Wait until every running engine task has finished.
     async fn drain(&self) {
@@ -808,15 +848,11 @@ async fn usage(
     headers: HeaderMap,
     Query(input): Query<UsageQuery>,
 ) -> Result<Response, HttpError> {
+    let deadline = tokio::time::Instant::now() + engine::USAGE_BUDGET;
     let machine = server.authorize(&headers).await?;
-    let engine = server.engine.clone();
     let account = input.account_id.clone();
     let result = server
-        .run(async move {
-            engine
-                .usage_for(&machine.user, &machine.id, &input.account_id, input.cached)
-                .await
-        })
+        .read_usage(&machine, &input.account_id, input.cached, deadline)
         .await?
         .map_err(|e| server.engine_error(&e, "usage_unavailable"))?;
     if let Some(reason) = result.failure {
