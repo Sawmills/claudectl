@@ -65,7 +65,7 @@ jobs:
     name: Build ${{ matrix.label }}
     needs: setup
     # trunk-ignore(actionlint/runner-label): Existing Namespace profile
-    runs-on: ${{ fromJSON('{"ubuntu-latest":"namespace-profile-sawmills-runner","ubuntu-22.04-arm":"namespace-profile-sawmills-runner-arm64"}')[matrix.os] || matrix.os }}
+    runs-on: ${{ fromJSON('{"macos-14":"macos-14","macos-15-intel":"macos-15-intel","ubuntu-latest":"namespace-profile-sawmills-runner","ubuntu-22.04-arm":"namespace-profile-sawmills-runner-arm64"}')[matrix.os] }}
     container: ${{ matrix.container || '' }}
     defaults:
       run:
