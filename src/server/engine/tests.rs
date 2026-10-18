@@ -1774,10 +1774,21 @@ async fn live_usage_waits_for_another_replicas_refresh_of_an_expired_cache() {
             let read = follower.usage_for("person", "machine", &account.account_id, false);
             tokio::pin!(read);
             let early = tokio::time::timeout(Duration::from_millis(100), &mut read).await;
+            let cached_during_wait = tokio::time::timeout(
+                Duration::from_secs(1),
+                follower.usage("person", &account.account_id, true),
+            )
+            .await;
             release.notify_one();
             assert!(
                 early.is_err(),
                 "a live read returned the expired cache during refresh"
+            );
+            assert!(
+                cached_during_wait
+                    .expect("a cached read waited behind the live follower")
+                    .unwrap()
+                    .stale
             );
             tokio::time::timeout(Duration::from_secs(2), read)
                 .await

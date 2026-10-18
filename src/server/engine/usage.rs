@@ -104,14 +104,19 @@ impl Engine {
     }
     async fn read_usage(&self, user: &str, id: &str, cached: bool) -> Result<Usage> {
         // The client allows 40 s. Reserve 3 s for optional metadata and leave room for
-        // store reads/release; waiting for a replica consumes the same provider budget.
+        // store reads/release. A late lease claim must not shorten the provider timeout.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(32);
         self.selected(user, id).await?;
+        if cached {
+            let mut result: Usage = self.stored(id).await?;
+            result.stale = result.is_stale_at(now());
+            return Ok(result);
+        }
         let _poll = self.usage_poll.lock().await;
         loop {
             let mut result: Usage = self.stored(id).await?;
             result.stale = result.is_stale_at(now());
-            if cached || now() < result.next_retry_at {
+            if now() < result.next_retry_at {
                 return Ok(result);
             }
             // Only the holder polls and updates the shared throttle. A live follower waits
@@ -124,8 +129,13 @@ impl Engine {
                     if now() < result.next_retry_at {
                         return Ok(result);
                     }
+                    if deadline.saturating_duration_since(tokio::time::Instant::now())
+                        < Duration::from_secs(30)
+                    {
+                        return Err(RefreshInProgress.into());
+                    }
                     let loaded = self.selected(user, id).await?;
-                    self.poll_usage(&loaded, id, result, deadline).await
+                    self.poll_usage(&loaded, id, result).await
                 }
                 .await;
                 self.store.release_lease(&lease, USAGE_LEASE).await?;
@@ -137,13 +147,7 @@ impl Engine {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
-    async fn poll_usage(
-        &self,
-        loaded: &Loaded,
-        id: &str,
-        mut result: Usage,
-        deadline: tokio::time::Instant,
-    ) -> Result<Usage> {
+    async fn poll_usage(&self, loaded: &Loaded, id: &str, mut result: Usage) -> Result<Usage> {
         let mut throttle: Throttle = self.stored(THROTTLE).await?;
         if now() < throttle.cooldown_until {
             result.next_retry_at = result.next_retry_at.max(throttle.cooldown_until);
@@ -159,17 +163,11 @@ impl Engine {
         if wait > 0 {
             tokio::time::sleep(Duration::from_millis(wait)).await;
         }
-        let timeout = deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or(RefreshInProgress)?
-            .min(Duration::from_secs(30));
         throttle.last_request = now();
         let response = self
             .http
             .get(format!("{}/api/oauth/usage", self.endpoints.api))
             .query(&[("cedar_ember", "1")])
-            .timeout(timeout)
             .bearer_auth(&loaded.record.grant.access_token)
             .header("anthropic-beta", BETA)
             .send()
