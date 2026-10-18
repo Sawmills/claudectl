@@ -1804,6 +1804,87 @@ async fn live_usage_waits_for_another_replicas_refresh_of_an_expired_cache() {
 }
 
 #[tokio::test]
+async fn a_usage_follower_preserves_a_shared_cooldown_after_waiting() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let count = Arc::new(AtomicUsize::new(0));
+    let provider = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/api/oauth/usage",
+            get({
+                let (entered, release, count) = (entered.clone(), release.clone(), count.clone());
+                move || {
+                    let (entered, release, count) =
+                        (entered.clone(), release.clone(), count.clone());
+                    async move {
+                        if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                            return Json(json!({"seven_day":{"utilization":98}})).into_response();
+                        }
+                        entered.notify_one();
+                        release.notified().await;
+                        axum::http::StatusCode::TOO_MANY_REQUESTS.into_response()
+                    }
+                }
+            }),
+        );
+    let Some((_fixture, owner, follower)) = replicas(provider).await else {
+        return;
+    };
+    let idle = owner
+        .admit(
+            "person",
+            "idle",
+            "m",
+            grant_until("idle", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let busy = owner
+        .admit(
+            "other",
+            "busy",
+            "m",
+            grant_until("busy", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut expired = owner
+        .usage("person", &idle.account_id, false)
+        .await
+        .unwrap();
+    expired.observed_at = Some(now() - 300_001);
+    expired.next_retry_at = now() - 1;
+    owner
+        .store
+        .put_usage(&idle.account_id, &owner.seal(&expired).unwrap())
+        .await
+        .unwrap();
+    let (limited, pending) = tokio::join!(owner.usage("other", &busy.account_id, false), async {
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let read = follower.usage("person", &idle.account_id, false);
+        tokio::pin!(read);
+        // A late claim must still return a genuine shared cooldown, not a local budget error.
+        let early = tokio::time::timeout(Duration::from_millis(2_100), &mut read).await;
+        release.notify_one();
+        assert!(early.is_err());
+        tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .unwrap()
+    });
+    let (limited, pending) = (limited.unwrap(), pending.unwrap());
+    assert_eq!(limited.error.as_deref(), Some("usage_throttled"));
+    assert!(pending.stale && pending.error.is_none());
+    assert_eq!(pending.next_retry_at, limited.next_retry_at);
+    assert!(pending.next_retry_at > now());
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn two_replicas_reading_usage_poll_the_provider_once() {
     let count = Arc::new(AtomicUsize::new(0));
     let calls = count.clone();

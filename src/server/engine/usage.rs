@@ -129,13 +129,8 @@ impl Engine {
                     if now() < result.next_retry_at {
                         return Ok(result);
                     }
-                    if deadline.saturating_duration_since(tokio::time::Instant::now())
-                        < Duration::from_secs(30)
-                    {
-                        return Err(RefreshInProgress.into());
-                    }
                     let loaded = self.selected(user, id).await?;
-                    self.poll_usage(&loaded, id, result).await
+                    self.poll_usage(&loaded, id, result, deadline).await
                 }
                 .await;
                 self.store.release_lease(&lease, USAGE_LEASE).await?;
@@ -147,7 +142,13 @@ impl Engine {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
-    async fn poll_usage(&self, loaded: &Loaded, id: &str, mut result: Usage) -> Result<Usage> {
+    async fn poll_usage(
+        &self,
+        loaded: &Loaded,
+        id: &str,
+        mut result: Usage,
+        deadline: tokio::time::Instant,
+    ) -> Result<Usage> {
         let mut throttle: Throttle = self.stored(THROTTLE).await?;
         if now() < throttle.cooldown_until {
             result.next_retry_at = result.next_retry_at.max(throttle.cooldown_until);
@@ -162,6 +163,10 @@ impl Engine {
         let wait = (throttle.last_request + 1000 - now()).max(0) as u64;
         if wait > 0 {
             tokio::time::sleep(Duration::from_millis(wait)).await;
+        }
+        if deadline.saturating_duration_since(tokio::time::Instant::now()) < Duration::from_secs(30)
+        {
+            return Err(RefreshInProgress.into());
         }
         throttle.last_request = now();
         let response = self
