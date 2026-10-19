@@ -7,6 +7,28 @@ const ARMED: &str = "cron-recovery";
 const TRANSCRIPT: &str = "cron-transcript.json";
 const TRANSCRIPT_LIMIT: u64 = 8 * 1024 * 1024;
 
+/// Recovery diagnostics must never write over Claude's live terminal. Keep them outside
+/// the temporary run directory so they remain available after the session exits.
+pub(super) fn log_notice(home: &Path, directory: &Path, message: &str) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = home.join(".claudectl/server/cron-recovery.jsonl");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .context("could not open cron recovery log")?;
+    let mut record = serde_json::to_vec(&json!({
+        "at": now(),
+        "session": directory.file_name().and_then(|name| name.to_str()).context("run directory has no name")?,
+        "message": message,
+    }))?;
+    record.push(b'\n');
+    file.write_all(&record)
+        .context("could not append cron recovery log")
+}
+
 struct Job {
     file: PathBuf,
     schedule: String,
@@ -34,14 +56,14 @@ pub(super) struct Recovery {
 
 impl Recovery {
     pub(super) fn prepare(home: &Path, directory: &Path, session_id: &str) -> Result<Option<Self>> {
-        let mut recovery = Self::discover(home)?;
+        let mut recovery = Self::discover(home, directory)?;
         if let Some(recovery) = &mut recovery {
             recovery.arm(directory, session_id)?;
         }
         Ok(recovery)
     }
 
-    fn discover(home: &Path) -> Result<Option<Self>> {
+    fn discover(home: &Path, run: &Path) -> Result<Option<Self>> {
         let Some(tab) = std::env::var_os("HERDR_TAB_ID") else {
             return Ok(None);
         };
@@ -68,10 +90,14 @@ impl Recovery {
                 Ok(text) => text,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(_) => {
-                    eprintln!(
-                        "claudectl: cron recovery discovery skipped unreadable Operator card: {}",
-                        card.display()
-                    );
+                    log_notice(
+                        home,
+                        run,
+                        &format!(
+                            "cron recovery discovery skipped unreadable Operator card: {}",
+                            card.display()
+                        ),
+                    )?;
                     continue;
                 }
             };
