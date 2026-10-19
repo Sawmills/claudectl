@@ -17,14 +17,14 @@ pub struct Cli {
 }
 
 const RUN_EXAMPLES: &str = "Examples:
-  claudectl run                 start Claude on the account with the most room
+  claudectl run                 start Claude on the account whose week resets first
   claudectl run amir2           start on amir2 (full name, email name, or a unique prefix)
   claudectl run amir2 --failover   on a usage limit, move the session to another account
   claudectl run -- --resume ID  pass arguments to Claude after --";
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start Claude on a server account (the one with the most room if none is named)
+    /// Start Claude on a server account (the earliest weekly reset if none is named)
     #[command(after_help = format!("{RUN_EXAMPLES}\n\n{}", claudectl::central::RUN_SETTINGS_HELP))]
     Run {
         /// Account to use: full name, email name (amir2), or a unique prefix
@@ -122,10 +122,10 @@ enum Commands {
         /// Custom alias (defaults to email)
         alias: Option<String>,
     },
-    /// Switch to a profile by alias (or most available if omitted)
+    /// Switch to a profile by alias (or earliest weekly reset if omitted)
     #[command(hide = true)]
     Use {
-        /// Profile alias to switch to (auto-selects most available if omitted)
+        /// Profile alias to switch to (auto-selects earliest weekly reset if omitted)
         alias: Option<String>,
     },
     /// Interactive fuzzy picker to switch accounts
@@ -189,7 +189,7 @@ enum Commands {
         /// Lane name: the session state kept between accounts
         #[arg(long)]
         lane: String,
-        /// Start on this saved profile (default: the rate-limited account with most room)
+        /// Start on this saved profile (default: the unbilled account whose week resets first)
         #[arg(long)]
         account: Option<String>,
         /// Allow starting on an account that may bill credits without asking

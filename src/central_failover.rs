@@ -403,6 +403,24 @@ mod tests {
     }
 
     #[test]
+    fn recovery_prefers_the_ready_account_whose_week_resets_first() {
+        let with_reset = |week, reset: &str| {
+            let mut data = room(25.0, week);
+            data["seven_day"]["resets_at"] = json!(reset);
+            data
+        };
+        let rows = [
+            row("current", full()),
+            row("amir5", with_reset(35.0, "2099-01-07T00:00:00Z")),
+            row("amir", with_reset(62.0, "2099-01-02T00:00:00Z")),
+        ];
+        assert_eq!(
+            choose(&rows, "current", &[], &HashMap::new(), &[]).as_deref(),
+            Some("amir")
+        );
+    }
+
+    #[test]
     fn a_single_session_is_never_blocked_by_the_cap() {
         let rows = vec![row("cur", full()), row("free", room(1.0, 1.0))];
         let live = HashMap::from([("cur".to_string(), 1)]);

@@ -31,8 +31,8 @@ _claudectl_profiles() {
         // Complete profile aliases for use, remove, status, and label.
         // `use`'s alias is optional, so clap emits a double-colon spec.
         script = script.replace(
-            "'::alias -- Profile alias to switch to (auto-selects most available if omitted):_default'",
-            "'::alias -- Profile alias to switch to (auto-selects most available if omitted):_claudectl_profiles'",
+            "'::alias -- Profile alias to switch to (auto-selects earliest weekly reset if omitted):_default'",
+            "'::alias -- Profile alias to switch to (auto-selects earliest weekly reset if omitted):_claudectl_profiles'",
         );
         script = script.replace(
             "':alias -- Profile alias to remove:_default'",

@@ -1,7 +1,7 @@
 # claudectl
 
 Run Claude Code on the company's shared Claude accounts. claudectl picks the account
-with the most room, moves a session to another account at a usage limit, and shows
+whose week resets first, moves a session to another account at a usage limit, and shows
 every account's usage in the terminal and in a browser dashboard. It also manages
 local Claude Code profiles. The account server is an implementation preview (see
 below). Sibling of [codexctl](https://github.com/Sawmills/codexctl).
@@ -27,7 +27,7 @@ access tokens only, never a refresh token.
 claudectl server connect https://claudectl.example.com --name laptop   # once per machine
 claudectl add amir8              # add an account: sign in to Claude, paste the code
 claudectl                        # the accounts, the one to use, and the next command
-claudectl run                    # start Claude on the account with the most room
+claudectl run                    # start Claude on the account whose week resets first
 claudectl run amir2              # start on amir2 (full name, email name, or prefix)
 echo '<code#state>' | claudectl add amir8 --no-browser   # add from a script
 ```
@@ -280,7 +280,7 @@ returns an error that asks you to retry after the other command finishes.
 
 ```bash
 claudectl use amir+2@example.com   # direct
-claudectl use                      # auto-select the most available account
+claudectl use                      # auto-select the earliest weekly reset
 claudectl switch                   # interactive fuzzy picker
 ```
 
@@ -293,10 +293,12 @@ live auth. On macOS it updates the `Claude Code-credentials` Keychain entry,
 `~/.claude/.credentials.json`, and the `oauthAccount` identity in `~/.claude.json` —
 so Claude Code shows the right account immediately.
 
-Auto-select uses only fresh, successful results with known five-hour and weekly
-usage below 100%. It picks the lowest `max(5h, 7d)` utilization and breaks near-ties
-toward the soonest weekly reset. Model-specific limits remain visible in the table;
-automatic selection does not choose for a particular model.
+Automatic selection uses only fresh, successful results with known five-hour and
+weekly usage below 100%, no exhausted model-specific window, and extra usage known
+off. It prefers the earliest weekly reset hour, then the most weekly room. Accounts
+with an unknown reset time follow all known resets, ordered by weekly room. This
+rule applies to local profiles, server launches, and recovery. Server recovery also
+keeps its Ready-only, recent-target, and session-crowding guards.
 
 ### Run one command on a saved account
 
@@ -401,13 +403,13 @@ a time holds a lane.
 When Claude records a rate-limit error in the lane's transcript and one usage
 read confirms the account is at 100% of a window, claudectl ends the run
 (Claude gets `SIGTERM` and saves its session), picks the rate-limited account
-with the most room that this launch has not tried, and starts it with
+whose week resets first among those this launch has not tried, and starts it with
 `--resume <session> "<recovery prompt>"`. It never picks an account that may
 bill credits (`usage_based` or `unknown` in `status --json`) and stops after 3
 recoveries in an hour, or when no account has room; the session stays in the
 lane. An explicit `--account` that may bill credits needs a yes on the terminal
 or `--allow-billing`. Without `--account`, it starts on the rate-limited
-account with the most room. `--lane` names the lane; `accounts.jsonl` in the
+account whose week resets first. `--lane` names the lane; `accounts.jsonl` in the
 lane records which account ran when, and `receipts.jsonl` holds the `exec`
 receipts.
 
