@@ -2311,14 +2311,15 @@ mod tests {
         );
         // Short names: the shared domain is dropped.
         let amir3 = lines.iter().find(|l| l.contains("amir3")).unwrap();
-        assert!(amir3.starts_with("→ "), "{text}");
+        assert!(!amir3.starts_with("→ "), "{text}");
         assert!(!amir3.contains("@sawmills.ai"), "{text}");
         assert!(amir3.contains("ready"), "{text}");
         assert!(amir3.contains("5h in 12h 52m"), "{text}");
         let amir4 = lines.iter().find(|l| l.contains("amir4")).unwrap();
         assert!(amir4.contains("Fable limit"), "{text}");
         let amir7 = lines.iter().find(|l| l.contains("amir7")).unwrap();
-        assert!(amir7.starts_with("* "), "{text}");
+        // A known weekly reset wins over amir3's unknown reset, despite less room.
+        assert!(amir7.starts_with("→ "), "{text}");
         assert!(
             amir7.contains("low (week)") && amir7.contains("week in 1d 3h"),
             "{text}"
@@ -2329,7 +2330,7 @@ mod tests {
         );
         assert_eq!(
             *lines.last().unwrap(),
-            "Next: claudectl run   (picks amir3)"
+            "Next: claudectl use amir7@sawmills.ai"
         );
         // No repeated commands, no disclaimer footer, no box drawing.
         assert_eq!(text.matches("claudectl").count(), 1, "{text}");
