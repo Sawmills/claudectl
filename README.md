@@ -46,6 +46,12 @@ echo '<code#state>' | claudectl add amir8 --no-browser   # add from a script
 
 Pass per-session Claude settings after `--`:
 
+New server and pinned local sessions put `~/.local/lib/lane-bin` first on PATH
+when that directory exists. Any later copy of that entry is removed; all other
+entries keep their order. Without the directory, PATH stays unchanged. This lets
+session tools use installed lane wrappers, including the GitHub App wrapper.
+Existing sessions keep their original environment until restarted.
+
 ```bash
 claudectl run work -- --settings '{"crossSessionInbound":"accept","isolatePeerMachines":true}'
 claudectl server run work -- --settings ./pilot-settings.json

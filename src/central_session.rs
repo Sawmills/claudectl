@@ -8,6 +8,7 @@ use crate::exec;
 use std::{ffi::OsString, process::Command};
 
 pub struct Session {
+    home: PathBuf,
     directory: tempfile::TempDir,
     _lease: File,
     account: Account,
@@ -54,6 +55,7 @@ impl Session {
         let lease = options.open(directory.path().join("owner.lock"))?;
         lease.try_lock()?;
         let session = Self {
+            home: paths.home.clone(),
             directory,
             _lease: lease,
             account: account.clone(),
@@ -132,6 +134,7 @@ impl Session {
     }
     pub fn command(&self, program: &Path, args: &[OsString]) -> Result<Command> {
         let mut command = Command::new(program);
+        exec::prefer_lane_bin(&mut command, &self.home).context("cannot build session PATH")?;
         command.args(args);
         for (name, _) in std::env::vars_os() {
             if name.to_str().is_some_and(exec::is_scrubbed_env) {
