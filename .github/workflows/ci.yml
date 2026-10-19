@@ -81,7 +81,6 @@ jobs:
       contents: read
       checks: write
     name: Trunk Check
-    needs: check
     if: github.event_name != 'merge_group' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-slim
     steps:
@@ -184,6 +183,7 @@ jobs:
 
   build-macos:
     name: Build (macOS)
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
