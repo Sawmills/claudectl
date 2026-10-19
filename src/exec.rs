@@ -25,6 +25,24 @@ use crate::profile;
 pub const TOKEN_FD_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR";
 pub const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 
+/// Every session prefers installed lane wrappers. Preserve all other PATH entries,
+/// including empty entries, and leave PATH untouched when lane-bin is absent.
+pub(crate) fn prefer_lane_bin(
+    command: &mut Command,
+    home: &Path,
+) -> Result<(), std::env::JoinPathsError> {
+    let lane_bin = home.join(".local/lib/lane-bin");
+    if !lane_bin.is_dir() {
+        return Ok(());
+    }
+    let mut paths = vec![lane_bin.clone()];
+    if let Some(inherited) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&inherited).filter(|path| path != &lane_bin));
+    }
+    command.env("PATH", std::env::join_paths(paths)?);
+    Ok(())
+}
+
 /// Credential sources the child must not inherit that `is_scrubbed_env`'s
 /// name rules do not cover.
 const SCRUBBED_ENV: &[&str] = &[
@@ -885,6 +903,8 @@ fn run_in_dir(
     receipt.write(&with(base, "prepared", serde_json::json!({})))?;
 
     let mut command = Command::new(&snapshot);
+    prefer_lane_bin(&mut command, &paths.home)
+        .map_err(|error| ExecError::Spawn(format!("cannot build session PATH: {error}")))?;
     command.args(&req.args);
     set_arg0(&mut command, &prepared.program);
     for (name, _) in std::env::vars_os() {
