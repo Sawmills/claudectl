@@ -30,7 +30,7 @@ pub fn run(alias: Option<&str>) -> Result<()> {
                 .collect();
             let Some(best) = accounts::best(&candidates) else {
                 bail!(
-                    "no saved profile has fresh usage below the general limits\nTry: claudectl run (server accounts), or claudectl status"
+                    "no saved profile is eligible: usage is missing, stale or exhausted, or billing is on or unknown\nTry: claudectl status --json"
                 );
             };
             let best = fetched[best].alias.clone();
