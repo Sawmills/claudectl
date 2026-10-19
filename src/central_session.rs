@@ -1031,11 +1031,14 @@ pub fn run(
                 ) {
                     Ok(recovery) => recovery,
                     Err(error) => {
-                        super::crons::log_notice(
+                        if let Err(error) = super::crons::log_notice(
                             &paths.home,
                             session.directory(),
                             &format!("cron recovery skipped: {error:#}"),
-                        )?;
+                        ) {
+                            // The old child is stopped and the next has not spawned.
+                            eprintln!("claudectl: could not record cron recovery: {error:#}");
+                        }
                         None
                     }
                 };

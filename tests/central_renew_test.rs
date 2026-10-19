@@ -421,6 +421,12 @@ fn operator_recovery_logs_its_result_without_touching_the_child_terminal() {
     use std::os::unix::fs::PermissionsExt;
     let env = Env::new();
     env.operator_card();
+    let log = env
+        .home
+        .path()
+        .join(".claudectl/server/cron-recovery.jsonl");
+    std::fs::write(&log, "").unwrap();
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
     let refresher = env.refresh_when_idle();
     let quote = |s: &Path| format!("'{}'", s.display().to_string().replace('\'', "'\\''"));
     let inner = format!(
@@ -458,10 +464,6 @@ fn operator_recovery_logs_its_result_without_touching_the_child_terminal() {
             .unwrap()
             .is_empty()
     );
-    let log = env
-        .home
-        .path()
-        .join(".claudectl/server/cron-recovery.jsonl");
     let records: Vec<Value> = std::fs::read_to_string(&log)
         .unwrap()
         .lines()
@@ -483,6 +485,46 @@ fn operator_recovery_logs_its_result_without_touching_the_child_terminal() {
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[1]["tty"], true);
     assert_eq!(runs[1]["foreground"], true);
+}
+
+#[test]
+fn a_failed_cron_notice_log_does_not_abort_renewal_or_saved_job_recovery() {
+    for conflict in [false, true] {
+        let env = Env::new();
+        let [first, _] = env.operator_card();
+        let card = env.home.path().join("Code/.fleet/another/operator.md");
+        private_write(
+            &card,
+            if conflict {
+                "operator_tab: w9C:tF\ncron_prompts: '../example/check prompt.txt' 0 12 * * *\n"
+            } else {
+                "operator_tab: w9C:tOther\n"
+            },
+        );
+        if !conflict {
+            // An unreadable unrelated card must not suppress valid saved jobs either.
+            std::fs::write(card, b"operator_tab: w9C:tOther\n\xff").unwrap();
+        }
+        std::fs::create_dir(
+            env.home
+                .path()
+                .join(".claudectl/server/cron-recovery.jsonl"),
+        )
+        .unwrap();
+        let output = env.operator_restart(json!([]), "w9C:tF", false);
+        let runs = env.runs();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[1]["token"], "token-2");
+        let note = runs[1]["args"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(note.contains(first.to_str().unwrap()), !conflict, "{note}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("could not record cron recovery"));
+    }
 }
 
 #[test]

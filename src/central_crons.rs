@@ -10,7 +10,7 @@ const TRANSCRIPT_LIMIT: u64 = 8 * 1024 * 1024;
 /// Recovery diagnostics must never write over Claude's live terminal. Keep them outside
 /// the temporary run directory so they remain available after the session exits.
 pub(super) fn log_notice(home: &Path, directory: &Path, message: &str) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let path = home.join(".claudectl/server/cron-recovery.jsonl");
     let mut file = OpenOptions::new()
         .create(true)
@@ -19,6 +19,7 @@ pub(super) fn log_notice(home: &Path, directory: &Path, message: &str) -> Result
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .context("could not open cron recovery log")?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let mut record = serde_json::to_vec(&json!({
         "at": now(),
         "session": directory.file_name().and_then(|name| name.to_str()).context("run directory has no name")?,
@@ -90,14 +91,17 @@ impl Recovery {
                 Ok(text) => text,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(_) => {
-                    log_notice(
+                    if let Err(error) = log_notice(
                         home,
                         run,
                         &format!(
                             "cron recovery discovery skipped unreadable Operator card: {}",
                             card.display()
                         ),
-                    )?;
+                    ) {
+                        // Discovery runs between children, before the replacement spawns.
+                        eprintln!("claudectl: could not record cron recovery: {error:#}");
+                    }
                     continue;
                 }
             };
