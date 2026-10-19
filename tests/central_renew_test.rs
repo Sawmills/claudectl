@@ -575,14 +575,14 @@ fn operator_renewal_merges_owned_cards_and_deduplicates_shared_prompt_files() {
     assert!(note.contains(card.to_str().unwrap()), "{note}");
     assert!(note.contains("EACH named Operator card"), "{note}");
     assert!(note.contains("same new ID on every owning card"), "{note}");
-    let stderr = env.recovery_log(&output);
+    let notices = env.recovery_log(&output);
     assert!(
-        stderr.contains("cron recovery verified: 3/3 saved jobs"),
-        "{stderr}"
+        notices.contains("cron recovery verified: 3/3 saved jobs"),
+        "{notices}"
     );
     assert!(
-        !stderr.contains("missing cron") && !stderr.contains("cron recovery skipped"),
-        "{stderr}"
+        !notices.contains("missing cron") && !notices.contains("cron recovery skipped"),
+        "{notices}"
     );
 }
 
@@ -601,12 +601,12 @@ fn operator_renewal_preserves_distinct_schedules_for_one_cards_prompt_file() {
         {"id":"new-two","cron":"24 8 * * *","prompt":"Read the daily evidence.\n","recurring":true,"durable":false},
         {"id":"new-three","cron":"0 12 * * *","prompt":"Check the owned lanes.\n","recurring":true,"durable":false}
     ]), "w9C:tF", false);
-    let stderr = env.recovery_log(&output);
+    let notices = env.recovery_log(&output);
     assert!(
-        stderr.contains("cron recovery verified: 3/3 saved jobs"),
-        "{stderr}"
+        notices.contains("cron recovery verified: 3/3 saved jobs"),
+        "{notices}"
     );
-    assert!(!stderr.contains("cron recovery skipped"), "{stderr}");
+    assert!(!notices.contains("cron recovery skipped"), "{notices}");
 }
 
 #[test]
@@ -619,11 +619,11 @@ fn operator_renewal_skips_conflicting_schedules_without_aborting_the_renewal() {
     );
     let output = env.operator_restart(json!([]), "w9C:tF", false);
     env.assert_followed(&env.runs(), "token-2");
-    let stderr = env.recovery_log(&output);
-    assert!(stderr.contains("cron recovery skipped:"), "{stderr}");
-    assert!(stderr.contains("conflicting schedules"), "{stderr}");
-    assert!(stderr.contains(shared.to_str().unwrap()), "{stderr}");
-    assert!(!stderr.contains("cron recovery verified"), "{stderr}");
+    let notices = env.recovery_log(&output);
+    assert!(notices.contains("cron recovery skipped:"), "{notices}");
+    assert!(notices.contains("conflicting schedules"), "{notices}");
+    assert!(notices.contains(shared.to_str().unwrap()), "{notices}");
+    assert!(!notices.contains("cron recovery verified"), "{notices}");
 }
 
 #[test]
@@ -631,15 +631,15 @@ fn operator_renewal_reports_the_saved_job_missing_from_the_final_cron_list() {
     let env = Env::new();
     let [first, missing] = env.operator_card();
     let output = env.operator_restart(json!([{"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.\n","recurring":true,"durable":false}]), "w9C:tF", false);
-    let stderr = env.recovery_log(&output);
+    let notices = env.recovery_log(&output);
     assert!(
-        stderr.contains(&format!("missing cron: {}", missing.display())),
-        "{stderr}"
+        notices.contains(&format!("missing cron: {}", missing.display())),
+        "{notices}"
     );
-    assert!(stderr.contains("24 8 * * *"), "{stderr}");
+    assert!(notices.contains("24 8 * * *"), "{notices}");
     assert!(
-        !stderr.contains(&format!("missing cron: {}", first.display())),
-        "{stderr}"
+        !notices.contains(&format!("missing cron: {}", first.display())),
+        "{notices}"
     );
 }
 
@@ -651,16 +651,16 @@ fn operator_renewal_verifies_both_saved_crons_from_the_new_inventory() {
         {"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.\n","recurring":true,"durable":false},
         {"id":"new-two","cron":"24 8 * * *","prompt":"Read the daily evidence.\n","recurring":true,"durable":false}
     ]), "w9C:tF", false);
-    let stderr = env.recovery_log(&output);
+    let notices = env.recovery_log(&output);
     assert_eq!(
-        stderr
+        notices
             .matches("cron recovery verified: 2/2 saved jobs")
             .count(),
         1,
-        "{stderr}"
+        "{notices}"
     );
-    assert!(!stderr.contains("missing cron"), "{stderr}");
-    assert!(!stderr.contains("Check the owned lanes."), "{stderr}");
+    assert!(!notices.contains("missing cron"), "{notices}");
+    assert!(!notices.contains("Check the owned lanes."), "{notices}");
 }
 
 #[test]
@@ -672,9 +672,9 @@ fn operator_renewal_does_not_verify_an_old_duplicate_beside_the_recreated_jobs()
         {"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.","recurring":true,"durable":false},
         {"id":"new-two","cron":"24 8 * * *","prompt":"Read the daily evidence.","recurring":true,"durable":false}
     ]), "w9C:tF", false);
-    let stderr = env.recovery_log(&output);
-    assert!(stderr.contains("duplicate saved cron:"), "{stderr}");
-    assert!(!stderr.contains("cron recovery verified"), "{stderr}");
+    let notices = env.recovery_log(&output);
+    assert!(notices.contains("duplicate saved cron:"), "{notices}");
+    assert!(!notices.contains("cron recovery verified"), "{notices}");
 }
 
 #[test]
@@ -711,12 +711,12 @@ fn operator_renewal_does_not_trust_cron_results_without_the_restart_prompt() {
         {"id":"old-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.","recurring":true,"durable":false},
         {"id":"old-two","cron":"24 8 * * *","prompt":"Read the daily evidence.","recurring":true,"durable":false}
     ]), "w9C:tF", true);
-    let stderr = env.recovery_log(&output);
+    let notices = env.recovery_log(&output);
     assert!(
-        stderr.contains("cron recovery unverified: no post-restart CronList"),
-        "{stderr}"
+        notices.contains("cron recovery unverified: no post-restart CronList"),
+        "{notices}"
     );
-    assert!(!stderr.contains("cron recovery verified"), "{stderr}");
+    assert!(!notices.contains("cron recovery verified"), "{notices}");
 }
 
 #[test]
@@ -743,12 +743,12 @@ fn operator_renewal_cannot_reuse_a_previous_identical_recovery_inventory() {
         ..Default::default()
     };
     let output = env.operator_restart(jobs, "w9C:tF", true);
-    let stderr = env.recovery_log(&output);
+    let notices = env.recovery_log(&output);
     assert!(
-        stderr.contains("cron recovery unverified: no post-restart CronList"),
-        "{stderr}"
+        notices.contains("cron recovery unverified: no post-restart CronList"),
+        "{notices}"
     );
-    assert!(!stderr.contains("cron recovery verified"), "{stderr}");
+    assert!(!notices.contains("cron recovery verified"), "{notices}");
 }
 
 #[test]
@@ -810,10 +810,10 @@ fn an_unreadable_saved_prompt_does_not_abort_operator_token_renewal() {
     std::fs::remove_file(&first).unwrap();
     let output = env.operator_restart(json!([]), "w9C:tF", false);
     env.assert_followed(&env.runs(), "token-2");
-    let stderr = env.recovery_log(&output);
-    assert!(stderr.contains("cron recovery skipped:"), "{stderr}");
-    assert!(stderr.contains(first.to_str().unwrap()), "{stderr}");
-    assert!(!stderr.contains("cron recovery verified"), "{stderr}");
+    let notices = env.recovery_log(&output);
+    assert!(notices.contains("cron recovery skipped:"), "{notices}");
+    assert!(notices.contains(first.to_str().unwrap()), "{notices}");
+    assert!(!notices.contains("cron recovery verified"), "{notices}");
 }
 
 #[test]
@@ -826,10 +826,10 @@ fn unsupported_operator_prompt_paths_are_named_clearly() {
         );
         let output = env.operator_restart(json!([]), "w9C:tF", false);
         env.assert_followed(&env.runs(), "token-2");
-        let stderr = env.recovery_log(&output);
-        assert!(stderr.contains("cron recovery skipped:"), "{stderr}");
-        assert!(stderr.contains("unsupported saved cron path"), "{stderr}");
-        assert!(stderr.contains(path), "{stderr}");
+        let notices = env.recovery_log(&output);
+        assert!(notices.contains("cron recovery skipped:"), "{notices}");
+        assert!(notices.contains("unsupported saved cron path"), "{notices}");
+        assert!(notices.contains(path), "{notices}");
     }
 }
 
