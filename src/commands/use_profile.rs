@@ -1,9 +1,12 @@
 use anyhow::{Result, bail};
+use claudectl::accounts;
 use claudectl::auth_store::AuthStore;
 use claudectl::config;
 use claudectl::profile;
 
-use crate::commands::status::{self, FetchedUsage};
+use crate::commands::status;
+#[cfg(test)]
+use crate::commands::status::FetchedUsage;
 
 pub fn run(alias: Option<&str>) -> Result<()> {
     let paths = config::default_paths()?;
@@ -20,16 +23,20 @@ pub fn run(alias: Option<&str>) -> Result<()> {
             if fetched.is_empty() {
                 bail!("no profiles saved. Use 'claudectl save' or 'claudectl login <alias>'.");
             }
-            let candidates: Vec<Candidate> = fetched.iter().map(candidate_from).collect();
-            let Some(best) = select_most_available(&candidates) else {
+            let now = chrono::Utc::now().timestamp();
+            let candidates: Vec<_> = fetched
+                .iter()
+                .map(|f| status::candidate_of(f, now))
+                .collect();
+            let Some(best) = accounts::best(&candidates) else {
                 bail!(
                     "no saved profile has fresh usage below the general limits\nTry: claudectl run (server accounts), or claudectl status"
                 );
             };
-            let best = best.to_string();
+            let best = fetched[best].alias.clone();
             let email = profile::switch_to(&store, &paths, &best)?;
             status::record_statusline_for(&paths, &fetched, &best);
-            println!("auto-selected most available: {best} ({email})");
+            println!("auto-selected by weekly reset: {best} ({email})");
             println!();
             status::print_focused(&fetched, &best);
             Ok(())
@@ -47,70 +54,14 @@ fn switch_explicit(store: &AuthStore, paths: &config::Paths, alias: &str) -> Res
     Ok(())
 }
 
-pub(crate) struct Candidate {
-    alias: String,
-    /// max(5h, 7d) utilization; f64::MAX when the account errored.
-    score: f64,
-    /// 7d reset unix ts; i64::MAX when unknown (never preferred on ties).
-    d7_reset_ts: i64,
-}
-
-pub(crate) fn candidate_from(f: &FetchedUsage) -> Candidate {
-    match &f.usage {
-        Some(u) if f.snapshot.is_fresh_at(chrono::Utc::now().timestamp()) && f.error.is_none() => {
-            let h5 = u
-                .five_hour
-                .as_ref()
-                .and_then(|w| w.utilization)
-                .unwrap_or(f64::MAX);
-            let d7 = u
-                .seven_day
-                .as_ref()
-                .and_then(|w| w.utilization)
-                .unwrap_or(f64::MAX);
-            Candidate {
-                alias: f.alias.clone(),
-                score: h5.max(d7),
-                d7_reset_ts: u
-                    .seven_day
-                    .as_ref()
-                    .and_then(|w| w.reset_timestamp())
-                    .unwrap_or(i64::MAX),
-            }
-        }
-        _ => Candidate {
-            alias: f.alias.clone(),
-            score: f64::MAX,
-            d7_reset_ts: i64::MAX,
-        },
-    }
-}
-
-/// Lowest max-utilization wins; near-ties (within half a percent) break toward
-/// the soonest 7d reset. Errored/expired candidates (score MAX) never win.
-pub(crate) fn select_most_available(candidates: &[Candidate]) -> Option<&str> {
-    candidates
-        .iter()
-        .filter(|c| c.score < 100.0)
-        .min_by_key(|c| ((c.score * 2.0).round() as i64, c.d7_reset_ts))
-        .map(|c| c.alias.as_str())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn candidate(alias: &str, score: f64, d7_reset_ts: i64) -> Candidate {
-        Candidate {
-            alias: alias.to_string(),
-            score,
-            d7_reset_ts,
-        }
-    }
-
     fn fetched(fresh: bool, usage: &str) -> FetchedUsage {
         FetchedUsage {
             alias: "candidate".into(),
+            plan: Some("max".into()),
             usage: Some(serde_json::from_str(usage).unwrap()),
             snapshot: claudectl::usage_cache::Snapshot {
                 fresh,
@@ -147,51 +98,45 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_unbilled_profile_is_eligible() {
+        let status = fetched(
+            true,
+            r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":2},"extra_usage":{"is_enabled":false}}"#,
+        );
+        assert_eq!(accounts::best(&[status::candidate_of(&status, 1)]), Some(0));
+    }
+
+    #[test]
+    fn a_billed_profile_is_never_selected_automatically() {
+        let status = fetched(
+            true,
+            r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":2},"extra_usage":{"is_enabled":true}}"#,
+        );
+        assert!(accounts::best(&[status::candidate_of(&status, 1)]).is_none());
+    }
+
+    #[test]
     fn stale_usage_never_becomes_a_candidate() {
         let status = fetched(
             false,
-            r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":2}}"#,
+            r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":2},"extra_usage":{"is_enabled":false}}"#,
         );
-        assert!(select_most_available(&[candidate_from(&status)]).is_none());
+        assert!(accounts::best(&[status::candidate_of(&status, 1)]).is_none());
     }
 
     #[test]
     fn missing_usage_is_not_zero_usage() {
         let status = fetched(true, "{}");
-        assert!(select_most_available(&[candidate_from(&status)]).is_none());
+        assert!(accounts::best(&[status::candidate_of(&status, 1)]).is_none());
     }
 
     #[test]
     fn exhausted_general_limit_is_not_selected() {
         let status = fetched(
             true,
-            r#"{"five_hour":{"utilization":0},"seven_day":{"utilization":100}}"#,
+            r#"{"five_hour":{"utilization":0},"seven_day":{"utilization":100},"extra_usage":{"is_enabled":false}}"#,
         );
-        assert!(select_most_available(&[candidate_from(&status)]).is_none());
-    }
-
-    #[test]
-    fn picks_lowest_max_utilization() {
-        let c = vec![candidate("busy", 80.0, 100), candidate("fresh", 10.0, 9000)];
-        assert_eq!(select_most_available(&c), Some("fresh"));
-    }
-
-    #[test]
-    fn ties_break_by_soonest_7d_reset() {
-        let c = vec![candidate("late", 20.0, 9000), candidate("soon", 20.0, 100)];
-        assert_eq!(select_most_available(&c), Some("soon"));
-    }
-
-    #[test]
-    fn skips_errored_candidates() {
-        let c = vec![candidate("err", f64::MAX, 0), candidate("ok", 90.0, 100)];
-        assert_eq!(select_most_available(&c), Some("ok"));
-    }
-
-    #[test]
-    fn returns_none_when_all_errored() {
-        let c = vec![candidate("a", f64::MAX, 0), candidate("b", f64::MAX, 0)];
-        assert_eq!(select_most_available(&c), None);
+        assert!(accounts::best(&[status::candidate_of(&status, 1)]).is_none());
     }
 }
 
@@ -199,9 +144,10 @@ mod tests {
 #[test]
 fn snapshot_that_expires_during_batch_is_not_selected() {
     let status = FetchedUsage {
+        plan: Some("max".into()),
         usage: Some(
             serde_json::from_str(
-                r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":2}}"#,
+                r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":2},"extra_usage":{"is_enabled":false}}"#,
             )
             .unwrap(),
         ),
@@ -213,5 +159,5 @@ fn snapshot_that_expires_during_batch_is_not_selected() {
         },
         ..Default::default()
     };
-    assert!(select_most_available(&[candidate_from(&status)]).is_none());
+    assert!(accounts::best(&[status::candidate_of(&status, 3)]).is_none());
 }

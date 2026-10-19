@@ -137,21 +137,23 @@ pub struct Candidate {
     pub billed: bool,
 }
 
-/// The account to use: fresh, not billed, no full window; then the most room (the lowest
-/// highest-window use); then the soonest week reset; then the name.
+/// The account to use: fresh, not billed, no full window; then the soonest known weekly
+/// reset hour, the most weekly room, and the name. Unknown reset times sort last.
 pub fn best(candidates: &[Candidate]) -> Option<usize> {
-    let highest = |c: &Candidate| {
-        c.windows
-            .iter()
-            .filter_map(|w| w.used)
-            .fold(0.0_f64, f64::max)
-    };
-    let week_reset = |c: &Candidate| {
+    let week_reset_hour = |c: &Candidate| {
         c.windows
             .iter()
             .find(|w| w.name == "week")
             .and_then(|w| w.resets_at)
+            .map(|at| at.div_euclid(3_600))
             .unwrap_or(i64::MAX)
+    };
+    let week_used = |c: &Candidate| {
+        c.windows
+            .iter()
+            .find(|w| w.name == "week")
+            .and_then(|w| w.used)
+            .unwrap_or(f64::MAX)
     };
     candidates
         .iter()
@@ -160,9 +162,9 @@ pub fn best(candidates: &[Candidate]) -> Option<usize> {
             c.fresh && !c.billed && matches!(state(&c.windows), State::Ready | State::Low { .. })
         })
         .min_by(|(_, a), (_, b)| {
-            highest(a)
-                .total_cmp(&highest(b))
-                .then_with(|| week_reset(a).cmp(&week_reset(b)))
+            week_reset_hour(a)
+                .cmp(&week_reset_hour(b))
+                .then_with(|| week_used(a).total_cmp(&week_used(b)))
                 .then_with(|| a.name.cmp(&b.name))
         })
         .map(|(i, _)| i)

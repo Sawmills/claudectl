@@ -104,7 +104,7 @@ fn best_spends_weekly_room_before_its_earlier_reset() {
 }
 
 #[test]
-fn best_skips_limits_stale_and_billed_and_prefers_room_then_the_soonest_reset() {
+fn best_skips_limits_stale_and_billed_before_ranking_resets() {
     let mut fable_full = ready("amir4", 0.0, 10.0, 50);
     fable_full.windows.push(w("Fable", 100.0, None));
     let mut stale = ready("old", 0.0, 0.0, 10);
@@ -115,24 +115,54 @@ fn best_skips_limits_stale_and_billed_and_prefers_room_then_the_soonest_reset() 
         fable_full,
         stale,
         billed,
-        ready("amir", 55.0, 76.0, 20),
-        ready("amir2", 3.0, 1.0, 900),
-        ready("amir3", 2.0, 1.0, 800),
+        ready("amir6", 0.0, 100.0, 16 * 3_600),
+        ready("amir", 55.0, 76.0, 34 * 3_600),
+        ready("amir2", 3.0, 1.0, 143 * 3_600),
     ];
-    // amir2 and amir3 have the same room (highest window 3% vs 2%: amir3 wins on room).
     assert_eq!(
         accounts::best(&rows).map(|i| rows[i].name.as_str()),
-        Some("amir3")
+        Some("amir")
     );
-    // Equal room: the soonest week reset wins.
-    let tie = vec![ready("a", 1.0, 2.0, 900), ready("b", 1.0, 2.0, 800)];
-    assert_eq!(
-        accounts::best(&tie).map(|i| tie[i].name.as_str()),
-        Some("b")
-    );
-    // Nothing usable: no pick.
     let none = vec![ready("full", 100.0, 1.0, 1)];
     assert_eq!(accounts::best(&none), None);
+}
+
+#[test]
+fn best_breaks_a_reset_hour_tie_by_weekly_room_not_session_room() {
+    let tie = [
+        ready("earlier_minute", 1.0, 62.0, 7_210),
+        ready("more_weekly_room", 99.0, 35.0, 10_799),
+    ];
+    assert_eq!(
+        accounts::best(&tie).map(|i| tie[i].name.as_str()),
+        Some("more_weekly_room")
+    );
+}
+
+#[test]
+fn best_places_unknown_resets_after_every_known_reset() {
+    let mut unknown = ready("unknown", 0.0, 1.0, 0);
+    unknown.windows[1].resets_at = None;
+    let rows = [unknown, ready("known", 10.0, 99.0, 143 * 3_600)];
+    assert_eq!(
+        accounts::best(&rows).map(|i| rows[i].name.as_str()),
+        Some("known")
+    );
+}
+
+#[test]
+fn best_uses_weekly_room_when_all_reset_times_are_unknown() {
+    let mut rows = [
+        ready("busy_week", 1.0, 62.0, 0),
+        ready("roomy_week", 99.0, 35.0, 0),
+    ];
+    for row in &mut rows {
+        row.windows[1].resets_at = None;
+    }
+    assert_eq!(
+        accounts::best(&rows).map(|i| rows[i].name.as_str()),
+        Some("roomy_week")
+    );
 }
 
 #[test]

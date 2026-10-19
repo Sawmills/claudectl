@@ -1226,7 +1226,7 @@ fn with_label(mut row: Vec<Cell>, account: &AccountStatus, show_label: bool) -> 
 /// An account as the shared picker (`claudectl::accounts`) sees it. A local profile is
 /// never billed only when it is `rate_limited`; a server account only when extra usage is
 /// known off.
-fn candidate_of(f: &FetchedUsage, now: i64) -> claudectl::accounts::Candidate {
+pub(super) fn candidate_of(f: &FetchedUsage, now: i64) -> claudectl::accounts::Candidate {
     claudectl::accounts::Candidate {
         name: f.alias.clone(),
         windows: f

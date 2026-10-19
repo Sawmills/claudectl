@@ -1197,7 +1197,7 @@ pub fn run(
         Some(name) => name.to_owned(),
         None => {
             let picked = pick_account(&paths)?;
-            eprintln!("claudectl: starting Claude on {picked} (most room)");
+            eprintln!("claudectl: starting Claude on {picked} (weekly reset priority)");
             picked
         }
     };

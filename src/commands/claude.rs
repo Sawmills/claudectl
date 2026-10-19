@@ -16,7 +16,6 @@ use claudectl::lane::{self, Lane, RateLimitHit};
 use claudectl::usage_cache::FetchMode;
 
 use crate::commands::status::{self, FetchedUsage};
-use crate::commands::use_profile;
 
 /// Token lifetime exec requires at launch.
 const MIN_VALID: Duration = Duration::from_secs(30 * 60);
@@ -323,11 +322,11 @@ fn limit_check(alias: &str) -> Limit {
 }
 
 /// The next account: rate-limited (never billed), with fresh usage below
-/// every limit, not the live login, and not tried in this launch, ranked as
-/// `use` ranks: lowest max(5h, 7d), a missing window counting as unavailable.
+/// every limit, not the live login, and not tried in this launch, ranked by
+/// the shared earliest-week-reset rule. A missing window counts as unavailable.
 fn choose(fetched: &[FetchedUsage], tried: &[String], live_uuid: Option<&str>) -> Option<String> {
     let usable_until = chrono::Utc::now().timestamp() + MIN_VALID.as_secs() as i64;
-    let candidates: Vec<use_profile::Candidate> = fetched
+    let candidates: Vec<_> = fetched
         .iter()
         .filter(|f| !f.is_active && !tried.contains(&f.alias))
         // The live login's account, also when the active marker is stale:
@@ -343,9 +342,9 @@ fn choose(fetched: &[FetchedUsage], tried: &[String], live_uuid: Option<&str>) -
                     && !status::exhausted(usage)
             })
         })
-        .map(use_profile::candidate_from)
+        .map(|f| status::candidate_of(f, chrono::Utc::now().timestamp()))
         .collect();
-    use_profile::select_most_available(&candidates).map(str::to_string)
+    claudectl::accounts::best(&candidates).map(|i| candidates[i].name.clone())
 }
 
 /// The live login's account UUID from `~/.claude.json`.
@@ -448,7 +447,7 @@ mod tests {
     const OFF: &str = r#""extra_usage":{"is_enabled":false}"#;
 
     #[test]
-    fn chooses_the_rate_limited_account_with_most_room() {
+    fn chooses_an_unbilled_account_with_weekly_room_when_resets_are_unknown() {
         let mut live = fetched(
             "live",
             &format!(
@@ -503,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn a_nearly_full_five_hour_window_ranks_low_and_a_missing_one_is_unavailable() {
+    fn weekly_room_ranks_before_session_room_but_missing_session_usage_is_unavailable() {
         let accounts = [
             fetched(
                 "hot",
@@ -525,12 +524,37 @@ mod tests {
                 Some("max"),
             ),
         ];
-        assert_eq!(choose(&accounts, &[], None).as_deref(), Some("calm"));
+        assert_eq!(choose(&accounts, &[], None).as_deref(), Some("hot"));
         assert_eq!(
-            choose(&accounts, &["calm".into()], None).as_deref(),
-            Some("hot")
+            choose(&accounts, &["hot".into()], None).as_deref(),
+            Some("calm")
         );
         assert_eq!(choose(&accounts[2..], &[], None), None, "missing 5h window");
+    }
+
+    #[test]
+    fn local_recovery_prefers_the_earlier_weekly_reset() {
+        let accounts = [
+            fetched(
+                "amir5",
+                &format!(
+                    r#"{{"five_hour":{{"utilization":26}},"seven_day":{{"utilization":35,"resets_at":"2099-01-07T00:00:00Z"}},{OFF}}}"#
+                ),
+                Some("max"),
+            ),
+            fetched(
+                "amir",
+                &format!(
+                    r#"{{"five_hour":{{"utilization":25}},"seven_day":{{"utilization":62,"resets_at":"2099-01-02T00:00:00Z"}},{OFF}}}"#
+                ),
+                Some("max"),
+            ),
+        ];
+        assert_eq!(choose(&accounts, &[], None).as_deref(), Some("amir"));
+        assert_eq!(
+            choose(&accounts, &["amir".into()], None).as_deref(),
+            Some("amir5")
+        );
     }
 
     #[test]
