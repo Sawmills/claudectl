@@ -92,6 +92,18 @@ fn a_full_window_is_a_limit_and_fable_counts() {
 }
 
 #[test]
+fn best_spends_weekly_room_before_its_earlier_reset() {
+    let rows = [
+        ready("amir5", 26.0, 35.0, 143 * 3_600),
+        ready("amir", 25.0, 62.0, 34 * 3_600),
+    ];
+    assert_eq!(
+        accounts::best(&rows).map(|i| rows[i].name.as_str()),
+        Some("amir")
+    );
+}
+
+#[test]
 fn best_skips_limits_stale_and_billed_and_prefers_room_then_the_soonest_reset() {
     let mut fable_full = ready("amir4", 0.0, 10.0, 50);
     fable_full.windows.push(w("Fable", 100.0, None));
