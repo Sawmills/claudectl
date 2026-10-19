@@ -30,6 +30,77 @@ fn account_for(access: &Access) -> Account {
     }
 }
 
+/// Run the launch seam in its own process so PATH tests do not mutate global test state.
+#[test]
+fn session_path_helper() {
+    let Some(home) = std::env::var_os("CLAUDECTL_TEST_SESSION_PATH_HOME") else {
+        return;
+    };
+    let paths = Paths::from_home(home.into());
+    let access = grant("synthetic-path", 1);
+    let session = Session::new(&paths, &account_for(&access), access).unwrap();
+    let output = session
+        .command(
+            std::path::Path::new("/bin/sh"),
+            &["-c".into(), "printf '%s' \"$PATH\"".into()],
+        )
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    std::fs::write(
+        std::env::var_os("CLAUDECTL_TEST_SESSION_PATH_OUT").unwrap(),
+        output.stdout,
+    )
+    .unwrap();
+}
+
+#[test]
+fn server_sessions_put_existing_lane_bin_first_without_reordering_other_paths() {
+    for case in ["present", "absent", "first", "later"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("user home");
+        let lane_bin = home.join(".local/lib/lane-bin");
+        if case != "absent" {
+            std::fs::create_dir_all(&lane_bin).unwrap();
+        }
+        let lane = lane_bin.display().to_string();
+        let (inherited, expected) = match case {
+            "absent" => (
+                "/usr/local/bin:/usr/bin:/bin".to_owned(),
+                "/usr/local/bin:/usr/bin:/bin".to_owned(),
+            ),
+            "first" => (
+                format!("{lane}:/usr/local/bin:/usr/bin:/bin"),
+                format!("{lane}:/usr/local/bin:/usr/bin:/bin"),
+            ),
+            "later" => (
+                format!("/usr/local/bin::{lane}:/usr/bin:{lane}:/bin:/usr/bin"),
+                format!("{lane}:/usr/local/bin::/usr/bin:/bin:/usr/bin"),
+            ),
+            _ => (
+                "/usr/local/bin:/usr/bin:/bin".to_owned(),
+                format!("{lane}:/usr/local/bin:/usr/bin:/bin"),
+            ),
+        };
+        let out = root.path().join("child-path");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "session_path_helper"])
+            .env("CLAUDECTL_TEST_SESSION_PATH_HOME", &home)
+            .env("CLAUDECTL_TEST_SESSION_PATH_OUT", &out)
+            .env("HOME", &home)
+            .env("PATH", inherited)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(out).unwrap(), expected, "{case}");
+    }
+}
+
 /// SAW-12555: the child keeps the host Claude config (no CLAUDE_CONFIG_DIR), so --resume,
 /// skills, hooks and trust work; only the server access token is swapped in, and no refresh
 /// authority reaches it.

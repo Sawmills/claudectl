@@ -149,6 +149,7 @@ fn fake_child(dir: &Path, out: &Path, code: i32) -> std::path::PathBuf {
 out='{out}'
 eval "cat <&$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" > "$out/token"
 printf '%s' "$CLAUDE_CONFIG_DIR" > "$out/config_dir"
+printf '%s' "$PATH" > "$out/path"
 if [ -d "$CLAUDE_CONFIG_DIR" ]; then echo yes > "$out/config_exists"; fi
 if [ -f "$CLAUDE_CONFIG_DIR/.claude.json" ]; then cp "$CLAUDE_CONFIG_DIR/.claude.json" "$out/claude_json"; fi
 env | cut -d= -f1 | grep -E '^(CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_OAUTH_REFRESH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY|ANTHROPIC_AWS|ANTHROPIC_GOOGLE_CLOUD|GATEWAY|MANTLE)|ANTHROPIC_(BASE_URL|API_HOST|ASSETS_HOST|CUSTOM_HEADERS)|ANTHROPIC_(AWS|BEDROCK|BEDROCK_MANTLE|FOUNDRY|GOOGLE_CLOUD|VERTEX)_BASE_URL)$' > "$out/leaked_env" || true
@@ -691,6 +692,35 @@ fn run_helper_in(
         }
     }
     helper.status().unwrap()
+}
+
+#[test]
+fn pinned_exec_sessions_put_lane_bin_before_the_inherited_path() {
+    let _guard = run_guard();
+    let (home, paths, _store) = setup();
+    save(
+        &paths,
+        "one",
+        "uuid-one",
+        &creds("a-one", "r-one", 2 * HOUR_MS),
+    );
+    let lane_bin = home.path().join(".local/lib/lane-bin");
+    std::fs::create_dir_all(&lane_bin).unwrap();
+    let out = home.path().join("out-path");
+    std::fs::create_dir(&out).unwrap();
+    fake_child(&out, &out, 0);
+    let status = run_helper(
+        home.path(),
+        "one",
+        &out,
+        &[("PATH", "/usr/local/bin:/usr/bin:/bin")],
+        false,
+    );
+    assert!(status.success());
+    assert_eq!(
+        std::fs::read_to_string(out.join("path")).unwrap(),
+        format!("{}:/usr/local/bin:/usr/bin:/bin", lane_bin.display())
+    );
 }
 
 #[test]
