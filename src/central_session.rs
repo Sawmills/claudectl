@@ -565,17 +565,19 @@ impl Monitor {
 }
 #[cfg(unix)]
 impl Monitor {
-    fn check_crons(&mut self, finished: bool) {
-        if let Some(recovery) = &self.crons {
-            match recovery.check(&self.directory, finished) {
-                Ok(None) => return,
-                Ok(Some(report)) => eprintln!("claudectl: {report}"),
-                Err(_) => eprintln!(
-                    "claudectl: cron recovery unverified: transcript evidence unavailable"
-                ),
+    fn check_crons(&mut self, finished: bool) -> Result<()> {
+        let Some(recovery) = self.crons.take() else {
+            return Ok(());
+        };
+        let report = match recovery.check(&self.directory, finished) {
+            Ok(None) => {
+                self.crons = Some(recovery);
+                return Ok(());
             }
-            self.crons = None;
-        }
+            Ok(Some(report)) => report,
+            Err(_) => "cron recovery unverified: transcript evidence unavailable".into(),
+        };
+        super::crons::log_notice(&self.paths.home, &self.directory, &report)
     }
     fn watch(mut self, stopped: std::sync::mpsc::Receiver<()>) -> Outcome {
         use super::renew;
@@ -598,10 +600,14 @@ impl Monitor {
         let mut retry_now = false;
         let mut sent: Option<(i64, Restart)> = None;
         let mut pending = Pending::default();
+        let mut cron_log_error = None;
         while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
             stopped.recv_timeout(Duration::from_millis(timing.tick_ms))
         {
-            self.check_crons(false);
+            if let Err(error) = self.check_crons(false) {
+                // Stderr is Claude's terminal until it exits. Defer only the log failure.
+                cron_log_error = Some(format!("could not record cron recovery: {error:#}"));
+            }
             if now() - last_usage >= 300_000 {
                 if let Ok(usage) = self.client.usage(&self.account_id, false) {
                     let _ = atomic(
@@ -729,9 +735,14 @@ impl Monitor {
         // request ran): that exit is the user's, never a renewal (CX-0119).
         let ended_first = self.read_events(&mut activity).is_ok()
             && matches!((&sent, activity.idle.ended), (Some((at, _)), Some(end)) if end <= *at);
-        self.check_crons(true);
+        if let Err(error) = self.check_crons(true) {
+            cron_log_error = Some(format!("could not record cron recovery: {error:#}"));
+        }
         outcome.restart = sent.filter(|_| !ended_first).map(|(_, restart)| restart);
-        outcome.notice = pending.notice.take();
+        outcome.notice = match (pending.notice.take(), cron_log_error) {
+            (Some(notice), Some(error)) => Some(format!("{notice}\n{error}")),
+            (notice, error) => notice.or(error),
+        };
         outcome
     }
 }
@@ -1020,7 +1031,14 @@ pub fn run(
                 ) {
                     Ok(recovery) => recovery,
                     Err(error) => {
-                        eprintln!("claudectl: cron recovery skipped: {error:#}");
+                        if let Err(error) = super::crons::log_notice(
+                            &paths.home,
+                            session.directory(),
+                            &format!("cron recovery skipped: {error:#}"),
+                        ) {
+                            // The old child is stopped and the next has not spawned.
+                            eprintln!("claudectl: could not record cron recovery: {error:#}");
+                        }
                         None
                     }
                 };
