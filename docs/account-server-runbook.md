@@ -15,7 +15,7 @@ Reference: [account-server.md](account-server.md) describes the commands and the
 | Argo CD application             | Sawmills/argocd-deploy `plat/ue1-staging/argocd/claudectl-application.yaml`                                                       |
 | Database `claudectl`            | staging quota-manager RDS, Sawmills/infra component `rds/claudectl`                                                               |
 | Database secrets                | `claudectl-postgres` (runtime), `claudectl-migrator-postgres` (schema owner), infra `eks/claudectl-db-secret`                     |
-| App secrets                     | SSM `/app/claudectl/vault-key`, `/app/claudectl/oidc-client-secret`                                                             |
+| App secrets                     | SSM `/app/claudectl/vault-key`, `/app/claudectl/oidc-client-secret`                                                               |
 | Sign-in                         | Google Workspace OAuth client (Internal, Web application), redirect `https://claudectl.ue1.staging.plat.sm-svc.com/auth/callback` |
 | Endpoint                        | `https://claudectl.ue1.staging.plat.sm-svc.com` (internal ALB, Twingate)                                                          |
 
