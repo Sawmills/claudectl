@@ -1,9 +1,8 @@
 # Claude accounts on a company account server
 
-Implementation preview; do not deploy real refresh grants until the remaining
-pilot checks below pass. The one exception is the current fleet pilot, which runs by
-owner decision only (see [Current fleet pilot](#current-fleet-pilot)). The design research is in
-[the central design](superpowers/specs/2026-10-02-claudectl-central-design.md).
+The account server runs in production. It holds refresh credentials centrally so
+connected machines can run Claude Code with access tokens only. The design
+research is in [the central design](superpowers/specs/2026-10-02-claudectl-central-design.md).
 
 A company server holds Claude refresh credentials. Each enrolled machine receives
 only access tokens. Claude-only users install `claudectl` and Claude Code; they do
@@ -474,37 +473,23 @@ claudectl-server audit --key-file /keys/vault-key
   protects `/metrics`. Scrape configuration, secret wiring and network exposure must
   be reconciled before rollout; this code change does not change the deployed image.
 
-## Current fleet pilot
+## Validation history
 
-The account owner (Amir Jakoby, Sawmills) decided to run a pilot before the release
-gates below pass. Its bounds:
-
-- Server: the Sawmills staging account server only.
-- Accounts: the owner's own Claude accounts only. No other person enrolls a real
-  account.
-- Machines: Sawmills fleet machines that the owner connects.
-- End: the pilot ends when the release gates pass, or when the owner stops it.
-
-This exception is not a general release. Everyone else waits for the gates.
-
-## Validation and remaining release gates
+The account server is in production use. The reports below record earlier
+experiments and their limits; they are historical evidence, not release gates.
 
 The executable experiments are in [experiments/settings-renewal](../experiments/settings-renewal).
-They use synthetic tokens and block external networking/real credential reads.
+They use synthetic tokens and block external networking and real credential reads.
 The Linux and Mac lifecycle matrices cover proactive replacement, 401 retry,
-delayed replacement, outage/recovery, missing/malformed settings and terminal
-continuity. The Linux and Mac full-launcher checks also renew access during an eight-second
-Bash operation, observe the successor on the next model request, prove the tool
-ran once, and check credential cleanup. Mac also covers a late-appearing conflicting Keychain credential.
-“Delayed replacement” is a simulated rejection; settings tokens contain no expiry
-metadata and this experiment does not establish real OAuth lifetime.
+delayed replacement, outage and recovery, missing or malformed settings, and
+terminal continuity. The full launcher checks also renew access during an
+eight-second Bash operation, observe the successor on the next model request,
+prove the tool ran once, and check credential cleanup. Mac also covers a
+late-appearing conflicting Keychain credential. Delayed replacement is a simulated
+rejection; these settings tokens contain no expiry metadata, so this experiment
+does not establish real OAuth lifetime.
 
-A limited live check on one inactive Team account returned a successful inference
-through this access-only client. The [validation report](account-server-validation.md)
-distinguishes that check from a complete server migration and billing validation.
-The implementation is not release-approved. Outstanding acceptance includes live
-subscription entitlement/billing, actual expiry and repeated rotation on both
-machines, a complete ownership inventory, native Mac Keychain isolation, runtime
-managed-policy changes, and broader resume/tool/signal coverage.
-The current pilot account has not been migrated: SSH cannot read its authoritative
-Keychain credential even after a successful native unlock.
+An early live check on one inactive Team account returned a successful inference
+through the access-only client. The [validation report](account-server-validation.md)
+records what that check proved and what it did not. For current deployment and
+operations procedures, use the [server runbook](account-server-runbook.md).

@@ -1,512 +1,124 @@
 # claudectl
 
-Run Claude Code on the company's shared Claude accounts. claudectl picks the account
-whose week resets first, moves a session to another account at a usage limit, and shows
-every account's usage in the terminal and in a browser dashboard. It also manages
-local Claude Code profiles. The account server is an implementation preview (see
-below). Sibling of [codexctl](https://github.com/Sawmills/codexctl).
+Run Claude Code on shared company accounts or local profiles. claudectl shows
+account usage and selects the account whose week resets first. At a usage limit,
+it can resume the conversation on another account. The account server
+runs in production and keeps refresh credentials on the server; connected machines
+receive access tokens only.
 
 ## Install
 
-```bash
+Install [Claude Code](https://code.claude.com/docs/en/setup), then claudectl:
+
+```sh
+brew install Sawmills/tap/claudectl
+```
+
+Or build from source with Rust:
+
+```sh
 cargo install --git https://github.com/Sawmills/claudectl
 ```
 
-## Use a company account server
+## Quick Start
 
-> **Implementation preview.** The account server is not release-approved. Do not
-> enroll real Claude accounts (`claudectl add`, `claudectl server login`) until the
-> remaining checks in
-> [docs/account-server.md](docs/account-server.md#validation-and-remaining-release-gates)
-> pass. The server keeps each account's refresh grant.
+Use the account server URL supplied by your company. Connect once per machine
+with your company sign-in. To add an account, complete the Claude sign-in and paste the
+returned code when prompted.
 
-The account server holds the Claude accounts. A connected machine gets short-lived
-access tokens only, never a refresh token.
-
-```bash
-claudectl server connect https://claudectl.example.com --name laptop   # once per machine
-claudectl add amir8              # add an account: sign in to Claude, paste the code
-claudectl                        # the accounts, the one to use, and the next command
-claudectl run                    # start Claude on the account whose week resets first
-claudectl run amir2              # start on amir2 (full name, email name, or prefix)
-echo '<code#state>' | claudectl add amir8 --no-browser   # add from a script
+```sh
+claudectl server connect https://accounts.example.com --name laptop
+claudectl add work
+claudectl status
+claudectl run
+claudectl run work
+claudectl renew work
 ```
 
-- `claudectl run` without an account moves the session to another account when a
-  turn hits a usage limit. It resumes the same conversation and never picks an
-  account that may bill extra usage. A named run stays on its account unless you
-  add `--failover`; `--no-failover` turns it off.
-- `claudectl add` and `claudectl renew` show the code as you paste it. Without a terminal
-  they read it from standard input (the last line of the example above).
-- `claudectl status --details` shows token expiry and fetch diagnostics, and
-  `claudectl status --json` prints a machine-readable report (see below).
-- `claudectl shim install` makes plain `claude` run through the server.
-- The server's dashboard (its URL, signed in with Google) shows the same accounts and
-  lets you add, renew, or remove an account and revoke a machine.
+Use `renew` when the account's login needs attention. You can also add, renew, or
+remove accounts and revoke machines in the server's browser dashboard after
+signing in with Google.
 
-New server and pinned local sessions put `~/.local/lib/lane-bin` first on PATH
-when that directory exists. Any later copy of that entry is removed; all other
-entries keep their order. Without the directory, PATH stays unchanged. This lets
-session tools use installed lane wrappers, including the GitHub App wrapper.
-Existing sessions keep their original environment until restarted.
+## Choose an Account and Resume a Conversation
 
-Pass per-session Claude settings after `--`:
-
-```bash
-claudectl run work -- --settings '{"crossSessionInbound":"accept","isolatePeerMachines":true}'
-claudectl server run work -- --settings ./pilot-settings.json
+```sh
+claudectl run work --failover
+claudectl run -- --resume SESSION_ID
 ```
 
-Both run commands accept repeated `--settings <JSON-or-file>` or
-`--settings=<JSON-or-file>`. They merge objects in argument order; later values win,
-except hook arrays are appended to preserve claudectl's renewal hooks. Claude receives
-one private settings file, kept across token renewal and rebuilt after account failover.
-Unreadable files, invalid JSON, credential or routing overrides, malformed hook arrays,
-and `disableAllHooks: true` stop the launch. Global `~/.claude` settings are not changed.
+An automatic run chooses an eligible account with the earliest weekly reset. It
+resumes the same conversation on another account at a usage limit and never
+selects an account that may bill extra usage. A named run stays on that account
+unless you add `--failover`; `--no-failover` disables recovery.
 
-claudectl checks JSON syntax and account isolation, not Claude's full settings schema.
-Use settings valid for your installed Claude version. A schema error such as `"model": 5`
-can make Claude ignore the entire merged file, including claudectl's renewal and failover
-hooks. Check Claude's startup settings warnings and correct invalid values.
+See [session settings and diagnostics](docs/session-settings.md) for per-session
+Claude settings, tool PATH behavior, and the cron recovery log.
 
-After token renewal, Operator-card cron recovery writes its results to
-`~/.claudectl/server/cron-recovery.jsonl` (mode `0600`). Each JSON line has the
-time in milliseconds (`at`), the run directory name (`session`), and `message`.
-Verified, missing, duplicate, skipped, and unverified results stay in this log
-after the run exits. They never print over Claude's terminal or enter its input.
-The log contains no tokens or saved prompt contents.
+## Check Usage and Apply a Reset
 
-Most failures name the next command on a last line that starts with `Try:`. Setup
-failures, such as a `~/.claudectl` directory that cannot be created, print only the
-error.
-See the [commands, migration contract, and pilot gates](docs/account-server.md).
-
-## Local profiles (without a server)
-
-The commands below manage Claude Code logins saved on this machine. `login`, `save`,
-`use`, `switch`, `list`, `remove`, `whoami`, `label`, and `launcher` no longer show
-in `claudectl --help`, but they keep working.
-
-### Save accounts
-
-Save the account you're currently logged into:
-
-```bash
-claudectl save                 # alias defaults to the account email
-claudectl save work-main       # custom alias
+```sh
+claudectl status --details
+claudectl status --json
+claudectl resets
+claudectl reset work
 ```
 
-Add more accounts without touching the live login:
+`status --cached` reads saved usage without network requests. `status --refresh`
+requests fresh data but still obeys cooldowns. A reset requires a fresh exhausted
+window and a usable offer; it asks for confirmation and uses the offer closest to
+expiry. It is separate from billing and session recovery.
 
-```bash
-claudectl login amir+2@example.com
+See the [usage and JSON reference](docs/cli-reference.md#check-usage-and-capacity)
+for fields, cache rules, limits, and troubleshooting messages.
+
+## Use Plain `claude` with a Server Account
+
+```sh
+claudectl shim install --account work
+export PATH="$HOME/.local/claudectl/bin:$PATH"
 ```
 
-`claudectl login` runs its own OAuth flow (browser opens, you paste the code back) and
-saves the tokens straight into a profile — it never runs the `claude` binary and never
-overwrites another account's session. If the flow is ever rejected, fall back to
-logging in with `claude /login` and running `claudectl save <alias>`.
+The shim sends plain `claude` launches through the account server. Installation
+prints the PATH instruction and leaves shell startup files unchanged. See the
+[shim reference](docs/account-server.md#plain-claude-through-the-server-shim).
 
-If activation fails after the OAuth flow completed, the profile is still saved. Fix the
-reported problem and run `claudectl use <alias>` — there is no need to log in again.
+## Manage Accounts and Machines
 
-### macOS Keychain preflight
-
-On macOS, claudectl writes live credentials to the Keychain already containing the
-`Claude Code-credentials` item, or to the default Keychain when that item does not
-exist. Every command that writes live credentials (`login`, `use`, `switch`) checks
-that target Keychain is unlocked **first** — for `login` that means before the browser
-opens and before any token is exchanged; for `switch`, the check runs immediately
-after you pick a profile.
-
-- **Unlocked** — nothing happens, the command proceeds.
-- **Locked, running in a terminal** — claudectl runs `security unlock-keychain` with the
-  terminal handed straight to `security(1)`, so macOS prompts you for the password
-  itself. claudectl never accepts, passes, stores, or logs your Keychain password.
-  Unlock status is re-checked after the prompt.
-- **Locked, no terminal** (CI, a pipe, a non-interactive shell) — the command fails
-  immediately and tells you exactly what to run:
-
-  ```bash
-  security unlock-keychain '/path/reported/by/claudectl'
-  ```
-
-The unlock check cannot prove that an existing item's access controls will authorize
-claudectl to update it. If macOS denies that write after OAuth, the profile is already
-saved; resolve the reported Keychain access problem and run `claudectl use <alias>`
-without logging in again.
-
-### Check usage and capacity
-
-```bash
-claudectl status                  # all profiles; reuse data for up to five minutes
-claudectl status work-main        # one profile
-claudectl status --cached         # no network requests or token refresh
-claudectl status --refresh        # request fresh data; obey saved cooldowns
-claudectl status --details        # token expiry, old usage, and fetch diagnostics
-claudectl status --json           # machine-readable report (version 1)
-claudectl resets                  # list usable limit-reset offers
-claudectl resets --json           # machine-readable reset offers
-claudectl reset <alias>           # apply one offer after confirmation
-claudectl reset <alias> --yes     # apply from a non-interactive shell
+```sh
+claudectl rm work
+claudectl server devices
+claudectl server revoke MACHINE_ID
 ```
 
-`reset` requires a fresh exhausted window and a usable offer. It chooses the offer
-closest to expiry. Server accounts use the account server's audited, idempotent
-Apply path; local profiles call the provider directly. The command never runs as
-part of billing or Claude session recovery, and service-account tokens cannot redeem.
+`rm` asks for confirmation before removing an account. `revoke` stops a machine
+from getting more access tokens; tokens already issued expire on their own. Use
+the ID printed by `server devices`.
 
-`status --json` prints `{"version": 1, "accounts": [...]}`, sorted by alias. Each
-account has `alias`, `label`, `active`, `plan`, `pace_points`, `billing_class`, `exhausted`,
-`windows` (`five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet` with
-`used_percent` and `resets_at`; `fable_weekly` with `used_percent`),
-`limit_reset_offers` (an array, empty when no offers are available),
-`extra_usage`, `token_expires_in_seconds`, `usage_age_seconds`, `usage_stale`
-and `error`. `billing_class` is `usage_based` when extra usage is on (running past
-a plan window bills credits), `rate_limited` for a subscription plan with usage
-windows and extra usage reported off, and `unknown` otherwise (missing or null
-extra-usage data counts as unknown). `exhausted` is true when any window, including
-Opus, Sonnet and Fable, is at 100%. It combines with `--cached` and `--refresh`.
-A migrated profile stays in `accounts` with `error` set to
-`migrated to the account server`, so scripts never pick it for local use. The
-`server` key lists the account server's accounts: `state` (`connected`,
-`unreachable` or `not_connected`), `error`, and `accounts`, each with the same
-fields as above plus `available`.
+## Use Local Profiles Without a Server
 
-Version 1 only gains keys; no key is removed or changes type. Since 0.1.22 each
-account, local and server, also has:
-
-- `state`: `{"kind": "ready" | "low" | "limit" | "unknown", "window": <name or null>}`,
-  the same state as the compact view. `low` means a window is above 80%, `limit`
-  means a window is full, and `unknown` means the 5h or week figure is missing.
-- `billed`: true when the account may bill extra usage, and on any doubt. For a server
-  account it is false only when the usage reports extra usage off. For a local
-  profile it is false only when `billing_class` is `rate_limited`: extra usage off,
-  a plan, and 5h or week usage data. Without any of those it is true, even with
-  extra usage off. `claudectl run` and the compact view never pick a billed account.
-- `fresh`: the usage figures are current enough to choose on.
-- `on_server`: the account is on the account server. `claudectl run` picks only
-  among these.
-
-The report also has `best`, the account the compact view marks (a local profile is
-possible; null when no account is usable), and `next`, the command the compact view
-prints after `Next:`.
-
-On a machine connected to an account server, the default table has one row per
-account, local and server together. The `State` column says `active`, `local`,
-`on server`, or `unavailable`. A migrated alias shows once, as its server row, with
-the server's usage and the next step `claudectl server run <alias>`. If the server
-does not answer, local rows still print and server rows say `Server unreachable`.
-
-The default table shows each account's status and next step:
-
-It also shows the account `Plan` (`Pro`, `Max`, `Team`, or `Enterprise`) for both
-server and local accounts, the `Window resets` time, and an `Offers` count. A
-server plan comes from the provider profile and is cached with usage; a local
-plan comes from the saved credentials. Unknown plans show `-` (JSON `plan: null`).
-Cached status sends no provider request.
-If a later profile lookup fails, the server keeps that account's last known plan
-and records a diagnostic. A mismatched identity clears the plan.
-
-`Pace` compares weekly consumption with elapsed time in the seven-day window:
-`+25 ahead` means 25 percentage points above that budget, `-25 behind` means
-25 points below, and `0 on pace` means they match after rounding. Only fresh
-usage with a valid weekly percentage and reset time contributes. Missing or
-stale values show `-`; the column is hidden when every account is unknown.
-JSON always includes `pace_points`, using `null` for unknown values.
-
-The offers count is zero when no usable reset offer is available. JSON always includes
-`limit_reset_offers`, using an empty list when the server returned no offers.
-
-- `Login needed`: the login is missing or authentication was rejected. Follow the
-  command in `Next step`.
-- `Check live login`: claudectl cannot confirm which login owns token refresh.
-  Check Keychain access and the Claude Code login before logging into saved accounts.
-- `Let Claude refresh`: the expired token belongs to the live Claude Code login.
-  Open Claude Code. Log in again only if Claude cannot refresh it.
-- `Usage check throttled`: wait until the next check. HTTP 429 limits usage checks;
-  it does not prove that the account has exhausted its allowance.
-- `Refresh throttled`: wait until the next check. The token refresh service limited
-  requests before claudectl could check usage.
-- `Profile save failed`: check file permissions. Token refresh succeeded, but
-  claudectl could not save the new tokens. A saved account may need a fresh login.
-- `5-hour limit reached` or `Weekly limit reached`: wait for the displayed reset
-  or use another account.
-- `Within usage limits`: recent data shows available general usage. A model request
-  can still fail or have a separate limit.
-
-Other statuses also include a next step. `Access denied` asks you to check account
-permissions. `Cannot read login` asks you to check Claude Code and Keychain access.
-`Cannot read saved login` asks you to check the saved profile's file permissions,
-then repair it with `claudectl save <alias>` from the correct live account or
-`claudectl login <alias>`.
-`Check failed` points to `--details` for the error. `Usage unknown` asks you to run
-another check or verify model access. A model limit, such as `Fable limit reached`,
-asks you to use another model or account.
-
-`Usage used` shows percentages only when recent data is available and the latest
-check succeeded. Old data and failed checks show `Unknown`. The `Data` column
-shows whether saved data is old or recent. `*` marks the active account.
-In a terminal, the active account and headers are cyan. Green status means usage
-is within limits. Red status means a reached limit, a required login, denied
-access, or a profile save failure. Other checks that need attention are yellow.
-Usage color follows the highest reported percentage:
-green below 50%, yellow from 50%, and red from 80%. Colors are disabled when
-output is redirected or `NO_COLOR` has a nonempty value.
-An expired access token alone does not mean you must log in again.
-
-Use `--details` to see the full table, including old percentages, model limits,
-token expiry, exact fetch errors, and retry times. Recent cached data can lag by
-five minutes. Both views use the same data and refresh rules.
-
-All commands share a cache and an operating-system lock under `~/.claudectl/usage/`.
-Requests run one at a time, with a one-second gap. A concurrent command stops with
-an explicit message instead of starting another batch. Cache files contain usage
-data and token digests, never credential values. Token changes isolate the cache
-from an old login. Entries unused for a day are removed on the next cache update.
-A corrupt or unwritable cache produces an error.
-
-HTTP 429 pauses usage checks for all profiles on this machine. The delay is at
-least five minutes and at least the server's `Retry-After` value. Repeated 429s
-increase the local delay up to one hour. A longer server delay still applies.
-Other HTTP errors on usage fetches or token refreshes delay retries for that token.
-Network errors, timeouts, and invalid responses add no per-token retry delay.
-These controls reduce requests; they do not guarantee that Anthropic will accept
-the next request. Other clients
-and older claudectl versions do not share these controls.
-
-`--refresh` bypasses recent successful data, but never bypasses a cooldown.
-`--cached` and `--refresh` cannot be combined. A general usage window reset ends
-its cache validity early. Non-active expired tokens refresh only when a network
-check is due. Claude Code remains the sole owner of refresh for the active profile.
-Aliases with the same refresh token share one refresh result per check.
-They also share saved refresh cooldowns across separate checks.
-Selection and display recheck cache expiry after the batch completes. An alias
-that shares the live login's refresh token also leaves refresh to Claude Code.
-If the authoritative live credentials are unavailable, status does not refresh
-saved tokens. On macOS, a file fallback cannot prove Keychain token ownership.
-Account changes and token refresh share a separate lock. Status reads ownership
-under that lock and releases it before usage requests. A busy account update
-returns an error that asks you to retry after the other command finishes.
-
-### Switch accounts
-
-```bash
-claudectl use amir+2@example.com   # direct
-claudectl use                      # auto-select the earliest weekly reset
-claudectl switch                   # interactive fuzzy picker
+```sh
+claudectl save work
+claudectl login personal
+claudectl use work
 ```
 
-Explicit switching is a local operation (Keychain + files), with cached usage
-and no requests to Anthropic. Automatic selection checks usage once and reuses
-that result after the switch. If the cached display fails after an explicit switch,
-the command reports the completed switch and a separate warning.
-It runs the same [Keychain preflight](#macos-keychain-preflight) before touching the
-live auth. On macOS it updates the `Claude Code-credentials` Keychain entry,
-`~/.claude/.credentials.json`, and the `oauthAccount` identity in `~/.claude.json` —
-so Claude Code shows the right account immediately.
+`save` records the current live login; `login` signs in to another account and saves
+it as a profile. `use` switches the live login locally. Claude Code owns refresh
+for the active profile. See [local profiles and CLI reference](docs/cli-reference.md)
+for Keychain preflight, pinned commands, lanes, rate reports, and the status line.
 
-Automatic selection uses only fresh, successful results with known five-hour and
-weekly usage below 100%, no exhausted model-specific window, and extra usage known
-off. It prefers the earliest weekly reset hour, then the most weekly room. Accounts
-with an unknown reset time follow all known resets, ordered by weekly room. This
-rule applies to local profiles, server launches, and recovery. Server recovery also
-keeps its Ready-only, recent-target, and session-crowding guards.
+## Shell Completions
 
-### Run one command on a saved account
-
-```bash
-claudectl exec --profile amir+2@example.com -- claude -p "review this diff"
-claudectl launcher --profile amir+2@example.com --claude "$(command -v claude)" --out ./claude-amir2
-```
-
-`exec` runs one command on a saved profile and leaves the live login alone.
-The child gets the saved access token through an inherited pipe
-(`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`) and a fresh private
-`CLAUDE_CONFIG_DIR` that is removed when the run ends. So that the child
-starts at its prompt, that directory gets a `.claude.json` with only your
-onboarding state (`hasCompletedOnboarding`, `lastOnboardingVersion`) and the
-start-up approvals that cover the current directory (folder trust, also when
-it comes from a parent directory, and external CLAUDE.md imports). Accounts, tokens, allowed tools and MCP servers are never
-copied. The child runs
-in its own process group: `SIGTERM`, `SIGINT` and `SIGHUP` sent to claudectl
-reach the whole group once, and descendants left after the child exits get
-`SIGTERM`, then `SIGKILL`. `SIGCONT` follows each of these signals, so a
-stopped process acts on them.
-
-`exec` also runs an interactive child such as the Claude Code TUI. When
-claudectl owns the terminal foreground, the child's group takes it, as a shell
-job does: the terminal sends Ctrl-C and window size changes to the child
-directly. Ctrl-Z stops the child and claudectl together, and `fg` resumes both.
-claudectl takes the foreground back when the child exits, unless the shell
-owns it (after `bg`). This holds also for a Ctrl-Z that lands between the
-terminal handoff and the start of the child. If the terminal hangs
-up (for example, the pane closes), the child gets `SIGHUP` from the terminal,
-and the private directory is still removed after it exits. `exec` runs a
-private copy of the executable, so use it for a single-file program such as the
-Claude Code native binary; a program that loads files next to its own path does
-not find them. The Keychain entry,
-`~/.claude/.credentials.json`, `~/.claude.json` and the active marker are not
-written.
-
-The child's environment drops other credentials and routing settings: every
-`ANTHROPIC_*` or `CLAUDE_CODE_*` variable that selects a provider
-(`CLAUDE_CODE_USE_*`) or whose name ends in `_API_KEY`, `_TOKEN`,
-`_FILE_DESCRIPTOR`, `_BASE_URL`, `_HOST`, `_HEADERS` or `_HELPER`, for example
-`ANTHROPIC_API_KEY`, `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` and
-`ANTHROPIC_BASE_URL`. Other variables, such as `ANTHROPIC_MODEL`, pass
-through. A signal that claudectl inherits as ignored, for example `SIGHUP`
-under `nohup`, stays ignored for the child.
-
-Claude Code also reads project, local and managed settings files, which can
-set the same variables. `exec` checks `.claude/settings.json` and
-`.claude/settings.local.json` in the working directory and every parent
-directory (except `~/.claude` below home, which is user scope and replaced by
-the private config dir), and the managed settings (`managed-settings.json` and
-`managed-settings.d/`). If one sets such a variable in `env`, sets
-`CLAUDE_CONFIG_DIR` or `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` in `env`
-(they would replace the private directory or the token descriptor), or sets
-`apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport` or `gcpAuthRefresh`,
-`exec` refuses; run it from another directory. Arguments after `--` are passed
-as given, so do not pass `--settings` with such values.
-
-`exec` never refreshes a token. It refuses, and starts no child, when:
-
-- the profile is the active profile, shares its refresh grant with the live login, or is the same account as the live login (exit 5);
-- claudectl cannot tell which account the live login uses, or the live login changes while `exec` prepares the run (exit 5);
-- the saved credentials are unreadable, have no access token, or change while `exec` prepares the run (exit 5);
-- a settings file Claude Code would load sets a credential, provider or endpoint, sets `CLAUDE_CONFIG_DIR` or the token descriptor variable, or cannot be read or parsed (exit 5);
-- the token has expired (run `claudectl status <alias>` to refresh it), or expires within `--min-valid` (default `30m`). claudectl refreshes a saved token only after it expires, so retry after it expires and run `claudectl status <alias>`. `claudectl login <alias>` also gives a fresh token, but it makes that profile active; switch back with `claudectl use` before running `exec` (exit 5);
-- another `exec` run is active in the same process, or the auth state stays locked (exit 5);
-- the profile has no saved `accountUuid`, the token's account differs from it or from `--expect-account`, or the account lookup fails (exit 3);
-- the executable's SHA-256 differs from `--expect-sha256`, the executable changes after it is hashed, or the running claudectl does not match its own path (exit 4);
-- a receipt record cannot be written (exit 6);
-- the token pipe, the private config directory or the child process cannot be created (exit 7).
-
-A run that started but whose private config directory could not be removed, or whose descendant processes survived `SIGKILL`, exits 8 and names the child's exit code.
-
-Otherwise it exits with the child's exit code. `exec` writes JSON receipt
-records to stderr, or appends them to `--receipt <file>`: `prepared`,
-`started` (with the child PID), `exited` (with the exit code, signal and
-descendant teardown result), or `refused`, `spawn_failed` and
-`cleanup_failed`. Each names the profile, account, executable path and
-SHA-256, and the claudectl path, SHA-256 and version. Receipts never contain
-tokens.
-
-`launcher` writes a script for tools that take a `--claude-bin` path. The script
-pins the profile's account and the executable's SHA-256. It also keeps a private
-copy of claudectl in `<launcher>.claudectl/`, checks that copy's SHA-256 and runs
-it, so a later claudectl upgrade does not change what the launcher runs.
-
-### Lanes: one session across accounts
-
-```bash
-claudectl claude --lane review -- --dangerously-skip-permissions
-claudectl claude --lane review --account amir+2@example.com
-```
-
-`claudectl claude` runs Claude Code through `exec` on a saved account, with
-`CLAUDE_CONFIG_DIR` set to the lane's directory, `~/.claudectl/lanes/<lane>/config`.
-Only `projects/` (session transcripts) and the start-up decisions you made in
-the lane (folder trust, external CLAUDE.md imports) carry from one run to the
-next; a usage read that fails is retried after 30 seconds. Everything else, the `.claude.json` account state included, is rebuilt
-at every launch, so nothing moves from one account to another. One launcher at
-a time holds a lane.
-
-When Claude records a rate-limit error in the lane's transcript and one usage
-read confirms the account is at 100% of a window, claudectl ends the run
-(Claude gets `SIGTERM` and saves its session), picks the rate-limited account
-whose week resets first among those this launch has not tried, and starts it with
-`--resume <session> "<recovery prompt>"`. It never picks an account that may
-bill credits (`usage_based` or `unknown` in `status --json`) and stops after 3
-recoveries in an hour, or when no account has room; the session stays in the
-lane. An explicit `--account` that may bill credits needs a yes on the terminal
-or `--allow-billing`. Without `--account`, it starts on the rate-limited
-account whose week resets first. `--lane` names the lane; `accounts.jsonl` in the
-lane records which account ran when, and `receipts.jsonl` holds the `exec`
-receipts.
-
-### Rate: responses and limits per account
-
-```bash
-claudectl rate              # last 10 minutes
-claudectl rate --minutes 60 --json
-```
-
-`rate` counts, per account, the assistant responses (one per API message) and
-the rate-limit errors (429) in lane transcripts, and the share of 429s. It
-counts lanes only: `accounts.jsonl` is the only record of which account ran
-when, so a Claude session outside `claudectl claude` has no account to count
-against. A turn outside every logged run shows as `(outside a lane run)`, with
-`"alias": null` in `--json`, which prints `{"version": 1, "window_minutes": N,
-"accounts": [{"alias", "lanes", "ok", "rate_limited"}], "skipped": N}`.
-`skipped` counts transcript records that could not be read (the table shows a
-warning instead), so low counts are visible as such. An unreadable lane
-directory fails the command rather than report no activity.
-
-### Statusline
-
-```bash
-claudectl statusline   # e.g. "team 62% wk · 6d22h · 90% 5h"
-```
-
-`statusline` prints the active account's weekly room, the time to its weekly
-reset and, while a 5-hour window is open, its 5-hour room. The name is the
-account's label, or the alias before the `@`, cleaned to letters, digits, space,
-`.`, `_` and `-` and capped at 20 characters. It only reads a small sample that
-`status`, `use` and `switch` write for the active account
-(`~/.claudectl/statusline.json`, no credentials), so it never touches the
-network or the Keychain. It prints nothing, and exits 0, when the sample is
-missing, older than 5 minutes, for another account (alias, profile or live
-login account UUID),
-past its weekly reset, or slow to read (150 ms). Use it as
-Claude Code's status line in `~/.claude/settings.json`:
-
-```json
-{ "statusLine": { "type": "command", "command": "claudectl statusline" } }
-```
-
-### Housekeeping
-
-```bash
-claudectl list      # saved profiles, * marks active
-claudectl whoami    # active profile
-claudectl remove <alias>
-claudectl label <alias> "Team seat"   # display label; omit the text to clear
-```
-
-A label is a display name only: `list` shows it in brackets, and `status` adds a
-Label column when any account has one. It is at most 40 characters and need
-not be unique. Saving the alias again keeps it.
-
-### Shell completions
-
-```bash
-# zsh (~/.zshrc)
+```sh
 source <(claudectl completions zsh)
-
-# bash (~/.bashrc)
-source <(claudectl completions bash)
-
-# fish
-claudectl completions fish > ~/.config/fish/completions/claudectl.fish
 ```
 
-## How it works
+Other supported shells: `bash`, `elvish`, `fish`, and `powershell`.
 
-Profiles live under `~/.claudectl/profiles/<alias>/` as a `credentials.json`
-(exactly the shape Claude Code stores) plus an `account.json` identity snapshot.
-`~/.claudectl/active` tracks the profile claudectl last activated.
+## Reference
 
-Two safety rules are baked in:
-
-- **Switching captures rotated tokens first.** Claude Code refreshes tokens while it
-  runs, so before overwriting the live auth, claudectl folds the live tokens back into
-  the outgoing profile (only when the live identity still matches it).
-- **The active profile is never auto-refreshed.** Claude Code owns the active refresh
-  token; rotating it underneath Claude Code would log you out. Only non-active
-  profiles with a different refresh token from the live login can be refreshed.
-
-If `status --details` shows an expired token, follow the default view's `Next step`.
-Claude Code refreshes the active login. Status can refresh saved accounts when
-refresh ownership is known. Log in again when the login is missing or rejected.
+- [Account server commands, sessions, and migration](docs/account-server.md)
+- [Server operations runbook](docs/account-server-runbook.md)
+- [Session settings and diagnostics](docs/session-settings.md)
+- [Local profiles, usage JSON, lanes, and credential behavior](docs/cli-reference.md)
+- [codexctl](https://github.com/Sawmills/codexctl), the companion for Codex accounts
