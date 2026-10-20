@@ -3,8 +3,8 @@
 Scope: Amir's own Claude subscription accounts only (SAW-12454). No other company user is
 on the allow list, and no account is shared or loaned.
 
-Reference: [account-server.md](account-server.md) describes the commands and the design;
-[the plan](superpowers/plans/2026-10-06-saw-12454-claude-server.md) records the decisions.
+See the [account server guide](account-server.md) for commands, session behavior,
+and migration.
 
 ## Components
 

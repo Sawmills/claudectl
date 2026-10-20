@@ -18,8 +18,8 @@
 - `src/config.rs`, `src/profile.rs`, and `src/shell.rs` contain configuration, profile, and shell code.
 - `tests/cli_test.rs` contains CLI tests.
 - `README.md` documents installation, usage, and credential behavior.
-- `docs/superpowers/specs/2026-06-09-claudectl-design.md` contains the design.
-- `docs/superpowers/plans/2026-06-09-claudectl-v1.md` contains the existing implementation plan.
+- `docs/account-server.md` and `docs/account-server-runbook.md` document the account server.
+- `docs/cli-reference.md` and `docs/session-settings.md` document local profiles and sessions.
 
 ## Commands
 
