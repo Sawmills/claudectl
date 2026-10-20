@@ -1,4 +1,4 @@
-# Session settings and diagnostics
+# Session Settings and Diagnostics
 
 New server and pinned local sessions put `~/.local/lib/lane-bin` first on PATH
 when that directory exists. Any later copy of that entry is removed; all other

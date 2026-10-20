@@ -1,10 +1,10 @@
-# Local profiles and CLI reference
+# Local Profiles and CLI Reference
 
 The commands below manage Claude Code logins saved on this machine. `login`, `save`,
 `use`, `switch`, `list`, `remove`, `whoami`, `label`, and `launcher` no longer show
 in `claudectl --help`, but they keep working.
 
-### Save accounts
+### Save Accounts
 
 Save the account you're currently logged into:
 
@@ -20,28 +20,28 @@ claudectl login amir+2@example.com
 ```
 
 `claudectl login` runs its own OAuth flow (browser opens, you paste the code back) and
-saves the tokens straight into a profile — it never runs the `claude` binary and never
+saves the tokens straight into a profile; it never runs the `claude` binary and never
 overwrites another account's session. If the flow is ever rejected, fall back to
 logging in with `claude /login` and running `claudectl save <alias>`.
 
 If activation fails after the OAuth flow completed, the profile is still saved. Fix the
-reported problem and run `claudectl use <alias>` — there is no need to log in again.
+reported problem and run `claudectl use <alias>`; there is no need to log in again.
 
-### macOS Keychain preflight
+### macOS Keychain Preflight
 
 On macOS, claudectl writes live credentials to the Keychain already containing the
 `Claude Code-credentials` item, or to the default Keychain when that item does not
 exist. Every command that writes live credentials (`login`, `use`, `switch`) checks
-that target Keychain is unlocked **first** — for `login` that means before the browser
+that target Keychain is unlocked **first**; for `login` that means before the browser
 opens and before any token is exchanged; for `switch`, the check runs immediately
 after you pick a profile.
 
-- **Unlocked** — nothing happens, the command proceeds.
-- **Locked, running in a terminal** — claudectl runs `security unlock-keychain` with the
+- **Unlocked**; nothing happens, the command proceeds.
+- **Locked, running in a terminal**; claudectl runs `security unlock-keychain` with the
   terminal handed straight to `security(1)`, so macOS prompts you for the password
   itself. claudectl never accepts, passes, stores, or logs your Keychain password.
   Unlock status is re-checked after the prompt.
-- **Locked, no terminal** (CI, a pipe, a non-interactive shell) — the command fails
+- **Locked, no terminal** (CI, a pipe, a non-interactive shell); the command fails
   immediately and tells you exactly what to run:
 
   ```bash
@@ -53,7 +53,7 @@ claudectl to update it. If macOS denies that write after OAuth, the profile is a
 saved; resolve the reported Keychain access problem and run `claudectl use <alias>`
 without logging in again.
 
-### Check usage and capacity
+### Check Usage and Capacity
 
 ```bash
 claudectl status                  # all profiles; reuse data for up to five minutes
@@ -206,7 +206,7 @@ Account changes and token refresh share a separate lock. Status reads ownership
 under that lock and releases it before usage requests. A busy account update
 returns an error that asks you to retry after the other command finishes.
 
-### Switch accounts
+### Switch Accounts
 
 ```bash
 claudectl use amir+2@example.com   # direct
@@ -220,7 +220,7 @@ that result after the switch. If the cached display fails after an explicit swit
 the command reports the completed switch and a separate warning.
 It runs the same [Keychain preflight](#macos-keychain-preflight) before touching the
 live auth. On macOS it updates the `Claude Code-credentials` Keychain entry,
-`~/.claude/.credentials.json`, and the `oauthAccount` identity in `~/.claude.json` —
+`~/.claude/.credentials.json`, and the `oauthAccount` identity in `~/.claude.json` ;
 so Claude Code shows the right account immediately.
 
 Automatic selection uses only fresh, successful results with known five-hour and
@@ -230,7 +230,7 @@ with an unknown reset time follow all known resets, ordered by weekly room. This
 rule applies to local profiles, server launches, and recovery. Server recovery also
 keeps its Ready-only, recent-target, and session-crowding guards.
 
-### Run one command on a saved account
+### Run One Command on a Saved Account
 
 ```bash
 claudectl exec --profile amir+2@example.com -- claude -p "review this diff"
@@ -315,7 +315,7 @@ pins the profile's account and the executable's SHA-256. It also keeps a private
 copy of claudectl in `<launcher>.claudectl/`, checks that copy's SHA-256 and runs
 it, so a later claudectl upgrade does not change what the launcher runs.
 
-### Lanes: one session across accounts
+### Lanes: One Session Across Accounts
 
 ```bash
 claudectl claude --lane review -- --dangerously-skip-permissions
@@ -343,7 +343,7 @@ account whose week resets first. `--lane` names the lane; `accounts.jsonl` in th
 lane records which account ran when, and `receipts.jsonl` holds the `exec`
 receipts.
 
-### Rate: responses and limits per account
+### Rate: Responses and Limits per Account
 
 ```bash
 claudectl rate              # last 10 minutes
@@ -396,7 +396,7 @@ A label is a display name only: `list` shows it in brackets, and `status` adds a
 Label column when any account has one. It is at most 40 characters and need
 not be unique. Saving the alias again keeps it.
 
-### Shell completions
+### Shell Completions
 
 ```bash
 # zsh (~/.zshrc)
@@ -409,7 +409,7 @@ source <(claudectl completions bash)
 claudectl completions fish > ~/.config/fish/completions/claudectl.fish
 ```
 
-## How it works
+## How It Works
 
 Profiles live under `~/.claudectl/profiles/<alias>/` as a `credentials.json`
 (exactly the shape Claude Code stores) plus an `account.json` identity snapshot.
