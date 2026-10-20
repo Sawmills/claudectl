@@ -56,8 +56,7 @@ spec:
             - >-
               cp /projected/vault-key /keys/vault-key;
               cp /projected/oidc-client-secret /keys/oidc-client-secret;
-              cp /projected/metrics-token /keys/metrics-token;
-              chmod 600 /keys/vault-key /keys/oidc-client-secret /keys/metrics-token
+              chmod 600 /keys/vault-key /keys/oidc-client-secret
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -81,8 +80,6 @@ spec:
             - 0.0.0.0:8787
             - --public-url
             - https://claudectl.ue1.staging.plat.sm-svc.com
-            - --metrics-token-file
-            - /keys/metrics-token
             - --sso-config
             - /configuration/sso.json
             # Amir's own accounts only (SAW-12454). Add nobody else.
