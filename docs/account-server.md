@@ -410,7 +410,7 @@ cargo build --release --features server --bin claudectl-server
 DATABASE_URL='postgres://migrator@db/claudectl?sslmode=require' claudectl-server migrate
 DATABASE_URL='postgres://claudectl@db/claudectl?sslmode=require' claudectl-server serve \
   --key-file /keys/vault-key --listen 0.0.0.0:8787 --public-url https://claudectl.example.com \
-  --sso-config /configuration/sso.json --metrics-token-file /keys/metrics-token \
+  --sso-config /configuration/sso.json \
   --allow-user person@example.com
 # One machine, file store:
 claudectl-server setup --state /data/state --key-file /keys/vault-key --if-absent
@@ -468,10 +468,14 @@ claudectl-server audit --key-file /keys/vault-key
   `claudectl_server_failed_requests_total{reason}` and
   `claudectl_server_last_failure_timestamp_seconds{reason}`. The staging overlay in
   `deploy/k8s` alerts on both through the existing alert routing. Account and machine
-  routes still require their existing authentication. The legacy `--metrics-token-file`
-  launch option remains accepted for the staged SAW-13160 rollout; it no longer
-  protects `/metrics`. Scrape configuration, secret wiring and network exposure must
-  be reconciled before rollout; this code change does not change the deployed image.
+  routes still require their existing authentication. Omit `--metrics-token-file`
+  when starting the server. The legacy option remains accepted for compatibility
+  and reads the supplied file, but does not protect `/metrics`.
+  [PR #118](https://github.com/Sawmills/claudectl/pull/118) removes the old staging
+  metrics-file and scrape-authorization wiring. Operator rollout and per-replica
+  scrape readback remain separate gates. Existing SSM parameter deletion needs
+  separate approval; this documentation change does not deploy an image or change
+  network exposure.
 
 ## Validation history
 
