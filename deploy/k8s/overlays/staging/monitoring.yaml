@@ -46,7 +46,6 @@ spec:
             description: "A forced refresh (reason forced or migration) revokes the access token that every running server run of the account holds; those sessions restart on the new token at their next idle point (claudectl 0.1.17 and later) or fail. Find the machine in the audit log (operation refresh, reason forced or migration). Best effort only: a rotation is missed when the pod restarts before the next scrape, or crashes between the provider exchange and the audit append; the audit log holds every refresh whose append succeeded."
             runbook_url: https://github.com/Sawmills/claudectl/blob/main/docs/account-server.md
 ---
-# The staging ServiceMonitor schema lacks authentication. ScrapeConfig supports credentials.
 apiVersion: monitoring.coreos.com/v1alpha1
 kind: ScrapeConfig
 metadata:
@@ -60,11 +59,6 @@ spec:
   scrapeInterval: 30s
   scrapeTimeout: 5s
   scrapeProtocols: [PrometheusText0.0.4]
-  authorization:
-    type: Bearer
-    credentials:
-      name: claudectl-secrets
-      key: metrics-token
   # Failure counters live in each process: scrape every pod, not the load-balanced Service.
   dnsSDConfigs:
     - names: [claudectl-pods.claudectl.svc.cluster.local]
