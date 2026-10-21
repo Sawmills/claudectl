@@ -264,9 +264,8 @@ async fn service_jobs_keep_billing_guard_without_automatic_pick_headroom_cutoff(
             .output()
             .unwrap();
         server.abort();
-        assert_eq!(
-            marker.exists(),
-            false,
+        assert!(
+            !marker.exists(),
             "billed={billed}, week={week}: {output:?}"
         );
         assert!(!output.status.success());
