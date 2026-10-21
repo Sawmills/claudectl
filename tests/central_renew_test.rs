@@ -183,6 +183,20 @@ def term(*_):
         out.write(status.get("renewal", ""))
     sys.exit(143)
 signal.signal(signal.SIGTERM, term)
+if os.environ.get("FAKE_TASK_CHILD") and token == "token-1":
+    # Claude's background Bash/Monitor owns an output file, unlike an MCP or LSP.
+    task_dir = os.path.join(os.environ["TMPDIR"], "claude-" + str(os.getuid()), "project", "tasks")
+    os.makedirs(task_dir, exist_ok=True)
+    with open(os.path.join(task_dir, "background.output"), "w") as output:
+        subprocess.Popen([sys.executable, "-c", '''
+import os, time
+release = os.environ["FAKE_LOG"] + ".task-release"
+deadline = time.monotonic() + 15
+while not os.path.exists(release) and time.monotonic() < deadline:
+    time.sleep(0.02)
+if os.path.exists(release):
+    open(os.environ["FAKE_LOG"] + ".task-done", "w").close()
+'''], stdout=output, stderr=output)
 if os.environ.get("FAKE_EXTRA_CHILD") and token == "token-1":
     # An LSP, caffeinate or a background shell: it joins Claude's group after the monitor
     # took its baseline, and never leaves.
@@ -1163,6 +1177,60 @@ fn an_idle_claude_with_extra_processes_follows_an_early_refresh() {
     let runs = env.runs();
     assert_eq!(runs.len(), 2, "{runs:?}");
     assert_eq!(runs[1]["token"], "token-2");
+}
+
+/// A completed foreground turn does not authorize killing a live production task.
+#[test]
+fn renewal_waits_for_a_live_task_output_child() {
+    let env = Env::new();
+    let refresher = env.refresh_when_idle();
+    let temporary = env.home.path().join("tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+    env.env(&mut command);
+    command
+        .env("TMPDIR", temporary)
+        .env("FAKE_TASK_CHILD", "1")
+        .args(["server", "run", "work", "--claude"])
+        .arg(&env.claude)
+        .args(["--", "--model", "opus"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let journal = env
+        .home
+        .path()
+        .join(".claudectl/server/restart-decisions.jsonl");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut deferred = false;
+    while std::time::Instant::now() < deadline {
+        deferred = std::fs::read_to_string(&journal).is_ok_and(|text| {
+            text.lines().any(|line| {
+                serde_json::from_str::<Value>(line).is_ok_and(|record| {
+                    record["event"] == "restart_deferred" && record["reason"] == "background_task"
+                })
+            })
+        });
+        if deferred || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Release the real child before asserting, so even a failing wrapper is reaped.
+    std::fs::write(env.log.with_extension("log.task-release"), "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    refresher.join().unwrap();
+    assert!(
+        deferred,
+        "renewal restarted while a task-output child was live: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        env.log.with_extension("log.task-done").exists(),
+        "background task was killed"
+    );
+    assert_eq!(output.status.code(), Some(7));
+    env.assert_followed(&env.runs(), "token-2");
 }
 
 /// A clean /exit ends `server run`, even when a token request in flight across the
