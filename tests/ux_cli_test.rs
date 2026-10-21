@@ -188,7 +188,7 @@ fn local_profile_commands_are_hidden_but_still_work() {
     let home = Home::new();
     let commands = listed(&out(&home.run(&["--help"])));
     for hidden in [
-        "login", "save", "use", "switch", "list", "remove", "whoami", "label", "launcher",
+        "login", "save", "switch", "list", "remove", "whoami", "label", "launcher",
     ] {
         assert!(
             !commands.contains(&hidden.to_string()),
@@ -199,6 +199,7 @@ fn local_profile_commands_are_hidden_but_still_work() {
     }
     for visible in [
         "run",
+        "use",
         "status",
         "add",
         "renew",

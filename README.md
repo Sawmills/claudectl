@@ -27,19 +27,26 @@ with your company sign-in, then start Claude Code:
 ```sh
 claudectl server connect https://accounts.example.com --name laptop
 claudectl status
-claudectl run
+claudectl use
+claude
 ```
+
+`use` selects the account for new plain `claude` launches. It installs or updates
+the launcher and prints one PATH line if this shell needs it. Run that line once;
+claudectl leaves shell startup files unchanged. Running sessions keep their account.
 
 ## Choose an Account and Resume
 
 ```sh
+claudectl use work
 claudectl run work
 claudectl run work --failover
 claudectl run -- --resume SESSION_ID
 ```
 
-An automatic run chooses an eligible account with the earliest weekly reset and
-excludes accounts that may bill extra usage. It resumes the conversation on
+Automatic `use` and `run` choose an eligible account with the earliest weekly reset.
+They exclude accounts with 5% or less weekly headroom and accounts that may bill
+extra usage. An automatic run resumes the conversation on
 another account at a usage limit. A named run stays on that account unless you
 add `--failover`; `--no-failover` disables recovery.
 
@@ -79,12 +86,12 @@ cache rules, reset selection, and diagnostics.
 ## Use Plain `claude` with a Server Account
 
 ```sh
-claudectl shim install --account work
-export PATH="$HOME/.local/claudectl/bin:$PATH"
+claudectl use work
 ```
 
-The shim routes plain `claude` launches through the account server. Installation
-prints the PATH instruction and leaves shell startup files unchanged. See the
+The shim routes plain `claude` launches through the selected account on the account
+server. `claudectl status` marks that account when PATH reaches the launcher.
+Local profiles still use the local login swap. See the
 [shim reference](docs/account-server.md#plain-claude-through-the-server-shim).
 
 ## Reference

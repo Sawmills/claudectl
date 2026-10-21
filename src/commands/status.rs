@@ -113,6 +113,25 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
     {
         return Err(error);
     }
+    #[cfg(unix)]
+    {
+        use claudectl::central::shim;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        if let Some(dir) = shim::active_dir(&path) {
+            let selected = shim::status(&dir, &path)?;
+            for account in &mut local {
+                account.is_active = false;
+            }
+            if selected.real_ok && selected.claudectl_ok {
+                for account in &mut remote {
+                    account.is_active = selected
+                        .alias
+                        .as_ref()
+                        .is_some_and(|alias| alias.eq_ignore_ascii_case(&account.alias));
+                }
+            }
+        }
+    }
     // The server's account list is authoritative: a migrated alias it no longer has was
     // removed there.
     if let claudectl::central::ServerView::Rows(_) = &view {
@@ -1369,7 +1388,11 @@ fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
             text.push_str(" (may bill)");
         }
         if f.is_active {
-            text.push_str(" (local login, waiting for Claude Code to refresh)");
+            if f.on_server {
+                text.push_str(" (plain claude)");
+            } else {
+                text.push_str(" (local login, waiting for Claude Code to refresh)");
+            }
         }
         let mut row = vec![
             names[i].clone(),

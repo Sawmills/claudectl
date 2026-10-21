@@ -906,12 +906,16 @@ pub fn pick_account(paths: &Paths) -> Result<String> {
             bail!("the account server has no accounts for you\nTry: claudectl add <name>")
         }
         None => bail!(
-            "no account has room now (every one is at a limit, billed, or without fresh usage): {}\nTry: claudectl status",
+            "no server account is eligible:\n{}\nTry: claudectl status --details",
             candidates
                 .iter()
-                .map(|c| c.name.as_str())
+                .map(|c| format!(
+                    "  {}: {}",
+                    c.name,
+                    crate::accounts::selection_reason(c).unwrap_or_default()
+                ))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join("\n")
         ),
     }
 }

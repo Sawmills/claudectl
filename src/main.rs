@@ -24,7 +24,7 @@ const RUN_EXAMPLES: &str = "Examples:
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start Claude on a server account (the earliest weekly reset if none is named)
+    /// Start Claude on an eligible server account (weekly reset priority if none is named)
     #[command(after_help = format!("{RUN_EXAMPLES}\n\n{}", claudectl::central::RUN_SETTINGS_HELP))]
     Run {
         /// Account to use: full name, email name (amir2), or a unique prefix
@@ -122,10 +122,9 @@ enum Commands {
         /// Custom alias (defaults to email)
         alias: Option<String>,
     },
-    /// Switch to a profile by alias (or earliest weekly reset if omitted)
-    #[command(hide = true)]
+    /// Select the account for new plain `claude` launches
     Use {
-        /// Profile alias to switch to (auto-selects earliest weekly reset if omitted)
+        /// Server account or local profile (auto-selects an eligible account if omitted)
         alias: Option<String>,
     },
     /// Interactive fuzzy picker to switch accounts

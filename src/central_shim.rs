@@ -322,8 +322,17 @@ pub fn path_line(dir: &Path) -> String {
     }
 }
 
-fn default_dir(paths: &crate::config::Paths) -> PathBuf {
+pub fn default_dir(paths: &crate::config::Paths) -> PathBuf {
     paths.home.join(".local").join("claudectl").join("bin")
+}
+
+/// The managed launcher plain `claude` reaches on this PATH. The escape hatch bypasses it.
+pub fn active_dir(path: &OsStr) -> Option<PathBuf> {
+    if std::env::var_os("CLAUDECTL_SHIM").is_some_and(|value| value == "off") {
+        return None;
+    }
+    let program = on_path("claude", path)?;
+    is_shim(&program).then(|| program.parent().unwrap_or(Path::new(".")).to_path_buf())
 }
 
 pub fn dispatch(command: Command) -> Result<()> {
@@ -343,9 +352,11 @@ pub fn dispatch(command: Command) -> Result<()> {
             let account = account.unwrap_or_else(|| default_account().into());
             // Only a server account: the launcher never falls back to a local or billed login.
             super::Client::load(paths)?.account(&account)?;
+            let previous = status(&dir, &path)?;
+            let recorded_real = previous.real.as_deref().filter(|_| previous.real_ok);
             let spec = Spec {
                 alias: account,
-                real: find_real(claude.as_deref(), &path)?,
+                real: find_real(claude.as_deref().or(recorded_real), &path)?,
                 claudectl: claudectl_path_from(&path, &cwd, &std::env::current_exe()?),
             };
             let target = install(&spec, &dir)?;
@@ -356,7 +367,7 @@ pub fn dispatch(command: Command) -> Result<()> {
             if status(&dir, &path)?.first_on_path {
                 println!("`claude` on this PATH already runs the shim.");
             } else {
-                println!("Put this line in your shell profile, then open a new terminal:");
+                println!("For new launches in this shell, run:");
                 println!("  {}", path_line(&dir));
             }
             println!("Escape hatch: CLAUDECTL_SHIM=off claude ...");

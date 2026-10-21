@@ -13,8 +13,37 @@ pub fn run(alias: Option<&str>) -> Result<()> {
     let store = AuthStore::real(paths.clone());
 
     match alias {
-        Some(a) => switch_explicit(&store, &paths, profile::validate_alias(a)?),
+        Some(a) => {
+            let alias = profile::validate_alias(a)?;
+            let local = profile::list_profiles_from(&paths)?;
+            if local.iter().any(|p| p.meta.alias == alias)
+                && !claudectl::central::is_migrated(&paths, alias)
+            {
+                return switch_explicit(&store, &paths, alias);
+            }
+            if paths
+                .claudectl_dir()
+                .join("server/connection.json")
+                .try_exists()?
+                || claudectl::central::service_account::configured()
+            {
+                let account = claudectl::central::Client::load(&paths)?.account(alias)?;
+                return point_server_account(&account.alias);
+            }
+            let names: Vec<_> = local.iter().map(|p| p.meta.alias.as_str()).collect();
+            let alias = accounts::resolve(alias, &names)?;
+            switch_explicit(&store, &paths, alias)
+        }
         None => {
+            if paths
+                .claudectl_dir()
+                .join("server/connection.json")
+                .try_exists()?
+                || claudectl::central::service_account::configured()
+            {
+                let alias = claudectl::central::pick_account(&paths)?;
+                return point_server_account(&alias);
+            }
             // Only the auto-select path needs this here: it fetches usage over
             // the network before it knows which profile to activate, and
             // `switch_to` already preflights on the explicit-alias path.
@@ -30,11 +59,21 @@ pub fn run(alias: Option<&str>) -> Result<()> {
                 .collect();
             let Some(best) = accounts::best(&candidates) else {
                 bail!(
-                    "no saved profile is eligible: usage is missing, stale or exhausted, or billing is on or unknown\nTry: claudectl status --json"
+                    "no local profile is eligible:\n{}\nTry: claudectl status --details",
+                    candidates
+                        .iter()
+                        .map(|c| format!(
+                            "  {}: {}",
+                            c.name,
+                            accounts::selection_reason(c).unwrap_or_default()
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 );
             };
             let best = fetched[best].alias.clone();
             let email = profile::switch_to(&store, &paths, &best)?;
+            remove_server_shim(&paths)?;
             status::record_statusline_for(&paths, &fetched, &best);
             println!("auto-selected by weekly reset: {best} ({email})");
             println!();
@@ -44,13 +83,50 @@ pub fn run(alias: Option<&str>) -> Result<()> {
     }
 }
 
+fn point_server_account(alias: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use claudectl::central::shim;
+        shim::dispatch(shim::Command::Install {
+            account: Some(alias.to_owned()),
+            claude: None,
+            dir: None,
+        })?;
+        println!("plain claude account: {alias} (new launches only)");
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    bail!(
+        "server account switching requires the Claude PATH shim on Unix\nTry: claudectl run {alias}"
+    );
+}
+
 fn switch_explicit(store: &AuthStore, paths: &config::Paths, alias: &str) -> Result<()> {
     let email = profile::switch_to(store, paths, alias)?;
+    remove_server_shim(paths)?;
     println!("switched to {alias} ({email})");
     println!();
     if let Err(error) = status::run_focused(store, paths, alias) {
         eprintln!("warning: profile switch completed; cached usage unavailable: {error}");
     }
+    Ok(())
+}
+
+fn remove_server_shim(paths: &config::Paths) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use claudectl::central::shim;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let active = shim::active_dir(&path);
+        let default = shim::default_dir(paths);
+        for dir in active.iter().chain(std::iter::once(&default)) {
+            if shim::is_shim(&dir.join("claude")) {
+                shim::uninstall(dir)?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = paths;
     Ok(())
 }
 
