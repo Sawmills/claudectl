@@ -383,7 +383,11 @@ pub fn hold(paths: &Paths, command: HoldCommand) -> Result<()> {
                 println!("hold already active for {}", existing.run);
                 return Ok(());
             }
-            let pid = unsafe { libc::getppid() } as u32;
+            // Bash tool shells are short-lived. The wrapper owns the run and its hold.
+            let pid = status["pid"]
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok())
+                .context("run owner unavailable")?;
             let hold = Hold {
                 run: run_id(&directory)?.into(),
                 reason,
@@ -443,9 +447,10 @@ pub fn deferred_sessions(paths: &Paths) -> Result<Vec<Value>> {
                     continue;
                 }
                 let file = directory.join("restart-status.json");
-                match private_read(&file) {
-                    Ok(bytes) => {
-                        let value: Value = serde_json::from_slice(&bytes)?;
+                match private_read(&file)
+                    .and_then(|bytes| Ok(serde_json::from_slice::<Value>(&bytes)?))
+                {
+                    Ok(value) => {
                         if value["deferred"] == true {
                             rows.insert(run_id(&directory)?.to_owned(), value);
                         }
@@ -454,7 +459,12 @@ pub fn deferred_sessions(paths: &Paths) -> Result<Vec<Value>> {
                         if error
                             .downcast_ref::<std::io::Error>()
                             .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {}
-                    Err(error) => return Err(error),
+                    Err(_) => {
+                        rows.insert(
+                            run_id(&directory)?.to_owned(),
+                            unknown_status(run_id(&directory)?),
+                        );
+                    }
                 }
             }
         }
@@ -472,22 +482,41 @@ pub fn deferred_sessions(paths: &Paths) -> Result<Vec<Value>> {
                     continue;
                 };
                 let directory = sessions.join(run);
-                let Some(hold) = read_hold(&paths.home, &directory)? else {
+                if run_id(&directory).is_err() {
                     continue;
+                }
+                let hold = match read_hold(&paths.home, &directory) {
+                    Ok(Some(hold)) => hold,
+                    Ok(None) => continue,
+                    Err(_) => {
+                        rows.insert(run.into(), unknown_status(run));
+                        continue;
+                    }
                 };
                 let stale = !directory.exists()
-                    || hold_reason(&paths.home, &directory)? == Some(Reason::StaleHold);
-                rows.entry(run.into()).or_insert_with(|| {
+                    || !process_start(hold.owner_pid)
+                        .is_ok_and(|start| start == hold.owner_started);
+                let row = rows.entry(run.into()).or_insert_with(|| {
                     json!({"run":run,"alias":hold.alias,
                 "deferred":true,"reason":if stale {"stale_hold"} else {"explicit_hold"},
                 "stage":if stale {"blocked"} else {"deferred"}})
                 });
+                if stale {
+                    row["reason"] = "stale_hold".into();
+                    row["stage"] = "blocked".into();
+                    row["attention_required"] = true.into();
+                }
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
     Ok(rows.into_values().collect())
+}
+
+fn unknown_status(run: &str) -> Value {
+    json!({"run":run,"deferred":true,"reason":"evidence_unknown","stage":"blocked",
+        "attention_required":true})
 }
 
 /// The inherited server run's status, without a network read.

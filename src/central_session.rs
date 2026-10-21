@@ -497,8 +497,32 @@ fn read_new_events(path: &Path, activity: &mut Activity) -> std::io::Result<()> 
         Err(error) => return Err(error),
     };
     let mut chunk = String::new();
+    if file.metadata()?.len() < activity.offset {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "hook log truncated",
+        ));
+    }
     file.seek(SeekFrom::Start(activity.offset))?;
     file.read_to_string(&mut chunk)?;
+    if !chunk.is_empty() && !chunk.ends_with('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "incomplete hook record",
+        ));
+    }
+    for line in chunk.lines() {
+        let record: Value = serde_json::from_str(line)?;
+        if record["at"].as_i64().is_none()
+            || record["event"].as_str().is_none()
+            || record["session_id"].as_str().is_none_or(str::is_empty)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid hook record",
+            ));
+        }
+    }
     if let Some(end) = chunk.rfind('\n') {
         activity.offset += end as u64 + 1;
         let events = super::renew::parse_events(&chunk[..end]);
@@ -690,7 +714,6 @@ impl Monitor {
                 super::restart_gate::Cause::Renewal
             };
             if !gate.check(&activity.idle, cause, self.held_expires_at) {
-                retry_now = true;
                 continue;
             }
             // A usage limit first: while one is pending, renewal waits (one restart decision
@@ -701,7 +724,7 @@ impl Monitor {
                 && pending.handled != Some(failed_at)
             {
                 if let Some((account, access)) =
-                    self.failover_target(&mut activity, &timing, &mut pending, failed_at)
+                    self.failover_target(&mut activity, &mut gate, &timing, &mut pending, failed_at)
                 {
                     match self.stop_for_restart(&mut activity, &mut gate, &timing, cause) {
                         Ok(true) => {
@@ -844,6 +867,7 @@ impl Monitor {
     fn failover_target(
         &self,
         activity: &mut Activity,
+        gate: &mut super::restart_gate::Gate,
         timing: &super::renew::Timing,
         pending: &mut Pending,
         failed_at: i64,
@@ -889,6 +913,39 @@ impl Monitor {
                 let account = self.client.account(to).ok()?;
                 // Never a forced refresh: that revokes the token other sessions of `to` hold.
                 let access = self.client.acquire(&account.account_id, None).ok()?;
+                // All remote reads have completed. Do not reserve an account for work
+                // that became busy during them; the signal still has its final admission.
+                let _admission = match super::restart_gate::admission(&self.directory) {
+                    Ok(lock) => lock,
+                    Err(_) => {
+                        gate.unknown(
+                            &activity.idle,
+                            super::restart_gate::Cause::Failover,
+                            self.held_expires_at,
+                        );
+                        return None;
+                    }
+                };
+                if self.directory.join("hook-error").exists() || self.read_events(activity).is_err()
+                {
+                    gate.unknown(
+                        &activity.idle,
+                        super::restart_gate::Cause::Failover,
+                        self.held_expires_at,
+                    );
+                    return None;
+                }
+                let mut inputs = self.inputs(activity, timing, None);
+                inputs.restarts_last_hour = state.last_hour;
+                if super::renew::idle_gate(&inputs).is_err()
+                    || !gate.check(
+                        &activity.idle,
+                        super::restart_gate::Cause::Failover,
+                        self.held_expires_at,
+                    )
+                {
+                    return None;
+                }
                 Some((account, access))
             },
         );
