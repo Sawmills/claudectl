@@ -1,9 +1,5 @@
 # Claude accounts on a company account server
 
-The account server runs in production. It holds refresh credentials centrally so
-connected machines can run Claude Code with access tokens only. The design
-research is in [the central design](superpowers/specs/2026-10-02-claudectl-central-design.md).
-
 A company server holds Claude refresh credentials. Each enrolled machine receives
 only access tokens. Claude-only users install `claudectl` and Claude Code; they do
 not need Codex or an OpenAI account. The server is the `claudectl-server` binary in
@@ -494,6 +490,7 @@ rejection; these settings tokens contain no expiry metadata, so this experiment
 does not establish real OAuth lifetime.
 
 An early live check on one inactive Team account returned a successful inference
-through the access-only client. The [validation report](account-server-validation.md)
-records what that check proved and what it did not. For current deployment and
-operations procedures, use the [server runbook](account-server-runbook.md).
+through the access-only client. The [reduced live report](../experiments/settings-renewal/live-access-result.json)
+records that result. It does not establish billing behavior, credential rotation,
+or SSO deployment readiness. For current deployment and operations procedures, use
+the [server runbook](account-server-runbook.md).
