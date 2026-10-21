@@ -31,7 +31,7 @@ fn listed_refusals_end_with_a_try_line() {
         ("src/central.rs", "invalid Claude login challenge"),
         (
             "src/commands/use_profile.rs",
-            "no saved profile is eligible",
+            "no local profile is eligible",
         ),
         ("src/accounts.rs", "no account named"),
         (
