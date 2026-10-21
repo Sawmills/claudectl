@@ -64,7 +64,7 @@ pub fn run(alias: Option<&str>) -> Result<()> {
             };
             let best = fetched[best].alias.clone();
             let email = profile::switch_to(&store, &paths, &best)?;
-            remove_server_shim(&paths).context("local login switched, but plain claude still needs repair\nTry: claudectl shim status")?;
+            point_local_account(&paths, &best).context("local login switched, but plain claude still needs repair\nTry: claudectl shim status")?;
             status::record_statusline_for(&paths, &fetched, &best);
             println!("auto-selected by weekly reset: {best} ({email})");
             println!();
@@ -94,7 +94,7 @@ fn point_server_account(alias: &str) -> Result<()> {
 
 fn switch_explicit(store: &AuthStore, paths: &config::Paths, alias: &str) -> Result<()> {
     let email = profile::switch_to(store, paths, alias)?;
-    remove_server_shim(paths).context(
+    point_local_account(paths, alias).context(
         "local login switched, but plain claude still needs repair\nTry: claudectl shim status",
     )?;
     println!("switched to {alias} ({email})");
@@ -105,33 +105,11 @@ fn switch_explicit(store: &AuthStore, paths: &config::Paths, alias: &str) -> Res
     Ok(())
 }
 
-fn remove_server_shim(paths: &config::Paths) -> Result<()> {
+fn point_local_account(paths: &config::Paths, alias: &str) -> Result<()> {
     #[cfg(unix)]
-    {
-        use claudectl::central::shim;
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let active = shim::active_dir(&path);
-        let default = shim::default_dir(paths);
-        let mut recorded_real = None;
-        for dir in active.iter().chain(std::iter::once(&default)) {
-            if shim::is_shim(&dir.join("claude")) {
-                let selected = shim::status(dir, &path)?;
-                if recorded_real.is_none() && selected.real_ok {
-                    recorded_real = selected.real;
-                }
-                shim::uninstall(dir)?;
-            }
-        }
-        if let Some(real) = recorded_real
-            && shim::find_real(None, &path).is_err()
-            && let Some(dir) = real.parent()
-        {
-            println!("For plain claude in this shell, run:");
-            println!("  {}", shim::path_line(dir));
-        }
-    }
+    claudectl::central::shim::use_local(paths, alias)?;
     #[cfg(not(unix))]
-    let _ = paths;
+    let _ = (paths, alias);
     Ok(())
 }
 

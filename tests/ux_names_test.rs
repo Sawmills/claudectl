@@ -279,6 +279,7 @@ fn use_server_alias_repoints_plain_claude_without_changing_live_credentials() {
             alias: "previous-account".into(),
             real,
             claudectl: assert_cmd::cargo::cargo_bin("claudectl"),
+            local: false,
         },
         &shim_dir,
     )
@@ -389,7 +390,11 @@ fn use_a_local_profile_restores_local_plain_claude_after_a_server_selection() {
     let live: CredentialsFile =
         serde_json::from_slice(&std::fs::read(paths.claude_credentials_file()).unwrap()).unwrap();
     assert_eq!(live.claude_ai_oauth.access_token, "synthetic-local");
-    assert!(!paths.home.join(".local/claudectl/bin/claude").exists());
+    assert!(
+        claudectl::central::shim::status(&paths.home.join(".local/claudectl/bin"), &path)
+            .unwrap()
+            .local
+    );
 }
 
 #[test]
@@ -403,6 +408,7 @@ fn use_repoints_a_custom_shim_whose_real_claude_is_outside_path() {
             alias: "previous".into(),
             real: env.home.path().join("real-bin/claude"),
             claudectl: assert_cmd::cargo::cargo_bin("claudectl"),
+            local: false,
         },
         &dir,
     )
@@ -417,7 +423,7 @@ fn use_repoints_a_custom_shim_whose_real_claude_is_outside_path() {
 }
 
 #[test]
-fn local_use_supplies_a_path_line_when_only_the_shim_reached_claude() {
+fn local_use_keeps_a_nonstandard_executable_reachable_and_can_switch_back() {
     use claudectl::{
         central::shim::{self, Spec},
         config::Paths,
@@ -426,6 +432,9 @@ fn local_use_supplies_a_path_line_when_only_the_shim_reached_claude() {
     let env = Env::new();
     env.claude_path(false);
     let home = env.home.path();
+    let real = home.join("real-bin/claude-code");
+    std::fs::rename(home.join("real-bin/claude"), &real).unwrap();
+    std::fs::write(&real, "#!/bin/sh\nprintf 'synthetic-local-claude\\n'\n").unwrap();
     let paths = Paths::from_home(home.into());
     let creds = serde_json::from_value(json!({"claudeAiOauth": {"accessToken":"synthetic-local"}}))
         .unwrap();
@@ -434,8 +443,9 @@ fn local_use_supplies_a_path_line_when_only_the_shim_reached_claude() {
     shim::install(
         &Spec {
             alias: "previous".into(),
-            real: home.join("real-bin/claude"),
+            real,
             claudectl: assert_cmd::cargo::cargo_bin("claudectl"),
+            local: false,
         },
         &dir,
     )
@@ -444,21 +454,25 @@ fn local_use_supplies_a_path_line_when_only_the_shim_reached_claude() {
     let output = env.with_path(&["use", "local"], &path);
     assert!(output.status.success(), "{output:?}");
     let text = String::from_utf8_lossy(&output.stdout);
-    let line = text
-        .lines()
-        .find(|line| line.trim_start().starts_with("export PATH="))
-        .unwrap_or_else(|| panic!("plain claude needs the recorded binary's PATH: {text}"));
+    assert!(!text.contains("export PATH="));
     let found = std::process::Command::new("/bin/sh")
         .env_clear()
         .env("HOME", home)
-        .env("PATH", path)
-        .args(["-c", &format!("{line}\ncommand -v claude")])
+        .env("PATH", &path)
+        .args(["-c", "claude"])
         .output()
         .unwrap();
     assert!(found.status.success());
     assert_eq!(
         String::from_utf8_lossy(&found.stdout).trim(),
-        home.join("real-bin/claude").to_str().unwrap()
+        "synthetic-local-claude"
+    );
+    let output = env.with_path(&["use", "amir2"], &path);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !shim::status(&home.join(".local/claudectl/bin"), &path)
+            .unwrap()
+            .local
     );
 }
 

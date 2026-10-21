@@ -19,6 +19,9 @@ pub struct Spec {
     pub alias: String,
     pub real: PathBuf,
     pub claudectl: PathBuf,
+    /// Local selections launch the recorded Claude directly, using the local login.
+    #[serde(default)]
+    pub local: bool,
 }
 
 #[derive(clap::Subcommand)]
@@ -91,6 +94,11 @@ pub fn render(spec: &Spec) -> Result<String> {
     let claudectl = quote(text(&spec.claudectl)?);
     let alias = quote(&spec.alias);
     let recorded = serde_json::to_string(spec)?;
+    let launch = if spec.local {
+        "direct \"$@\"".to_owned()
+    } else {
+        format!("exec {claudectl} server run {alias} --claude \"$real\" -- \"$@\"")
+    };
     Ok(format!(
         "#!/bin/sh\n\
          {MARKER}\n\
@@ -105,7 +113,7 @@ pub fn render(spec: &Spec) -> Result<String> {
          }}\n\
          if [ \"${{CLAUDECTL_SHIM:-}}\" = off ]; then direct \"$@\"; fi\n\
          case \"${{1:-}}\" in {PASS_THROUGH}) direct \"$@\" ;; esac\n\
-         exec {claudectl} server run {alias} --claude \"$real\" -- \"$@\"\n"
+         {launch}\n"
     ))
 }
 
@@ -250,6 +258,7 @@ fn on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
 #[derive(Debug)]
 pub struct Status {
     pub installed: bool,
+    pub local: bool,
     pub alias: Option<String>,
     pub real: Option<PathBuf>,
     pub real_ok: bool,
@@ -274,6 +283,7 @@ pub fn status(dir: &Path, path: &OsStr) -> Result<Status> {
         });
     Ok(Status {
         installed,
+        local: spec.as_ref().is_some_and(|s| s.local),
         alias: spec.as_ref().map(|s| s.alias.clone()),
         real: spec.as_ref().map(|s| s.real.clone()),
         real_ok,
@@ -335,6 +345,24 @@ pub fn active_dir(path: &OsStr) -> Option<PathBuf> {
     is_shim(&program).then(|| program.parent().unwrap_or(Path::new(".")).to_path_buf())
 }
 
+/// Keep the managed launcher's real executable reachable when switching to a local login.
+pub fn use_local(paths: &crate::config::Paths, alias: &str) -> Result<()> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let active = active_dir(&path);
+    let default = default_dir(paths);
+    for dir in active.iter().chain(std::iter::once(&default)) {
+        if !is_shim(&dir.join("claude")) {
+            continue;
+        }
+        let mut spec =
+            read_spec(&dir.join("claude")).context("cannot read the managed Claude launcher")?;
+        spec.alias = alias.to_owned();
+        spec.local = true;
+        install(&spec, dir)?;
+    }
+    Ok(())
+}
+
 pub fn dispatch(command: Command) -> Result<()> {
     let paths = &crate::config::default_paths()?;
     let path = std::env::var_os("PATH").unwrap_or_default();
@@ -358,6 +386,7 @@ pub fn dispatch(command: Command) -> Result<()> {
                 alias: account,
                 real: find_real(claude.as_deref().or(recorded_real), &path)?,
                 claudectl: claudectl_path_from(&path, &cwd, &std::env::current_exe()?),
+                local: false,
             };
             let target = install(&spec, &dir)?;
             println!("Installed {}", target.display());
@@ -391,6 +420,9 @@ pub fn dispatch(command: Command) -> Result<()> {
             }
             println!("shim      {}", dir.join("claude").display());
             println!("account   {}", s.alias.as_deref().unwrap_or("unknown"));
+            if s.local {
+                println!("route     local login");
+            }
             match &s.real {
                 Some(real) if s.real_ok => println!("claude    {}", real.display()),
                 Some(real) => println!("claude    {} (missing: run install again)", real.display()),

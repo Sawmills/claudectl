@@ -44,6 +44,7 @@ impl Fixture {
             alias: alias.into(),
             real: self.real.clone(),
             claudectl: self.claudectl.clone(),
+            local: false,
         }
     }
     /// Run the installed shim: its stdout lines.
@@ -145,6 +146,7 @@ fn quoting_survives_hostile_paths_and_aliases() {
         alias: "a'b".into(),
         real: fake(&root, "claude"),
         claudectl: fake(&root, "claudectl"),
+        local: false,
     };
     shim::install(&spec, &f.dir).unwrap();
     let out = f.run(&["x"], &[]);

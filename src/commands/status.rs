@@ -119,10 +119,12 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
         let path = std::env::var_os("PATH").unwrap_or_default();
         if let Some(dir) = shim::active_dir(&path) {
             let selected = shim::status(&dir, &path)?;
-            for account in &mut local {
-                account.is_active = false;
+            if !selected.local {
+                for account in &mut local {
+                    account.is_active = false;
+                }
             }
-            if selected.real_ok && selected.claudectl_ok {
+            if !selected.local && selected.real_ok && selected.claudectl_ok {
                 let aliases: Vec<_> = remote
                     .iter()
                     .map(|account| account.alias.as_str())
