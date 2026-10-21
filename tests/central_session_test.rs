@@ -193,6 +193,26 @@ fn a_stale_hold_overrides_cached_deferred_status_without_losing_its_counter() {
     assert!(hold.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn damaged_restart_diagnostics_report_attention_without_hiding_account_status() {
+    let home = tempfile::tempdir().unwrap();
+    let paths = Paths::from_home(home.path().to_path_buf());
+    let access = grant("synthetic", 1);
+    let session = Session::new(&paths, &account_for(&access), access).unwrap();
+    std::fs::write(session.directory().join("restart-status.json"), "damaged").unwrap();
+    let output = hold_command(&session, &["status", "--cached", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["sessions"][0]["reason"], "evidence_unknown");
+    assert_eq!(status["sessions"][0]["stage"], "blocked");
+    assert_eq!(status["sessions"][0]["attention_required"], true);
+}
+
 /// Run the launch seam in its own process so PATH tests do not mutate global test state.
 #[test]
 fn session_path_helper() {

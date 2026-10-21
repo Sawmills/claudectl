@@ -397,7 +397,13 @@ pub(super) fn record_hook(
     use std::io::Write;
     let dir = session_dir(sessions, dir)?;
     #[cfg(unix)]
-    let _admission = super::restart_gate::admission(&dir)?;
+    let _admission = match super::restart_gate::admission(&dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            mark_hook_error(&dir);
+            return Err(error);
+        }
+    };
     let v: serde_json::Value = match serde_json::from_str(input) {
         Ok(v) => v,
         Err(error) => {
@@ -949,6 +955,27 @@ mod tests {
         let input = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#;
         assert!(record_hook(&sessions, &dir, input, 1).is_err());
         assert!(dir.join("hook-error").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_that_cannot_lock_admission_leaves_the_error_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        let dir = sessions.join("run-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(dir.join("restart.lock")).unwrap();
+        assert!(
+            record_hook(
+                &sessions,
+                &dir,
+                r#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#,
+                1
+            )
+            .is_err()
+        );
+        assert!(dir.join("hook-error").exists());
+        assert!(!dir.join("events").exists());
     }
 
     #[test]

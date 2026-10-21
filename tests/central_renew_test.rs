@@ -191,8 +191,14 @@ if hold_open:
     start = [os.environ["FAKE_WRAPPER_BIN"], "hold", "start", "--reason", "FLT-553 synthetic prod step"]
     if os.environ.get("FAKE_STALE_HOLD"):
         subprocess.run([sys.executable, "-c", "import subprocess,sys; subprocess.run(sys.argv[1:], check=True)"] + start, check=True)
+        run = os.path.basename(os.environ["CLAUDECTL_SERVER_RUN"])
+        path = os.path.join(os.environ["HOME"], ".claudectl", "server", "holds", run + ".json")
+        saved = json.load(open(path))
+        saved["owner_started"] = "previous wrapper incarnation"
+        with open(path, "w") as out:
+            json.dump(saved, out)
     else:
-        subprocess.run(start, check=True)
+        subprocess.run(["/bin/sh", "-c", '"$@"; :', "hold-shell"] + start, check=True)
 if os.environ.get("FAKE_TASK_CHILD") and token == "token-1":
     if os.environ.get("FAKE_TASK_DURING_READ"):
         open(os.environ["FAKE_LOG"] + ".ready", "w").close()
