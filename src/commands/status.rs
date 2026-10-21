@@ -123,9 +123,17 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
                 account.is_active = false;
             }
             if selected.real_ok && selected.claudectl_ok {
+                let aliases: Vec<_> = remote
+                    .iter()
+                    .map(|account| account.alias.as_str())
+                    .collect();
+                let resolved = selected.alias.as_deref().and_then(|alias| {
+                    claudectl::accounts::resolve(alias, &aliases)
+                        .ok()
+                        .map(str::to_owned)
+                });
                 for account in &mut remote {
-                    account.is_active = selected
-                        .alias
+                    account.is_active = resolved
                         .as_ref()
                         .is_some_and(|alias| alias.eq_ignore_ascii_case(&account.alias));
                 }
@@ -1460,6 +1468,7 @@ fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
             let unpicked = order.iter().copied().find(|&i| {
                 let c = &candidates[i];
                 c.fresh
+                    && c.billed
                     && matches!(
                         accounts::state(&c.windows),
                         State::Ready | State::Low { .. }

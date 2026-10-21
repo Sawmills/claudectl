@@ -907,15 +907,7 @@ pub fn pick_account(paths: &Paths) -> Result<String> {
         }
         None => bail!(
             "no server account is eligible:\n{}\nTry: claudectl status --details",
-            candidates
-                .iter()
-                .map(|c| format!(
-                    "  {}: {}",
-                    c.name,
-                    crate::accounts::selection_reason(c).unwrap_or_default()
-                ))
-                .collect::<Vec<_>>()
-                .join("\n")
+            crate::accounts::selection_failures(&candidates)
         ),
     }
 }

@@ -206,64 +206,68 @@ async fn service_job_rejection_never_falls_back_to_a_saved_human_machine_or_star
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn service_jobs_refuse_billed_accounts_before_starting_claude() {
+async fn service_jobs_keep_billing_guard_without_automatic_pick_headroom_cutoff() {
     use std::os::unix::fs::PermissionsExt;
-    let grants = Arc::new(AtomicUsize::new(0));
-    let posted = grants.clone();
-    let app = Router::new()
+    for (billed, week, should_probe) in [(true, 20.0, false), (false, 96.0, true)] {
+        let grants = Arc::new(AtomicUsize::new(0));
+        let posted = grants.clone();
+        let app = Router::new()
         .route("/v1/me", get(|| async { Json(json!({"id":"company-user"})) }))
         .route("/v2/anthropic/accounts", get(|| async { Json(json!([{
             "provider":"anthropic", "account_id":"a".repeat(64), "alias":"work",
             "identity":{"account_uuid":"account","organization_uuid":"org"}, "available":true
         }])) }))
-        .route("/v2/anthropic/usage", get(|| async {
+        .route("/v2/anthropic/usage", get(move || async move {
             let now = chrono::Utc::now().timestamp_millis();
-            Json(json!({"data":{"five_hour":{"utilization":10.0},"seven_day":{"utilization":20.0},
-                "extra_usage":{"is_enabled":true}}, "observed_at":now,
+            Json(json!({"data":{"five_hour":{"utilization":10.0},"seven_day":{"utilization":week},
+                "extra_usage":{"is_enabled":billed}}, "observed_at":now,
                 "next_retry_at":now+300000,"stale":false,"error":null}))
         }))
         .route("/v2/anthropic/token", axum::routing::post(move || {
             let grants = posted.clone();
             async move { grants.fetch_add(1, Ordering::SeqCst); axum::http::StatusCode::UNAUTHORIZED }
         }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let home = tempfile::tempdir().unwrap();
-    let marker = home.path().join("child-started");
-    let binary = home.path().join("claude");
-    std::fs::write(
-        &binary,
-        format!(
-            "#!/bin/sh\ntouch {}\nprintf 'fixture-unqualified\\n'\n",
-            claudectl::shell::arg(marker.to_str().unwrap())
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_claudectl"))
-        .args(["server", "run", "work", "--claude"])
-        .arg(&binary)
-        .args(["--", "-p", "synthetic prompt"])
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap())
-        .env("HOME", home.path())
-        .env("CLAUDECTL_SERVICE_TOKEN", "synthetic-claude-service")
-        .env("CLAUDECTL_SERVER_URL", origin)
-        .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
-        .output()
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let marker = home.path().join("child-started");
+        let binary = home.path().join("claude");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\ntouch {}\nprintf 'fixture-unqualified\\n'\n",
+                claudectl::shell::arg(marker.to_str().unwrap())
+            ),
+        )
         .unwrap();
-    server.abort();
-    assert!(
-        !marker.exists(),
-        "service job started a Claude child on a billed account"
-    );
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("service job requires fresh included capacity")
-    );
-    assert_eq!(grants.load(Ordering::SeqCst), 0);
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_claudectl"))
+            .args(["server", "run", "work", "--claude"])
+            .arg(&binary)
+            .args(["--", "-p", "synthetic prompt"])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", home.path())
+            .env("CLAUDECTL_SERVICE_TOKEN", "synthetic-claude-service")
+            .env("CLAUDECTL_SERVER_URL", origin)
+            .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .output()
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            marker.exists(),
+            should_probe,
+            "billed={billed}, week={week}: {output:?}"
+        );
+        assert!(!output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("service job requires fresh included capacity"),
+            billed
+        );
+        assert_eq!(grants.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

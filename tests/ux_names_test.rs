@@ -393,6 +393,76 @@ fn use_a_local_profile_restores_local_plain_claude_after_a_server_selection() {
 }
 
 #[test]
+fn use_repoints_a_custom_shim_whose_real_claude_is_outside_path() {
+    use claudectl::central::shim::{self, Spec};
+    let env = Env::new();
+    env.claude_path(false);
+    let dir = env.home.path().join("custom-shim");
+    shim::install(
+        &Spec {
+            alias: "previous".into(),
+            real: env.home.path().join("real-bin/claude"),
+            claudectl: assert_cmd::cargo::cargo_bin("claudectl"),
+        },
+        &dir,
+    )
+    .unwrap();
+    let path = std::env::join_paths([dir.clone(), "/usr/bin".into(), "/bin".into()]).unwrap();
+    let output = env.with_path(&["use", "amir2"], &path);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        shim::status(&dir, &path).unwrap().alias.as_deref(),
+        Some("amir2@sawmills.ai")
+    );
+}
+
+#[test]
+fn local_use_supplies_a_path_line_when_only_the_shim_reached_claude() {
+    use claudectl::{
+        central::shim::{self, Spec},
+        config::Paths,
+        profile,
+    };
+    let env = Env::new();
+    env.claude_path(false);
+    let home = env.home.path();
+    let paths = Paths::from_home(home.into());
+    let creds = serde_json::from_value(json!({"claudeAiOauth": {"accessToken":"synthetic-local"}}))
+        .unwrap();
+    profile::save_profile_to(&paths, "local", &creds, None).unwrap();
+    let dir = home.join(".local/claudectl/bin");
+    shim::install(
+        &Spec {
+            alias: "previous".into(),
+            real: home.join("real-bin/claude"),
+            claudectl: assert_cmd::cargo::cargo_bin("claudectl"),
+        },
+        &dir,
+    )
+    .unwrap();
+    let path = std::env::join_paths([dir, "/usr/bin".into(), "/bin".into()]).unwrap();
+    let output = env.with_path(&["use", "local"], &path);
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("export PATH="))
+        .unwrap_or_else(|| panic!("plain claude needs the recorded binary's PATH: {text}"));
+    let found = std::process::Command::new("/bin/sh")
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", path)
+        .args(["-c", &format!("{line}\ncommand -v claude")])
+        .output()
+        .unwrap();
+    assert!(found.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&found.stdout).trim(),
+        home.join("real-bin/claude").to_str().unwrap()
+    );
+}
+
+#[test]
 fn rm_names_the_resolved_account_before_and_after_it_removes_it() {
     let env = Env::new();
     // A prefix: the confirmation names the account it would remove, never the typed text.

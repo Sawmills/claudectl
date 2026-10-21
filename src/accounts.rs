@@ -137,8 +137,8 @@ pub struct Candidate {
     pub billed: bool,
 }
 
-/// Why an account cannot be picked automatically. Explicit choices remain a user decision.
-pub fn selection_reason(c: &Candidate) -> Option<String> {
+/// Why an account lacks fresh included capacity, including for named service jobs.
+pub fn capacity_reason(c: &Candidate) -> Option<String> {
     if !c.fresh {
         return Some("usage is unavailable or stale".into());
     }
@@ -150,6 +150,14 @@ pub fn selection_reason(c: &Candidate) -> Option<String> {
         State::Limit { window, .. } => return Some(format!("{window} window is exhausted")),
         _ => {}
     }
+    None
+}
+
+/// Why an account cannot be picked automatically. Named choices keep the capacity rules.
+pub fn selection_reason(c: &Candidate) -> Option<String> {
+    if let Some(reason) = capacity_reason(c) {
+        return Some(reason);
+    }
     if c.windows
         .iter()
         .any(|w| w.name == "week" && w.used >= Some(95.0))
@@ -157,6 +165,15 @@ pub fn selection_reason(c: &Candidate) -> Option<String> {
         return Some("5% or less weekly headroom remains".into());
     }
     None
+}
+
+/// Per-account reasons for an automatic selection refusal.
+pub fn selection_failures(candidates: &[Candidate]) -> String {
+    candidates
+        .iter()
+        .filter_map(|c| selection_reason(c).map(|reason| format!("  {}: {reason}", c.name)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The account to use: fresh, not billed, no full window, more than 5% weekly room;

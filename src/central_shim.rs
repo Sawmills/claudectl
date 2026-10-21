@@ -351,7 +351,7 @@ pub fn dispatch(command: Command) -> Result<()> {
             let dir = resolve(dir);
             let account = account.unwrap_or_else(|| default_account().into());
             // Only a server account: the launcher never falls back to a local or billed login.
-            super::Client::load(paths)?.account(&account)?;
+            let account = super::Client::load(paths)?.account(&account)?.alias;
             let previous = status(&dir, &path)?;
             let recorded_real = previous.real.as_deref().filter(|_| previous.real_ok);
             let spec = Spec {
