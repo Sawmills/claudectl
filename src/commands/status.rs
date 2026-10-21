@@ -1484,7 +1484,7 @@ fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
                 None => match fix {
                     Some(command) => out.push_str(&format!("Next: {command}\n")),
                     None => out
-                        .push_str("Next: claudectl status --details   (no account has room now)\n"),
+                        .push_str("Next: claudectl status --details   (no account can be picked automatically)\n"),
                 },
             }
         }
