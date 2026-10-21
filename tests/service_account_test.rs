@@ -208,7 +208,7 @@ async fn service_job_rejection_never_falls_back_to_a_saved_human_machine_or_star
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn service_jobs_keep_billing_guard_without_automatic_pick_headroom_cutoff() {
     use std::os::unix::fs::PermissionsExt;
-    for (billed, week, should_probe) in [(true, 20.0, false), (false, 96.0, true)] {
+    for (billed, week, should_acquire) in [(true, 20.0, false), (false, 96.0, true)] {
         let grants = Arc::new(AtomicUsize::new(0));
         let posted = grants.clone();
         let app = Router::new()
@@ -242,6 +242,15 @@ async fn service_jobs_keep_billing_guard_without_automatic_pick_headroom_cutoff(
         )
         .unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let qualified = home
+            .path()
+            .join(".claudectl/server/qualified-host-config-builds.json");
+        std::fs::create_dir_all(qualified.parent().unwrap()).unwrap();
+        std::fs::write(&qualified, json!([{
+            "sha256": claudectl::exec::sha256_file(&binary).unwrap(),
+            "platform": std::env::consts::OS, "qualified_at":"test", "check":"supervised_host_config"
+        }]).to_string()).unwrap();
+        std::fs::set_permissions(&qualified, std::fs::Permissions::from_mode(0o600)).unwrap();
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_claudectl"))
             .args(["server", "run", "work", "--claude"])
             .arg(&binary)
@@ -257,7 +266,7 @@ async fn service_jobs_keep_billing_guard_without_automatic_pick_headroom_cutoff(
         server.abort();
         assert_eq!(
             marker.exists(),
-            should_probe,
+            false,
             "billed={billed}, week={week}: {output:?}"
         );
         assert!(!output.status.success());
@@ -266,7 +275,7 @@ async fn service_jobs_keep_billing_guard_without_automatic_pick_headroom_cutoff(
                 .contains("service job requires fresh included capacity"),
             billed
         );
-        assert_eq!(grants.load(Ordering::SeqCst), 0);
+        assert_eq!(grants.load(Ordering::SeqCst), usize::from(should_acquire));
     }
 }
 
