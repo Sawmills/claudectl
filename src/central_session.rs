@@ -559,6 +559,9 @@ struct Activity {
 impl Monitor {
     /// Fold the hook events appended since the last read into the activity.
     fn read_events(&self, activity: &mut Activity) -> std::io::Result<()> {
+        // A healthy writer's in-progress append must not look like damaged evidence.
+        let _admission =
+            super::restart_gate::admission(&self.directory).map_err(std::io::Error::other)?;
         read_new_events(&self.directory.join("events"), activity)
     }
     /// The decision inputs from the current activity, terminal and process group. Without a
@@ -832,7 +835,9 @@ impl Monitor {
                 return Err(());
             }
         };
-        if self.directory.join("hook-error").exists() || self.read_events(activity).is_err() {
+        if self.directory.join("hook-error").exists()
+            || read_new_events(&self.directory.join("events"), activity).is_err()
+        {
             gate.unknown(&activity.idle, cause, self.held_expires_at);
             return Err(());
         }
@@ -926,7 +931,8 @@ impl Monitor {
                         return None;
                     }
                 };
-                if self.directory.join("hook-error").exists() || self.read_events(activity).is_err()
+                if self.directory.join("hook-error").exists()
+                    || read_new_events(&self.directory.join("events"), activity).is_err()
                 {
                     gate.unknown(
                         &activity.idle,
