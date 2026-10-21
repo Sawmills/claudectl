@@ -104,6 +104,18 @@ fn best_spends_weekly_room_before_its_earlier_reset() {
 }
 
 #[test]
+fn automatic_selection_keeps_five_percent_weekly_headroom() {
+    let rows = [
+        ready("almost_empty", 1.0, 99.0, 3_600),
+        ready("enough_room", 10.0, 40.0, 86_400),
+    ];
+    assert_eq!(accounts::best(&rows), Some(1));
+    assert_eq!(accounts::best(&rows[..1]), None);
+    assert_eq!(accounts::best(&[ready("boundary", 1.0, 95.0, 1)]), None);
+    assert_eq!(accounts::best(&[ready("eligible", 1.0, 94.9, 1)]), Some(0));
+}
+
+#[test]
 fn best_skips_limits_stale_and_billed_before_ranking_resets() {
     let mut fable_full = ready("amir4", 0.0, 10.0, 50);
     fable_full.windows.push(w("Fable", 100.0, None));
@@ -143,7 +155,7 @@ fn best_breaks_a_reset_hour_tie_by_weekly_room_not_session_room() {
 fn best_places_unknown_resets_after_every_known_reset() {
     let mut unknown = ready("unknown", 0.0, 1.0, 0);
     unknown.windows[1].resets_at = None;
-    let rows = [unknown, ready("known", 10.0, 99.0, 143 * 3_600)];
+    let rows = [unknown, ready("known", 10.0, 94.0, 143 * 3_600)];
     assert_eq!(
         accounts::best(&rows).map(|i| rows[i].name.as_str()),
         Some("known")

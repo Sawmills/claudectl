@@ -137,7 +137,47 @@ pub struct Candidate {
     pub billed: bool,
 }
 
-/// The account to use: fresh, not billed, no full window; then the soonest known weekly
+/// Why an account lacks fresh included capacity, including for named service jobs.
+pub fn capacity_reason(c: &Candidate) -> Option<String> {
+    if !c.fresh {
+        return Some("usage is unavailable or stale".into());
+    }
+    if c.billed {
+        return Some("extra usage billing is enabled or unknown".into());
+    }
+    match state(&c.windows) {
+        State::Unknown => return Some("5h or weekly usage is missing".into()),
+        State::Limit { window, .. } => return Some(format!("{window} window is exhausted")),
+        _ => {}
+    }
+    None
+}
+
+/// Why an account cannot be picked automatically. Named choices keep the capacity rules.
+pub fn selection_reason(c: &Candidate) -> Option<String> {
+    if let Some(reason) = capacity_reason(c) {
+        return Some(reason);
+    }
+    if c.windows
+        .iter()
+        .any(|w| w.name == "week" && w.used >= Some(95.0))
+    {
+        return Some("5% or less weekly headroom remains".into());
+    }
+    None
+}
+
+/// Per-account reasons for an automatic selection refusal.
+pub fn selection_failures(candidates: &[Candidate]) -> String {
+    candidates
+        .iter()
+        .filter_map(|c| selection_reason(c).map(|reason| format!("  {}: {reason}", c.name)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The account to use: fresh, not billed, no full window, more than 5% weekly room;
+/// then the soonest known weekly
 /// reset hour, the most weekly room, and the name. Unknown reset times sort last.
 pub fn best(candidates: &[Candidate]) -> Option<usize> {
     let week_reset_hour = |c: &Candidate| {
@@ -158,9 +198,7 @@ pub fn best(candidates: &[Candidate]) -> Option<usize> {
     candidates
         .iter()
         .enumerate()
-        .filter(|(_, c)| {
-            c.fresh && !c.billed && matches!(state(&c.windows), State::Ready | State::Low { .. })
-        })
+        .filter(|(_, c)| selection_reason(c).is_none())
         .min_by(|(_, a), (_, b)| {
             week_reset_hour(a)
                 .cmp(&week_reset_hour(b))

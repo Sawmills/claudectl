@@ -59,7 +59,7 @@ pub(super) fn account(client: &Client, alias: &str) -> Result<Option<super::Acco
         available: account.available,
         usage: Ok(client.usage(&account.account_id, false)?),
     });
-    if crate::accounts::best(&[candidate]).is_none() {
+    if crate::accounts::capacity_reason(&candidate).is_some() {
         bail!("service job requires fresh included capacity");
     }
     Ok(Some(account))

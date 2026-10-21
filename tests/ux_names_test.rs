@@ -104,15 +104,31 @@ impl Env {
         Self { home, logins }
     }
     fn claudectl(&self, args: &[&str]) -> std::process::Output {
+        self.with_path(args, std::ffi::OsStr::new("/usr/local/bin:/usr/bin:/bin"))
+    }
+    fn with_path(&self, args: &[&str], path: &std::ffi::OsStr) -> std::process::Output {
         Command::cargo_bin("claudectl")
             .unwrap()
             .env_clear()
             .env("HOME", self.home.path())
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("PATH", path)
             .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(args)
             .output()
             .unwrap()
+    }
+    fn claude_path(&self, shim_first: bool) -> std::ffi::OsString {
+        use std::os::unix::fs::PermissionsExt;
+        let real_dir = self.home.path().join("real-bin");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real = real_dir.join("claude");
+        std::fs::write(&real, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut dirs = vec![real_dir, "/usr/bin".into(), "/bin".into()];
+        if shim_first {
+            dirs.insert(0, self.home.path().join(".local/claudectl/bin"));
+        }
+        std::env::join_paths(dirs).unwrap()
     }
 }
 
@@ -247,6 +263,232 @@ fn status_resolves_the_short_name_of_a_server_account() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(stdout.contains("amir2"), "{stdout}");
+}
+
+#[test]
+fn use_server_alias_repoints_plain_claude_without_changing_live_credentials() {
+    use claudectl::central::shim::{self, Spec};
+
+    let env = Env::new();
+    let home = env.home.path();
+    let path = env.claude_path(true);
+    let real = home.join("real-bin/claude");
+    let shim_dir = home.join(".local/claudectl/bin");
+    shim::install(
+        &Spec {
+            alias: "previous-account".into(),
+            real,
+            claudectl: assert_cmd::cargo::cargo_bin("claudectl"),
+            local: false,
+        },
+        &shim_dir,
+    )
+    .unwrap();
+    let live = home.join(".claude/.credentials.json");
+    private_write(&live, "synthetic-live-login-must-stay");
+    let output = env.with_path(&["use", "amir2"], &path);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("amir2@sawmills.ai"));
+    let selected = shim::status(&home.join(".local/claudectl/bin"), &path).unwrap();
+    assert_eq!(selected.alias.as_deref(), Some("amir2@sawmills.ai"));
+    assert!(selected.first_on_path && selected.real_ok && selected.claudectl_ok);
+    assert_eq!(
+        std::fs::read_to_string(live).unwrap(),
+        "synthetic-live-login-must-stay"
+    );
+}
+
+#[test]
+fn automatic_use_installs_a_server_account_and_status_marks_plain_claude() {
+    let env = Env::new();
+    let path = env.claude_path(true);
+    let output = env.with_path(&["use"], &path);
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("amir2@sawmills.ai"));
+    let paths = claudectl::config::Paths::from_home(env.home.path().into());
+    let creds = serde_json::from_value(json!({"claudeAiOauth":{"accessToken":""}})).unwrap();
+    claudectl::profile::save_profile_to(&paths, "local", &creds, None).unwrap();
+    claudectl::profile::set_active_from(&paths, "local").unwrap();
+    let output = env.with_path(&["status"], &path);
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("(plain claude)"));
+    let output = env.with_path(&["status", "--json"], &path);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["server"]["accounts"][0]["active"], true);
+    assert_eq!(report["accounts"][0]["active"], true);
+}
+
+#[test]
+fn use_prints_one_path_line_without_editing_shell_startup() {
+    let env = Env::new();
+    let path = env.claude_path(false);
+    let startup = env.home.path().join(".zshrc");
+    std::fs::write(&startup, "# leave my shell alone\n").unwrap();
+    let output = env.with_path(&["use", "amir2"], &path);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .matches("export PATH=")
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(startup).unwrap(),
+        "# leave my shell alone\n"
+    );
+    let output = env.with_path(&["status", "--json"], &path);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["server"]["accounts"][0]["active"], false);
+}
+
+#[test]
+fn automatic_use_and_run_refuse_a_99_percent_week_with_the_actual_reason() {
+    let env = Env::with_usage(Some(json!({
+        "data": {"five_hour": {"utilization": 1}, "seven_day": {"utilization": 99},
+            "extra_usage": {"is_enabled": false}},
+        "observed_at": chrono::Utc::now().timestamp_millis(),
+        "next_retry_at": 0, "stale": false, "error": null,
+    })));
+    for command in ["use", "run"] {
+        let output = env.claudectl(&[command]);
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("weekly headroom"), "{error}");
+        assert!(error.contains("Try: claudectl status --details"), "{error}");
+    }
+    assert!(!env.home.path().join(".local/claudectl/bin/claude").exists());
+}
+
+#[test]
+fn an_unknown_use_alias_names_the_accounts_and_next_command() {
+    let env = Env::new();
+    let output = env.claudectl(&["use", "nobody"]);
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(error.contains("no account named 'nobody'"), "{error}");
+    assert!(error.contains("amir2@sawmills.ai"), "{error}");
+    assert!(error.contains("Try: claudectl status"), "{error}");
+}
+
+#[test]
+fn use_a_local_profile_restores_local_plain_claude_after_a_server_selection() {
+    use claudectl::{api::CredentialsFile, config::Paths, profile};
+    let env = Env::new();
+    let path = env.claude_path(true);
+    assert!(env.with_path(&["use", "amir2"], &path).status.success());
+    let paths = Paths::from_home(env.home.path().into());
+    let creds: CredentialsFile = serde_json::from_value(json!({
+        "claudeAiOauth": {"accessToken": "synthetic-local", "subscriptionType": "max"}
+    }))
+    .unwrap();
+    profile::save_profile_to(&paths, "local", &creds, None).unwrap();
+    let output = env.with_path(&["use", "local"], &path);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        profile::get_active_from(&paths).unwrap().as_deref(),
+        Some("local")
+    );
+    let live: CredentialsFile =
+        serde_json::from_slice(&std::fs::read(paths.claude_credentials_file()).unwrap()).unwrap();
+    assert_eq!(live.claude_ai_oauth.access_token, "synthetic-local");
+    assert!(
+        claudectl::central::shim::status(&paths.home.join(".local/claudectl/bin"), &path)
+            .unwrap()
+            .local
+    );
+}
+
+#[test]
+fn use_repoints_a_custom_shim_whose_real_claude_is_outside_path() {
+    use claudectl::central::shim::{self, Spec};
+    let env = Env::new();
+    env.claude_path(false);
+    let dir = env.home.path().join("custom-shim");
+    shim::install(
+        &Spec {
+            alias: "previous".into(),
+            real: env.home.path().join("real-bin/claude"),
+            claudectl: assert_cmd::cargo::cargo_bin("claudectl"),
+            local: false,
+        },
+        &dir,
+    )
+    .unwrap();
+    let path = std::env::join_paths([dir.clone(), "/usr/bin".into(), "/bin".into()]).unwrap();
+    let output = env.with_path(&["use", "amir2"], &path);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        shim::status(&dir, &path).unwrap().alias.as_deref(),
+        Some("amir2@sawmills.ai")
+    );
+}
+
+#[test]
+fn local_use_keeps_a_nonstandard_executable_reachable_and_can_switch_back() {
+    use claudectl::{
+        central::shim::{self, Spec},
+        config::Paths,
+        profile,
+    };
+    let env = Env::new();
+    env.claude_path(false);
+    let home = env.home.path();
+    let real = home.join("real-bin/claude-code");
+    std::fs::rename(home.join("real-bin/claude"), &real).unwrap();
+    std::fs::write(&real, "#!/bin/sh\nprintf 'synthetic-local-claude\\n'\n").unwrap();
+    let paths = Paths::from_home(home.into());
+    let creds = serde_json::from_value(json!({"claudeAiOauth": {"accessToken":"synthetic-local"}}))
+        .unwrap();
+    profile::save_profile_to(&paths, "local", &creds, None).unwrap();
+    let dir = home.join(".local/claudectl/bin");
+    shim::install(
+        &Spec {
+            alias: "previous".into(),
+            real,
+            claudectl: assert_cmd::cargo::cargo_bin("claudectl"),
+            local: false,
+        },
+        &dir,
+    )
+    .unwrap();
+    let path = std::env::join_paths([dir, "/usr/bin".into(), "/bin".into()]).unwrap();
+    let output = env.with_path(&["use", "local"], &path);
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains("export PATH="));
+    let found = std::process::Command::new("/bin/sh")
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", &path)
+        .args(["-c", "claude"])
+        .output()
+        .unwrap();
+    assert!(found.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&found.stdout).trim(),
+        "synthetic-local-claude"
+    );
+    let output = env.with_path(&["use", "amir2"], &path);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !shim::status(&home.join(".local/claudectl/bin"), &path)
+            .unwrap()
+            .local
+    );
+    std::fs::remove_file(home.join("real-bin/claude-code")).unwrap();
+    let fallback_path = env.claude_path(true);
+    let output = env.with_path(&["use", "local"], &fallback_path);
+    assert!(output.status.success(), "{output:?}");
+    let selected = shim::status(&home.join(".local/claudectl/bin"), &fallback_path).unwrap();
+    assert!(selected.local);
+    assert_eq!(
+        selected.real.as_deref(),
+        Some(home.join("real-bin/claude").as_path())
+    );
 }
 
 #[test]

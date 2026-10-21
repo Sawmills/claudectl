@@ -113,6 +113,31 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
     {
         return Err(error);
     }
+    #[cfg(unix)]
+    {
+        use claudectl::central::shim;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        if let Some(dir) = shim::active_dir(&path) {
+            let selected = shim::status(&dir, &path)?;
+            // The live local login retains its refresh ownership and repair instructions.
+            if !selected.local && selected.real_ok && selected.claudectl_ok {
+                let aliases: Vec<_> = remote
+                    .iter()
+                    .map(|account| account.alias.as_str())
+                    .collect();
+                let resolved = selected.alias.as_deref().and_then(|alias| {
+                    claudectl::accounts::resolve(alias, &aliases)
+                        .ok()
+                        .map(str::to_owned)
+                });
+                for account in &mut remote {
+                    account.is_active = resolved
+                        .as_ref()
+                        .is_some_and(|alias| alias.eq_ignore_ascii_case(&account.alias));
+                }
+            }
+        }
+    }
     // The server's account list is authoritative: a migrated alias it no longer has was
     // removed there.
     if let claudectl::central::ServerView::Rows(_) = &view {
@@ -1369,7 +1394,11 @@ fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
             text.push_str(" (may bill)");
         }
         if f.is_active {
-            text.push_str(" (local login, waiting for Claude Code to refresh)");
+            if f.on_server {
+                text.push_str(" (plain claude)");
+            } else {
+                text.push_str(" (local login, waiting for Claude Code to refresh)");
+            }
         }
         let mut row = vec![
             names[i].clone(),
@@ -1437,6 +1466,7 @@ fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
             let unpicked = order.iter().copied().find(|&i| {
                 let c = &candidates[i];
                 c.fresh
+                    && c.billed
                     && matches!(
                         accounts::state(&c.windows),
                         State::Ready | State::Low { .. }
@@ -1454,7 +1484,7 @@ fn compact(fetched: &[&FetchedUsage], now: i64) -> String {
                 None => match fix {
                     Some(command) => out.push_str(&format!("Next: {command}\n")),
                     None => out
-                        .push_str("Next: claudectl status --details   (no account has room now)\n"),
+                        .push_str("Next: claudectl status --details   (no account can be picked automatically)\n"),
                 },
             }
         }

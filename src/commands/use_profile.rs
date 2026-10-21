@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use claudectl::accounts;
 use claudectl::auth_store::AuthStore;
 use claudectl::config;
@@ -11,9 +11,37 @@ use crate::commands::status::FetchedUsage;
 pub fn run(alias: Option<&str>) -> Result<()> {
     let paths = config::default_paths()?;
     let store = AuthStore::real(paths.clone());
+    let alias = alias.map(profile::validate_alias).transpose()?;
+    let local = profile::list_profiles_from(&paths)?;
+    if let Some(alias) = alias
+        && local.iter().any(|p| p.meta.alias == alias)
+        && !claudectl::central::is_migrated(&paths, alias)
+    {
+        return switch_explicit(&store, &paths, alias);
+    }
+    if paths
+        .claudectl_dir()
+        .join("server/connection.json")
+        .try_exists()?
+        || claudectl::central::service_account::configured()
+    {
+        let alias = match alias {
+            Some(alias) => {
+                claudectl::central::Client::load(&paths)?
+                    .account(alias)?
+                    .alias
+            }
+            None => claudectl::central::pick_account(&paths)?,
+        };
+        return point_server_account(&alias);
+    }
 
     match alias {
-        Some(a) => switch_explicit(&store, &paths, profile::validate_alias(a)?),
+        Some(alias) => {
+            let names: Vec<_> = local.iter().map(|p| p.meta.alias.as_str()).collect();
+            let alias = accounts::resolve(alias, &names)?;
+            switch_explicit(&store, &paths, alias)
+        }
         None => {
             // Only the auto-select path needs this here: it fetches usage over
             // the network before it knows which profile to activate, and
@@ -30,11 +58,13 @@ pub fn run(alias: Option<&str>) -> Result<()> {
                 .collect();
             let Some(best) = accounts::best(&candidates) else {
                 bail!(
-                    "no saved profile is eligible: usage is missing, stale or exhausted, or billing is on or unknown\nTry: claudectl status --json"
+                    "no local profile is eligible:\n{}\nTry: claudectl status --details",
+                    accounts::selection_failures(&candidates)
                 );
             };
             let best = fetched[best].alias.clone();
             let email = profile::switch_to(&store, &paths, &best)?;
+            point_local_account(&paths, &best).context("local login switched, but plain claude still needs repair\nTry: claudectl shim status")?;
             status::record_statusline_for(&paths, &fetched, &best);
             println!("auto-selected by weekly reset: {best} ({email})");
             println!();
@@ -44,13 +74,42 @@ pub fn run(alias: Option<&str>) -> Result<()> {
     }
 }
 
+fn point_server_account(alias: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use claudectl::central::shim;
+        shim::dispatch(shim::Command::Install {
+            account: Some(alias.to_owned()),
+            claude: None,
+            dir: shim::active_dir(&std::env::var_os("PATH").unwrap_or_default()),
+        })?;
+        println!("plain claude account: {alias} (new launches only)");
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    bail!(
+        "server account switching requires the Claude PATH shim on Unix\nTry: claudectl run {alias}"
+    );
+}
+
 fn switch_explicit(store: &AuthStore, paths: &config::Paths, alias: &str) -> Result<()> {
     let email = profile::switch_to(store, paths, alias)?;
+    point_local_account(paths, alias).context(
+        "local login switched, but plain claude still needs repair\nTry: claudectl shim status",
+    )?;
     println!("switched to {alias} ({email})");
     println!();
     if let Err(error) = status::run_focused(store, paths, alias) {
         eprintln!("warning: profile switch completed; cached usage unavailable: {error}");
     }
+    Ok(())
+}
+
+fn point_local_account(paths: &config::Paths, alias: &str) -> Result<()> {
+    #[cfg(unix)]
+    claudectl::central::shim::use_local(paths, alias)?;
+    #[cfg(not(unix))]
+    let _ = (paths, alias);
     Ok(())
 }
 

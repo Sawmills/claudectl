@@ -194,7 +194,7 @@ fn answer(accounts: &[Account], names: &[String], now: i64) -> String {
             )
         );
     }
-    // Room counts only accounts safe to recommend; room that may bill is counted apart.
+    // Count included capacity; automatic selection also reserves weekly headroom.
     let room = accounts
         .iter()
         .filter(|a| a.has_room() && !a.billed)
@@ -230,7 +230,7 @@ fn answer(accounts: &[Account], names: &[String], now: i64) -> String {
             );
         }
         return format!(
-            r#"<h1 id="answer-title">No account has room now</h1>{count}<p class="next-step">The table below shows when each limit resets.</p>"#
+            r#"<h1 id="answer-title">No account can be picked automatically</h1>{count}<p class="next-step">Automatic picks require fresh included usage and more than 5% weekly room. The table below shows the latest limits.</p>"#
         );
     };
     let a = &accounts[best];
@@ -679,7 +679,10 @@ mod tests {
         let html = overview(&snapshot(vec![fable], vec![]));
         assert!(html.contains("Fable limit"), "{html}");
         assert!(html.contains("0 of 1 accounts have room"), "{html}");
-        assert!(html.contains("No account has room now"), "{html}");
+        assert!(
+            html.contains("No account can be picked automatically"),
+            "{html}"
+        );
         assert!(html.contains("Fable window"), "a Fable column: {html}");
         let mut billed = account("roomy", Some(0.0), Some(0.0));
         billed.billed = true;
