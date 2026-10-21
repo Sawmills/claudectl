@@ -309,12 +309,17 @@ fn automatic_use_installs_a_server_account_and_status_marks_plain_claude() {
     let output = env.with_path(&["use"], &path);
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("amir2@sawmills.ai"));
+    let paths = claudectl::config::Paths::from_home(env.home.path().into());
+    let creds = serde_json::from_value(json!({"claudeAiOauth":{"accessToken":""}})).unwrap();
+    claudectl::profile::save_profile_to(&paths, "local", &creds, None).unwrap();
+    claudectl::profile::set_active_from(&paths, "local").unwrap();
     let output = env.with_path(&["status"], &path);
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("(plain claude)"));
     let output = env.with_path(&["status", "--json"], &path);
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["server"]["accounts"][0]["active"], true);
+    assert_eq!(report["accounts"][0]["active"], true);
 }
 
 #[test]
@@ -473,6 +478,16 @@ fn local_use_keeps_a_nonstandard_executable_reachable_and_can_switch_back() {
         !shim::status(&home.join(".local/claudectl/bin"), &path)
             .unwrap()
             .local
+    );
+    std::fs::remove_file(home.join("real-bin/claude-code")).unwrap();
+    let fallback_path = env.claude_path(true);
+    let output = env.with_path(&["use", "local"], &fallback_path);
+    assert!(output.status.success(), "{output:?}");
+    let selected = shim::status(&home.join(".local/claudectl/bin"), &fallback_path).unwrap();
+    assert!(selected.local);
+    assert_eq!(
+        selected.real.as_deref(),
+        Some(home.join("real-bin/claude").as_path())
     );
 }
 

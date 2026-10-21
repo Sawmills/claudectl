@@ -119,11 +119,7 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
         let path = std::env::var_os("PATH").unwrap_or_default();
         if let Some(dir) = shim::active_dir(&path) {
             let selected = shim::status(&dir, &path)?;
-            if !selected.local {
-                for account in &mut local {
-                    account.is_active = false;
-                }
-            }
+            // The live local login retains its refresh ownership and repair instructions.
             if !selected.local && selected.real_ok && selected.claudectl_ok {
                 let aliases: Vec<_> = remote
                     .iter()

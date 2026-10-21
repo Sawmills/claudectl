@@ -345,6 +345,12 @@ pub fn active_dir(path: &OsStr) -> Option<PathBuf> {
     is_shim(&program).then(|| program.parent().unwrap_or(Path::new(".")).to_path_buf())
 }
 
+fn resolve_real(dir: &Path, path: &OsStr, explicit: Option<&Path>) -> Result<PathBuf> {
+    let previous = status(dir, path)?;
+    let recorded = previous.real.as_deref().filter(|_| previous.real_ok);
+    find_real(explicit.or(recorded), path)
+}
+
 /// Keep the managed launcher's real executable reachable when switching to a local login.
 pub fn use_local(paths: &crate::config::Paths, alias: &str) -> Result<()> {
     let path = std::env::var_os("PATH").unwrap_or_default();
@@ -356,6 +362,7 @@ pub fn use_local(paths: &crate::config::Paths, alias: &str) -> Result<()> {
         }
         let mut spec =
             read_spec(&dir.join("claude")).context("cannot read the managed Claude launcher")?;
+        spec.real = resolve_real(dir, &path, None)?;
         spec.alias = alias.to_owned();
         spec.local = true;
         install(&spec, dir)?;
@@ -380,11 +387,9 @@ pub fn dispatch(command: Command) -> Result<()> {
             let account = account.unwrap_or_else(|| default_account().into());
             // Only a server account: the launcher never falls back to a local or billed login.
             let account = super::Client::load(paths)?.account(&account)?.alias;
-            let previous = status(&dir, &path)?;
-            let recorded_real = previous.real.as_deref().filter(|_| previous.real_ok);
             let spec = Spec {
                 alias: account,
-                real: find_real(claude.as_deref().or(recorded_real), &path)?,
+                real: resolve_real(&dir, &path, claude.as_deref())?,
                 claudectl: claudectl_path_from(&path, &cwd, &std::env::current_exe()?),
                 local: false,
             };
