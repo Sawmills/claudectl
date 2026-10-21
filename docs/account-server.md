@@ -323,10 +323,12 @@ ends with `StopFailure` and counts too), no terminal input for 5 min (the termin
 access time), and fewer than 3 restarts in the last hour. Once the held token is dead (it
 expired, or a turn failed with `authentication_failed`), the 60 s wait and the input gate no
 longer apply and the request runs every 30 s: every turn fails on that token, and a user who
-retries would otherwise hold the restart back for good (SAW-12610, 10-09). Extra processes in Claude's group
-(an LSP, `caffeinate`, a background shell) do not hold a restart back: the held token is
-already superseded or expired, so it is dead for every holder; work still running in
-Claude's group ends with the restart. A turn in progress is never cut; a draft typed earlier
+retries would otherwise hold the restart back for good (SAW-12610, 10-09). Foreground turns,
+live background tasks and explicit production holds still prevent renewal and failover,
+even after token expiry. The task check reads live descendants' stdout/stderr descriptors:
+a Claude task file under `<tmp>/claude-<uid>/.../tasks/*.output` holds admission. MCP/LSP
+servers and `caffeinate` without task-output descriptors do not block. Missing workload
+evidence defers the restart. The wrapper never interrupts a turn in progress; a draft typed earlier
 than the input gate is lost on restart. Relaunch happens only after claudectl's own
 SIGTERM; any other exit ends `server run` with Claude's exit code. A session that Claude ended (`/exit`: a `SessionEnd`
 with no new session after it) is never restarted, also when a new token arrives while
@@ -337,6 +339,44 @@ never restarted. If Claude sends no hook event within 30 s, or a hook could not 
 `renewing`; no token) is updated on every renewal; a supervisor leaves expiry to
 `server run` and skips a renewing session. A per-session lock protects live session
 directories; a later launch removes abandoned ones after their recorded expiry.
+
+### Production Holds and Deferred Restarts
+
+Inside a server-run child, hold a production step explicitly:
+
+```sh
+claudectl hold start --reason "SAW-12345 production migration"
+# Complete or abort the step, including its cleanup, before ending the hold.
+claudectl hold end
+```
+
+The command uses the inherited `CLAUDECTL_SERVER_RUN` identity. It does not parse goals,
+Slack messages or outboxes. One hold belongs to one run; starting a different reason while
+a hold exists fails. Check the command's exit status before starting the production step.
+Lane skill/runbook adoption is a separate rollout.
+An older running wrapper cannot enforce a hold. The command checks the wrapper's recorded
+gate capability and refuses the start if it is absent; installing a new CLI alone does not
+upgrade a wrapper that is already running.
+
+Holds stay in `~/.claudectl/server/holds/<run-id>.json`, outside temporary session cleanup.
+A hold whose owner exits remains blocked and reports attention. It never clears by age or
+token expiry. After the wrapper exits, explicitly clear its recorded hold with
+`claudectl hold end --run <run-id>` after the production step and its cleanup are complete.
+
+`claudectl status` and the inherited session's status line show
+`restart deferred: <reason>`. `status --json` adds a `sessions` list with the run, reason,
+stage and deferred counter. At five minutes before token expiry the wrapper warns; expiry
+or an authentication failure changes the stage to blocked. It keeps the child and its
+background work alive until admission is safe, with no forced timeout. API use can fail
+while the held token is expired or revoked; another session can revoke it before its
+recorded expiry.
+
+`~/.claudectl/server/restart-decisions.jsonl` records each changed `restart_deferred`
+decision with session identity, bounded reason and severity. Its
+`claudectl_restart_deferred_total` metric has only cause, reason and stage labels; repeated
+polls do not add another count. The current run's `restart-status.json` holds its status
+and counter. Records contain no tokens or prompt contents. A diagnostic write failure
+closes automatic admission for that child and reports attention instead of restarting it.
 
 This is not an OS sandbox. Tools inherit the access token environment and can
 access files available to the same OS user. The Mac experiment's fake `security`

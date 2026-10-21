@@ -95,6 +95,18 @@ pub fn record(paths: &Paths, active: Option<Active<'_>>, now: i64) -> Result<()>
 
 /// The line to print, or None when anything is in doubt.
 pub fn render(paths: &Paths, now: i64) -> Option<String> {
+    let base = render_sample(paths, now);
+    #[cfg(unix)]
+    if let Some(deferred) = crate::central::restart_gate::current_line(paths) {
+        return Some(match base {
+            Some(base) => format!("{base} · {deferred}"),
+            None => deferred,
+        });
+    }
+    base
+}
+
+fn render_sample(paths: &Paths, now: i64) -> Option<String> {
     let sample = read_sample(&sample_path(paths))?;
     let active = std::fs::read_to_string(paths.active_file()).ok()?;
     if sample.version != VERSION || sample.alias != active.trim() {
