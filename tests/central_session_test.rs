@@ -147,6 +147,52 @@ fn an_abandoned_hold_survives_run_cleanup_until_explicit_end() {
     assert!(!hold.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn a_stale_hold_overrides_cached_deferred_status_without_losing_its_counter() {
+    let home = tempfile::tempdir().unwrap();
+    let paths = Paths::from_home(home.path().to_path_buf());
+    let access = grant("synthetic", 1);
+    let session = Session::new(&paths, &account_for(&access), access).unwrap();
+    assert!(
+        hold_command(&session, &["hold", "start", "--reason", "FLT-553 prod"])
+            .status
+            .success()
+    );
+    let run = session.directory().file_name().unwrap().to_str().unwrap();
+    let hold = home
+        .path()
+        .join(".claudectl/server/holds")
+        .join(format!("{run}.json"));
+    let mut saved: Value = serde_json::from_slice(&std::fs::read(&hold).unwrap()).unwrap();
+    saved["owner_started"] = "previous process incarnation".into();
+    std::fs::write(&hold, serde_json::to_vec(&saved).unwrap()).unwrap();
+    std::fs::write(
+        session.directory().join("restart-status.json"),
+        serde_json::to_vec(
+            &serde_json::json!({"run":run,"session_id":"sess-1","alias":"work",
+            "deferred":true,"reason":"explicit_hold","stage":"deferred",
+            "restart_deferred_total":7}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let output = hold_command(&session, &["status", "--cached", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let row = &status["sessions"][0];
+    assert_eq!(row["reason"], "stale_hold");
+    assert_eq!(row["stage"], "blocked");
+    assert_eq!(row["restart_deferred_total"], 7);
+    assert_eq!(row["session_id"], "sess-1");
+    assert_eq!(row["run"], run);
+    assert!(hold.exists());
+}
+
 /// Run the launch seam in its own process so PATH tests do not mutate global test state.
 #[test]
 fn session_path_helper() {

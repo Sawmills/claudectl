@@ -183,6 +183,9 @@ def term(*_):
         out.write(status.get("renewal", ""))
     sys.exit(143)
 signal.signal(signal.SIGTERM, term)
+if os.environ.get("FAKE_BAD_EVENT"):
+    with open(os.path.join(os.path.dirname(settings), "events"), "a") as events:
+        events.write(os.environ["FAKE_BAD_EVENT"])
 hold_open = bool(os.environ.get("FAKE_HOLD")) and token == "token-1"
 if hold_open:
     start = [os.environ["FAKE_WRAPPER_BIN"], "hold", "start", "--reason", "FLT-553 synthetic prod step"]
@@ -1201,6 +1204,46 @@ fn an_idle_claude_with_extra_processes_follows_an_early_refresh() {
 #[test]
 fn renewal_waits_for_a_live_task_output_child() {
     guarded_renewal("FAKE_TASK_CHILD", "background_task", "deferred", false);
+}
+
+#[test]
+fn damaged_hook_evidence_never_authorizes_a_restart_from_cached_idle_state() {
+    for damaged in [
+        r#"{"at":3,"event":"UserPromptSubmit""#,
+        "damaged record\n",
+        "{\"at\":3,\"event\":\"UserPromptSubmit\",\"session_id\":null}\n",
+    ] {
+        let env = Env::new();
+        let refresher = env.refresh_when_idle();
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+        env.env(&mut command);
+        command
+            .env("FAKE_BAD_EVENT", damaged)
+            .env("FAKE_WATCHDOG_S", "3")
+            .args(["server", "run", "work", "--claude"])
+            .arg(&env.claude);
+        let output = Command::from_std(command)
+            .timeout(std::time::Duration::from_secs(15))
+            .output()
+            .unwrap();
+        refresher.join().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(99),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(env.runs().len(), 1);
+        let journal = std::fs::read_to_string(
+            env.home
+                .path()
+                .join(".claudectl/server/restart-decisions.jsonl"),
+        )
+        .unwrap();
+        assert!(journal.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|row| row["reason"] == "evidence_unknown")
+        }));
+    }
 }
 
 #[test]
