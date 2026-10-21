@@ -250,6 +250,56 @@ fn status_resolves_the_short_name_of_a_server_account() {
 }
 
 #[test]
+fn use_server_alias_repoints_plain_claude_without_changing_live_credentials() {
+    use claudectl::central::shim::{self, Spec};
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = Env::new();
+    let home = env.home.path();
+    let real_dir = home.join("real-bin");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    let real = real_dir.join("claude");
+    std::fs::write(&real, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let shim_dir = home.join(".local/claudectl/bin");
+    shim::install(
+        &Spec {
+            alias: "previous-account".into(),
+            real,
+            claudectl: assert_cmd::cargo::cargo_bin("claudectl"),
+        },
+        &shim_dir,
+    )
+    .unwrap();
+    let live = home.join(".claude/.credentials.json");
+    private_write(&live, "synthetic-live-login-must-stay");
+    let path =
+        std::env::join_paths([shim_dir, real_dir, "/usr/bin".into(), "/bin".into()]).unwrap();
+    let output = Command::cargo_bin("claudectl")
+        .unwrap()
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", &path)
+        .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .args(["use", "amir2"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("amir2@sawmills.ai"));
+    let selected = shim::status(&home.join(".local/claudectl/bin"), &path).unwrap();
+    assert_eq!(selected.alias.as_deref(), Some("amir2@sawmills.ai"));
+    assert!(selected.first_on_path && selected.real_ok && selected.claudectl_ok);
+    assert_eq!(
+        std::fs::read_to_string(live).unwrap(),
+        "synthetic-live-login-must-stay"
+    );
+}
+
+#[test]
 fn rm_names_the_resolved_account_before_and_after_it_removes_it() {
     let env = Env::new();
     // A prefix: the confirmation names the account it would remove, never the typed text.
