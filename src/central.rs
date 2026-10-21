@@ -29,6 +29,9 @@ mod migration;
 mod qualify;
 #[path = "central_renew.rs"]
 mod renew;
+#[cfg(unix)]
+#[path = "central_restart_gate.rs"]
+pub mod restart_gate;
 #[path = "service_account.rs"]
 pub mod service_account;
 #[path = "central_session.rs"]

@@ -305,9 +305,8 @@ pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     if !dead && i.tty_idle_ms.is_some_and(|ms| ms < i.tty_gate_ms) {
         return Err("terminal input in the last 5 min");
     }
-    // Extra processes (an LSP, caffeinate, background shells) do not block: a restart happens
-    // only when the held token was superseded or expired, so it is dead for every holder, and
-    // a gate on them left idle tabs on a dead token for good (SAW-12610).
+    // restart_gate separately protects task-output descendants and explicit holds.
+    // MCP/LSP/caffeinate helpers without task output never block admission.
     if i.restarts_last_hour >= RESTARTS_PER_HOUR {
         return Err("restart budget used up for this hour");
     }
@@ -397,6 +396,8 @@ pub(super) fn record_hook(
 ) -> anyhow::Result<()> {
     use std::io::Write;
     let dir = session_dir(sessions, dir)?;
+    #[cfg(unix)]
+    let _admission = super::restart_gate::admission(&dir)?;
     let v: serde_json::Value = match serde_json::from_str(input) {
         Ok(v) => v,
         Err(error) => {

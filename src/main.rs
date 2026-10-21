@@ -72,6 +72,12 @@ enum Commands {
         #[command(subcommand)]
         command: claudectl::central::Command,
     },
+    /// Prevent automatic renewal/failover during a production step in this run
+    #[cfg(unix)]
+    Hold {
+        #[command(subcommand)]
+        command: claudectl::central::restart_gate::HoldCommand,
+    },
     /// Make plain `claude` run through `claudectl server run` (a PATH shim)
     #[cfg(unix)]
     Shim {
@@ -277,6 +283,9 @@ fn main() {
         }),
         Commands::Rm { account, yes } => claudectl::central::remove_confirmed(&account, yes),
         Commands::Server { command } => claudectl::central::dispatch(command),
+        #[cfg(unix)]
+        Commands::Hold { command } => config::default_paths()
+            .and_then(|paths| claudectl::central::restart_gate::hold(&paths, command)),
         #[cfg(unix)]
         Commands::Shim { command } => claudectl::central::shim::dispatch(command),
         Commands::Status {

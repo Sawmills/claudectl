@@ -120,6 +120,18 @@ if token != "token-work":
     subprocess.run(["/bin/sh", "-c", command], check=True, input=json.dumps(
         {"hook_event_name": "SessionStart", "session_id": resumed}).encode())
     sys.exit(7)
+if os.environ.get("FAKE_TASK_CHILD"):
+    task_dir = os.path.join(os.environ["TMPDIR"], "claude-" + str(os.getuid()), "project", "tasks")
+    os.makedirs(task_dir, exist_ok=True)
+    with open(os.path.join(task_dir, "monitor.output"), "w") as output:
+        subprocess.Popen([sys.executable, "-c", '''
+import os, time
+deadline = time.monotonic() + 15
+while not os.path.exists(os.environ["FAKE_LOG"] + ".release") and time.monotonic() < deadline:
+    time.sleep(0.02)
+if os.path.exists(os.environ["FAKE_LOG"] + ".release"):
+    open(os.environ["FAKE_LOG"] + ".task-done", "w").close()
+'''], stdout=output, stderr=output)
 for event in ({"hook_event_name": "SessionStart", "session_id": "sess-1"},
               {"hook_event_name": "UserPromptSubmit", "session_id": "sess-1"},
               {"hook_event_name": "StopFailure", "session_id": "sess-1", "error": "rate_limit",
@@ -137,6 +149,65 @@ struct Env {
     fake: Shared,
     claude: std::path::PathBuf,
     log: std::path::PathBuf,
+}
+
+#[test]
+fn a_usage_limit_does_not_move_an_account_while_a_task_is_live() {
+    let env = Env::new();
+    let temporary = env.home.path().join("tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+    command
+        .env_clear()
+        .env("HOME", env.home.path())
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env("CLAUDECTL_TEST_RENEW_FAST", "1")
+        .env("FAKE_LOG", &env.log)
+        .env("TMPDIR", temporary)
+        .env("FAKE_TASK_CHILD", "1")
+        .args(["run", "work", "--failover", "--claude"])
+        .arg(&env.claude)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let journal = env
+        .home
+        .path()
+        .join(".claudectl/server/restart-decisions.jsonl");
+    let mut deferred = false;
+    while std::time::Instant::now() < deadline {
+        deferred = std::fs::read_to_string(&journal).is_ok_and(|text| {
+            text.lines().any(|line| {
+                serde_json::from_str::<Value>(line).is_ok_and(|r| {
+                    r["event"] == "restart_deferred"
+                        && r["reason"] == "background_task"
+                        && r["cause"] == "failover"
+                })
+            })
+        });
+        if deferred || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let records_while_live = env.records();
+    std::fs::write(env.log.with_extension("log.release"), "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        deferred,
+        "failover killed the task: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        records_while_live.is_empty(),
+        "account move was recorded while busy"
+    );
+    assert!(env.log.with_extension("log.task-done").exists());
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(env.records().len(), 1);
+    assert_eq!(env.runs()[1]["token"], "token-spare");
 }
 
 impl Env {
