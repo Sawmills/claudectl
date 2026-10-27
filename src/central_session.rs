@@ -794,7 +794,6 @@ impl Monitor {
                     }
                     Ok(false) => break,
                     Err(()) => {
-                        retry_now = true;
                         continue;
                     }
                 }

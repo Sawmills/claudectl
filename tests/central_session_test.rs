@@ -32,6 +32,13 @@ fn account_for(access: &Access) -> Account {
 
 #[cfg(unix)]
 fn hold_command(session: &Session, args: &[&str]) -> std::process::Output {
+    let home = session
+        .directory()
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .expect("session home");
     session
         .command(
             &assert_cmd::cargo::cargo_bin("claudectl"),
@@ -41,6 +48,7 @@ fn hold_command(session: &Session, args: &[&str]) -> std::process::Output {
                 .collect::<Vec<_>>(),
         )
         .unwrap()
+        .env("HOME", home)
         .output()
         .unwrap()
 }
