@@ -130,8 +130,7 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
         let mut report = report_json(&local, &view, &remote, now);
         #[cfg(unix)]
         {
-            report["sessions"] =
-                serde_json::json!(claudectl::central::restart_gate::deferred_sessions(&paths)?);
+            report["sessions"] = serde_json::json!(deferred_status(&paths));
         }
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -175,7 +174,7 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
 
 fn print_restart_status(paths: &config::Paths) -> Result<()> {
     #[cfg(unix)]
-    for session in claudectl::central::restart_gate::deferred_sessions(paths)? {
+    for session in deferred_status(paths) {
         println!(
             "{}: restart deferred: {} ({})",
             session["run"].as_str().unwrap_or("unknown"),
@@ -186,6 +185,20 @@ fn print_restart_status(paths: &config::Paths) -> Result<()> {
     #[cfg(not(unix))]
     let _ = paths;
     Ok(())
+}
+
+#[cfg(unix)]
+fn deferred_status(paths: &config::Paths) -> Vec<serde_json::Value> {
+    match claudectl::central::restart_gate::deferred_sessions(paths) {
+        Ok(rows) => rows,
+        Err(_) => vec![serde_json::json!({
+            "run": "unknown",
+            "deferred": true,
+            "reason": "evidence_unknown",
+            "stage": "blocked",
+            "attention_required": true
+        })],
+    }
 }
 
 /// The status error of a profile whose account moved to the account server.

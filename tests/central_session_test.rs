@@ -185,6 +185,11 @@ fn a_stale_hold_overrides_cached_deferred_status_without_losing_its_counter() {
         .unwrap(),
     )
     .unwrap();
+    std::fs::set_permissions(
+        session.directory().join("restart-status.json"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let output = hold_command(&session, &["status", "--cached", "--json"]);
     assert!(
         output.status.success(),
@@ -209,6 +214,11 @@ fn damaged_restart_diagnostics_report_attention_without_hiding_account_status() 
     let access = grant("synthetic", 1);
     let session = Session::new(&paths, &account_for(&access), access).unwrap();
     std::fs::write(session.directory().join("restart-status.json"), "damaged").unwrap();
+    std::fs::set_permissions(
+        session.directory().join("restart-status.json"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let output = hold_command(&session, &["status", "--cached", "--json"]);
     assert!(
         output.status.success(),

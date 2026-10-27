@@ -218,16 +218,6 @@ impl Gate {
             status["reason"] = json!(d.reason);
             status["stage"] = json!(d.stage);
             status["restart_deferred_total"] = json!(self.total);
-            if d.stage != Stage::Deferred {
-                eprintln!(
-                    "claudectl: restart deferred: {} ({:?}); token expiry {}; attention required",
-                    serde_json::to_value(d.reason)?
-                        .as_str()
-                        .unwrap_or("evidence_unknown"),
-                    d.stage,
-                    expires_at
-                );
-            }
         }
         atomic(&self.directory.join("restart-status.json"), &status)?;
         self.last = decision;
@@ -304,6 +294,7 @@ fn process_start(pid: u32) -> Result<String> {
     let result = Command::new("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
         .env("LC_ALL", "C")
+        .env("TZ", "UTC")
         .output()?;
     let value = std::str::from_utf8(&result.stdout)?.trim();
     if !result.status.success() || value.is_empty() {
