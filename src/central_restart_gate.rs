@@ -542,11 +542,12 @@ pub fn current_line(paths: &Paths) -> Option<String> {
         Ok(directory) => directory,
         Err(_) => return Some("restart deferred: evidence_unknown (attention required)".into()),
     };
-    if matches!(
-        hold_reason(&paths.home, &directory),
-        Ok(Some(Reason::StaleHold))
-    ) {
-        return Some("restart deferred: stale_hold (blocked)".into());
+    match hold_reason(&paths.home, &directory) {
+        Ok(Some(Reason::StaleHold)) => {
+            return Some("restart deferred: stale_hold (blocked)".into());
+        }
+        Ok(None | Some(Reason::ExplicitHold)) => {}
+        Err(_) => return Some("restart deferred: evidence_unknown (attention required)".into()),
     }
     let path = directory.join("restart-status.json");
     match private_read(&path) {
