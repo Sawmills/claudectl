@@ -452,6 +452,16 @@ pub fn deferred_sessions(paths: &Paths) -> Result<Vec<Value>> {
                 {
                     Ok(value) => {
                         if value["deferred"] == true {
+                            let live = owner_live(&directory);
+                            let value = if live {
+                                value
+                            } else {
+                                let mut stale = value;
+                                stale["reason"] = "stale_run".into();
+                                stale["stage"] = "blocked".into();
+                                stale["attention_required"] = true.into();
+                                stale
+                            };
                             rows.insert(run_id(&directory)?.to_owned(), value);
                         }
                     }
@@ -517,6 +527,18 @@ pub fn deferred_sessions(paths: &Paths) -> Result<Vec<Value>> {
 fn unknown_status(run: &str) -> Value {
     json!({"run":run,"deferred":true,"reason":"evidence_unknown","stage":"blocked",
         "attention_required":true})
+}
+
+fn owner_live(directory: &Path) -> bool {
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(directory.join("owner.lock"))
+    else {
+        return false;
+    };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }
 
 /// The inherited server run's status, without a network read.
