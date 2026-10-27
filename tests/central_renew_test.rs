@@ -1374,6 +1374,9 @@ fn guarded_renewal(flag: &str, reason: &str, stage: &str, stale: bool) {
     );
     let status = status_command.unwrap();
     assert!(String::from_utf8_lossy(&status.stdout).contains("restart deferred:"));
+    if stale {
+        assert!(String::from_utf8_lossy(&status.stdout).contains("stale_hold"));
+    }
     let report = report_command.unwrap();
     assert!(
         report.status.success(),
