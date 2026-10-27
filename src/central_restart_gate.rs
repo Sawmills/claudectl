@@ -154,12 +154,7 @@ impl Gate {
             .publish(decision, idle.session.as_deref(), held_expires_at, at)
             .is_err()
         {
-            if !self.log_error {
-                eprintln!(
-                    "claudectl: restart deferred: cannot persist restart decision; attention required"
-                );
-                self.log_error = true;
-            }
+            self.log_error = true;
             // An uncertain journal write must not be retried and counted twice.
             let _ = atomic(
                 &self.directory.join("restart-status.json"),
