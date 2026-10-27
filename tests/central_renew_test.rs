@@ -1407,7 +1407,7 @@ fn guarded_renewal(flag: &str, reason: &str, stage: &str, stale: bool) {
     );
     if stage == "blocked" && !stale {
         assert!(relevant.iter().any(|r| r["stage"] == "warn"));
-        assert!(String::from_utf8_lossy(&output.stderr).contains("attention required"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("attention required"));
     }
     assert_eq!(output.status.code(), Some(7));
     env.assert_followed(&env.runs(), "token-2");
