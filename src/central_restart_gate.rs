@@ -99,6 +99,7 @@ impl Gate {
         held_expires_at: i64,
     ) -> bool {
         if self.log_error {
+            self.retry_error_status(idle, held_expires_at);
             return false;
         }
         let held = hold_reason(&self.home, &self.directory);
@@ -133,17 +134,7 @@ impl Gate {
         held_expires_at: i64,
     ) -> bool {
         if self.log_error {
-            // The journal append and counter are intentionally never retried after
-            // uncertain persistence. Status is independent and may recover later.
-            let _ = atomic(
-                &self.directory.join("restart-status.json"),
-                &json!({
-                    "at":now(),"session_id":idle.session.as_deref(),"run":run_id(&self.directory).unwrap_or("unknown"),
-                    "alias":self.alias,"expires_at":held_expires_at,"deferred":true,
-                    "reason":"evidence_unknown","stage":"blocked","attention_required":true,
-                    "restart_deferred_total":self.total,
-                }),
-            );
+            self.retry_error_status(idle, held_expires_at);
             return false;
         }
         let at = now();
@@ -167,19 +158,25 @@ impl Gate {
         {
             self.log_error = true;
             // An uncertain journal write must not be retried and counted twice.
-            let _ = atomic(
-                &self.directory.join("restart-status.json"),
-                &json!({
-                    "run":run_id(&self.directory).unwrap_or("unknown"),"deferred":true,
-                    "alias":self.alias,
-                    "reason":"evidence_unknown","stage":"blocked","attention_required":true,
-                    "restart_deferred_total":self.total,
-                }),
-            );
+            self.retry_error_status(idle, held_expires_at);
             return false;
         }
         self.log_error = false;
         decision.is_none()
+    }
+
+    fn retry_error_status(&self, idle: &super::renew::Idle, expires_at: i64) {
+        // The journal append and counter are intentionally never retried after
+        // uncertain persistence. Status is independent and may recover later.
+        let _ = atomic(
+            &self.directory.join("restart-status.json"),
+            &json!({
+                "at":now(),"session_id":idle.session.as_deref(),"run":run_id(&self.directory).unwrap_or("unknown"),
+                "alias":self.alias,"expires_at":expires_at,"deferred":true,
+                "reason":"evidence_unknown","stage":"blocked","attention_required":true,
+                "restart_deferred_total":self.total,
+            }),
+        );
     }
 
     fn publish(
