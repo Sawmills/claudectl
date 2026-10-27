@@ -133,6 +133,17 @@ impl Gate {
         held_expires_at: i64,
     ) -> bool {
         if self.log_error {
+            // The journal append and counter are intentionally never retried after
+            // uncertain persistence. Status is independent and may recover later.
+            let _ = atomic(
+                &self.directory.join("restart-status.json"),
+                &json!({
+                    "at":now(),"session_id":idle.session.as_deref(),"run":run_id(&self.directory).unwrap_or("unknown"),
+                    "alias":self.alias,"expires_at":held_expires_at,"deferred":true,
+                    "reason":"evidence_unknown","stage":"blocked","attention_required":true,
+                    "restart_deferred_total":self.total,
+                }),
+            );
             return false;
         }
         let at = now();
@@ -874,6 +885,22 @@ mod tests {
         assert!(!gate.check(&idle, Cause::Renewal, now() + 600_000));
         idle.since = Some(0);
         assert!(!gate.check(&idle, Cause::Renewal, now() + 600_000));
+        assert_eq!(gate.total, 0);
+    }
+
+    #[test]
+    fn failed_logging_retries_only_status_after_storage_recovers() {
+        let (_home, mut gate, mut idle) = setup();
+        idle.since = None;
+        std::fs::create_dir(gate.home.join(".claudectl/server/restart-decisions.jsonl")).unwrap();
+        let status = gate.directory.join("restart-status.json");
+        std::fs::create_dir(&status).unwrap();
+        assert!(!gate.check(&idle, Cause::Renewal, now() + 600_000));
+        std::fs::remove_dir(&status).unwrap();
+        assert!(!gate.check(&idle, Cause::Renewal, now() + 600_000));
+        let value: Value = serde_json::from_slice(&private_read(&status).unwrap()).unwrap();
+        assert_eq!(value["reason"], "evidence_unknown");
+        assert_eq!(value["stage"], "blocked");
         assert_eq!(gate.total, 0);
     }
 
