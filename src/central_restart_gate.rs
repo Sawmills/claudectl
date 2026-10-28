@@ -397,6 +397,7 @@ pub fn hold(paths: &Paths, command: HoldCommand) -> Result<()> {
             println!("hold started for {}", hold.run);
         }
         HoldCommand::End { run } => {
+            let explicit_run = run.is_some();
             let directory = match run {
                 Some(run) => {
                     let leaf = Path::new(&run);
@@ -408,6 +409,9 @@ pub fn hold(paths: &Paths, command: HoldCommand) -> Result<()> {
                 }
                 None => bound_directory(paths)?,
             };
+            if explicit_run && owner_live(&directory) {
+                bail!("cannot end a live server-run hold by ID; end it from that run");
+            }
             let _admission = if directory.exists() {
                 Some(admission(&directory)?)
             } else {
@@ -547,6 +551,7 @@ pub fn current_line(paths: &Paths) -> Option<String> {
             return Some("restart deferred: stale_hold (blocked)".into());
         }
         Ok(None | Some(Reason::ExplicitHold)) => {}
+        Ok(Some(_)) => {}
         Err(_) => return Some("restart deferred: evidence_unknown (attention required)".into()),
     }
     let path = directory.join("restart-status.json");

@@ -86,6 +86,9 @@ fn ending_another_runs_hold_does_not_clear_a_production_hold() {
             .status
             .success()
     );
+    let run = first.directory().file_name().unwrap().to_str().unwrap();
+    let live_end = hold_command(&first, &["hold", "end", "--run", run]);
+    assert!(!live_end.status.success());
     assert!(hold_command(&second, &["hold", "end"]).status.success());
     let path = home.path().join(".claudectl/server/holds").join(format!(
         "{}.json",
