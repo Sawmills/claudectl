@@ -854,6 +854,16 @@ impl Monitor {
         if atomic(&self.directory.join("session.json"), &status).is_err() {
             return Err(());
         }
+        // A prompt hook can publish its pending marker after the first gate check while
+        // this admission lock is held. Re-check after publishing the renewing state and
+        // before SIGTERM so a queued prompt wins over the restart. Restore the visible
+        // state if the final check defers.
+        if !gate.check(&activity.idle, cause, self.held_expires_at) {
+            let mut status = self.status.clone();
+            status["renewal"] = "on".into();
+            let _ = atomic(&self.directory.join("session.json"), &status);
+            return Err(());
+        }
         // SIGTERM the leader; teardown of the rest of the group follows its exit. A leader
         // that already exited (not yet reaped, so kill would still succeed) left on its own.
         if exec::has_exited(self.pid) || unsafe { libc::kill(self.pid as i32, libc::SIGTERM) } != 0

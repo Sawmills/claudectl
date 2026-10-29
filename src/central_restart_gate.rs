@@ -34,6 +34,8 @@ pub(super) enum Cause {
 enum Reason {
     RunningTurn,
     BackgroundTask,
+    OpenProductionStep,
+    QueuedHook,
     ExplicitHold,
     StaleHold,
     EvidenceUnknown,
@@ -103,12 +105,22 @@ impl Gate {
             return false;
         }
         let held = hold_reason(&self.home, &self.directory);
+        let pending = hook_pending(&self.directory);
+        let pending_reason = match pending {
+            Ok(Some(_)) => Some(Reason::QueuedHook),
+            Ok(None) => None,
+            Err(_) => Some(Reason::EvidenceUnknown),
+        };
         let reason = if self.unknown_evidence {
             Some(Reason::EvidenceUnknown)
+        } else if pending_reason.is_some() {
+            pending_reason
         } else if let Ok(Some(reason)) = held {
             Some(reason)
         } else if held.is_err() || idle.session.is_none() || idle.ended.is_some() {
             Some(Reason::EvidenceUnknown)
+        } else if production_step(&self.home).unwrap_or(true) {
+            Some(Reason::OpenProductionStep)
         } else if idle.since.is_none() {
             Some(Reason::RunningTurn)
         } else {
@@ -338,6 +350,101 @@ fn hold_reason(home: &Path, directory: &Path) -> Result<Option<Reason>> {
             Reason::StaleHold
         },
     ))
+}
+
+fn hook_pending(directory: &Path) -> Result<Option<u32>> {
+    let path = directory.join("hook-pending");
+    match private_read(&path) {
+        Ok(bytes) => {
+            let pid = serde_json::from_slice::<Value>(&bytes)?["pid"]
+                .as_u64()
+                .context("hook pending PID unavailable")?;
+            let pid = u32::try_from(pid).context("hook pending PID invalid")?;
+            Ok(Some(pid))
+        }
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn production_step(home: &Path) -> Result<bool> {
+    let Some(goal) =
+        std::env::var_os("LANE_GOAL_FILE").or_else(|| std::env::var_os("SAW_GOAL_FILE"))
+    else {
+        return Ok(false);
+    };
+    let lane = std::env::var("HERDR_TAB_ID")
+        .or_else(|_| std::env::var("HERDR_PANE_ID"))
+        .context("lane identity unavailable for production markers")?;
+    let mut sources = vec![PathBuf::from(goal)];
+    let root = home.join("Code/.fleet/voice-between");
+    for name in ["agents-cases-outbox.md", "slack-outbox.md"] {
+        let path = root.join(name);
+        if path.exists() {
+            sources.push(path);
+        }
+    }
+    let mut texts = Vec::new();
+    for path in sources {
+        texts.push(std::fs::read_to_string(path)?);
+    }
+    Ok(production_markers(&lane, &texts))
+}
+
+fn production_markers(lane: &str, texts: &[String]) -> bool {
+    let mut open = HashSet::new();
+    for text in texts {
+        for line in text.lines() {
+            if !line_has_lane(line, lane) {
+                continue;
+            }
+            let Some(key) = marker_key(line) else {
+                continue;
+            };
+            if line.contains("[starting]") || line.contains("STARTING NOW") {
+                open.insert(key);
+            } else if line.contains("[done]") || line.contains("DONE") {
+                open.remove(&key);
+            }
+        }
+    }
+    !open.is_empty()
+}
+
+fn line_has_lane(line: &str, lane: &str) -> bool {
+    line.split_whitespace().any(|word| {
+        word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != ':' && c != '_' && c != '-')
+            == lane
+    })
+}
+
+fn marker_key(line: &str) -> Option<String> {
+    let words: Vec<_> = line.split_whitespace().collect();
+    let ticket = words.iter().position(|word| {
+        let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+        let Some((prefix, suffix)) = word.split_once('-') else {
+            return false;
+        };
+        !prefix.is_empty()
+            && prefix.chars().any(|c| c.is_ascii_alphabetic())
+            && !suffix.is_empty()
+            && suffix.chars().all(|c| c.is_ascii_digit())
+    })?;
+    Some(
+        words[ticket..]
+            .iter()
+            .take(2)
+            .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase(),
+    )
 }
 
 /// Local only. A hold is keyed by the inherited run identity, never by goal/outbox prose.
@@ -884,6 +991,42 @@ mod tests {
         private_dir(path.parent().unwrap()).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(!gate.check(&idle, Cause::Renewal, now() + 600_000));
+    }
+
+    #[test]
+    fn a_marker_only_production_step_defers_until_matching_done() {
+        let texts = vec![
+            "- w28:t1 [starting] FLT-553 migration\n".to_string(),
+            "- w28:t1 [done] FLT-553 migration\n".to_string(),
+        ];
+        assert!(production_markers("w28:t1", &texts[..1]));
+        assert!(!production_markers("w28:t1", &texts));
+
+        let repeated = vec![
+            "- w28:t1 [done] FLT-553 migration\n".to_string(),
+            "- w28:t1 [starting] FLT-553 migration\n".to_string(),
+        ];
+        assert!(production_markers("w28:t1", &repeated));
+
+        let other_lane = vec!["- w28:t10 [starting] FLT-553 migration\n".to_string()];
+        assert!(!production_markers("w28:t1", &other_lane));
+    }
+
+    #[test]
+    fn a_queued_hook_defers_restart_admission() {
+        let (_home, mut gate, idle) = setup();
+        assert!(gate.check(&idle, Cause::Renewal, now() + 600_000));
+        atomic(
+            &gate.directory.join("hook-pending"),
+            &json!({"pid": std::process::id()}),
+        )
+        .unwrap();
+        assert!(!gate.check(&idle, Cause::Renewal, now() + 600_000));
+        let status: Value = serde_json::from_slice(
+            &private_read(&gate.directory.join("restart-status.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["reason"], "queued_hook");
     }
 
     #[test]
