@@ -1,7 +1,6 @@
 #![cfg(all(feature = "server", target_os = "linux"))]
-//! SAW-12610: `claudectl server run` against a scripted account server and a fake Claude.
-//! Linux only, debug build (the monitor's fast test clock). Synthetic tokens only.
-use assert_cmd::Command;
+//! Synthetic CLI coverage for fail-closed input admission. Recovery parsing lives at its
+//! module interface; no fixture bypasses the automatic signal guard.
 use axum::{
     Json, Router,
     extract::State,
@@ -9,261 +8,109 @@ use axum::{
 };
 use serde_json::{Value, json};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
+    process::{Child, Command, Output, Stdio},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 const ACCOUNT: &str = "abababababababababababababababababababababababababababababababab";
-
 #[derive(Default)]
 struct Fake {
-    /// The `previous_revision` of every token request, in order.
     requests: Vec<Value>,
-    /// The `observe` flag of every token request, in order.
-    observes: Vec<bool>,
-    /// When each token request arrived (ms).
-    request_times: Vec<i64>,
-    /// The first token's lifetime (ms); later tokens live longer.
-    first_life_ms: Option<i64>,
-    /// The token generation the server holds now.
+    life_ms: i64,
     generation: u64,
-    /// The server refreshes on the next token request (what a server-side refresh does).
-    refresh_next: bool,
-    /// Further refreshes that also happened before this request (a second refresh, for
-    /// example `server refresh-access` on another machine).
-    extra_refreshes: u32,
-    /// Hold every token response after the first this long (a slow server or refresh).
-    hold_ms: u64,
-    /// A strict order with the fake Claude: on a request after the first, write
-    /// `<this>.inflight`, then answer only once `<this>.ended` exists.
-    handshake: Option<std::path::PathBuf>,
 }
 type Shared = Arc<Mutex<Fake>>;
-
 fn identity() -> Value {
-    json!({"account_uuid": "claude-account", "organization_uuid": "claude-org"})
+    json!({"account_uuid":"claude-account","organization_uuid":"claude-org"})
 }
-
 async fn accounts() -> Json<Value> {
     Json(
-        json!([{"provider": "anthropic", "account_id": ACCOUNT, "alias": "work",
-        "identity": identity(), "available": true}]),
+        json!([{"provider":"anthropic","account_id":ACCOUNT,"alias":"work","identity":identity(),"available":true}]),
     )
 }
-
 async fn usage() -> Json<Value> {
+    Json(json!({"data":null,"observed_at":null,"next_retry_at":0,"stale":true,"error":null}))
+}
+async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Value> {
+    let mut fake = shared.lock().unwrap();
+    fake.requests.push(body);
     Json(
-        json!({"data": null, "observed_at": null, "next_retry_at": 0, "stale": true, "error": null}),
+        json!({"provider":"anthropic","account_id":ACCOUNT,"user_id":"person","identity":identity(),
+        "access_token":format!("token-{}",fake.generation),"expires_at":chrono::Utc::now().timestamp_millis()+fake.life_ms,
+        "scopes":["user:inference","user:profile"],"revision":format!("revision-{}",fake.generation),"generation":fake.generation}),
     )
 }
-
-async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Value> {
-    let hold = {
-        let fake = shared.lock().unwrap();
-        if fake.requests.is_empty() {
-            0
-        } else {
-            fake.hold_ms
-        }
-    };
-    {
-        let mut fake = shared.lock().unwrap();
-        fake.requests.push(body["previous_revision"].clone());
-        fake.observes
-            .push(body["observe"].as_bool().unwrap_or(false));
-        fake.request_times
-            .push(chrono::Utc::now().timestamp_millis());
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
-    let handshake = {
-        let fake = shared.lock().unwrap();
-        fake.handshake.clone().filter(|_| fake.requests.len() > 1)
-    };
-    if let Some(log) = handshake {
-        std::fs::write(log.with_extension("log.inflight"), "").unwrap();
-        for _ in 0..200 {
-            if log.with_extension("log.ended").exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-    let mut fake = shared.lock().unwrap();
-    if fake.refresh_next {
-        fake.refresh_next = false;
-        fake.generation += 1 + u64::from(fake.extra_refreshes);
-        fake.extra_refreshes = 0;
-    }
-    let generation = fake.generation;
-    let now = chrono::Utc::now().timestamp_millis();
-    Json(json!({
-        "provider": "anthropic", "account_id": ACCOUNT, "user_id": "person",
-        "identity": identity(),
-        "access_token": format!("token-{generation}"),
-        // Each newer generation lives longer, as a refresh gives a fresh 8 h token.
-        "expires_at": match (generation, fake.first_life_ms) {
-            (1, Some(life)) => now + life,
-            _ => now + 1_800_000 * generation as i64,
-        },
-        "scopes": ["user:inference", "user:profile"],
-        "revision": format!("revision-{generation}"),
-        "generation": generation,
-    }))
-}
-
-fn private_write(path: &Path, contents: &str) {
+fn private_write(path: &Path, value: &str) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, contents).unwrap();
+    std::fs::write(path, value).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
-
-/// A fake Claude: one process (no children), logs its token and arguments, reports a
-/// session and a finished turn through the renewal hook, then waits for SIGTERM. With the
-/// renewed token it reports its session start and exits 7. `FAKE_FORK`: the turn runs in a
-/// fork (`sess-fork`) that never sent its own SessionStart. `FAKE_GONE=<id>`: a resume of
-/// that session fails as Claude's does ("No conversation found", exit 1, no hook event).
 const FAKE_CLAUDE: &str = r#"#!/usr/bin/env python3
-import json, os, select, signal, subprocess, sys, time
-args = sys.argv[1:]
-token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
-tty = os.isatty(0)
-foreground = tty and os.tcgetpgrp(0) == os.getpgrp()
-settings = args[args.index("--settings") + 1]
-config = json.load(open(settings))
-with open(os.environ["FAKE_LOG"], "a") as log:
-    log.write(json.dumps({"token": token, "args": args, "tty": tty, "foreground": foreground, "settings": config, "run": os.environ.get("CLAUDECTL_SERVER_RUN")}) + "\n")
-command = config["hooks"]["Stop"][0]["hooks"][0]["command"]
-def hook(event):
-    subprocess.run(["/bin/sh", "-c", command], input=json.dumps(event).encode(), check=True)
-if token != "token-1":
-    resumed = args[args.index("--resume") + 1] if "--resume" in args else None
-    if os.environ.get("FAKE_INTERRUPT"):
-        # Ctrl-C before the first hook: Claude dies by SIGINT.
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        os.kill(os.getpid(), signal.SIGINT)
-    if resumed is not None and resumed == os.environ.get("FAKE_GONE"):
-        print("No conversation found with session ID: " + resumed, file=sys.stderr)
-        sys.exit(1)
-    hook({"hook_event_name": "SessionStart", "session_id": resumed or "sess-new"})
-    if "FAKE_CRON_JOBS" in os.environ:
-        # Native transcript tool evidence: an empty initial inventory, then the final one.
-        session = resumed or "sess-new"
-        transcript = os.path.join(os.environ["HOME"], "restarted.jsonl")
-        note = "earlier user turn" if os.environ.get("FAKE_CRON_STALE") else args[-1]
-        prior = os.path.join(os.environ["HOME"], "prior-prompt.txt")
-        if os.environ.get("FAKE_CRON_STALE") and os.path.exists(prior):
-            note = open(prior).read()
-        rows = [{"type": "user", "sessionId": session, "message": {"content": note}}]
-        for number, jobs in enumerate([[], json.loads(os.environ["FAKE_CRON_JOBS"])]):
-            call, uuid = "list-" + str(number), "assistant-" + str(number)
-            rows.append({"type": "assistant", "sessionId": session, "uuid": uuid,
-                         "message": {"content": [{"type": "tool_use", "name": "CronList", "id": call, "input": {}}]}})
-            rows.append({"type": "user", "sessionId": session, "sourceToolAssistantUUID": uuid,
-                         "message": {"content": [{"type": "tool_result", "tool_use_id": call, "content": "inventory"}]},
-                         "toolUseResult": {"jobs": jobs}})
-        with open(transcript, "w") as out:
-            out.write("\n".join(json.dumps(row) for row in rows) + "\n")
-        hook({"hook_event_name": "Stop", "session_id": session, "transcript_path": transcript})
-        time.sleep(0.5)
-        if os.environ.get("FAKE_CAPTURE_INPUT"):
-            ready, _, _ = select.select([sys.stdin], [], [], 0)
-            data = os.read(0, 4096) if ready else b""
-            with open(os.environ["FAKE_LOG"] + ".input", "wb") as out:
-                out.write(data)
-    sys.exit(7)
-turn = "sess-fork" if os.environ.get("FAKE_FORK") else "sess-1"
-for event in ({"hook_event_name": "SessionStart", "session_id": "sess-1"},
-              {"hook_event_name": "UserPromptSubmit", "session_id": turn},
-              {"hook_event_name": "Stop", "session_id": turn}):
-    hook(event)
+import json, os, signal, subprocess, sys, time
+from pathlib import Path
+home=Path(os.environ['HOME'])
+log=home/'claude.log'
+mode=os.environ['FAKE_MODE']
+args=sys.argv[1:]
+settings=json.load(open(args[args.index('--settings')+1]))
+run=Path(os.environ['CLAUDECTL_SERVER_RUN'])
+with log.open('a') as out:
+    out.write(json.dumps({'token':os.environ['CLAUDE_CODE_OAUTH_TOKEN'],'args':args,'settings':settings,'run':str(run),'pid':os.getpid(),'tty':os.isatty(0),'foreground':not os.isatty(0) or os.tcgetpgrp(0)==os.getpgrp()})+'\n')
 def term(*_):
-    status = json.load(open(os.path.join(os.path.dirname(settings), "session.json")))
-    with open(os.environ["FAKE_LOG"] + ".term", "w") as out:
-        out.write(status.get("renewal", ""))
+    (home/'terminated').touch()
     sys.exit(143)
-signal.signal(signal.SIGTERM, term)
-if os.environ.get("FAKE_BAD_EVENT"):
-    with open(os.path.join(os.path.dirname(settings), "events"), "a") as events:
-        events.write(os.environ["FAKE_BAD_EVENT"])
-hold_open = bool(os.environ.get("FAKE_HOLD")) and token == "token-1"
-if hold_open:
-    start = [os.environ["FAKE_WRAPPER_BIN"], "hold", "start", "--reason", "FLT-553 synthetic prod step"]
-    if os.environ.get("FAKE_STALE_HOLD"):
-        subprocess.run([sys.executable, "-c", "import subprocess,sys; subprocess.run(sys.argv[1:], check=True)"] + start, check=True)
-        run = os.path.basename(os.environ["CLAUDECTL_SERVER_RUN"])
-        path = os.path.join(os.environ["HOME"], ".claudectl", "server", "holds", run + ".json")
-        saved = json.load(open(path))
-        saved["owner_started"] = "previous wrapper incarnation"
-        with open(path, "w") as out:
-            json.dump(saved, out)
-    else:
-        subprocess.run(["/bin/sh", "-c", '"$@"; :', "hold-shell"] + start, check=True)
-if os.environ.get("FAKE_TASK_CHILD") and token == "token-1":
-    if os.environ.get("FAKE_TASK_DURING_READ"):
-        open(os.environ["FAKE_LOG"] + ".ready", "w").close()
-        deadline = time.monotonic() + 10
-        while not os.path.exists(os.environ["FAKE_LOG"] + ".inflight") and time.monotonic() < deadline:
-            time.sleep(0.02)
-    # Claude's background Bash/Monitor owns an output file, unlike an MCP or LSP.
-    task_dir = os.path.join(os.environ["TMPDIR"], "claude-" + str(os.getuid()), "project", "tasks")
-    os.makedirs(task_dir, exist_ok=True)
-    with open(os.path.join(task_dir, "background.output"), "w") as output:
-        subprocess.Popen([sys.executable, "-c", '''
-import os, time
-release = os.environ["FAKE_LOG"] + ".task-release"
-deadline = time.monotonic() + 15
-while not os.path.exists(release) and time.monotonic() < deadline:
-    time.sleep(0.02)
-if os.path.exists(release):
-    open(os.environ["FAKE_LOG"] + ".task-done", "w").close()
-'''], stdout=output, stderr=output)
-    if os.environ.get("FAKE_TASK_DURING_READ"):
-        open(os.environ["FAKE_LOG"] + ".ended", "w").close()
-if os.environ.get("FAKE_EXTRA_CHILD") and token == "token-1":
-    # An LSP, caffeinate or a background shell: it joins Claude's group after the monitor
-    # took its baseline, and never leaves.
-    time.sleep(0.5)
-    subprocess.Popen(["sleep", "60"])
-if os.environ.get("FAKE_CLEAN_EXIT") and token == "token-1":
-    # A strict order: idle (ready arms a server refresh); the monitor's token request is in
-    # flight (the server wrote .inflight and holds the answer); the user types /exit, so
-    # Claude ends the session (SessionEnd hook) and writes .ended; only then does the server
-    # answer, with the new revision; Claude shuts down for a while and exits 0.
-    with open(os.environ["FAKE_LOG"] + ".ready", "w") as ready:
-        ready.write("idle")
-    deadline = time.time() + 10
-    while not os.path.exists(os.environ["FAKE_LOG"] + ".inflight") and time.time() < deadline:
-        time.sleep(0.05)
-    subprocess.run(["/bin/sh", "-c", command], check=True, input=json.dumps(
-        {"hook_event_name": "SessionEnd", "session_id": "sess-1", "reason": "prompt_input_exit"}).encode())
-    open(os.environ["FAKE_LOG"] + ".ended", "w").close()
-    time.sleep(2)
-    sys.exit(0)
-with open(os.environ["FAKE_LOG"] + ".ready", "w") as ready:
-    ready.write("idle")
-# A watchdog: a build that never restarts fails the test instead of hanging it.
-deadline = time.time() + float(os.environ.get("FAKE_WATCHDOG_S", "20"))
-while time.time() < deadline:
-    if hold_open and os.path.exists(os.environ["FAKE_LOG"] + ".task-release"):
-        subprocess.run([os.environ["FAKE_WRAPPER_BIN"], "hold", "end"], check=True)
-        open(os.environ["FAKE_LOG"] + ".task-done", "w").close()
-        hold_open = False
-    time.sleep(0.05)
-sys.exit(99)
+signal.signal(signal.SIGTERM,term)
+command=settings['hooks']['Stop'][0]['hooks'][0]['command']
+def hook(event):
+    subprocess.run(['/bin/sh','-c',command],input=json.dumps({'hook_event_name':event,'session_id':'s'}).encode(),check=True)
+if mode != 'no_hooks':
+    hook('SessionStart'); hook('UserPromptSubmit')
+    if mode != 'busy': hook('Stop')
+task=None
+if mode=='task':
+    folder=Path(os.environ['TMPDIR'])/('claude-'+str(os.getuid()))/'project/tasks'
+    folder.mkdir(parents=True)
+    with (folder/'task.output').open('w') as out:
+        task=subprocess.Popen([sys.executable,'-c',"import os,time; from pathlib import Path; h=Path(os.environ['HOME']); end=time.monotonic()+15\nwhile not (h/'release').exists() and time.monotonic()<end:\n (h/'task-progress').write_text(str(time.monotonic())); time.sleep(.02)\n(h/'task-done').touch()"],stdout=out,stderr=out)
+if mode=='hold':
+    subprocess.run([os.environ['FAKE_WRAPPER_BIN'],'hold','start','--reason','FLT-553 synthetic step'],check=True)
+if mode=='hook_error': (run/'hook-error').touch()
+if mode=='damaged':
+    with (run/'events').open('a') as out: out.write('broken record\n')
+if mode=='extra': task=subprocess.Popen(['sleep','15'])
+(home/'ready').touch()
+deadline=time.monotonic()+15
+prompted=False
+while not (home/'release').exists() and time.monotonic()<deadline:
+    if (home/'submit').exists() and not prompted:
+        hook('UserPromptSubmit'); prompted=True
+    if (home/'turn-done').exists() and prompted:
+        hook('Stop'); prompted=False; (home/'submit').unlink(missing_ok=True)
+    time.sleep(.02)
+if task is not None:
+    if mode=='extra': task.terminate()
+    task.wait(timeout=3)
+if mode not in ['no_hooks','hook_error','damaged']: hook('SessionEnd')
+sys.exit(23)
 "#;
 
-struct Env {
+struct Fixture {
     home: tempfile::TempDir,
-    fake: Shared,
-    claude: std::path::PathBuf,
-    log: std::path::PathBuf,
+    state: Shared,
+    mode: String,
+    child: Option<Child>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    server: Option<std::thread::JoinHandle<()>>,
 }
-
-impl Env {
-    fn new() -> Self {
+impl Fixture {
+    fn start(mode: &str, life_ms: i64, tty: bool) -> Self {
+        use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
-        let fake: Shared = Arc::new(Mutex::new(Fake {
+        let state = Arc::new(Mutex::new(Fake {
+            life_ms,
             generation: 1,
             ..Default::default()
         }));
@@ -274,1275 +121,285 @@ impl Env {
             .route("/v2/anthropic/accounts", get(accounts))
             .route("/v2/anthropic/usage", get(usage))
             .route("/v2/anthropic/token", post(token))
-            .with_state(fake.clone());
-        std::thread::spawn(move || {
+            .with_state(state.clone());
+        let (shutdown, done) = tokio::sync::oneshot::channel();
+        let server = std::thread::spawn(move || {
             tokio::runtime::Runtime::new()
                 .unwrap()
                 .block_on(async move {
-                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                    axum::serve(listener, app).await.unwrap();
-                });
+                    axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                        .with_graceful_shutdown(async {
+                            let _ = done.await;
+                        })
+                        .await
+                        .unwrap();
+                })
         });
-        let server = home.path().join(".claudectl/server");
+        let root = home.path().join(".claudectl/server");
         private_write(
-            &server.join("connection.json"),
-            &json!({"server": origin, "user_id": "person", "token_file": server.join("machine.json")})
+            &root.join("connection.json"),
+            &json!({"server":origin,"user_id":"person","token_file":root.join("machine.json")})
                 .to_string(),
         );
-        private_write(
-            &server.join("machine.json"),
-            &json!("synthetic-machine").to_string(),
-        );
+        private_write(&root.join("machine.json"), "\"synthetic-machine\"");
         let claude = home.path().join("claude");
         std::fs::write(&claude, FAKE_CLAUDE).unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let digest = claudectl::exec::sha256_file(&claude).unwrap();
-        private_write(
-            &server.join("qualified-host-config-builds.json"),
-            &json!([{"sha256": digest, "platform": "linux", "qualified_at": "test",
-                "check": "supervised_host_config"}])
-            .to_string(),
-        );
-        let log = home.path().join("claude.log");
-        Self {
-            home,
-            fake,
-            claude,
-            log,
-        }
-    }
-    /// The server refreshes once the first Claude is idle (another client, or the margin).
-    fn refresh_when_idle(&self) -> std::thread::JoinHandle<()> {
-        let fake = self.fake.clone();
-        let ready = self.log.with_extension("log.ready");
-        std::thread::spawn(move || {
-            for _ in 0..400 {
-                if ready.exists() {
-                    fake.lock().unwrap().refresh_next = true;
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        })
-    }
-    fn env(&self, command: &mut std::process::Command) {
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_write(&root.join("qualified-host-config-builds.json"), &json!([{"sha256":claudectl::exec::sha256_file(&claude).unwrap(),"platform":"linux","qualified_at":"test","check":"supervised_host_config"}]).to_string());
+        std::fs::create_dir(home.path().join("tmp")).unwrap();
+        let binary = assert_cmd::cargo::cargo_bin("claudectl");
+        let settings = r#"{"crossSessionInbound":"accept","isolatePeerMachines":true}"#;
+        let mut command = if tty {
+            let quote = |s: &Path| format!("'{}'", s.display().to_string().replace('\'', "'\\''"));
+            let mut c = Command::new("/usr/bin/script");
+            c.args([
+                "-qec",
+                &format!(
+                    "{} server run work --claude {} -- --model opus --settings '{}'",
+                    quote(&binary),
+                    quote(&claude),
+                    settings
+                ),
+                "/dev/null",
+            ]);
+            c
+        } else {
+            let mut c = Command::new(&binary);
+            c.args(["server", "run", "work", "--claude"])
+                .arg(&claude)
+                .args([
+                    "--",
+                    "--model",
+                    "opus",
+                    "--resume",
+                    "old",
+                    "--settings",
+                    settings,
+                ]);
+            c
+        };
         command
             .env_clear()
-            .env("HOME", self.home.path())
+            .env("HOME", home.path())
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .env("TERM", "xterm")
             .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
             .env("CLAUDECTL_TEST_RENEW_FAST", "1")
-            .env("FAKE_LOG", &self.log);
-    }
-    fn runs(&self) -> Vec<Value> {
-        std::fs::read_to_string(&self.log)
-            .unwrap()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect()
-    }
-    fn recovery_log(&self, output: &std::process::Output) -> String {
-        for bytes in [&output.stdout, &output.stderr] {
-            let terminal = String::from_utf8_lossy(bytes);
-            for notice in ["cron recovery", "missing cron:", "duplicate saved cron:"] {
-                assert!(
-                    !terminal.contains(notice),
-                    "recovery notice reached terminal: {terminal}"
-                );
-            }
+            .env("TMPDIR", home.path().join("tmp"))
+            .env("FAKE_MODE", mode)
+            .env("FAKE_WRAPPER_BIN", binary)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+        Self {
+            home,
+            state,
+            mode: mode.into(),
+            child: Some(child),
+            shutdown: Some(shutdown),
+            server: Some(server),
         }
-        let path = self
-            .home
-            .path()
-            .join(".claudectl/server/cron-recovery.jsonl");
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return String::new(),
-            Err(error) => panic!("could not read recovery log: {error}"),
-        };
-        let runs = self.runs();
-        let run = Path::new(runs.last().unwrap()["run"].as_str().unwrap())
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap();
-        text.lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .filter(|record| record["session"] == run)
-            .map(|record| record["message"].as_str().unwrap().to_owned())
-            .collect::<Vec<_>>()
-            .join("\n")
     }
-    fn operator_card(&self) -> [std::path::PathBuf; 2] {
-        let card = self.home.path().join("Code/.fleet/example/operator.md");
-        let first = card.parent().unwrap().join("check prompt.txt");
-        let second = card.parent().unwrap().join("deep-dive.txt");
-        private_write(&first, "Check the owned lanes.\n");
-        private_write(&second, "Read the daily evidence.\n");
-        private_write(
-            &card,
-            &format!(
-                "operator_tab: w9C:tF\ncron_ids: old-one old-two\ncron_prompts: '{}' */5 * * * *; {} 24 8 * * *\nclaude_session_file: /old/session.jsonl\n",
-                first.display(),
-                second.display()
-            ),
-        );
-        // Non-directory fleet entries are not Operator cards.
-        private_write(&self.home.path().join("Code/.fleet/notes.txt"), "notes");
-        [first, second]
-    }
-    fn operator_restart(&self, jobs: Value, tab: &str, stale: bool) -> std::process::Output {
-        let refresher = self.refresh_when_idle();
-        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-        self.env(&mut command);
-        command
-            .env("HERDR_TAB_ID", tab)
-            .env("FAKE_CRON_JOBS", jobs.to_string())
-            .args(["server", "run", "work", "--claude"])
-            .arg(&self.claude)
-            .args(["--", "--model", "opus"]);
-        if stale {
-            command.env("FAKE_CRON_STALE", "1");
-        }
-        let output = Command::from_std(command)
-            .timeout(std::time::Duration::from_secs(60))
-            .output()
-            .unwrap();
-        refresher.join().unwrap();
-        assert_eq!(
-            output.status.code(),
-            Some(7),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        output
-    }
-    fn assert_followed(&self, runs: &[Value], token: &str) {
-        assert_eq!(runs.len(), 2, "{runs:?}");
-        assert_eq!(runs[0]["token"], "token-1");
-        assert_eq!(runs[1]["token"], token);
-        // The supervisor-visible marker was set before Claude got SIGTERM.
-        let term = std::fs::read_to_string(self.log.with_extension("log.term")).unwrap();
-        assert_eq!(term, "renewing");
-        let args: Vec<String> = serde_json::from_value(runs[1]["args"].clone()).unwrap();
-        let settings = args.iter().position(|a| a == "--settings").unwrap();
-        let mut user: Vec<&str> = args.iter().map(String::as_str).collect();
-        user.drain(settings..settings + 2);
-        // Only the renewal resume carries the note that re-creates the session's crons:
-        // Claude Code can keep them listed but stop firing them after a resume (SAW-12610).
-        let note = user.pop().unwrap();
-        assert!(note.contains("CronList") && note.contains("stop"), "{note}");
-        assert!(
-            note.contains("compare each job's schedule")
-                && note.contains("time since this session's last turn"),
-            "{note}"
-        );
-        assert!(
-            note.contains("one or more fires were missed")
-                && note.contains("run that job's prompt ONCE now")
-                && note.contains("regardless of how many fires were missed"),
-            "{note}"
-        );
-        assert!(note.ends_with("Then stop: do no other work."), "{note}");
-        assert_eq!(user, ["--model", "opus", "--resume", "sess-1"]);
-        let first: Vec<String> = serde_json::from_value(runs[0]["args"].clone()).unwrap();
-        assert!(first.iter().all(|a| !a.contains("CronList")), "{first:?}");
-        // No request ever forced a refresh (SAW-12610 root cause).
-        let requests = self.fake.lock().unwrap().requests.clone();
-        assert!(requests.iter().all(Value::is_null), "{requests:?}");
-    }
-}
-
-#[test]
-fn operator_recovery_logs_its_result_without_touching_the_child_terminal() {
-    use std::os::unix::fs::PermissionsExt;
-    let env = Env::new();
-    env.operator_card();
-    let log = env
-        .home
-        .path()
-        .join(".claudectl/server/cron-recovery.jsonl");
-    std::fs::write(&log, "").unwrap();
-    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let refresher = env.refresh_when_idle();
-    let quote = |s: &Path| format!("'{}'", s.display().to_string().replace('\'', "'\\''"));
-    let inner = format!(
-        "{} server run work --claude {} -- --model opus",
-        quote(&assert_cmd::cargo::cargo_bin("claudectl")),
-        quote(&env.claude),
-    );
-    let mut command = std::process::Command::new("/usr/bin/script");
-    env.env(&mut command);
-    command
-        .env("HERDR_TAB_ID", "w9C:tF")
-        .env("FAKE_CAPTURE_INPUT", "1")
-        .env("FAKE_CRON_JOBS", json!([
-            {"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.","recurring":true,"durable":false},
-            {"id":"new-two","cron":"24 8 * * *","prompt":"Read the daily evidence.","recurring":true,"durable":false}
-        ]).to_string())
-        .args(["-qec", &inner, "/dev/null"]);
-    let output = Command::from_std(command)
-        .timeout(std::time::Duration::from_secs(60))
-        .output()
-        .unwrap();
-    refresher.join().unwrap();
-    assert_eq!(output.status.code(), Some(7));
-    let terminal = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        !terminal.contains("cron recovery verified"),
-        "recovery result reached Claude terminal: {terminal}"
-    );
-    assert!(
-        std::fs::read(env.log.with_extension("log.input"))
-            .unwrap()
-            .is_empty()
-    );
-    let records: Vec<Value> = std::fs::read_to_string(&log)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(records.len(), 1);
-    assert_eq!(
-        records[0]["message"],
-        "cron recovery verified: 2/2 saved jobs"
-    );
-    assert!(records[0]["session"].as_str().unwrap().starts_with("run-"));
-    assert!(records[0]["at"].as_i64().unwrap() > 0);
-    assert_eq!(
-        std::fs::metadata(log).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    assert!(!records[0].to_string().contains("Check the owned lanes."));
-    let runs = env.runs();
-    assert_eq!(runs.len(), 2);
-    assert_eq!(runs[1]["tty"], true);
-    assert_eq!(runs[1]["foreground"], true);
-}
-
-#[test]
-fn a_failed_cron_notice_log_does_not_abort_renewal_or_saved_job_recovery() {
-    for conflict in [false, true] {
-        let env = Env::new();
-        let [first, _] = env.operator_card();
-        let card = env.home.path().join("Code/.fleet/another/operator.md");
-        private_write(
-            &card,
-            if conflict {
-                "operator_tab: w9C:tF\ncron_prompts: '../example/check prompt.txt' 0 12 * * *\n"
-            } else {
-                "operator_tab: w9C:tOther\n"
-            },
-        );
-        if !conflict {
-            // An unreadable unrelated card must not suppress valid saved jobs either.
-            std::fs::write(card, b"operator_tab: w9C:tOther\n\xff").unwrap();
-        }
-        std::fs::create_dir(
-            env.home
-                .path()
-                .join(".claudectl/server/cron-recovery.jsonl"),
-        )
-        .unwrap();
-        let output = env.operator_restart(json!([]), "w9C:tF", false);
-        let runs = env.runs();
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[1]["token"], "token-2");
-        let note = runs[1]["args"]
-            .as_array()
-            .unwrap()
-            .last()
-            .unwrap()
-            .as_str()
-            .unwrap();
-        assert_eq!(note.contains(first.to_str().unwrap()), !conflict, "{note}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("could not record cron recovery"));
-    }
-}
-
-#[test]
-fn operator_renewal_names_saved_crons_even_when_the_session_list_is_empty() {
-    let env = Env::new();
-    let [first, second] = env.operator_card();
-    env.operator_restart(json!([]), "w9C:tF", false);
-    let runs = env.runs();
-    let arguments = runs[1]["args"].as_array().unwrap();
-    let note = arguments.last().unwrap().as_str().unwrap();
-    for expected in [
-        first.to_str().unwrap(),
-        second.to_str().unwrap(),
-        "*/5 * * * *",
-        "24 8 * * *",
-        "cron_ids",
-        "claude_session_file",
-    ] {
-        assert!(
-            note.contains(expected),
-            "restart prompt omitted {expected}: {note}"
-        );
-    }
-    assert!(note.contains("even if CronList is empty"), "{note}");
-    let first_args = runs[0]["args"].as_array().unwrap();
-    assert!(
-        first_args
-            .iter()
-            .all(|arg| !arg.as_str().unwrap().contains("CronCreate"))
-    );
-}
-
-#[test]
-fn operator_renewal_uses_saved_crons_when_another_owned_card_has_none() {
-    for fields in ["", "cron_prompts:\n"] {
-        let env = Env::new();
-        let [first, second] = env.operator_card();
-        private_write(
-            &env.home.path().join("Code/.fleet/codexctl/operator.md"),
-            &format!("operator_tab: w9C:tF\n{fields}"),
-        );
-        let output = env.operator_restart(json!([]), "w9C:tF", false);
-        let runs = env.runs();
-        let note = runs[1]["args"]
-            .as_array()
-            .unwrap()
-            .last()
-            .unwrap()
-            .as_str()
-            .unwrap();
-        for file in [&first, &second] {
-            assert!(note.contains(file.to_str().unwrap()), "{note}");
-        }
-        assert!(note.contains("even if CronList is empty"), "{note}");
-        assert!(!env.recovery_log(&output).contains("ambiguous"));
-    }
-}
-
-#[test]
-fn operator_renewal_merges_owned_cards_and_deduplicates_shared_prompt_files() {
-    let env = Env::new();
-    let [shared, _] = env.operator_card();
-    let card = env.home.path().join("Code/.fleet/another/operator.md");
-    let third = card.parent().unwrap().join("third.txt");
-    private_write(&third, "Check the other project.\n");
-    private_write(
-        &card,
-        "operator_tab: w9C:tF\ncron_ids: old-shared old-third\ncron_prompts: '../example/./check prompt.txt' */5 * * * *; third.txt 0 12 * * *\n",
-    );
-    let output = env.operator_restart(json!([
-        {"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.\n","recurring":true,"durable":false},
-        {"id":"new-two","cron":"24 8 * * *","prompt":"Read the daily evidence.\n","recurring":true,"durable":false},
-        {"id":"new-three","cron":"0 12 * * *","prompt":"Check the other project.\n","recurring":true,"durable":false}
-    ]), "w9C:tF", false);
-    let runs = env.runs();
-    let note = runs[1]["args"]
-        .as_array()
-        .unwrap()
-        .last()
-        .unwrap()
-        .as_str()
-        .unwrap();
-    assert_eq!(
-        note.matches(&format!("file: {}\n", shared.display()))
-            .count(),
-        1,
-        "{note}"
-    );
-    assert!(note.contains(third.to_str().unwrap()), "{note}");
-    assert!(note.contains(card.to_str().unwrap()), "{note}");
-    assert!(note.contains("EACH named Operator card"), "{note}");
-    assert!(note.contains("same new ID on every owning card"), "{note}");
-    let notices = env.recovery_log(&output);
-    assert!(
-        notices.contains("cron recovery verified: 3/3 saved jobs"),
-        "{notices}"
-    );
-    assert!(
-        !notices.contains("missing cron") && !notices.contains("cron recovery skipped"),
-        "{notices}"
-    );
-}
-
-#[test]
-fn operator_renewal_preserves_distinct_schedules_for_one_cards_prompt_file() {
-    let env = Env::new();
-    let [shared, _] = env.operator_card();
-    let card = shared.parent().unwrap().join("operator.md");
-    let text = std::fs::read_to_string(&card).unwrap();
-    private_write(
-        &card,
-        &format!("{text}cron_prompts: '{}' 0 12 * * *\n", shared.display()),
-    );
-    let output = env.operator_restart(json!([
-        {"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.\n","recurring":true,"durable":false},
-        {"id":"new-two","cron":"24 8 * * *","prompt":"Read the daily evidence.\n","recurring":true,"durable":false},
-        {"id":"new-three","cron":"0 12 * * *","prompt":"Check the owned lanes.\n","recurring":true,"durable":false}
-    ]), "w9C:tF", false);
-    let notices = env.recovery_log(&output);
-    assert!(
-        notices.contains("cron recovery verified: 3/3 saved jobs"),
-        "{notices}"
-    );
-    assert!(!notices.contains("cron recovery skipped"), "{notices}");
-}
-
-#[test]
-fn operator_renewal_skips_conflicting_schedules_without_aborting_the_renewal() {
-    let env = Env::new();
-    let [shared, _] = env.operator_card();
-    private_write(
-        &env.home.path().join("Code/.fleet/another/operator.md"),
-        "operator_tab: w9C:tF\ncron_prompts: '../example/check prompt.txt' 0 12 * * *\n",
-    );
-    let output = env.operator_restart(json!([]), "w9C:tF", false);
-    env.assert_followed(&env.runs(), "token-2");
-    let notices = env.recovery_log(&output);
-    assert!(notices.contains("cron recovery skipped:"), "{notices}");
-    assert!(notices.contains("conflicting schedules"), "{notices}");
-    assert!(notices.contains(shared.to_str().unwrap()), "{notices}");
-    assert!(!notices.contains("cron recovery verified"), "{notices}");
-}
-
-#[test]
-fn operator_renewal_reports_the_saved_job_missing_from_the_final_cron_list() {
-    let env = Env::new();
-    let [first, missing] = env.operator_card();
-    let output = env.operator_restart(json!([{"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.\n","recurring":true,"durable":false}]), "w9C:tF", false);
-    let notices = env.recovery_log(&output);
-    assert!(
-        notices.contains(&format!("missing cron: {}", missing.display())),
-        "{notices}"
-    );
-    assert!(notices.contains("24 8 * * *"), "{notices}");
-    assert!(
-        !notices.contains(&format!("missing cron: {}", first.display())),
-        "{notices}"
-    );
-}
-
-#[test]
-fn operator_renewal_verifies_both_saved_crons_from_the_new_inventory() {
-    let env = Env::new();
-    env.operator_card();
-    let output = env.operator_restart(json!([
-        {"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.\n","recurring":true,"durable":false},
-        {"id":"new-two","cron":"24 8 * * *","prompt":"Read the daily evidence.\n","recurring":true,"durable":false}
-    ]), "w9C:tF", false);
-    let notices = env.recovery_log(&output);
-    assert_eq!(
-        notices
-            .matches("cron recovery verified: 2/2 saved jobs")
-            .count(),
-        1,
-        "{notices}"
-    );
-    assert!(!notices.contains("missing cron"), "{notices}");
-    assert!(!notices.contains("Check the owned lanes."), "{notices}");
-}
-
-#[test]
-fn operator_renewal_does_not_verify_an_old_duplicate_beside_the_recreated_jobs() {
-    let env = Env::new();
-    env.operator_card();
-    let output = env.operator_restart(json!([
-        {"id":"old-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.","recurring":true,"durable":false},
-        {"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.","recurring":true,"durable":false},
-        {"id":"new-two","cron":"24 8 * * *","prompt":"Read the daily evidence.","recurring":true,"durable":false}
-    ]), "w9C:tF", false);
-    let notices = env.recovery_log(&output);
-    assert!(notices.contains("duplicate saved cron:"), "{notices}");
-    assert!(!notices.contains("cron recovery verified"), "{notices}");
-}
-
-#[test]
-fn operator_renewal_prompt_preserves_non_card_jobs_and_checks_only_saved_jobs() {
-    let env = Env::new();
-    env.operator_card();
-    let output = env.operator_restart(json!([
-        {"id":"new-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.","recurring":true,"durable":false},
-        {"id":"new-two","cron":"24 8 * * *","prompt":"Read the daily evidence.","recurring":true,"durable":false},
-        {"id":"manual","cron":"0 9 * * *","prompt":"Manual reminder.","recurring":true,"durable":false}
-    ]), "w9C:tF", false);
-    let runs = env.runs();
-    let note = runs[1]["args"]
-        .as_array()
-        .unwrap()
-        .last()
-        .unwrap()
-        .as_str()
-        .unwrap();
-    assert!(note.contains("Delete only card-owned IDs"), "{note}");
-    assert!(note.contains("card's cron_ids"), "{note}");
-    assert!(note.contains("Preserve every other listed job"), "{note}");
-    assert!(
-        env.recovery_log(&output)
-            .contains("cron recovery verified: 2/2 saved jobs")
-    );
-}
-
-#[test]
-fn operator_renewal_does_not_trust_cron_results_without_the_restart_prompt() {
-    let env = Env::new();
-    env.operator_card();
-    let output = env.operator_restart(json!([
-        {"id":"old-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.","recurring":true,"durable":false},
-        {"id":"old-two","cron":"24 8 * * *","prompt":"Read the daily evidence.","recurring":true,"durable":false}
-    ]), "w9C:tF", true);
-    let notices = env.recovery_log(&output);
-    assert!(
-        notices.contains("cron recovery unverified: no post-restart CronList"),
-        "{notices}"
-    );
-    assert!(!notices.contains("cron recovery verified"), "{notices}");
-}
-
-#[test]
-fn operator_renewal_cannot_reuse_a_previous_identical_recovery_inventory() {
-    let env = Env::new();
-    env.operator_card();
-    let jobs = json!([
-        {"id":"old-one","cron":"*/5 * * * *","prompt":"Check the owned lanes.","recurring":true,"durable":false},
-        {"id":"old-two","cron":"24 8 * * *","prompt":"Read the daily evidence.","recurring":true,"durable":false}
-    ]);
-    env.operator_restart(jobs.clone(), "w9C:tF", false);
-    let runs = env.runs();
-    let old_prompt = runs[1]["args"]
-        .as_array()
-        .unwrap()
-        .last()
-        .unwrap()
-        .as_str()
-        .unwrap();
-    std::fs::write(env.home.path().join("prior-prompt.txt"), old_prompt).unwrap();
-    std::fs::remove_file(env.log.with_extension("log.ready")).unwrap();
-    *env.fake.lock().unwrap() = Fake {
-        generation: 1,
-        ..Default::default()
-    };
-    let output = env.operator_restart(jobs, "w9C:tF", true);
-    let notices = env.recovery_log(&output);
-    assert!(
-        notices.contains("cron recovery unverified: no post-restart CronList"),
-        "{notices}"
-    );
-    assert!(!notices.contains("cron recovery verified"), "{notices}");
-}
-
-#[test]
-fn operator_renewal_accepts_the_canonical_inline_operator_header() {
-    let env = Env::new();
-    let [first, _] = env.operator_card();
-    let card = first.parent().unwrap().join("operator.md");
-    let text = std::fs::read_to_string(&card).unwrap();
-    std::fs::write(
-        &card,
-        text.replace(
-            "operator_tab: w9C:tF",
-            "hq: example  hq_pane: w5C:t41  operator_tab: w9C:tF",
-        ),
-    )
-    .unwrap();
-    env.operator_restart(json!([]), "w9C:tF", false);
-    let runs = env.runs();
-    let note = runs[1]["args"]
-        .as_array()
-        .unwrap()
-        .last()
-        .unwrap()
-        .as_str()
-        .unwrap();
-    assert!(note.contains(first.to_str().unwrap()), "{note}");
-    assert!(note.contains("even if CronList is empty"), "{note}");
-}
-
-#[test]
-fn an_unreadable_unrelated_card_does_not_abort_an_ordinary_renewal() {
-    let env = Env::new();
-    let card = env.home.path().join("Code/.fleet/unrelated/operator.md");
-    std::fs::create_dir_all(card.parent().unwrap()).unwrap();
-    std::fs::write(card, b"hq: unrelated\noperator_tab: w9C:tOther\n\xff").unwrap();
-    let output = env.operator_restart(json!([]), "w9C:tF", false);
-    env.assert_followed(&env.runs(), "token-2");
-    assert!(!env.recovery_log(&output).contains("cron recovery verified"));
-}
-
-#[test]
-fn an_operator_card_without_saved_crons_keeps_the_existing_renewal() {
-    for fields in ["", "cron_ids:\ncron_prompts:\n"] {
-        let env = Env::new();
-        private_write(
-            &env.home.path().join("Code/.fleet/new/operator.md"),
-            &format!("hq: new  operator_tab: w9C:tF\n{fields}"),
-        );
-        let output = env.operator_restart(json!([]), "w9C:tF", false);
-        env.assert_followed(&env.runs(), "token-2");
-        assert!(!env.recovery_log(&output).contains("cron recovery verified"));
-    }
-}
-
-#[test]
-fn an_unreadable_saved_prompt_does_not_abort_operator_token_renewal() {
-    let env = Env::new();
-    let [first, _] = env.operator_card();
-    std::fs::remove_file(&first).unwrap();
-    let output = env.operator_restart(json!([]), "w9C:tF", false);
-    env.assert_followed(&env.runs(), "token-2");
-    let notices = env.recovery_log(&output);
-    assert!(notices.contains("cron recovery skipped:"), "{notices}");
-    assert!(notices.contains(first.to_str().unwrap()), "{notices}");
-    assert!(!notices.contains("cron recovery verified"), "{notices}");
-}
-
-#[test]
-fn unsupported_operator_prompt_paths_are_named_clearly() {
-    for path in ["$FLEET/check.txt", "~another-user/check.txt"] {
-        let env = Env::new();
-        private_write(
-            &env.home.path().join("Code/.fleet/example/operator.md"),
-            &format!("operator_tab: w9C:tF\ncron_prompts: {path} */5 * * * *\n"),
-        );
-        let output = env.operator_restart(json!([]), "w9C:tF", false);
-        env.assert_followed(&env.runs(), "token-2");
-        let notices = env.recovery_log(&output);
-        assert!(notices.contains("cron recovery skipped:"), "{notices}");
-        assert!(notices.contains("unsupported saved cron path"), "{notices}");
-        assert!(notices.contains(path), "{notices}");
-    }
-}
-
-#[test]
-fn another_tabs_operator_card_does_not_change_the_renewal_note() {
-    let env = Env::new();
-    env.operator_card();
-    let output = env.operator_restart(json!([]), "w9C:tOther", false);
-    let runs = env.runs();
-    env.assert_followed(&runs, "token-2");
-    assert!(!env.recovery_log(&output).contains("cron recovery"));
-}
-
-#[test]
-fn a_revoked_token_restarts_an_idle_claude_with_resume_on_the_new_token() {
-    let env = Env::new();
-    let refresher = env.refresh_when_idle();
-    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-    env.env(&mut command);
-    command
-        .args(["server", "run", "work", "--claude"])
-        .arg(&env.claude)
-        .args([
-            "--",
-            "--model",
-            "opus",
-            "--resume",
-            "old",
-            "--settings",
-            r#"{"crossSessionInbound":"accept","isolatePeerMachines":true}"#,
-        ]);
-    let output = Command::from_std(command)
-        .timeout(std::time::Duration::from_secs(60))
-        .output()
-        .unwrap();
-    refresher.join().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // The second Claude's own exit code ends `server run`.
-    assert_eq!(output.status.code(), Some(7), "{stderr}");
-    assert!(
-        stderr.contains("server token renewed; resuming session sess-1"),
-        "{stderr}"
-    );
-    let runs = env.runs();
-    env.assert_followed(&runs, "token-2");
-    for run in runs {
-        assert_eq!(run["settings"]["crossSessionInbound"], "accept");
-        assert_eq!(run["settings"]["isolatePeerMachines"], true);
-        assert_eq!(
-            run["settings"]["hooks"]["Stop"].as_array().unwrap().len(),
-            1
-        );
-        assert_eq!(
-            run["args"]
-                .as_array()
+    fn run(&self) -> Value {
+        serde_json::from_str(
+            std::fs::read_to_string(self.home.path().join("claude.log"))
                 .unwrap()
-                .iter()
-                .filter(|arg| *arg == "--settings")
-                .count(),
-            1
-        );
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap()
     }
-}
-
-/// Under a terminal, the relaunched Claude gets the terminal and its foreground again.
-#[test]
-fn a_relaunch_under_a_terminal_owns_the_foreground() {
-    if !Path::new("/usr/bin/script").exists() {
-        eprintln!("skipped: util-linux script(1) is not installed");
-        return;
+    fn directory(&self) -> PathBuf {
+        PathBuf::from(self.run()["run"].as_str().unwrap())
     }
-    let env = Env::new();
-    let refresher = env.refresh_when_idle();
-    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-    let inner = format!(
-        "{} server run work --claude {} -- --model opus --resume old; echo exit=$?; python3 -c 'import os; print(\"shell-foreground\", os.tcgetpgrp(0) == os.getpgrp())'",
-        quote(
-            &assert_cmd::cargo::cargo_bin("claudectl")
-                .display()
-                .to_string()
-        ),
-        quote(&env.claude.display().to_string()),
-    );
-    let mut command = std::process::Command::new("/usr/bin/script");
-    env.env(&mut command);
-    command.args(["-qec", &inner, "/dev/null"]);
-    let output = Command::from_std(command)
-        .timeout(std::time::Duration::from_secs(60))
-        .output()
-        .unwrap();
-    refresher.join().unwrap();
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("exit=7"), "{text}");
-    // After the relaunched Claude exits, the terminal goes back to the shell.
-    assert!(text.contains("shell-foreground True"), "{text}");
-    let runs = env.runs();
-    env.assert_followed(&runs, "token-2");
-    for run in &runs {
-        assert_eq!(run["tty"], true, "{run}");
-        assert_eq!(run["foreground"], true, "{run}");
-    }
-}
-
-/// Two refreshes before Claude went idle enough: the relaunch uses the newest token, taken
-/// right before the restart, never a revoked one.
-#[test]
-fn a_restart_uses_the_newest_token_when_the_server_refreshed_again() {
-    let env = Env::new();
-    env.fake.lock().unwrap().extra_refreshes = 1;
-    let refresher = env.refresh_when_idle();
-    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-    env.env(&mut command);
-    command
-        .args(["server", "run", "work", "--claude"])
-        .arg(&env.claude)
-        .args(["--", "--model", "opus", "--resume", "old"]);
-    let output = Command::from_std(command)
-        .timeout(std::time::Duration::from_secs(60))
-        .output()
-        .unwrap();
-    refresher.join().unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(7),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    env.assert_followed(&env.runs(), "token-3");
-}
-
-/// A busy Claude (a turn that never ends) never makes the monitor ask for a token: inside the
-/// server's margin such a request would refresh the grant and revoke the token the turn uses.
-#[test]
-fn a_busy_claude_never_triggers_a_token_request() {
-    let env = Env::new();
-    // This Claude starts a turn and stays in it until SIGTERM or its watchdog.
-    std::fs::write(
-        &env.claude,
-        FAKE_CLAUDE.replace(
-            r#"{"hook_event_name": "Stop", "session_id": turn}"#,
-            r#"{"hook_event_name": "UserPromptSubmit", "session_id": turn}"#,
-        ),
-    )
-    .unwrap();
-    let digest = claudectl::exec::sha256_file(&env.claude).unwrap();
-    private_write(
-        &env.home
-            .path()
-            .join(".claudectl/server/qualified-host-config-builds.json"),
-        &json!([{"sha256": digest, "platform": "linux", "qualified_at": "test",
-            "check": "supervised_host_config"}])
-        .to_string(),
-    );
-    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-    env.env(&mut command);
-    command
-        .env("FAKE_WATCHDOG_S", "3")
-        .args(["server", "run", "work", "--claude"])
-        .arg(&env.claude)
-        .args(["--", "--model", "opus"]);
-    let output = Command::from_std(command)
-        .timeout(std::time::Duration::from_secs(60))
-        .output()
-        .unwrap();
-    // The watchdog ended the busy Claude; server run ends with its code, no restart.
-    assert_eq!(
-        output.status.code(),
-        Some(99),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    // Only the launch asked for a token.
-    assert_eq!(env.fake.lock().unwrap().requests.len(), 1);
-    // A turn that is not eligible for renewal does not create a deferred-restart decision.
-    let journal = env
-        .home
-        .path()
-        .join(".claudectl/server/restart-decisions.jsonl");
-    assert!(!journal.exists());
-}
-
-/// A prompt that arrives while the token request is in flight: the monitor checks activity
-/// again after the request and does not stop the now-busy Claude.
-#[test]
-fn a_prompt_during_the_token_request_cancels_the_restart() {
-    let env = Env::new();
-    env.fake.lock().unwrap().hold_ms = 1_500;
-    let refresher = env.refresh_when_idle();
-    // When the monitor's request is in flight, the user submits a prompt.
-    let prompter = {
-        let fake = env.fake.clone();
-        let sessions = env.home.path().join(".claudectl/server/sessions");
-        std::thread::spawn(move || {
-            for _ in 0..400 {
-                if fake.lock().unwrap().requests.len() >= 2 {
-                    let dir = std::fs::read_dir(&sessions)
-                        .unwrap()
-                        .next()
-                        .unwrap()
-                        .unwrap()
-                        .path();
-                    let line = json!({"at": chrono::Utc::now().timestamp_millis(),
-                        "event": "UserPromptSubmit", "session_id": "sess-1"});
-                    use std::io::Write;
-                    let mut events = std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(dir.join("events"))
-                        .unwrap();
-                    writeln!(events, "{line}").unwrap();
-                    return;
+    fn wait(&mut self, reason: &str, stage: &str) -> Value {
+        let end = Instant::now() + Duration::from_secs(7);
+        while Instant::now() < end {
+            if self.home.path().join("ready").exists() {
+                let file = self.directory().join("restart-status.json");
+                if let Ok(bytes) = std::fs::read(file)
+                    && let Ok(status) = serde_json::from_slice::<Value>(&bytes)
+                    && status["reason"] == reason
+                    && status["stage"] == stage
+                    && (matches!(self.mode.as_str(), "no_hooks" | "hook_error" | "damaged")
+                        || status["session_id"] == "s")
+                {
+                    return status;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-        })
-    };
-    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-    env.env(&mut command);
-    command
-        .env("FAKE_WATCHDOG_S", "5")
-        .args(["server", "run", "work", "--claude"])
-        .arg(&env.claude)
-        .args(["--", "--model", "opus"]);
-    let output = Command::from_std(command)
-        .timeout(std::time::Duration::from_secs(60))
-        .output()
-        .unwrap();
-    refresher.join().unwrap();
-    prompter.join().unwrap();
-    // No restart: the busy Claude ran until its watchdog.
-    assert_eq!(
-        output.status.code(),
-        Some(99),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(env.runs().len(), 1);
-}
-
-/// A held token inside the server's refresh window: the monitor only observes (a request that
-/// never refreshes an unexpired token), so it may ask at once and never revokes a turn's token.
-#[test]
-fn inside_the_refresh_window_the_monitor_only_observes() {
-    let env = Env::new();
-    env.fake.lock().unwrap().first_life_ms = Some(3_000);
-    let refresher = env.refresh_when_idle();
-    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-    env.env(&mut command);
-    command
-        .args(["server", "run", "work", "--claude"])
-        .arg(&env.claude)
-        .args(["--", "--model", "opus"]);
-    let output = Command::from_std(command)
-        .timeout(std::time::Duration::from_secs(60))
-        .output()
-        .unwrap();
-    refresher.join().unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(7),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let fake = env.fake.lock().unwrap();
-    // The launch acquires; every monitor request observes.
-    assert!(fake.observes.len() >= 2, "{:?}", fake.observes);
-    assert!(!fake.observes[0], "{:?}", fake.observes);
-    assert!(fake.observes[1..].iter().all(|o| *o), "{:?}", fake.observes);
-}
-
-/// Helpers in Claude's group (an LSP, MCP server or caffeinate) never block
-/// following a revision another session's refresh superseded before expiry (SAW-12610,
-/// 10-08 17:08 repro).
-#[test]
-fn an_idle_claude_with_extra_processes_follows_an_early_refresh() {
-    let env = Env::new();
-    let refresher = env.refresh_when_idle();
-    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-    env.env(&mut command);
-    command
-        .env("FAKE_EXTRA_CHILD", "1")
-        .args(["server", "run", "work", "--claude"])
-        .arg(&env.claude)
-        .args(["--", "--model", "opus"]);
-    let output = Command::from_std(command)
-        .timeout(std::time::Duration::from_secs(60))
-        .output()
-        .unwrap();
-    refresher.join().unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(7),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let runs = env.runs();
-    assert_eq!(runs.len(), 2, "{runs:?}");
-    assert_eq!(runs[1]["token"], "token-2");
-}
-
-/// A completed foreground turn does not authorize killing a live production task.
-#[test]
-fn renewal_waits_for_a_live_task_output_child() {
-    guarded_renewal("FAKE_TASK_CHILD", "background_task", "deferred", false);
-}
-
-#[test]
-fn damaged_hook_evidence_never_authorizes_a_restart_from_cached_idle_state() {
-    for damaged in [
-        r#"{"at":3,"event":"UserPromptSubmit""#,
-        "damaged record\n",
-        "{\"at\":3,\"event\":\"UserPromptSubmit\",\"session_id\":null}\n",
-    ] {
-        let env = Env::new();
-        let refresher = env.refresh_when_idle();
-        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-        env.env(&mut command);
-        command
-            .env("FAKE_BAD_EVENT", damaged)
-            .env("FAKE_WATCHDOG_S", "3")
-            .args(["server", "run", "work", "--claude"])
-            .arg(&env.claude);
-        let output = Command::from_std(command)
-            .timeout(std::time::Duration::from_secs(15))
-            .output()
-            .unwrap();
-        refresher.join().unwrap();
-        assert_eq!(
-            output.status.code(),
-            Some(99),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(env.runs().len(), 1);
-        let journal = std::fs::read_to_string(
-            env.home
+            if self.child.as_mut().unwrap().try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("no {reason}/{stage} status; child exited or admission stalled");
+    }
+    fn journal(&self) -> Vec<Value> {
+        std::fs::read_to_string(
+            self.home
                 .path()
                 .join(".claudectl/server/restart-decisions.jsonl"),
         )
-        .unwrap();
-        assert!(journal.lines().any(|line| {
-            serde_json::from_str::<Value>(line).is_ok_and(|row| row["reason"] == "evidence_unknown")
-        }));
-    }
-}
-
-#[test]
-fn a_task_started_during_the_provider_request_cancels_renewal() {
-    guarded_renewal(
-        "FAKE_TASK_DURING_READ",
-        "background_task",
-        "deferred",
-        false,
-    );
-}
-
-#[test]
-fn an_explicit_hold_defers_until_its_matching_end() {
-    guarded_renewal("FAKE_HOLD", "explicit_hold", "deferred", false);
-}
-
-#[test]
-fn a_stale_hold_is_reported_and_never_automatically_cleared() {
-    guarded_renewal("FAKE_HOLD", "stale_hold", "blocked", true);
-}
-
-#[test]
-fn an_expired_token_never_overrides_a_live_background_task() {
-    guarded_renewal("FAKE_TASK_CHILD", "background_task", "blocked", false);
-}
-
-fn guarded_renewal(flag: &str, reason: &str, stage: &str, stale: bool) {
-    let env = Env::new();
-    if stage == "blocked" && !stale {
-        env.fake.lock().unwrap().first_life_ms = Some(3_000);
-    }
-    if flag == "FAKE_TASK_DURING_READ" {
-        env.fake.lock().unwrap().handshake = Some(env.log.clone());
-    }
-    let refresher = env.refresh_when_idle();
-    let temporary = env.home.path().join("tmp");
-    std::fs::create_dir(&temporary).unwrap();
-    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-    env.env(&mut command);
-    command
-        .env("TMPDIR", temporary)
-        .env(flag, "1")
-        .env(
-            "FAKE_WRAPPER_BIN",
-            assert_cmd::cargo::cargo_bin("claudectl"),
-        )
-        .args(["server", "run", "work", "--claude"])
-        .arg(&env.claude)
-        .args(["--", "--model", "opus"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    if stale {
-        command.env("FAKE_STALE_HOLD", "1");
-    }
-    if flag == "FAKE_TASK_DURING_READ" {
-        command.env("FAKE_TASK_CHILD", "1");
-    }
-    let mut child = command.spawn().unwrap();
-    let journal = env
-        .home
-        .path()
-        .join(".claudectl/server/restart-decisions.jsonl");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut deferred = false;
-    while std::time::Instant::now() < deadline {
-        deferred = std::fs::read_to_string(&journal).is_ok_and(|text| {
-            text.lines().any(|line| {
-                serde_json::from_str::<Value>(line).is_ok_and(|record| {
-                    record["event"] == "restart_deferred"
-                        && record["reason"] == reason
-                        && record["stage"] == stage
-                })
-            })
-        });
-        if deferred {
-            deferred = env
-                .runs()
-                .first()
-                .and_then(|run| run["run"].as_str())
-                .is_some_and(|run| {
-                    std::fs::read(Path::new(run).join("restart-status.json"))
-                        .ok()
-                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                        .is_some_and(|state| state["reason"] == reason && state["stage"] == stage)
-                });
-        }
-        if deferred || child.try_wait().unwrap().is_some() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let status_command = if deferred {
-        let run = env.runs()[0]["run"].as_str().unwrap().to_owned();
-        let mut status = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-        env.env(&mut status);
-        status.env("CLAUDECTL_SERVER_RUN", run).arg("statusline");
-        Some(status.output().unwrap())
-    } else {
-        None
-    };
-    let report_command = if deferred {
-        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-        env.env(&mut command);
-        command.args(["status", "--cached", "--json"]);
-        Some(command.output().unwrap())
-    } else {
-        None
-    };
-    // Release the task/hold before asserting, so even a failing wrapper is reaped.
-    std::fs::write(env.log.with_extension("log.task-release"), "").unwrap();
-    let output = child.wait_with_output().unwrap();
-    refresher.join().unwrap();
-    assert!(
-        deferred,
-        "renewal restarted while a task-output child was live: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        env.log.with_extension("log.task-done").exists(),
-        "background task was killed"
-    );
-    let status = status_command.unwrap();
-    assert!(String::from_utf8_lossy(&status.stdout).contains("restart deferred:"));
-    if stale {
-        assert!(String::from_utf8_lossy(&status.stdout).contains("stale_hold"));
-    }
-    let report = report_command.unwrap();
-    assert!(
-        report.status.success(),
-        "{}",
-        String::from_utf8_lossy(&report.stderr)
-    );
-    let report: Value = serde_json::from_slice(&report.stdout).unwrap();
-    assert!(
-        report["sessions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|s| s["reason"] == reason && s["stage"] == stage)
-    );
-    let records: Vec<Value> = std::fs::read_to_string(journal)
         .unwrap()
         .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    let relevant: Vec<_> = records.iter().filter(|r| r["reason"] == reason).collect();
-    assert_eq!(
-        relevant.iter().filter(|r| r["stage"] == stage).count(),
-        1,
-        "repeated polls must not count a decision twice: {relevant:?}"
-    );
-    assert!(relevant.iter().all(|r| r["metric"]["value"] == 1));
-    assert!(
-        relevant
-            .iter()
-            .all(|r| r["metric"]["labels"].get("session_id").is_none())
-    );
-    if stage == "blocked" && !stale {
-        assert!(relevant.iter().any(|r| r["stage"] == "warn"));
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("attention required"));
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
     }
-    assert_eq!(output.status.code(), Some(7));
-    env.assert_followed(&env.runs(), "token-2");
+    fn finish(&mut self) -> Output {
+        std::fs::write(self.home.path().join("release"), "").unwrap();
+        let output = self.child.take().unwrap().wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(23),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!self.home.path().join("terminated").exists());
+        assert_eq!(
+            std::fs::read_to_string(self.home.path().join("claude.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(self.run()["token"], "token-1");
+        assert_eq!(
+            self.state.lock().unwrap().requests.len(),
+            1,
+            "only the initial token grant is allowed"
+        );
+        assert!(
+            !self
+                .home
+                .path()
+                .join(".claudectl/server/failovers.jsonl")
+                .exists()
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("resuming session"));
+        output
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.take() {
+            let _ = std::fs::write(self.home.path().join("release"), "");
+            let _ = child.wait_with_output();
+        }
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(server) = self.server.take() {
+            let _ = server.join();
+        }
+    }
 }
 
-/// A clean /exit ends `server run`, even when a token request in flight across the
-/// SessionEnd answers with a new revision: only claudectl's own renewal stop may resume
-/// (SAW-12610, CX-0119).
 #[test]
-fn a_clean_exit_ends_server_run_without_a_resume() {
-    let env = Env::new();
-    // The monitor's request is in flight across the SessionEnd (handshake files).
-    env.fake.lock().unwrap().handshake = Some(env.log.clone());
-    let refresher = env.refresh_when_idle();
-    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-    env.env(&mut command);
-    command
-        .env("FAKE_CLEAN_EXIT", "1")
-        .args(["server", "run", "work", "--claude"])
-        .arg(&env.claude)
-        .args(["--", "--model", "opus"]);
-    let output = Command::from_std(command)
-        .timeout(std::time::Duration::from_secs(60))
-        .output()
-        .unwrap();
-    refresher.join().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(0), "{stderr}");
-    assert!(!stderr.contains("resuming session"), "{stderr}");
-    assert_eq!(env.runs().len(), 1, "{:?}", env.runs());
-    // The overlap happened in order: a request was in flight, the session ended, and only
-    // then the request was answered with the new revision.
-    assert!(env.log.with_extension("log.inflight").exists());
-    assert!(env.log.with_extension("log.ended").exists());
-    let fake = env.fake.lock().unwrap();
-    assert!(fake.requests.len() >= 2, "{:?}", fake.requests);
-    assert_eq!(fake.generation, 2);
-}
-
-/// A fork (or a resume that continues under a new ID) sends no SessionStart of its own; its
-/// turns carry the new ID. The renewal resumes that current session, never the stale one
-/// (SAW-12882).
-#[test]
-fn a_renewal_resumes_the_current_session_after_a_fork() {
-    let env = Env::new();
-    let refresher = env.refresh_when_idle();
-    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-    env.env(&mut command);
-    command
-        .env("FAKE_FORK", "1")
-        .args(["server", "run", "work", "--claude"])
-        .arg(&env.claude)
-        .args(["--", "--model", "opus"]);
-    let output = Command::from_std(command)
-        .timeout(std::time::Duration::from_secs(60))
-        .output()
-        .unwrap();
-    refresher.join().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(7), "{stderr}");
-    assert!(
-        stderr.contains("server token renewed; resuming session sess-fork"),
-        "{stderr}"
+fn idle_hook_only_renewal_preserves_child_token_settings_and_accounting() {
+    let mut f = Fixture::start("idle", 600_000, false);
+    let status = f.wait("evidence_unknown", "deferred");
+    let recorded = status["restart_deferred_total"].clone();
+    let journal_len = f.journal().len();
+    f.state.lock().unwrap().generation = 2; // Another client changes the available revision.
+    std::thread::sleep(Duration::from_millis(350));
+    assert!(f.child.as_mut().unwrap().try_wait().unwrap().is_none());
+    let session: Value =
+        serde_json::from_slice(&std::fs::read(f.directory().join("session.json")).unwrap())
+            .unwrap();
+    assert_eq!(session["renewal"], "on");
+    assert_eq!(
+        f.wait("evidence_unknown", "deferred")["restart_deferred_total"],
+        recorded
     );
-    let runs = env.runs();
-    assert_eq!(runs.len(), 2, "{runs:?}");
-    let args: Vec<String> = serde_json::from_value(runs[1]["args"].clone()).unwrap();
-    let resume = args.iter().position(|a| a == "--resume").unwrap();
-    assert_eq!(args[resume + 1], "sess-fork");
-}
-
-/// A resume that fails before Claude starts a session never leaves the pane at a shell:
-/// `server run` says so loudly and starts a new session on the renewed token (SAW-12882).
-#[test]
-fn a_failed_resume_is_reported_and_a_new_session_starts() {
-    let env = Env::new();
-    let refresher = env.refresh_when_idle();
-    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-    env.env(&mut command);
-    command
-        .env("FAKE_GONE", "sess-1")
-        .args(["server", "run", "work", "--claude"])
-        .arg(&env.claude)
-        .args(["--", "--model", "opus"]);
-    let output = Command::from_std(command)
-        .timeout(std::time::Duration::from_secs(60))
-        .output()
-        .unwrap();
-    refresher.join().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // The new session's own exit code ends `server run`.
-    assert_eq!(output.status.code(), Some(7), "{stderr}");
-    assert!(
-        stderr.contains("could not resume session sess-1"),
-        "{stderr}"
+    assert_eq!(f.journal().len(), journal_len);
+    let run = f.run();
+    assert_eq!(run["settings"]["crossSessionInbound"], "accept");
+    assert_eq!(run["settings"]["isolatePeerMachines"], true);
+    assert_eq!(
+        run["settings"]["hooks"]["Stop"].as_array().unwrap().len(),
+        1
     );
-    let runs = env.runs();
-    assert_eq!(runs.len(), 3, "{runs:?}");
-    assert_eq!(runs[2]["token"], "token-2");
-    let args: Vec<String> = serde_json::from_value(runs[2]["args"].clone()).unwrap();
-    let settings = args.iter().position(|a| a == "--settings").unwrap();
-    let mut user: Vec<&str> = args.iter().map(String::as_str).collect();
-    user.drain(settings..settings + 2);
-    assert_eq!(user, ["--model", "opus"]);
+    f.finish();
 }
 
-/// A stop by signal (Ctrl-C) before the resumed Claude's first hook is the user's stop, not
-/// a failed resume: `server run` ends with it and starts nothing (SAW-12882 review).
 #[test]
-fn an_interrupt_before_the_first_hook_ends_server_run() {
-    let env = Env::new();
-    let refresher = env.refresh_when_idle();
-    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-    env.env(&mut command);
-    command
-        .env("FAKE_INTERRUPT", "1")
-        .args(["server", "run", "work", "--claude"])
-        .arg(&env.claude)
-        .args(["--", "--model", "opus"]);
-    let output = Command::from_std(command)
-        .timeout(std::time::Duration::from_secs(60))
-        .output()
-        .unwrap();
-    refresher.join().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(130), "{stderr}");
-    assert!(!stderr.contains("could not resume"), "{stderr}");
-    assert_eq!(env.runs().len(), 2, "{:?}", env.runs());
+fn every_deferred_session_warns_and_blocks_without_monitor_teardown() {
+    for (mode, reason) in [
+        ("idle", "evidence_unknown"),
+        ("busy", "running_turn"),
+        ("task", "background_task"),
+        ("hold", "explicit_hold"),
+        ("no_hooks", "evidence_unknown"),
+        ("hook_error", "evidence_unknown"),
+        ("damaged", "evidence_unknown"),
+    ] {
+        // Cross the missing-hook timeout before expiry, rather than only its startup path.
+        let life_ms = if mode == "no_hooks" { 6_500 } else { 2_500 };
+        let mut f = Fixture::start(mode, life_ms, false);
+        let warn = f.wait(reason, "warn");
+        assert_eq!(warn["attention_required"], true);
+        let hold = f.home.path().join(".claudectl/server/holds").join(format!(
+            "{}.json",
+            f.directory().file_name().unwrap().to_str().unwrap()
+        ));
+        let held = std::fs::read(&hold).ok();
+        let blocked = f.wait(reason, "blocked");
+        assert_eq!(blocked["attention_required"], true);
+        assert!(f.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        for stage in ["warn", "blocked"] {
+            let rows = f.journal();
+            let matching: Vec<_> = rows.iter().filter(|r| r["stage"] == stage).collect();
+            assert!(!matching.is_empty(), "each session needs its {stage} event");
+            assert_eq!(matching[0]["metric"]["labels"]["stage"], stage);
+        }
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+        command
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", f.home.path())
+            .env("CLAUDECTL_SERVER_RUN", f.directory())
+            .arg("statusline");
+        let output = command.output().unwrap();
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("restart deferred: {reason} (blocked)"))
+        );
+        if mode == "task" {
+            assert!(f.home.path().join("task-progress").exists());
+        }
+        let output = f.finish();
+        if mode == "no_hooks" {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("sent no hook events"));
+        }
+        if mode == "task" {
+            assert!(f.home.path().join("task-done").exists());
+        }
+        if let Some(held) = held {
+            assert_eq!(std::fs::read(hold).unwrap(), held);
+        }
+    }
+}
+
+#[test]
+fn later_prompts_and_non_task_helpers_do_not_bypass_unknown_admission() {
+    for mode in ["idle", "extra"] {
+        let mut f = Fixture::start(mode, 600_000, false);
+        f.wait("evidence_unknown", "deferred");
+        std::fs::write(f.home.path().join("submit"), "").unwrap();
+        f.wait("running_turn", "deferred");
+        std::fs::write(f.home.path().join("turn-done"), "").unwrap();
+        f.wait("evidence_unknown", "deferred");
+        f.finish();
+    }
+}
+
+#[test]
+fn an_idle_terminal_session_keeps_foreground_until_its_owner_exits() {
+    let mut f = Fixture::start("idle", 600_000, true);
+    f.wait("evidence_unknown", "deferred");
+    assert_eq!(f.run()["tty"], true);
+    assert_eq!(f.run()["foreground"], true);
+    f.finish();
 }

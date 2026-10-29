@@ -57,15 +57,29 @@ pub(super) struct Recovery {
 
 impl Recovery {
     pub(super) fn prepare(home: &Path, directory: &Path, session_id: &str) -> Result<Option<Self>> {
-        let mut recovery = Self::discover(home, directory)?;
+        Self::prepare_for_tab(
+            home,
+            directory,
+            session_id,
+            std::env::var_os("HERDR_TAB_ID").as_deref(),
+        )
+    }
+
+    fn prepare_for_tab(
+        home: &Path,
+        directory: &Path,
+        session_id: &str,
+        tab: Option<&std::ffi::OsStr>,
+    ) -> Result<Option<Self>> {
+        let mut recovery = Self::discover(home, directory, tab)?;
         if let Some(recovery) = &mut recovery {
             recovery.arm(directory, session_id)?;
         }
         Ok(recovery)
     }
 
-    fn discover(home: &Path, run: &Path) -> Result<Option<Self>> {
-        let Some(tab) = std::env::var_os("HERDR_TAB_ID") else {
+    fn discover(home: &Path, run: &Path, tab: Option<&std::ffi::OsStr>) -> Result<Option<Self>> {
+        let Some(tab) = tab else {
             return Ok(None);
         };
         let fleet = home.join("Code/.fleet");
@@ -432,3 +446,7 @@ pub(super) fn record_transcript(directory: &Path, event: &Value) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "central_crons_tests.rs"]
+mod tests;

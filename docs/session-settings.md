@@ -32,6 +32,11 @@ Verified, missing, duplicate, skipped, and unverified results stay in this log
 after the run exits. They never print over Claude's terminal or enter its input.
 The log contains no tokens or saved prompt contents.
 
+Current hook-only sessions no longer automatically restart at idle for renewal or failover.
+The supported hooks cannot prove that input admission is closed, so an otherwise idle
+session defers with `evidence_unknown`. Claudectl does not collect or replay prompts.
+The existing child and token stay in use, including past expiry, until its owner ends it.
+
 Renewal and failover also write deferred restart decisions to
 `~/.claudectl/server/restart-decisions.jsonl`. A running turn, live Claude task-output
 child or explicit run hold prevents a restart. `claudectl status`, `status --json` and

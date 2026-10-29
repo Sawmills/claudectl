@@ -112,11 +112,17 @@ account on a machine in one run (stop every Claude session there first; the comm
 while one runs). Read the summary table: rerun for `lost-reply` and `failed:fenced`, run
 `claudectl server migrate --abort <alias>` for `superseded` or `gone`, and stop and report
 for `unrotated`. A row `migrated (log out the live login)` means the live login on that
-machine holds a retired grant: run `claude auth logout` there; claudectl never deletes it. 7. **Verify** on the Mac and on the devbox with an interactive session (a `-p` run is never
-renewed): start `claudectl server run <alias>`, send one prompt, leave it idle, and after the
-next server refresh (or `claudectl server refresh-access <alias>`) look for
-`claudectl: server token renewed; resuming session <id>` and a reply to the next prompt in
-the same conversation. Then `claudectl server status <alias>`.
+machine holds a retired grant: run `claude auth logout` there; claudectl never deletes it.
+
+7. **Verify** on the Mac and devbox with an interactive session: start
+   `claudectl server run <alias>` and send one prompt. Current hook-only sessions no longer
+   automatically restart at idle for renewal or failover. Confirm the same child remains
+   alive, `claudectl status` or its status line reports `restart deferred: evidence_unknown`,
+   and no failover reservation or renewed-token resume is reported. Do not force a shared
+   account refresh as a restart test. At five minutes before the held token expires,
+   confirm the session's warning record/metric and `warn` status; expiry or an authentication
+   failure must report `blocked` while preserving the child and work. End and relaunch the
+   session explicitly only after its work and cleanup are complete.
 
 ## Alerts
 

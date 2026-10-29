@@ -239,32 +239,26 @@ forces a refresh: it takes the current token, and the server refreshes on demand
 `claudectl server refresh-access` forces one and ends every running session of that account
 (relaunch each with `--resume`).
 
-`server run` follows the account's token revision (SAW-12610). It registers its own Claude
-hooks (`--settings <session dir>/hooks.json`, run by a private copy of claudectl) for
-`SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `SessionEnd` and the `idle_prompt` notification, which record
-only the event, the session id and the time in `<session dir>/events`. It asks the server
-for the current token only while Claude passes every idle gate below, at most every 30 min
-(every 5 min in the token's last hour), retrying 30 s after a failed request. The request
-observes (`"observe": true`): the server never refreshes an unexpired token for it, so it
-cannot revoke the token another session's turn uses, and a revision that another session's
-refresh superseded early shows at once. After expiry the server refreshes as usual; the held
-token is dead for every session then. One case remains: while a migration's rotation is
-pending (between its admission and its first refresh), the server refreshes for any request;
-do not migrate an account while `server run` sessions use it. When the
-revision changed (a refresh revoked the held token), it restarts Claude with
-`--resume <current session>` on the new token, in the same folder and terminal, from the same
-checked build, and prints `claudectl: server token renewed; resuming session <id>`. The current
-session is the one of Claude's latest hook event: a fork, or a resume that continues under a new
-ID, sends no session start of its own, but its turns carry the new ID. If the resumed Claude
-exits with an error before any session starts (for example `No conversation found`), `server
-run` prints `claudectl: ERROR: Claude could not resume session <id>` and starts a new session in
-the same terminal on the same token, once; open the old conversation with `/resume <id>`. That
-resume, and only that one, adds a first prompt (unless the user's arguments already hold a
-prompt): Claude Code can keep session cron jobs listed after a resume but stop firing them, so
-the prompt tells the session to delete and create each listed job again with the same schedule
-and prompt, then to compare each job's schedule with the time since the session's last turn.
-If a job missed one or more fires, it tells the session to run that job's prompt once now,
-regardless of how many fires were missed, then stop.
+**Current limitation:** hook-only sessions no longer automatically restart at idle, for
+renewal or account failover. Claude's command hooks cannot acknowledge that all prompt
+sources are closed and every submitted prompt is safe to hand over. A missing acknowledgement
+is `evidence_unknown`, so the wrapper keeps the existing child and token instead of sending
+SIGTERM. It does not collect, store or replay prompts to work around that limit.
+
+`server run` registers Claude hooks for `SessionStart`, `UserPromptSubmit`, `Stop`,
+`StopFailure`, `SessionEnd` and the `idle_prompt` notification. They record only the event,
+session ID and time in `<session dir>/events`. Workload evidence still distinguishes running
+turns, background tasks and holds, but a clear workload sample is not input-admission proof.
+Every deferred session is checked each monitor tick, even before hooks arrive, during a
+running turn, or when no server revision has changed. Five minutes before token expiry its
+status and structured alert change to `warn`; expiry or an authentication failure changes
+them to `blocked`. The child and its work stay alive, without a forced timeout. The held
+token can stop working before you can safely end and relaunch the session.
+
+The retained restart and cron-recovery path described below is not reached by current
+hook-only sessions. It has no input-admission override. Existing sessions must be ended
+explicitly by their owner after the work and cleanup are complete; installing a new CLI
+does not upgrade a running wrapper.
 
 For a Fleet Operator, `HERDR_TAB_ID` selects the matching `operator_tab` in
 `~/Code/.fleet/*/operator.md`. Its `cron_prompts` entries (a prompt file and five schedule
@@ -317,28 +311,20 @@ This remains a best-effort workaround for Claude Code's resume behavior, with th
 - The defect belongs to Claude Code; an upstream report waits on the owner's decision. Remove
   the note once Claude Code fires restored jobs reliably.
 
-`server run` restarts Claude only when all hold: the new token outlives the held one, the last turn ended at
-least 60 s ago with no prompt since (a turn that failed, for example on a revoked token,
-ends with `StopFailure` and counts too), no terminal input for 5 min (the terminal device's
-access time), and fewer than 3 restarts in the last hour. Once the held token is dead (it
-expired, or a turn failed with `authentication_failed`), the 60 s wait and the input gate no
-longer apply and the request runs every 30 s: every turn fails on that token, and a user who
-retries would otherwise hold the restart back for good (SAW-12610, 10-09). Foreground turns,
-live background tasks and explicit production holds still prevent renewal and failover,
-even after token expiry. The task check reads live descendants' stdout/stderr descriptors:
+Automatic restart always requires both input-admission proof and fresh workload evidence.
+Foreground turns, live background tasks and explicit production holds prevent renewal and
+failover, even after token expiry. The task check reads live descendants' stdout/stderr:
 a Claude task file under `<tmp>/claude-<uid>/.../tasks/*.output` holds admission. MCP/LSP
-servers and `caffeinate` without task-output descriptors do not block. Missing workload
-evidence defers the restart. The wrapper never interrupts a turn in progress; a draft typed earlier
-than the input gate is lost on restart. Relaunch happens only after claudectl's own
-SIGTERM; any other exit ends `server run` with Claude's exit code. A session that Claude ended (`/exit`: a `SessionEnd`
-with no new session after it) is never restarted, also when a new token arrives while
-Claude shuts down; nor is a leader that already exited. A `-p`/`--print` run is
-never restarted. If Claude sends no hook event within 30 s, or a hook could not record an event (the
-`hook-error` marker), renewal is off for that session.
-`session.json` (alias, account, `expires_at`, pid, `renewal`: `on`, `off: <reason>` or
-`renewing`; no token) is updated on every renewal; a supervisor leaves expiry to
-`server run` and skips a renewing session. A per-session lock protects live session
-directories; a later launch removes abandoned ones after their recorded expiry.
+servers and `caffeinate` without task-output descriptors do not add a workload blocker.
+They do not remove the missing input-admission proof.
+
+Current command hooks provide no supported close-and-drain acknowledgement, so even an
+idle session defers with `evidence_unknown`. No failover reservation or restart budget is
+consumed. The final signal path independently checks admission before waiting on hook
+locks or publishing `renewal=renewing`. Any explicit child exit ends `server run` with that
+child's exit code. A `-p`/`--print` run is never automatically restarted either.
+`session.json` records the alias, account, held `expires_at`, pid and renewal state without
+the token. The run's deferred status identifies warnings and blocked sessions for Operators.
 
 ### Production Holds and Deferred Restarts
 
@@ -359,8 +345,8 @@ When the lane exports `HERDR_TAB_ID` (or `HERDR_PANE_ID`), the monitor consumes 
 (`LANE_GOAL_FILE` or `SAW_GOAL_FILE`) and fleet voice outboxes. Outbox markers are checked
 even when no goal file is configured. An open marker defers admission even when Claude has
 no local task-output child. Missing or unreadable marker evidence is reported as
-`evidence_unknown` and keeps admission closed until the evidence is readable again; explicit
-holds remain the preferred production boundary.
+`evidence_unknown` and keeps admission closed. Restoring workload evidence does not provide
+the missing input-admission proof; explicit holds remain the preferred production boundary.
 An older running wrapper cannot enforce a hold. The command checks the wrapper's recorded
 gate capability and refuses the start if it is absent; installing a new CLI alone does not
 upgrade a wrapper that is already running.
@@ -378,10 +364,10 @@ background work alive until admission is safe, with no forced timeout. API use c
 while the held token is expired or revoked; another session can revoke it before its
 recorded expiry.
 
-`~/.claudectl/server/restart-decisions.jsonl` records each changed `restart_deferred`
-decision with session identity, bounded reason and severity. Its
-`claudectl_restart_deferred_total` metric has only cause, reason and stage labels; repeated
-polls do not add another count. The current run's `restart-status.json` holds its status
+`~/.claudectl/server/restart-decisions.jsonl` records one `restart_deferred` event per
+session and severity stage. Its `claudectl_restart_deferred_total` metric has only cause,
+reason and stage labels. Routine workload or cause changes update current status without
+adding journal rows or counts; entering warning or blocked status emits a new event. The current run's `restart-status.json` holds its status
 and counter. Records contain no tokens or prompt contents. A diagnostic write failure
 closes automatic admission for that child and reports attention instead of restarting it.
 
@@ -402,12 +388,11 @@ Conversations that a `server run` before this model stored in
 `<project>/<session>.jsonl` into `~/.claude/projects/<project>/`; otherwise delete the
 directory.
 
-While Claude runs, the client reads usage every five minutes. It never changes the token of
-the running process; it asks for the current token only while Claude is idle, and that
-request never refreshes an unexpired token (above).
-Another session's request can still trigger the refresh; a busy session then fails its next
-request and restarts at its next idle point. After an early provider 401, wait for the
-renewal or use `server refresh-access work` (it ends every running session of the account).
+While Claude runs, the client reads usage every five minutes. It never changes the token
+of the running process. Hook-only sessions defer before token observations, account
+reservations and automatic restart; they do not refresh or replace the held token. Another
+client can still rotate the account's token, so a deferred session may lose API access.
+Plan an owner-controlled exit and relaunch only after its work and cleanup are complete.
 The client never replays tools. On server outage, the token of a running session stays
 valid until provider expiry or rejection. Revocation
 stops new acquisitions; it cannot revoke an access token already delivered.

@@ -19,7 +19,7 @@ pub struct Cli {
 const RUN_EXAMPLES: &str = "Examples:
   claudectl run                 start Claude on the account whose week resets first
   claudectl run amir2           start on amir2 (full name, email name, or a unique prefix)
-  claudectl run amir2 --failover   on a usage limit, move the session to another account
+  claudectl run amir2 --failover   request failover (currently deferred)
   claudectl run -- --resume ID  pass arguments to Claude after --";
 
 #[derive(Subcommand)]
@@ -32,7 +32,7 @@ enum Commands {
         /// Claude executable to run (default: `claude` on PATH)
         #[arg(long, default_value = "claude")]
         claude: std::path::PathBuf,
-        /// On a usage limit, resume the session on another account (default without an account)
+        /// Request failover (currently deferred: input admission is unproved)
         #[arg(long, conflicts_with = "no_failover")]
         failover: bool,
         /// Stay on the account at a usage limit (default with a named account)

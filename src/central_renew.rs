@@ -1001,9 +1001,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_hook_publishes_pending_only_after_hook_admission_lock() {
+    fn an_invisible_hook_waiter_cannot_authorize_restart() {
         let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
+        let sessions = root.path().join(".claudectl/server/sessions");
         let dir = sessions.join("run-hook-lock");
         std::fs::create_dir_all(&dir).unwrap();
         let lock = super::super::restart_gate::hook_admission(&dir).unwrap();
@@ -1033,8 +1033,101 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("hook-pending.")
         }));
+        let (mut child, mut gate, idle) = idle_hook_gate(root.path(), &dir);
+        let admitted = gate.check(&idle, super::super::restart_gate::Cause::Renewal, i64::MAX);
         drop(lock);
         assert!(worker.join().unwrap().is_ok());
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert!(
+            !admitted,
+            "an invisible hook waiter must never authorize SIGTERM"
+        );
+        let status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("restart-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["reason"], "evidence_unknown");
+    }
+
+    #[cfg(unix)]
+    fn idle_hook_gate(
+        home: &std::path::Path,
+        dir: &std::path::Path,
+    ) -> (std::process::Child, super::super::restart_gate::Gate, Idle) {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read -r _"])
+            .stdin(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let gate = super::super::restart_gate::Gate::new(home, dir, child.id(), "work");
+        let idle = Idle {
+            session: Some("s".into()),
+            since: Some(1),
+            ..Default::default()
+        };
+        (child, gate, idle)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_reading_input_cannot_authorize_restart() {
+        struct WaitingInput {
+            started: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+            input: std::io::Cursor<Vec<u8>>,
+        }
+        impl std::io::Read for WaitingInput {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.input.position() == 0 {
+                    self.started.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                self.input.read(buffer)
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join(".claudectl/server/sessions");
+        let dir = sessions.join("run-input");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (started, reading) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn({
+            let sessions = sessions.clone();
+            let dir = dir.clone();
+            move || {
+                hook_from(
+                    &sessions,
+                    &dir,
+                    WaitingInput {
+                        started,
+                        release: resume,
+                        input: std::io::Cursor::new(
+                            br#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#.to_vec(),
+                        ),
+                    },
+                    1,
+                )
+            }
+        });
+        reading
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let (mut child, mut gate, idle) = idle_hook_gate(root.path(), &dir);
+        let admitted = gate.check(&idle, super::super::restart_gate::Cause::Failover, i64::MAX);
+        release.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert!(
+            !admitted,
+            "a hook reading input must never authorize SIGTERM"
+        );
+        let status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("restart-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["reason"], "evidence_unknown");
     }
 
     #[test]

@@ -16,7 +16,10 @@ pub const RUN_SETTINGS_HELP: &str =
 Objects merge in argument order; hooks append to claudectl's generated hooks.
 Claude validates the settings schema. An invalid value such as model: 5 can make
 Claude ignore the WHOLE settings file, including claudectl's renewal/failover hooks.
-Test settings with your installed Claude version before rollout.";
+Test settings with your installed Claude version before rollout.
+
+Hook-only sessions do not automatically restart at idle.
+Renewal and failover defer as evidence_unknown; the held token may expire.";
 
 #[cfg(unix)]
 #[path = "central_crons.rs"]
@@ -1120,7 +1123,7 @@ pub enum Command {
         /// Claude executable to run (default: `claude` on PATH)
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
-        /// On a usage limit, resume the session on another account
+        /// Request failover (currently deferred: input admission is unproved)
         #[arg(long)]
         failover: bool,
         /// Arguments for Claude, after `--`
