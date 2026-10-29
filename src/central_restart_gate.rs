@@ -119,15 +119,16 @@ impl Gate {
             Some(reason)
         } else if held.is_err() || idle.session.is_none() || idle.ended.is_some() {
             Some(Reason::EvidenceUnknown)
-        } else if production_step(&self.home).unwrap_or(true) {
-            Some(Reason::OpenProductionStep)
-        } else if idle.since.is_none() {
-            Some(Reason::RunningTurn)
         } else {
-            match live_task(self.pid) {
-                Ok(true) => Some(Reason::BackgroundTask),
-                Ok(false) => None,
+            match production_step(&self.home) {
+                Ok(true) => Some(Reason::OpenProductionStep),
                 Err(_) => Some(Reason::EvidenceUnknown),
+                Ok(false) if idle.since.is_none() => Some(Reason::RunningTurn),
+                Ok(false) => match live_task(self.pid) {
+                    Ok(true) => Some(Reason::BackgroundTask),
+                    Ok(false) => None,
+                    Err(_) => Some(Reason::EvidenceUnknown),
+                },
             }
         };
         self.record(reason, idle, cause, held_expires_at)
@@ -353,23 +354,47 @@ fn hold_reason(home: &Path, directory: &Path) -> Result<Option<Reason>> {
 }
 
 fn hook_pending(directory: &Path) -> Result<Option<u32>> {
-    let path = directory.join("hook-pending");
-    match private_read(&path) {
-        Ok(bytes) => {
-            let pid = serde_json::from_slice::<Value>(&bytes)?["pid"]
-                .as_u64()
-                .context("hook pending PID unavailable")?;
-            let pid = u32::try_from(pid).context("hook pending PID invalid")?;
-            Ok(Some(pid))
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(pid) = name
+            .strip_prefix("hook-pending.")
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .filter(|pid| *pid != 0)
+        else {
+            continue;
+        };
+        let saved = serde_json::from_slice::<Value>(&private_read(&path)?)?["pid"]
+            .as_u64()
+            .context("hook pending PID unavailable")?;
+        let saved = u32::try_from(saved).context("hook pending PID invalid")?;
+        if saved != pid {
+            bail!("hook pending PID does not match its owner file");
         }
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            Ok(None)
+        if process_live(pid)? {
+            return Ok(Some(pid));
         }
-        Err(error) => Err(error),
+        std::fs::remove_file(path)?;
+    }
+    Ok(None)
+}
+
+fn process_live(pid: u32) -> Result<bool> {
+    match unsafe { libc::kill(pid as libc::pid_t, 0) } {
+        0 => Ok(true),
+        -1 => match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            Some(libc::EPERM) => Ok(true),
+            _ => bail!("could not inspect hook process"),
+        },
+        _ => bail!("could not inspect hook process"),
     }
 }
 
@@ -390,11 +415,15 @@ fn production_step(home: &Path) -> Result<bool> {
             sources.push(path);
         }
     }
+    production_markers_from_paths(&lane, &sources)
+}
+
+fn production_markers_from_paths(lane: &str, sources: &[PathBuf]) -> Result<bool> {
     let mut texts = Vec::new();
     for path in sources {
         texts.push(std::fs::read_to_string(path)?);
     }
-    Ok(production_markers(&lane, &texts))
+    Ok(production_markers(lane, &texts))
 }
 
 fn production_markers(lane: &str, texts: &[String]) -> bool {
@@ -1016,17 +1045,35 @@ mod tests {
     fn a_queued_hook_defers_restart_admission() {
         let (_home, mut gate, idle) = setup();
         assert!(gate.check(&idle, Cause::Renewal, now() + 600_000));
-        atomic(
-            &gate.directory.join("hook-pending"),
-            &json!({"pid": std::process::id()}),
-        )
-        .unwrap();
+        let pending = gate
+            .directory
+            .join(format!("hook-pending.{}", std::process::id()));
+        atomic(&pending, &json!({"pid": std::process::id()})).unwrap();
         assert!(!gate.check(&idle, Cause::Renewal, now() + 600_000));
         let status: Value = serde_json::from_slice(
             &private_read(&gate.directory.join("restart-status.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(status["reason"], "queued_hook");
+    }
+
+    #[test]
+    fn a_stale_hook_marker_is_removed_without_deferring_admission() {
+        let (_home, mut gate, idle) = setup();
+        let mut stale = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = stale.id();
+        stale.kill().unwrap();
+        stale.wait().unwrap();
+        let pending = gate.directory.join(format!("hook-pending.{pid}"));
+        atomic(&pending, &json!({"pid": pid})).unwrap();
+        assert!(gate.check(&idle, Cause::Renewal, now() + 600_000));
+        assert!(!pending.exists());
+    }
+
+    #[test]
+    fn unreadable_marker_sources_fail_closed() {
+        let missing = PathBuf::from("/definitely/missing/FLT-553-goal.md");
+        assert!(production_markers_from_paths("w28:t1", &[missing]).is_err());
     }
 
     #[test]

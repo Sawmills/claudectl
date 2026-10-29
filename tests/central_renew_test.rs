@@ -1086,6 +1086,12 @@ fn a_busy_claude_never_triggers_a_token_request() {
     );
     // Only the launch asked for a token.
     assert_eq!(env.fake.lock().unwrap().requests.len(), 1);
+    // A turn that is not eligible for renewal does not create a deferred-restart decision.
+    let journal = env
+        .home
+        .path()
+        .join(".claudectl/server/restart-decisions.jsonl");
+    assert!(!journal.exists());
 }
 
 /// A prompt that arrives while the token request is in flight: the monitor checks activity

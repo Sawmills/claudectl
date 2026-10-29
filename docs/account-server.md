@@ -350,10 +350,16 @@ claudectl hold start --reason "SAW-12345 production migration"
 claudectl hold end
 ```
 
-The command uses the inherited `CLAUDECTL_SERVER_RUN` identity. It does not parse goals,
-Slack messages or outboxes. One hold belongs to one run; starting a different reason while
-a hold exists fails. Check the command's exit status before starting the production step.
-Lane skill/runbook adoption is a separate rollout.
+The command uses the inherited `CLAUDECTL_SERVER_RUN` identity. One hold belongs to one run;
+starting a different reason while a hold exists fails. Check the command's exit status before
+starting the production step. Lane skill/runbook adoption is a separate rollout.
+
+When the lane exports `LANE_GOAL_FILE` (or `SAW_GOAL_FILE`) and `HERDR_TAB_ID` (or
+`HERDR_PANE_ID`), the monitor also consumes that lane's `[starting]`/`STARTING NOW` and
+matching `[done]`/`DONE` markers from the goal and fleet voice outboxes. An open marker
+defers admission even when Claude has no local task-output child. Missing or unreadable
+marker evidence is reported as `evidence_unknown` and keeps admission closed until the
+evidence is readable again; explicit holds remain the preferred production boundary.
 An older running wrapper cannot enforce a hold. The command checks the wrapper's recorded
 gate capability and refuses the start if it is absent; installing a new CLI alone does not
 upgrade a wrapper that is already running.
