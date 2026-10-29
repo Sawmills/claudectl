@@ -82,7 +82,7 @@ pub(super) struct Gate {
     alias: String,
     last: Option<Deferred>,
     total: u64,
-    recorded: Option<Deferred>,
+    recorded_stage: Option<Stage>,
     last_session: Option<String>,
     recorded_session: Option<String>,
     log_error: bool,
@@ -102,7 +102,7 @@ impl Gate {
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
                 .and_then(|v| v["restart_deferred_total"].as_u64())
                 .unwrap_or(0),
-            recorded: None,
+            recorded_stage: None,
             last_session: None,
             recorded_session: None,
             log_error: false,
@@ -144,7 +144,10 @@ impl Gate {
                 Ok(false) if idle.since.is_none() => Some(Reason::RunningTurn),
                 Ok(false) => match live_task(self.pid) {
                     Ok(true) => Some(Reason::BackgroundTask),
-                    Ok(false) => None,
+                    // Current command hooks cannot close every prompt source and
+                    // acknowledge safe input handover. Even idle workload evidence
+                    // cannot prove that a prompt will not arrive before SIGTERM.
+                    Ok(false) => Some(Reason::EvidenceUnknown),
                     Err(_) => Some(Reason::EvidenceUnknown),
                 },
             }
@@ -225,7 +228,7 @@ impl Gate {
             "expires_at":expires_at,"deferred":decision.is_some(),
             "restart_deferred_total":self.total});
         if let Some(d) = decision {
-            if self.recorded != Some(d) || self.recorded_session.as_deref() != session {
+            if self.recorded_stage != Some(d.stage) || self.recorded_session.as_deref() != session {
                 let mut file = OpenOptions::new()
                     .read(true)
                     .create(true)
@@ -245,19 +248,20 @@ impl Gate {
                 file.write_all(&line)?;
                 file.sync_data()?;
                 self.total += 1;
-                self.recorded = Some(d);
+                self.recorded_stage = Some(d.stage);
                 self.recorded_session = session.map(str::to_owned);
             }
             status["cause"] = json!(d.cause);
             status["reason"] = json!(d.reason);
             status["stage"] = json!(d.stage);
+            status["attention_required"] = json!(d.stage != Stage::Deferred);
             status["restart_deferred_total"] = json!(self.total);
         }
         atomic(&self.directory.join("restart-status.json"), &status)?;
         self.last = decision;
         self.last_session = session.map(str::to_owned);
         if decision.is_none() {
-            self.recorded = None;
+            self.recorded_stage = None;
             self.recorded_session = None;
         }
         Ok(())
@@ -996,9 +1000,97 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_session_is_admitted() {
+    fn an_idle_hook_only_session_cannot_prove_automatic_restart_safe() {
         let (_home, mut gate, idle) = setup();
-        assert!(gate.check(&idle, Cause::Renewal, now() + 600_000));
+        assert!(!gate.check(&idle, Cause::Renewal, now() + 600_000));
+        let status: Value = serde_json::from_slice(
+            &private_read(&gate.directory.join("restart-status.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["reason"], "evidence_unknown");
+    }
+
+    #[test]
+    fn every_deferred_session_warns_before_expiry_and_stays_blocked_after_it() {
+        for cause in [Cause::Renewal, Cause::Failover] {
+            let (_home, mut gate, mut idle) = setup();
+            for session in ["first", "second"] {
+                idle.session = Some(session.into());
+                for (remaining, stage) in
+                    [(600_000, "deferred"), (300_000, "warn"), (-1, "blocked")]
+                {
+                    for _ in 0..2 {
+                        assert!(!gate.check(&idle, cause, now() + remaining));
+                    }
+                    let status: Value = serde_json::from_slice(
+                        &private_read(&gate.directory.join("restart-status.json")).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(status["session_id"], session);
+                    assert_eq!(status["reason"], "evidence_unknown");
+                    assert_eq!(status["stage"], stage);
+                    assert_eq!(status["attention_required"], stage != "deferred");
+                }
+            }
+            let rows: Vec<Value> = std::fs::read_to_string(
+                gate.home.join(".claudectl/server/restart-decisions.jsonl"),
+            )
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+            assert_eq!(rows.len(), 6, "unchanged polls must not count twice");
+            for session in ["first", "second"] {
+                let alerts: Vec<_> = rows
+                    .iter()
+                    .filter(|row| row["session_id"] == session && row["stage"] == "warn")
+                    .collect();
+                assert_eq!(
+                    alerts.len(),
+                    1,
+                    "every deferred session needs its expiry warning"
+                );
+                assert_eq!(alerts[0]["metric"]["labels"]["stage"], "warn");
+                assert_eq!(alerts[0]["metric"]["value"], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn workload_changes_update_status_without_recounting_the_same_deferral_stage() {
+        let (_home, mut gate, mut idle) = setup();
+        for cause in [Cause::Renewal, Cause::Failover] {
+            for since in [Some(1), None, Some(2)] {
+                idle.since = since;
+                assert!(!gate.check(&idle, cause, now() + 600_000));
+                let status: Value = serde_json::from_slice(
+                    &private_read(&gate.directory.join("restart-status.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(status["restart_deferred_total"], 1);
+                assert_eq!(
+                    status["reason"],
+                    if since.is_some() {
+                        "evidence_unknown"
+                    } else {
+                        "running_turn"
+                    }
+                );
+            }
+        }
+        let rows =
+            std::fs::read_to_string(gate.home.join(".claudectl/server/restart-decisions.jsonl"))
+                .unwrap();
+        assert_eq!(rows.lines().count(), 1);
+        assert!(!gate.check(&idle, Cause::Failover, now() + 300_000));
+        let rows =
+            std::fs::read_to_string(gate.home.join(".claudectl/server/restart-decisions.jsonl"))
+                .unwrap();
+        assert_eq!(
+            rows.lines().count(),
+            2,
+            "warning still creates its own alert"
+        );
     }
 
     #[test]
@@ -1062,7 +1154,8 @@ mod tests {
         let other = gate.directory.with_file_name("run-other");
         private_dir(&other).unwrap();
         let mut other_gate = Gate::new(&gate.home, &other, gate.pid, "work");
-        assert!(other_gate.check(&idle, Cause::Renewal, now() + 600_000));
+        assert_eq!(hold_reason(&gate.home, &other).unwrap(), None);
+        assert!(!other_gate.check(&idle, Cause::Renewal, now() + 600_000));
     }
 
     #[test]
@@ -1096,7 +1189,7 @@ mod tests {
     #[test]
     fn a_queued_hook_defers_restart_admission() {
         let (_home, mut gate, idle) = setup();
-        assert!(gate.check(&idle, Cause::Renewal, now() + 600_000));
+        assert!(!gate.check(&idle, Cause::Renewal, now() + 600_000));
         let pending = gate
             .directory
             .join(format!("hook-pending.{}", std::process::id()));
@@ -1110,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_hook_marker_is_removed_without_deferring_admission() {
+    fn a_stale_hook_marker_is_removed_but_input_admission_remains_unknown() {
         let (_home, mut gate, idle) = setup();
         let mut stale = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let pid = stale.id();
@@ -1118,7 +1211,7 @@ mod tests {
         stale.wait().unwrap();
         let pending = gate.directory.join(format!("hook-pending.{pid}"));
         atomic(&pending, &json!({"pid": pid})).unwrap();
-        assert!(gate.check(&idle, Cause::Renewal, now() + 600_000));
+        assert!(!gate.check(&idle, Cause::Renewal, now() + 600_000));
         assert!(!pending.exists());
     }
 

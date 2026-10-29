@@ -1,9 +1,8 @@
 # claudectl
 
 Run Claude Code with accounts held by a company account server. claudectl checks
-usage, selects an eligible account, and can resume a conversation on another
-account at a usage limit. The server holds refresh credentials; connected machines
-receive access tokens only.
+usage and selects an eligible account. The server holds refresh credentials;
+connected machines receive access tokens only.
 
 ## Install
 
@@ -46,9 +45,11 @@ claudectl run -- --resume SESSION_ID
 
 Automatic `use` and `run` choose an eligible account with the earliest weekly reset.
 They exclude accounts with 5% or less weekly headroom and accounts that may bill
-extra usage. An automatic run resumes the conversation on
-another account at a usage limit. A named run stays on that account unless you
-add `--failover`; `--no-failover` disables recovery.
+extra usage. Current hook-only sessions do not automatically restart at idle or
+move accounts at a usage limit, including with `--failover`. Missing input-admission
+proof defers renewal and failover as `evidence_unknown`; the held token may expire
+while the child stays alive. After work and cleanup finish, end the session explicitly
+and resume it in a new run.
 
 ## Manage Accounts and Machines
 

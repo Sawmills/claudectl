@@ -450,8 +450,8 @@ struct Outcome {
     /// A failover notice for stderr once Claude no longer owns the terminal.
     notice: Option<String>,
 }
-/// Watches one Claude process: usage for the status line, and the account's token revision
-/// for renewal (SAW-12610).
+/// Watches one Claude process and publishes workload/expiry status. Automatic renewal
+/// and failover stay deferred while input-owner admission is unproved.
 #[cfg(unix)]
 struct Monitor {
     client: Client,
@@ -698,6 +698,13 @@ impl Monitor {
                 continue;
             }
             if !activity.seen_start {
+                // Missing startup events are unknown now, not a permanent hook failure.
+                // Continue sampling so later events can still identify the workload.
+                gate.check(
+                    &activity.idle,
+                    super::restart_gate::Cause::Renewal,
+                    self.held_expires_at,
+                );
                 if now() - started > timing.hooks_wait_ms {
                     eprintln!(
                         "claudectl: Claude sent no hook events; server token renewal is off for this session"
@@ -716,6 +723,12 @@ impl Monitor {
             } else {
                 super::restart_gate::Cause::Renewal
             };
+            // Sample every tick, including while a turn is busy or no revision has
+            // changed, so each deferred session still gets its expiry warning. Hook
+            // events alone cannot prove input admission is closed, even at idle.
+            if !gate.check(&activity.idle, cause, self.held_expires_at) {
+                continue;
+            }
             // A usage limit first: while one is pending, renewal waits (one restart decision
             // per tick, and a failover wins).
             if self.failover.is_some()
@@ -828,6 +841,11 @@ impl Monitor {
         timing: &super::renew::Timing,
         cause: super::restart_gate::Cause,
     ) -> std::result::Result<bool, ()> {
+        // Deferral must not wait behind a hook, publish renewing, or signal while
+        // input-owner admission is unproved. Keep this guard at the signal entry.
+        if !gate.check(&activity.idle, cause, self.held_expires_at) {
+            return Err(());
+        }
         let _hook_admission = match super::restart_gate::hook_admission(&self.directory) {
             Ok(lock) => lock,
             Err(_) => {
@@ -862,10 +880,8 @@ impl Monitor {
         if atomic(&self.directory.join("session.json"), &status).is_err() {
             return Err(());
         }
-        // The hook lock serializes marker publication with this final admission boundary.
-        // A hook that acquired it before this path is visible to the checks below; a hook
-        // that arrives after the lock is held waits until the signal decision is complete.
-        // Re-check all evidence after publishing the renewing state and before SIGTERM.
+        // These workload resamples do not establish an input-owner handover. The
+        // entry guard remains required even when every workload sample looks idle.
         if !gate.check(&activity.idle, cause, self.held_expires_at) {
             let mut status = self.status.clone();
             status["renewal"] = "on".into();
@@ -895,6 +911,15 @@ impl Monitor {
         failed_at: i64,
     ) -> Option<(Account, Access)> {
         use super::failover::{self, Confirm};
+        // No reservation, provider acquisition or budget/deadline accounting until
+        // automatic admission is proved, including callers outside the watch loop.
+        if !gate.check(
+            &activity.idle,
+            super::restart_gate::Cause::Failover,
+            self.held_expires_at,
+        ) {
+            return None;
+        }
         let state = self.failover.as_ref()?;
         let mut inputs = self.inputs(activity, timing, None);
         inputs.restarts_last_hour = state.last_hour;
@@ -1311,6 +1336,159 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
+    struct WaitingChild(std::process::Child);
+    #[cfg(unix)]
+    impl Drop for WaitingChild {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(unix)]
+    fn admission_fixture() -> (tempfile::TempDir, WaitingChild, Monitor, Activity) {
+        use std::os::unix::process::CommandExt;
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path().into());
+        let directory = root(&paths).join("sessions/run-admission");
+        private_dir(&directory).unwrap();
+        let child = WaitingChild(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "read -r _"])
+                .stdin(std::process::Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let status = json!({"renewal":"on","alias":"work","pid":child.0.id()});
+        atomic(&directory.join("session.json"), &status).unwrap();
+        let at = now() - 600_000;
+        std::fs::write(
+            directory.join("events"),
+            format!(
+                "{}\n{}\n",
+                json!({"at":at,"event":"SessionStart","session_id":"s"}),
+                json!({"at":at,"event":"Stop","session_id":"s"}),
+            ),
+        )
+        .unwrap();
+        let mut activity = Activity::default();
+        read_new_events(&directory.join("events"), &mut activity).unwrap();
+        let monitor = Monitor {
+            client: Client {
+                connection: super::super::Connection {
+                    server: "http://127.0.0.1:1".into(),
+                    user_id: "offline".into(),
+                    token_file: None,
+                },
+                token: "synthetic".into(),
+                http: reqwest::blocking::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap(),
+            },
+            paths,
+            directory,
+            pid: child.0.id(),
+            account_id: "a".repeat(64),
+            held_revision: "old".into(),
+            held_expires_at: now() + 600_000,
+            renewable: true,
+            restarts: 1,
+            tty: None,
+            status,
+            alias: "work".into(),
+            failover: Some(Failover {
+                tried: vec![],
+                last_hour: 1,
+            }),
+            crons: None,
+        };
+        (home, child, monitor, activity)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_admission_defers_without_waiting_for_hook_or_restart_locks() {
+        for hook_lock in [true, false] {
+            for cause in [
+                super::super::restart_gate::Cause::Renewal,
+                super::super::restart_gate::Cause::Failover,
+            ] {
+                let (_home, mut child, monitor, mut activity) = admission_fixture();
+                let directory = monitor.directory.clone();
+                let lock = if hook_lock {
+                    super::super::restart_gate::hook_admission(&directory).unwrap()
+                } else {
+                    super::super::restart_gate::admission(&directory).unwrap()
+                };
+                let (sent, received) = std::sync::mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    let mut gate = super::super::restart_gate::Gate::new(
+                        &monitor.paths.home,
+                        &monitor.directory,
+                        monitor.pid,
+                        &monitor.alias,
+                    );
+                    let deferred = monitor
+                        .stop_for_restart(
+                            &mut activity,
+                            &mut gate,
+                            &super::super::renew::timing(),
+                            cause,
+                        )
+                        .is_err();
+                    sent.send(deferred).unwrap();
+                });
+                let result = received.recv_timeout(Duration::from_secs(1));
+                drop(lock);
+                worker.join().unwrap();
+                assert!(
+                    matches!(result, Ok(true)),
+                    "final admission waited or signaled without proof"
+                );
+                assert!(child.0.try_wait().unwrap().is_none());
+                let status: Value =
+                    serde_json::from_slice(&private_read(&directory.join("session.json")).unwrap())
+                        .unwrap();
+                assert_eq!(status["renewal"], "on");
+                let deferred: Value = serde_json::from_slice(
+                    &private_read(&directory.join("restart-status.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(deferred["reason"], "evidence_unknown");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_admission_does_not_consume_failover_deadline_or_accounting() {
+        let (_home, mut child, monitor, mut activity) = admission_fixture();
+        let mut gate = super::super::restart_gate::Gate::new(
+            &monitor.paths.home,
+            &monitor.directory,
+            monitor.pid,
+            &monitor.alias,
+        );
+        let mut pending = Pending::default();
+        let target = monitor.failover_target(
+            &mut activity,
+            &mut gate,
+            &super::super::renew::timing(),
+            &mut pending,
+            now(),
+        );
+        assert!(target.is_none());
+        assert_eq!(pending.last_read, 0);
+        assert!(pending.handled.is_none());
+        assert_eq!(monitor.restarts, 1);
+        assert_eq!(monitor.failover.as_ref().unwrap().last_hour, 1);
+        assert!(!root(&monitor.paths).join("failovers.lock").exists());
+        assert!(!root(&monitor.paths).join("failovers.jsonl").exists());
+        assert!(child.0.try_wait().unwrap().is_none());
+    }
     #[cfg(unix)]
     #[test]
     fn a_failover_session_keeps_the_hook_copy_it_started_with() {
