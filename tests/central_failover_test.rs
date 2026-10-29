@@ -328,7 +328,7 @@ fn assert_deferred(env: &Env, output: &std::process::Output, cause: &str) {
         serde_json::from_slice(&std::fs::read(env.log.with_extension("log.deferred")).unwrap())
             .unwrap();
     // Stage-deduplicated journal rows retain the first cause; current status tracks the latest.
-    assert_eq!(status["reason"], "evidence_unknown");
+    assert_eq!(status["reason"], "quiet_window");
     assert_eq!(status["cause"], cause);
 }
 

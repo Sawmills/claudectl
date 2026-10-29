@@ -636,7 +636,8 @@ impl Monitor {
             &self.directory,
             self.pid,
             &self.alias,
-        );
+        )
+        .with_terminal(self.tty.clone());
         while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
             stopped.recv_timeout(Duration::from_millis(timing.tick_ms))
         {
@@ -653,12 +654,17 @@ impl Monitor {
                 }
                 last_usage = now();
             }
-            if let Some((at, _)) = &sent {
-                // Claude did not exit after SIGTERM: stop it.
-                if now() - at > 10_000 {
-                    unsafe {
-                        libc::kill(self.pid as i32, libc::SIGKILL);
-                    }
+            if let Some((_, restart)) = &sent {
+                // Await the child's own exit without a force-kill deadline, while
+                // retaining expiry attention if it ignores SIGTERM.
+                let cause = match &restart.kind {
+                    RestartKind::Renew(_) => super::restart_gate::Cause::Renewal,
+                    RestartKind::Failover { .. } => super::restart_gate::Cause::Failover,
+                };
+                if self.read_events(&mut activity).is_err() {
+                    gate.unknown(&activity.idle, cause, self.held_expires_at);
+                } else {
+                    gate.check(&activity.idle, cause, self.held_expires_at);
                 }
                 continue;
             }
@@ -724,8 +730,8 @@ impl Monitor {
                 super::restart_gate::Cause::Renewal
             };
             // Sample every tick, including while a turn is busy or no revision has
-            // changed, so each deferred session still gets its expiry warning. Hook
-            // events alone cannot prove input admission is closed, even at idle.
+            // changed, so each deferred session still gets its expiry warning.
+            // Observed quiet remains a heuristic, not closed input admission.
             if !gate.check(&activity.idle, cause, self.held_expires_at) {
                 continue;
             }
@@ -841,8 +847,8 @@ impl Monitor {
         timing: &super::renew::Timing,
         cause: super::restart_gate::Cause,
     ) -> std::result::Result<bool, ()> {
-        // Deferral must not wait behind a hook, publish renewing, or signal while
-        // input-owner admission is unproved. Keep this guard at the signal entry.
+        // Deferral must not publish renewing or signal before the quiet window.
+        // This guard and the locks do not close all input sources.
         if !gate.check(&activity.idle, cause, self.held_expires_at) {
             return Err(());
         }
@@ -880,8 +886,8 @@ impl Monitor {
         if atomic(&self.directory.join("session.json"), &status).is_err() {
             return Err(());
         }
-        // These workload resamples do not establish an input-owner handover. The
-        // entry guard remains required even when every workload sample looks idle.
+        // This last workload sample still leaves a sample-to-SIGTERM race.
+        // Option B accepts observed quiet only, with no prompt handover receipt.
         if !gate.check(&activity.idle, cause, self.held_expires_at) {
             let mut status = self.status.clone();
             status["renewal"] = "on".into();
@@ -912,7 +918,7 @@ impl Monitor {
     ) -> Option<(Account, Access)> {
         use super::failover::{self, Confirm};
         // No reservation, provider acquisition or budget/deadline accounting until
-        // automatic admission is proved, including callers outside the watch loop.
+        // the quiet/workload gate permits it, including direct callers.
         if !gate.check(
             &activity.idle,
             super::restart_gate::Cause::Failover,
@@ -1410,6 +1416,40 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn option_b_final_signal_requires_a_completed_quiet_window() {
+        let (_home, mut child, monitor, mut activity) = admission_fixture();
+        activity.idle.since = Some(now() - 600_001);
+        let mut gate = super::super::restart_gate::Gate::new(
+            &monitor.paths.home,
+            &monitor.directory,
+            monitor.pid,
+            &monitor.alias,
+        );
+        let cause = super::super::restart_gate::Cause::Renewal;
+        assert!(!gate.check_at(
+            &activity.idle,
+            cause,
+            i64::MAX,
+            Instant::now() - Duration::from_secs(600)
+        ));
+        assert_eq!(
+            monitor.stop_for_restart(
+                &mut activity,
+                &mut gate,
+                &super::super::renew::timing(),
+                cause
+            ),
+            Ok(true)
+        );
+        let status: Value =
+            serde_json::from_slice(&private_read(&monitor.directory.join("session.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["renewal"], "renewing");
+        assert!(!child.0.wait().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn final_admission_defers_without_waiting_for_hook_or_restart_locks() {
         for hook_lock in [true, false] {
             for cause in [
@@ -1457,7 +1497,7 @@ mod tests {
                     &private_read(&directory.join("restart-status.json")).unwrap(),
                 )
                 .unwrap();
-                assert_eq!(deferred["reason"], "evidence_unknown");
+                assert_eq!(deferred["reason"], "quiet_window");
             }
         }
     }

@@ -114,15 +114,15 @@ while one runs). Read the summary table: rerun for `lost-reply` and `failed:fenc
 for `unrotated`. A row `migrated (log out the live login)` means the live login on that
 machine holds a retired grant: run `claude auth logout` there; claudectl never deletes it.
 
-7. **Verify** on the Mac and devbox with an interactive session: start
-   `claudectl server run <alias>` and send one prompt. Current hook-only sessions no longer
-   automatically restart at idle for renewal or failover. Confirm the same child remains
-   alive, `claudectl status` or its status line reports `restart deferred: evidence_unknown`,
-   and no failover reservation or renewed-token resume is reported. Do not force a shared
-   account refresh as a restart test. At five minutes before the held token expires,
-   confirm the session's warning record/metric and `warn` status; expiry or an authentication
-   failure must report `blocked` while preserving the child and work. End and relaunch the
-   session explicitly only after its work and cleanup are complete.
+7. **Local option B verification, pending owner decision:** use isolated fixtures for
+   the ten-minute quiet window. Confirm every turn, task-output child, hold, open production
+   marker and pending hook blocks admission and restarts the window. Expiry and a 401 must
+   not shorten it. Check warning journal/metric/status five minutes before expiry and blocked
+   status at expiry for every deferred workload. Damaged/missing evidence stays blocked.
+   Do not start a test session on a shared account or force a shared account refresh.
+   Quiet does not close all inputs: a late or invisible hook can still lose a prompt at
+   SIGTERM. No prompt collection/replay or forced kill deadline is provided. Live acceptance
+   and rollout require a separate order after the pending owner decision.
 
 ## Alerts
 

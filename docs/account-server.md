@@ -239,11 +239,18 @@ forces a refresh: it takes the current token, and the server refreshes on demand
 `claudectl server refresh-access` forces one and ends every running session of that account
 (relaunch each with `--resume`).
 
-**Current limitation:** hook-only sessions no longer automatically restart at idle, for
-renewal or account failover. Claude's command hooks cannot acknowledge that all prompt
-sources are closed and every submitted prompt is safe to hand over. A missing acknowledgement
-is `evidence_unknown`, so the wrapper keeps the existing child and token instead of sending
-SIGTERM. It does not collect, store or replay prompts to work around that limit.
+**Local option B candidate, pending owner acceptance:** automatic renewal and failover
+require ten continuous minutes of observed quiet. The clock starts with the first clear
+workload sample and resets on an observed blocker, hook event, session change or terminal
+input. Startup never inherits old quiet time. Expiry or authentication failure does not
+shorten the window. Unknown or damaged evidence still blocks restart.
+
+**Residual race:** command hooks cannot acknowledge that all input sources are closed and
+every submitted prompt is safe to hand over. A waiting hook may be invisible before
+publication; a new prompt, peer message, scheduled job or task can arrive after the final
+sample but before SIGTERM. Sampling can also miss brief activity. Quiet is a heuristic,
+not all-input closure. No prompts are collected, stored or replayed. Option A, which
+always defers absent input-owner proof, remains preserved as a separate local ref.
 
 `server run` registers Claude hooks for `SessionStart`, `UserPromptSubmit`, `Stop`,
 `StopFailure`, `SessionEnd` and the `idle_prompt` notification. They record only the event,
@@ -255,10 +262,10 @@ status and structured alert change to `warn`; expiry or an authentication failur
 them to `blocked`. The child and its work stay alive, without a forced timeout. The held
 token can stop working before you can safely end and relaunch the session.
 
-The retained restart and cron-recovery path described below is not reached by current
-hook-only sessions. It has no input-admission override. Existing sessions must be ended
-explicitly by their owner after the work and cleanup are complete; installing a new CLI
-does not upgrade a running wrapper.
+After the quiet window and fresh workload checks pass, the retained restart and cron
+recovery path below can run. No timeout forces a restart while blocked, and no forced
+kill deadline follows SIGTERM. A child that does not exit keeps its current token and
+work. Installing a new CLI does not upgrade a running wrapper.
 
 For a Fleet Operator, `HERDR_TAB_ID` selects the matching `operator_tab` in
 `~/Code/.fleet/*/operator.md`. Its `cron_prompts` entries (a prompt file and five schedule
@@ -311,18 +318,21 @@ This remains a best-effort workaround for Claude Code's resume behavior, with th
 - The defect belongs to Claude Code; an upstream report waits on the owner's decision. Remove
   the note once Claude Code fires restored jobs reliably.
 
-Automatic restart always requires both input-admission proof and fresh workload evidence.
-Foreground turns, live background tasks and explicit production holds prevent renewal and
-failover, even after token expiry. The task check reads live descendants' stdout/stderr:
-a Claude task file under `<tmp>/claude-<uid>/.../tasks/*.output` holds admission. MCP/LSP
-servers and `caffeinate` without task-output descriptors do not add a workload blocker.
-They do not remove the missing input-admission proof.
+Option B requires the quiet window and fresh workload evidence before provider selection,
+failover reservation and the final signal. Foreground turns, live background tasks,
+production markers, pending hooks and explicit holds prevent renewal and failover, even
+after token expiry. The task check reads live descendants' stdout/stderr: a Claude task
+file under `<tmp>/claude-<uid>/.../tasks/*.output` holds admission. MCP/LSP servers and
+`caffeinate` without task-output descriptors do not add a workload blocker.
 
-Current command hooks provide no supported close-and-drain acknowledgement, so even an
-idle session defers with `evidence_unknown`. No failover reservation or restart budget is
-consumed. The final signal path independently checks admission before waiting on hook
-locks or publishing `renewal=renewing`. Any explicit child exit ends `server run` with that
-child's exit code. A `-p`/`--print` run is never automatically restarted either.
+After quiet completes, `restart_pending` retains expiry attention while a token read,
+restart budget or account choice still prevents a restart. Gate eligibility does not clear
+that alert. During the window the status reason is `quiet_window`; damaged or missing evidence is
+`evidence_unknown`. No failover reservation or restart budget is consumed while blocked.
+The signal path checks again before waiting on hook locks and before publishing
+`renewal=renewing`, then samples workload once more before SIGTERM. These locks and
+samples do not close all input sources. Any explicit child exit ends `server run` with
+that child's exit code. A `-p`/`--print` run is never automatically restarted either.
 `session.json` records the alias, account, held `expires_at`, pid and renewal state without
 the token. The run's deferred status identifies warnings and blocked sessions for Operators.
 
@@ -345,8 +355,8 @@ When the lane exports `HERDR_TAB_ID` (or `HERDR_PANE_ID`), the monitor consumes 
 (`LANE_GOAL_FILE` or `SAW_GOAL_FILE`) and fleet voice outboxes. Outbox markers are checked
 even when no goal file is configured. An open marker defers admission even when Claude has
 no local task-output child. Missing or unreadable marker evidence is reported as
-`evidence_unknown` and keeps admission closed. Restoring workload evidence does not provide
-the missing input-admission proof; explicit holds remain the preferred production boundary.
+`evidence_unknown` and keeps admission closed. Restoring clear workload evidence starts a new quiet window; it does not provide
+input-admission proof. Explicit holds remain the preferred production boundary.
 An older running wrapper cannot enforce a hold. The command checks the wrapper's recorded
 gate capability and refuses the start if it is absent; installing a new CLI alone does not
 upgrade a wrapper that is already running.

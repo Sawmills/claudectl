@@ -378,7 +378,7 @@ fn rate_without_lanes_reports_no_activity() {
 }
 
 #[test]
-fn run_help_discloses_hook_only_restart_deferral() {
+fn run_help_discloses_quiet_window_and_residual_race() {
     for args in [vec!["run", "--help"], vec!["server", "run", "--help"]] {
         let output = Command::cargo_bin("claudectl")
             .unwrap()
@@ -387,7 +387,9 @@ fn run_help_discloses_hook_only_restart_deferral() {
             .unwrap();
         assert!(output.status.success());
         let help = String::from_utf8(output.stdout).unwrap();
-        assert!(help.contains("Hook-only sessions do not automatically restart at idle"));
+        assert!(help.contains("automatic restart requires ten minutes of observed quiet"));
         assert!(help.contains("held token may expire"));
+        assert!(help.contains("a late prompt can be cut off at SIGTERM"));
+        assert!(help.contains("No prompt collection or replay"));
     }
 }

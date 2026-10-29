@@ -18,8 +18,10 @@ Claude validates the settings schema. An invalid value such as model: 5 can make
 Claude ignore the WHOLE settings file, including claudectl's renewal/failover hooks.
 Test settings with your installed Claude version before rollout.
 
-Hook-only sessions do not automatically restart at idle.
-Renewal and failover defer as evidence_unknown; the held token may expire.";
+Local option B: automatic restart requires ten minutes of observed quiet.
+Quiet does not prove all inputs are closed: a late prompt can be cut off at SIGTERM.
+Expiry does not bypass quiet; unknown evidence defers. The held token may expire.
+No prompt collection or replay.";
 
 #[cfg(unix)]
 #[path = "central_crons.rs"]

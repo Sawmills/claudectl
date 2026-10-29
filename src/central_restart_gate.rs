@@ -57,6 +57,8 @@ enum Reason {
     ExplicitHold,
     StaleHold,
     EvidenceUnknown,
+    QuietWindow,
+    RestartPending,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -74,6 +76,14 @@ struct Deferred {
     stage: Stage,
 }
 
+struct ObservedQuiet {
+    idle: super::renew::Idle,
+    input_at: Option<std::time::SystemTime>,
+    since: Instant,
+}
+
+const QUIET_WINDOW: Duration = Duration::from_secs(600);
+
 /// One gate per live Claude child. All automatic restart callers cross `check`.
 pub(super) struct Gate {
     directory: PathBuf,
@@ -87,6 +97,8 @@ pub(super) struct Gate {
     recorded_session: Option<String>,
     log_error: bool,
     unknown_evidence: bool,
+    quiet: Option<ObservedQuiet>,
+    terminal: Option<PathBuf>,
 }
 
 impl Gate {
@@ -107,7 +119,14 @@ impl Gate {
             recorded_session: None,
             log_error: false,
             unknown_evidence: false,
+            quiet: None,
+            terminal: None,
         }
+    }
+
+    pub(super) fn with_terminal(mut self, terminal: Option<PathBuf>) -> Self {
+        self.terminal = terminal;
+        self
     }
 
     /// Fresh workload evidence, with one diagnostic/counter per changed decision.
@@ -118,10 +137,29 @@ impl Gate {
         cause: Cause,
         held_expires_at: i64,
     ) -> bool {
+        self.check_at(idle, cause, held_expires_at, std::time::Instant::now())
+    }
+
+    pub(super) fn check_at(
+        &mut self,
+        idle: &super::renew::Idle,
+        cause: Cause,
+        held_expires_at: i64,
+        observed_at: std::time::Instant,
+    ) -> bool {
         if self.log_error {
             self.retry_error_status(idle, held_expires_at);
             return false;
         }
+        let input_at = self
+            .terminal
+            .as_ref()
+            .map(|path| std::fs::metadata(path).and_then(|metadata| metadata.accessed()))
+            .transpose();
+        let hook_failed = !matches!(
+            std::fs::symlink_metadata(self.directory.join("hook-error")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
         let held = hold_reason(&self.home, &self.directory);
         let pending = hook_pending(&self.directory);
         let pending_reason = match pending {
@@ -129,7 +167,7 @@ impl Gate {
             Ok(None) => None,
             Err(_) => Some(Reason::EvidenceUnknown),
         };
-        let reason = if self.unknown_evidence {
+        let reason = if self.unknown_evidence || input_at.is_err() || hook_failed {
             Some(Reason::EvidenceUnknown)
         } else if pending_reason.is_some() {
             pending_reason
@@ -144,15 +182,48 @@ impl Gate {
                 Ok(false) if idle.since.is_none() => Some(Reason::RunningTurn),
                 Ok(false) => match live_task(self.pid) {
                     Ok(true) => Some(Reason::BackgroundTask),
-                    // Current command hooks cannot close every prompt source and
-                    // acknowledge safe input handover. Even idle workload evidence
-                    // cannot prove that a prompt will not arrive before SIGTERM.
-                    Ok(false) => Some(Reason::EvidenceUnknown),
+                    Ok(false) => None,
                     Err(_) => Some(Reason::EvidenceUnknown),
                 },
             }
         };
-        self.record(reason, idle, cause, held_expires_at)
+        let reason = if reason.is_some() {
+            self.quiet = None;
+            reason
+        } else {
+            let input_at = input_at.expect("terminal evidence was checked");
+            if self
+                .quiet
+                .as_ref()
+                .is_none_or(|previous| previous.idle != *idle || previous.input_at != input_at)
+            {
+                self.quiet = Some(ObservedQuiet {
+                    idle: idle.clone(),
+                    input_at,
+                    since: observed_at,
+                });
+            }
+            let quiet = self.quiet.as_ref().expect("quiet clock initialized");
+            let terminal_quiet = input_at.is_none_or(|at| {
+                std::time::SystemTime::now()
+                    .duration_since(at)
+                    .unwrap_or_default()
+                    >= QUIET_WINDOW
+            });
+            (observed_at.saturating_duration_since(quiet.since) < QUIET_WINDOW || !terminal_quiet)
+                .then_some(Reason::QuietWindow)
+        };
+        // Option B is only an observed-quiet heuristic. A hook can still be
+        // invisible or arrive between this sample and SIGTERM.
+        let admitted = reason.is_none();
+        // Quiet eligibility does not mean a token read, budget or account choice
+        // will succeed. Keep expiry attention until this child actually exits.
+        let diagnostic = reason.or_else(|| {
+            (held_expires_at.saturating_sub(now()) <= 300_000 || idle.auth_failed.is_some())
+                .then_some(Reason::RestartPending)
+        });
+        let recorded = self.record(diagnostic, idle, cause, held_expires_at);
+        admitted && recorded
     }
 
     pub(super) fn unknown(&mut self, idle: &super::renew::Idle, cause: Cause, expires_at: i64) {
@@ -196,7 +267,7 @@ impl Gate {
             return false;
         }
         self.log_error = false;
-        decision.is_none()
+        true
     }
 
     fn retry_error_status(&self, idle: &super::renew::Idle, expires_at: i64) {
@@ -1000,14 +1071,244 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_hook_only_session_cannot_prove_automatic_restart_safe() {
+    fn option_b_requires_ten_continuous_minutes_of_observed_quiet() {
+        for cause in [Cause::Renewal, Cause::Failover] {
+            let (_home, mut gate, idle) = setup();
+            let start = std::time::Instant::now();
+            assert!(!gate.check_at(&idle, cause, i64::MAX, start));
+            assert!(!gate.check_at(&idle, cause, i64::MAX, start + Duration::from_secs(599)));
+            assert!(
+                gate.check_at(&idle, cause, i64::MAX, start + Duration::from_secs(600)),
+                "B may admit only after a full ten-minute observation window"
+            );
+        }
+    }
+
+    #[test]
+    fn option_b_observed_activity_restarts_the_entire_window() {
+        let (_home, mut gate, mut idle) = setup();
+        let start = Instant::now();
+        assert!(!gate.check_at(&idle, Cause::Renewal, i64::MAX, start));
+        idle.since = Some(1);
+        assert!(!gate.check_at(
+            &idle,
+            Cause::Renewal,
+            i64::MAX,
+            start + Duration::from_secs(599)
+        ));
+        assert!(
+            !gate.check_at(
+                &idle,
+                Cause::Renewal,
+                i64::MAX,
+                start + Duration::from_secs(600)
+            ),
+            "a new completed turn must not inherit old quiet time"
+        );
+        assert!(gate.check_at(
+            &idle,
+            Cause::Renewal,
+            i64::MAX,
+            start + Duration::from_secs(1199)
+        ));
+    }
+
+    #[test]
+    fn option_b_blockers_restart_quiet_and_expiry_never_shortens_it() {
+        for cause in [Cause::Renewal, Cause::Failover] {
+            for blocker in ["turn", "hold", "pending", "damaged"] {
+                let (_home, mut gate, mut idle) = setup();
+                let start = Instant::now();
+                assert!(!gate.check_at(&idle, cause, now() - 1, start));
+                let path = if blocker == "pending" {
+                    gate.directory
+                        .join(format!("hook-pending.{}", std::process::id()))
+                } else {
+                    hold_path(&gate.home, &gate.directory).unwrap()
+                };
+                match blocker {
+                    "turn" => idle.since = None,
+                    "hold" => atomic(
+                        &path,
+                        &Hold {
+                            run: "run-gate".into(),
+                            reason: "production".into(),
+                            owner_pid: std::process::id(),
+                            owner_started: process_start(std::process::id()).unwrap(),
+                            at: now(),
+                            alias: "work".into(),
+                        },
+                    )
+                    .unwrap(),
+                    "pending" => atomic(&path, &json!({"pid": std::process::id()})).unwrap(),
+                    _ => {
+                        private_dir(path.parent().unwrap()).unwrap();
+                        std::fs::write(&path, "broken").unwrap();
+                    }
+                }
+                assert!(!gate.check_at(&idle, cause, now() - 1, start + Duration::from_secs(599)));
+                if blocker == "turn" {
+                    idle.since = Some(0);
+                } else {
+                    std::fs::remove_file(&path).unwrap();
+                }
+                assert!(!gate.check_at(&idle, cause, now() - 1, start + Duration::from_secs(600)));
+                assert!(!gate.check_at(&idle, cause, now() - 1, start + Duration::from_secs(1199)));
+                assert!(
+                    gate.check_at(&idle, cause, now() - 1, start + Duration::from_secs(1200)),
+                    "{blocker}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn option_b_each_hook_record_resets_quiet_even_with_the_same_idle_timestamp() {
+        let (_home, mut gate, mut idle) = setup();
+        let start = Instant::now();
+        assert!(!gate.check_at(&idle, Cause::Renewal, i64::MAX, start));
+        super::super::renew::fold(&mut idle, &[(0, super::super::renew::Event::IdlePrompt)]);
+        assert!(!gate.check_at(
+            &idle,
+            Cause::Renewal,
+            i64::MAX,
+            start + Duration::from_secs(599)
+        ));
+        assert!(!gate.check_at(
+            &idle,
+            Cause::Renewal,
+            i64::MAX,
+            start + Duration::from_secs(600)
+        ));
+        assert!(gate.check_at(
+            &idle,
+            Cause::Renewal,
+            i64::MAX,
+            start + Duration::from_secs(1199)
+        ));
+        idle.session = Some("next-session".into());
+        assert!(!gate.check_at(
+            &idle,
+            Cause::Renewal,
+            i64::MAX,
+            start + Duration::from_secs(1200)
+        ));
+    }
+
+    #[test]
+    fn option_b_terminal_activity_resets_quiet_and_unreadable_terminal_blocks() {
+        let (_home, mut gate, idle) = setup();
+        let terminal = gate.directory.join("synthetic-terminal");
+        let file = File::create(&terminal).unwrap();
+        file.set_times(
+            std::fs::FileTimes::new().set_accessed(std::time::UNIX_EPOCH + Duration::from_secs(1)),
+        )
+        .unwrap();
+        gate = gate.with_terminal(Some(terminal.clone()));
+        let start = Instant::now();
+        assert!(!gate.check_at(&idle, Cause::Renewal, i64::MAX, start));
+        assert!(gate.check_at(
+            &idle,
+            Cause::Renewal,
+            i64::MAX,
+            start + Duration::from_secs(600)
+        ));
+        file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()))
+            .unwrap();
+        assert!(!gate.check_at(
+            &idle,
+            Cause::Renewal,
+            i64::MAX,
+            start + Duration::from_secs(601)
+        ));
+        assert!(!gate.check_at(
+            &idle,
+            Cause::Renewal,
+            i64::MAX,
+            start + Duration::from_secs(1201)
+        ));
+        std::fs::remove_file(terminal).unwrap();
+        assert!(!gate.check_at(
+            &idle,
+            Cause::Renewal,
+            i64::MAX,
+            start + Duration::from_secs(1801)
+        ));
+        let status: Value = serde_json::from_slice(
+            &private_read(&gate.directory.join("restart-status.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["reason"], "evidence_unknown");
+    }
+
+    #[test]
+    fn option_b_a_failed_hook_blocks_even_after_the_quiet_window() {
+        let (_home, mut gate, idle) = setup();
+        let start = Instant::now();
+        assert!(!gate.check_at(&idle, Cause::Renewal, i64::MAX, start));
+        File::create(gate.directory.join("hook-error")).unwrap();
+        assert!(
+            !gate.check_at(
+                &idle,
+                Cause::Renewal,
+                i64::MAX,
+                start + Duration::from_secs(600)
+            ),
+            "failed hook evidence must not become eligible after ten minutes"
+        );
+    }
+
+    #[test]
+    fn option_b_completed_quiet_retains_expiry_alert_until_the_child_restarts() {
+        for cause in [Cause::Renewal, Cause::Failover] {
+            let (_home, mut gate, idle) = setup();
+            let start = Instant::now();
+            assert!(!gate.check_at(&idle, cause, i64::MAX, start));
+            assert!(gate.check_at(&idle, cause, i64::MAX, start + Duration::from_secs(600)));
+            // A later token read, restart budget or candidate selection may still defer.
+            for (remaining, stage) in [(300_000, "warn"), (-1, "blocked")] {
+                for _ in 0..2 {
+                    assert!(gate.check_at(
+                        &idle,
+                        cause,
+                        now() + remaining,
+                        start + Duration::from_secs(601)
+                    ));
+                }
+                let status: Value = serde_json::from_slice(
+                    &private_read(&gate.directory.join("restart-status.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    status["stage"], stage,
+                    "quiet eligibility must not clear expiry attention"
+                );
+                assert_eq!(status["attention_required"], true);
+            }
+            let rows: Vec<Value> = std::fs::read_to_string(
+                gate.home.join(".claudectl/server/restart-decisions.jsonl"),
+            )
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+            assert_eq!(rows.iter().filter(|row| row["stage"] == "warn").count(), 1);
+            assert_eq!(
+                rows.iter().filter(|row| row["stage"] == "blocked").count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn an_idle_hook_only_session_starts_a_new_quiet_window() {
         let (_home, mut gate, idle) = setup();
         assert!(!gate.check(&idle, Cause::Renewal, now() + 600_000));
         let status: Value = serde_json::from_slice(
             &private_read(&gate.directory.join("restart-status.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(status["reason"], "evidence_unknown");
+        assert_eq!(status["reason"], "quiet_window");
     }
 
     #[test]
@@ -1027,7 +1328,7 @@ mod tests {
                     )
                     .unwrap();
                     assert_eq!(status["session_id"], session);
-                    assert_eq!(status["reason"], "evidence_unknown");
+                    assert_eq!(status["reason"], "quiet_window");
                     assert_eq!(status["stage"], stage);
                     assert_eq!(status["attention_required"], stage != "deferred");
                 }
@@ -1071,7 +1372,7 @@ mod tests {
                 assert_eq!(
                     status["reason"],
                     if since.is_some() {
-                        "evidence_unknown"
+                        "quiet_window"
                     } else {
                         "running_turn"
                     }
@@ -1203,7 +1504,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_hook_marker_is_removed_but_input_admission_remains_unknown() {
+    fn a_stale_hook_marker_is_removed_but_quiet_starts_fresh() {
         let (_home, mut gate, idle) = setup();
         let mut stale = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let pid = stale.id();

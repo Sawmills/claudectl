@@ -1,5 +1,5 @@
 #![cfg(all(feature = "server", target_os = "linux"))]
-//! Synthetic CLI coverage for fail-closed input admission. Recovery parsing lives at its
+//! Synthetic CLI coverage during option B's quiet window. Recovery parsing lives at its
 //! module interface; no fixture bypasses the automatic signal guard.
 use axum::{
     Json, Router,
@@ -297,9 +297,9 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn idle_hook_only_renewal_preserves_child_token_settings_and_accounting() {
+fn quiet_window_preserves_child_token_settings_and_accounting() {
     let mut f = Fixture::start("idle", 600_000, false);
-    let status = f.wait("evidence_unknown", "deferred");
+    let status = f.wait("quiet_window", "deferred");
     let recorded = status["restart_deferred_total"].clone();
     let journal_len = f.journal().len();
     f.state.lock().unwrap().generation = 2; // Another client changes the available revision.
@@ -310,7 +310,7 @@ fn idle_hook_only_renewal_preserves_child_token_settings_and_accounting() {
             .unwrap();
     assert_eq!(session["renewal"], "on");
     assert_eq!(
-        f.wait("evidence_unknown", "deferred")["restart_deferred_total"],
+        f.wait("quiet_window", "deferred")["restart_deferred_total"],
         recorded
     );
     assert_eq!(f.journal().len(), journal_len);
@@ -327,7 +327,7 @@ fn idle_hook_only_renewal_preserves_child_token_settings_and_accounting() {
 #[test]
 fn every_deferred_session_warns_and_blocks_without_monitor_teardown() {
     for (mode, reason) in [
-        ("idle", "evidence_unknown"),
+        ("idle", "quiet_window"),
         ("busy", "running_turn"),
         ("task", "background_task"),
         ("hold", "explicit_hold"),
@@ -383,14 +383,14 @@ fn every_deferred_session_warns_and_blocks_without_monitor_teardown() {
 }
 
 #[test]
-fn later_prompts_and_non_task_helpers_do_not_bypass_unknown_admission() {
+fn later_prompts_and_non_task_helpers_do_not_bypass_the_quiet_window() {
     for mode in ["idle", "extra"] {
         let mut f = Fixture::start(mode, 600_000, false);
-        f.wait("evidence_unknown", "deferred");
+        f.wait("quiet_window", "deferred");
         std::fs::write(f.home.path().join("submit"), "").unwrap();
         f.wait("running_turn", "deferred");
         std::fs::write(f.home.path().join("turn-done"), "").unwrap();
-        f.wait("evidence_unknown", "deferred");
+        f.wait("quiet_window", "deferred");
         f.finish();
     }
 }
@@ -398,7 +398,7 @@ fn later_prompts_and_non_task_helpers_do_not_bypass_unknown_admission() {
 #[test]
 fn an_idle_terminal_session_keeps_foreground_until_its_owner_exits() {
     let mut f = Fixture::start("idle", 600_000, true);
-    f.wait("evidence_unknown", "deferred");
+    f.wait("quiet_window", "deferred");
     assert_eq!(f.run()["tty"], true);
     assert_eq!(f.run()["foreground"], true);
     f.finish();

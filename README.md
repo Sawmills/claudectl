@@ -45,11 +45,16 @@ claudectl run -- --resume SESSION_ID
 
 Automatic `use` and `run` choose an eligible account with the earliest weekly reset.
 They exclude accounts with 5% or less weekly headroom and accounts that may bill
-extra usage. Current hook-only sessions do not automatically restart at idle or
-move accounts at a usage limit, including with `--failover`. Missing input-admission
-proof defers renewal and failover as `evidence_unknown`; the held token may expire
-while the child stays alive. After work and cleanup finish, end the session explicitly
-and resume it in a new run.
+extra usage. This local option B candidate permits automatic renewal and `--failover`
+after ten continuous minutes of observed quiet. Running turns, task-output descendants,
+production markers, pending hooks and explicit holds block restart and reset the window.
+Expiry and authentication failures do not shorten the wait. Unknown or damaged evidence
+keeps restart blocked; the held token may expire while the child stays alive.
+
+**Residual risk:** quiet does not prove all inputs are closed. A hook or new input can
+arrive after the final sample and before SIGTERM, so a submitted prompt can still be cut
+off. This candidate does not collect or replay prompts. Owner acceptance of option B is
+pending; this local candidate is not approved for rollout.
 
 ## Manage Accounts and Machines
 
