@@ -398,9 +398,10 @@ pub(super) fn record_hook(
 ) -> anyhow::Result<()> {
     use std::io::Write;
     let dir = session_dir(sessions, dir)?;
-    let pending = dir.join("hook-pending");
+    let pending = dir.join(format!("hook-pending.{}", std::process::id()));
     if let Err(error) = atomic(&pending, &serde_json::json!({"pid": std::process::id()})) {
         mark_hook_error(&dir);
+        let _ = std::fs::remove_file(&pending);
         return Err(error);
     }
     #[cfg(unix)]

@@ -716,9 +716,6 @@ impl Monitor {
             } else {
                 super::restart_gate::Cause::Renewal
             };
-            if !gate.check(&activity.idle, cause, self.held_expires_at) {
-                continue;
-            }
             // A usage limit first: while one is pending, renewal waits (one restart decision
             // per tick, and a failover wins).
             if self.failover.is_some()
@@ -726,6 +723,9 @@ impl Monitor {
                 && activity.idle.session.as_deref() == Some(session_id.as_str())
                 && pending.handled != Some(failed_at)
             {
+                if !gate.check(&activity.idle, cause, self.held_expires_at) {
+                    continue;
+                }
                 if let Some((account, access)) =
                     self.failover_target(&mut activity, &mut gate, &timing, &mut pending, failed_at)
                 {
@@ -787,6 +787,9 @@ impl Monitor {
             if decision == renew::Decision::Restart
                 && let Some(session_id) = activity.idle.session.clone()
             {
+                if !gate.check(&activity.idle, cause, self.held_expires_at) {
+                    continue;
+                }
                 match self.stop_for_restart(&mut activity, &mut gate, &timing, cause) {
                     Ok(true) => {
                         let kind = RestartKind::Renew(access);
