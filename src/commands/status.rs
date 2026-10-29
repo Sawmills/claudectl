@@ -152,7 +152,11 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
     }
     if json {
         let now = chrono::Utc::now().timestamp();
-        let report = report_json(&local, &view, &remote, now);
+        let mut report = report_json(&local, &view, &remote, now);
+        #[cfg(unix)]
+        {
+            report["sessions"] = serde_json::json!(deferred_status(&paths));
+        }
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
@@ -169,10 +173,12 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
         .collect();
     if !details {
         print!("{}", compact(&fetched, chrono::Utc::now().timestamp()));
+        print_restart_status(&paths)?;
         return Ok(());
     }
     if fetched.is_empty() {
         println!("no profiles saved. Use 'claudectl save' or 'claudectl login <alias>'.");
+        print_restart_status(&paths)?;
         return Ok(());
     }
 
@@ -187,7 +193,37 @@ pub fn run(alias: Option<&str>, mode: FetchMode, details: bool, json: bool) -> R
     print_fetched_at();
     print_table(&accounts);
     print!("{reset_notes}");
+    print_restart_status(&paths)?;
     Ok(())
+}
+
+fn print_restart_status(paths: &config::Paths) -> Result<()> {
+    #[cfg(unix)]
+    for session in deferred_status(paths) {
+        println!(
+            "{}: restart deferred: {} ({})",
+            session["run"].as_str().unwrap_or("unknown"),
+            session["reason"].as_str().unwrap_or("evidence_unknown"),
+            session["stage"].as_str().unwrap_or("blocked")
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = paths;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn deferred_status(paths: &config::Paths) -> Vec<serde_json::Value> {
+    match claudectl::central::restart_gate::deferred_sessions(paths) {
+        Ok(rows) => rows,
+        Err(_) => vec![serde_json::json!({
+            "run": "unknown",
+            "deferred": true,
+            "reason": "evidence_unknown",
+            "stage": "blocked",
+            "attention_required": true
+        })],
+    }
 }
 
 /// The status error of a profile whose account moved to the account server.

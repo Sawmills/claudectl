@@ -3,6 +3,8 @@
 //! `--resume <session>` on the new token, only at an idle point.
 use std::ffi::{OsStr, OsString};
 
+use super::atomic;
+
 /// Idle time after the last turn before a restart (ms).
 pub(super) const IDLE_AFTER_STOP_MS: i64 = 60_000;
 /// No terminal input for this long before a restart (ms): protects a draft being typed.
@@ -305,9 +307,8 @@ pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     if !dead && i.tty_idle_ms.is_some_and(|ms| ms < i.tty_gate_ms) {
         return Err("terminal input in the last 5 min");
     }
-    // Extra processes (an LSP, caffeinate, background shells) do not block: a restart happens
-    // only when the held token was superseded or expired, so it is dead for every holder, and
-    // a gate on them left idle tabs on a dead token for good (SAW-12610).
+    // restart_gate separately protects task-output descendants and explicit holds.
+    // MCP/LSP/caffeinate helpers without task output never block admission.
     if i.restarts_last_hour >= RESTARTS_PER_HOUR {
         return Err("restart budget used up for this hour");
     }
@@ -397,10 +398,34 @@ pub(super) fn record_hook(
 ) -> anyhow::Result<()> {
     use std::io::Write;
     let dir = session_dir(sessions, dir)?;
+    let pending = dir.join(format!("hook-pending.{}", std::process::id()));
+    #[cfg(unix)]
+    let _hook_admission = match super::restart_gate::hook_admission(&dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            mark_hook_error(&dir);
+            return Err(error);
+        }
+    };
+    if let Err(error) = atomic(&pending, &serde_json::json!({"pid": std::process::id()})) {
+        mark_hook_error(&dir);
+        let _ = std::fs::remove_file(&pending);
+        return Err(error);
+    }
+    #[cfg(unix)]
+    let _admission = match super::restart_gate::admission(&dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            mark_hook_error(&dir);
+            let _ = std::fs::remove_file(&pending);
+            return Err(error);
+        }
+    };
     let v: serde_json::Value = match serde_json::from_str(input) {
         Ok(v) => v,
         Err(error) => {
             mark_hook_error(&dir);
+            let _ = std::fs::remove_file(&pending);
             return Err(error.into());
         }
     };
@@ -423,6 +448,7 @@ pub(super) fn record_hook(
     #[cfg(unix)]
     if let Err(error) = super::crons::record_transcript(&dir, &v) {
         mark_hook_error(&dir);
+        let _ = std::fs::remove_file(&pending);
         return Err(error);
     }
     let path = dir.join("events");
@@ -438,8 +464,10 @@ pub(super) fn record_hook(
         .and_then(|mut file| writeln!(file, "{line}"));
     if let Err(error) = written {
         mark_hook_error(&dir);
+        let _ = std::fs::remove_file(&pending);
         return Err(error.into());
     }
+    std::fs::remove_file(pending).ok();
     Ok(())
 }
 
@@ -948,6 +976,65 @@ mod tests {
         let input = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#;
         assert!(record_hook(&sessions, &dir, input, 1).is_err());
         assert!(dir.join("hook-error").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_that_cannot_lock_admission_leaves_the_error_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        let dir = sessions.join("run-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(dir.join("restart.lock")).unwrap();
+        assert!(
+            record_hook(
+                &sessions,
+                &dir,
+                r#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#,
+                1
+            )
+            .is_err()
+        );
+        assert!(dir.join("hook-error").exists());
+        assert!(!dir.join("events").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_publishes_pending_only_after_hook_admission_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let dir = sessions.join("run-hook-lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = super::super::restart_gate::hook_admission(&dir).unwrap();
+        std::fs::remove_file(dir.join("hook.lock.opened")).unwrap();
+        let worker = std::thread::spawn({
+            let sessions = sessions.clone();
+            let dir = dir.clone();
+            move || {
+                record_hook(
+                    &sessions,
+                    &dir,
+                    r#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#,
+                    1,
+                )
+            }
+        });
+        let opened = dir.join("hook.lock.opened");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !opened.exists() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(opened.exists(), "hook worker did not open hook.lock");
+        assert!(!std::fs::read_dir(&dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("hook-pending.")
+        }));
+        drop(lock);
+        assert!(worker.join().unwrap().is_ok());
     }
 
     #[test]

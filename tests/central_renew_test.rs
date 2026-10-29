@@ -183,6 +183,43 @@ def term(*_):
         out.write(status.get("renewal", ""))
     sys.exit(143)
 signal.signal(signal.SIGTERM, term)
+if os.environ.get("FAKE_BAD_EVENT"):
+    with open(os.path.join(os.path.dirname(settings), "events"), "a") as events:
+        events.write(os.environ["FAKE_BAD_EVENT"])
+hold_open = bool(os.environ.get("FAKE_HOLD")) and token == "token-1"
+if hold_open:
+    start = [os.environ["FAKE_WRAPPER_BIN"], "hold", "start", "--reason", "FLT-553 synthetic prod step"]
+    if os.environ.get("FAKE_STALE_HOLD"):
+        subprocess.run([sys.executable, "-c", "import subprocess,sys; subprocess.run(sys.argv[1:], check=True)"] + start, check=True)
+        run = os.path.basename(os.environ["CLAUDECTL_SERVER_RUN"])
+        path = os.path.join(os.environ["HOME"], ".claudectl", "server", "holds", run + ".json")
+        saved = json.load(open(path))
+        saved["owner_started"] = "previous wrapper incarnation"
+        with open(path, "w") as out:
+            json.dump(saved, out)
+    else:
+        subprocess.run(["/bin/sh", "-c", '"$@"; :', "hold-shell"] + start, check=True)
+if os.environ.get("FAKE_TASK_CHILD") and token == "token-1":
+    if os.environ.get("FAKE_TASK_DURING_READ"):
+        open(os.environ["FAKE_LOG"] + ".ready", "w").close()
+        deadline = time.monotonic() + 10
+        while not os.path.exists(os.environ["FAKE_LOG"] + ".inflight") and time.monotonic() < deadline:
+            time.sleep(0.02)
+    # Claude's background Bash/Monitor owns an output file, unlike an MCP or LSP.
+    task_dir = os.path.join(os.environ["TMPDIR"], "claude-" + str(os.getuid()), "project", "tasks")
+    os.makedirs(task_dir, exist_ok=True)
+    with open(os.path.join(task_dir, "background.output"), "w") as output:
+        subprocess.Popen([sys.executable, "-c", '''
+import os, time
+release = os.environ["FAKE_LOG"] + ".task-release"
+deadline = time.monotonic() + 15
+while not os.path.exists(release) and time.monotonic() < deadline:
+    time.sleep(0.02)
+if os.path.exists(release):
+    open(os.environ["FAKE_LOG"] + ".task-done", "w").close()
+'''], stdout=output, stderr=output)
+    if os.environ.get("FAKE_TASK_DURING_READ"):
+        open(os.environ["FAKE_LOG"] + ".ended", "w").close()
 if os.environ.get("FAKE_EXTRA_CHILD") and token == "token-1":
     # An LSP, caffeinate or a background shell: it joins Claude's group after the monitor
     # took its baseline, and never leaves.
@@ -208,6 +245,10 @@ with open(os.environ["FAKE_LOG"] + ".ready", "w") as ready:
 # A watchdog: a build that never restarts fails the test instead of hanging it.
 deadline = time.time() + float(os.environ.get("FAKE_WATCHDOG_S", "20"))
 while time.time() < deadline:
+    if hold_open and os.path.exists(os.environ["FAKE_LOG"] + ".task-release"):
+        subprocess.run([os.environ["FAKE_WRAPPER_BIN"], "hold", "end"], check=True)
+        open(os.environ["FAKE_LOG"] + ".task-done", "w").close()
+        hold_open = False
     time.sleep(0.05)
 sys.exit(99)
 "#;
@@ -1045,6 +1086,12 @@ fn a_busy_claude_never_triggers_a_token_request() {
     );
     // Only the launch asked for a token.
     assert_eq!(env.fake.lock().unwrap().requests.len(), 1);
+    // A turn that is not eligible for renewal does not create a deferred-restart decision.
+    let journal = env
+        .home
+        .path()
+        .join(".claudectl/server/restart-decisions.jsonl");
+    assert!(!journal.exists());
 }
 
 /// A prompt that arrives while the token request is in flight: the monitor checks activity
@@ -1135,7 +1182,7 @@ fn inside_the_refresh_window_the_monitor_only_observes() {
     assert!(fake.observes[1..].iter().all(|o| *o), "{:?}", fake.observes);
 }
 
-/// Extra processes in Claude's group (an LSP, caffeinate, a background shell) never block
+/// Helpers in Claude's group (an LSP, MCP server or caffeinate) never block
 /// following a revision another session's refresh superseded before expiry (SAW-12610,
 /// 10-08 17:08 repro).
 #[test]
@@ -1163,6 +1210,216 @@ fn an_idle_claude_with_extra_processes_follows_an_early_refresh() {
     let runs = env.runs();
     assert_eq!(runs.len(), 2, "{runs:?}");
     assert_eq!(runs[1]["token"], "token-2");
+}
+
+/// A completed foreground turn does not authorize killing a live production task.
+#[test]
+fn renewal_waits_for_a_live_task_output_child() {
+    guarded_renewal("FAKE_TASK_CHILD", "background_task", "deferred", false);
+}
+
+#[test]
+fn damaged_hook_evidence_never_authorizes_a_restart_from_cached_idle_state() {
+    for damaged in [
+        r#"{"at":3,"event":"UserPromptSubmit""#,
+        "damaged record\n",
+        "{\"at\":3,\"event\":\"UserPromptSubmit\",\"session_id\":null}\n",
+    ] {
+        let env = Env::new();
+        let refresher = env.refresh_when_idle();
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+        env.env(&mut command);
+        command
+            .env("FAKE_BAD_EVENT", damaged)
+            .env("FAKE_WATCHDOG_S", "3")
+            .args(["server", "run", "work", "--claude"])
+            .arg(&env.claude);
+        let output = Command::from_std(command)
+            .timeout(std::time::Duration::from_secs(15))
+            .output()
+            .unwrap();
+        refresher.join().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(99),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(env.runs().len(), 1);
+        let journal = std::fs::read_to_string(
+            env.home
+                .path()
+                .join(".claudectl/server/restart-decisions.jsonl"),
+        )
+        .unwrap();
+        assert!(journal.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|row| row["reason"] == "evidence_unknown")
+        }));
+    }
+}
+
+#[test]
+fn a_task_started_during_the_provider_request_cancels_renewal() {
+    guarded_renewal(
+        "FAKE_TASK_DURING_READ",
+        "background_task",
+        "deferred",
+        false,
+    );
+}
+
+#[test]
+fn an_explicit_hold_defers_until_its_matching_end() {
+    guarded_renewal("FAKE_HOLD", "explicit_hold", "deferred", false);
+}
+
+#[test]
+fn a_stale_hold_is_reported_and_never_automatically_cleared() {
+    guarded_renewal("FAKE_HOLD", "stale_hold", "blocked", true);
+}
+
+#[test]
+fn an_expired_token_never_overrides_a_live_background_task() {
+    guarded_renewal("FAKE_TASK_CHILD", "background_task", "blocked", false);
+}
+
+fn guarded_renewal(flag: &str, reason: &str, stage: &str, stale: bool) {
+    let env = Env::new();
+    if stage == "blocked" && !stale {
+        env.fake.lock().unwrap().first_life_ms = Some(3_000);
+    }
+    if flag == "FAKE_TASK_DURING_READ" {
+        env.fake.lock().unwrap().handshake = Some(env.log.clone());
+    }
+    let refresher = env.refresh_when_idle();
+    let temporary = env.home.path().join("tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+    env.env(&mut command);
+    command
+        .env("TMPDIR", temporary)
+        .env(flag, "1")
+        .env(
+            "FAKE_WRAPPER_BIN",
+            assert_cmd::cargo::cargo_bin("claudectl"),
+        )
+        .args(["server", "run", "work", "--claude"])
+        .arg(&env.claude)
+        .args(["--", "--model", "opus"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if stale {
+        command.env("FAKE_STALE_HOLD", "1");
+    }
+    if flag == "FAKE_TASK_DURING_READ" {
+        command.env("FAKE_TASK_CHILD", "1");
+    }
+    let mut child = command.spawn().unwrap();
+    let journal = env
+        .home
+        .path()
+        .join(".claudectl/server/restart-decisions.jsonl");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut deferred = false;
+    while std::time::Instant::now() < deadline {
+        deferred = std::fs::read_to_string(&journal).is_ok_and(|text| {
+            text.lines().any(|line| {
+                serde_json::from_str::<Value>(line).is_ok_and(|record| {
+                    record["event"] == "restart_deferred"
+                        && record["reason"] == reason
+                        && record["stage"] == stage
+                })
+            })
+        });
+        if deferred {
+            deferred = env
+                .runs()
+                .first()
+                .and_then(|run| run["run"].as_str())
+                .is_some_and(|run| {
+                    std::fs::read(Path::new(run).join("restart-status.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .is_some_and(|state| state["reason"] == reason && state["stage"] == stage)
+                });
+        }
+        if deferred || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let status_command = if deferred {
+        let run = env.runs()[0]["run"].as_str().unwrap().to_owned();
+        let mut status = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+        env.env(&mut status);
+        status.env("CLAUDECTL_SERVER_RUN", run).arg("statusline");
+        Some(status.output().unwrap())
+    } else {
+        None
+    };
+    let report_command = if deferred {
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+        env.env(&mut command);
+        command.args(["status", "--cached", "--json"]);
+        Some(command.output().unwrap())
+    } else {
+        None
+    };
+    // Release the task/hold before asserting, so even a failing wrapper is reaped.
+    std::fs::write(env.log.with_extension("log.task-release"), "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    refresher.join().unwrap();
+    assert!(
+        deferred,
+        "renewal restarted while a task-output child was live: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        env.log.with_extension("log.task-done").exists(),
+        "background task was killed"
+    );
+    let status = status_command.unwrap();
+    assert!(String::from_utf8_lossy(&status.stdout).contains("restart deferred:"));
+    if stale {
+        assert!(String::from_utf8_lossy(&status.stdout).contains("stale_hold"));
+    }
+    let report = report_command.unwrap();
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let report: Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert!(
+        report["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["reason"] == reason && s["stage"] == stage)
+    );
+    let records: Vec<Value> = std::fs::read_to_string(journal)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let relevant: Vec<_> = records.iter().filter(|r| r["reason"] == reason).collect();
+    assert_eq!(
+        relevant.iter().filter(|r| r["stage"] == stage).count(),
+        1,
+        "repeated polls must not count a decision twice: {relevant:?}"
+    );
+    assert!(relevant.iter().all(|r| r["metric"]["value"] == 1));
+    assert!(
+        relevant
+            .iter()
+            .all(|r| r["metric"]["labels"].get("session_id").is_none())
+    );
+    if stage == "blocked" && !stale {
+        assert!(relevant.iter().any(|r| r["stage"] == "warn"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("attention required"));
+    }
+    assert_eq!(output.status.code(), Some(7));
+    env.assert_followed(&env.runs(), "token-2");
 }
 
 /// A clean /exit ends `server run`, even when a token request in flight across the
