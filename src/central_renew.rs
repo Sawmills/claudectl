@@ -3,6 +3,8 @@
 //! `--resume <session>` on the new token, only at an idle point.
 use std::ffi::{OsStr, OsString};
 
+use super::atomic;
+
 /// Idle time after the last turn before a restart (ms).
 pub(super) const IDLE_AFTER_STOP_MS: i64 = 60_000;
 /// No terminal input for this long before a restart (ms): protects a draft being typed.
@@ -396,11 +398,17 @@ pub(super) fn record_hook(
 ) -> anyhow::Result<()> {
     use std::io::Write;
     let dir = session_dir(sessions, dir)?;
+    let pending = dir.join("hook-pending");
+    if let Err(error) = atomic(&pending, &serde_json::json!({"pid": std::process::id()})) {
+        mark_hook_error(&dir);
+        return Err(error);
+    }
     #[cfg(unix)]
     let _admission = match super::restart_gate::admission(&dir) {
         Ok(lock) => lock,
         Err(error) => {
             mark_hook_error(&dir);
+            let _ = std::fs::remove_file(&pending);
             return Err(error);
         }
     };
@@ -408,6 +416,7 @@ pub(super) fn record_hook(
         Ok(v) => v,
         Err(error) => {
             mark_hook_error(&dir);
+            let _ = std::fs::remove_file(&pending);
             return Err(error.into());
         }
     };
@@ -430,6 +439,7 @@ pub(super) fn record_hook(
     #[cfg(unix)]
     if let Err(error) = super::crons::record_transcript(&dir, &v) {
         mark_hook_error(&dir);
+        let _ = std::fs::remove_file(&pending);
         return Err(error);
     }
     let path = dir.join("events");
@@ -445,8 +455,10 @@ pub(super) fn record_hook(
         .and_then(|mut file| writeln!(file, "{line}"));
     if let Err(error) = written {
         mark_hook_error(&dir);
+        let _ = std::fs::remove_file(&pending);
         return Err(error.into());
     }
+    std::fs::remove_file(pending).ok();
     Ok(())
 }
 
