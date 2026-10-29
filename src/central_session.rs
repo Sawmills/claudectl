@@ -796,9 +796,7 @@ impl Monitor {
                         sent = Some((now(), Restart { kind, session_id }));
                     }
                     Ok(false) => break,
-                    Err(()) => {
-                        continue;
-                    }
+                    Err(()) => continue,
                 }
             }
         }
@@ -830,6 +828,13 @@ impl Monitor {
         timing: &super::renew::Timing,
         cause: super::restart_gate::Cause,
     ) -> std::result::Result<bool, ()> {
+        let _hook_admission = match super::restart_gate::hook_admission(&self.directory) {
+            Ok(lock) => lock,
+            Err(_) => {
+                gate.unknown(&activity.idle, cause, self.held_expires_at);
+                return Err(());
+            }
+        };
         let _admission = match super::restart_gate::admission(&self.directory) {
             Ok(lock) => lock,
             Err(_) => {
@@ -857,10 +862,10 @@ impl Monitor {
         if atomic(&self.directory.join("session.json"), &status).is_err() {
             return Err(());
         }
-        // A prompt hook can publish its pending marker after the first gate check while
-        // this admission lock is held. Re-check after publishing the renewing state and
-        // before SIGTERM so a queued prompt wins over the restart. Restore the visible
-        // state if the final check defers.
+        // The hook lock serializes marker publication with this final admission boundary.
+        // A hook that acquired it before this path is visible to the checks below; a hook
+        // that arrives after the lock is held waits until the signal decision is complete.
+        // Re-check all evidence after publishing the renewing state and before SIGTERM.
         if !gate.check(&activity.idle, cause, self.held_expires_at) {
             let mut status = self.status.clone();
             status["renewal"] = "on".into();
@@ -932,6 +937,17 @@ impl Monitor {
                 let access = self.client.acquire(&account.account_id, None).ok()?;
                 // All remote reads have completed. Do not reserve an account for work
                 // that became busy during them; the signal still has its final admission.
+                let _hook_admission = match super::restart_gate::hook_admission(&self.directory) {
+                    Ok(lock) => lock,
+                    Err(_) => {
+                        gate.unknown(
+                            &activity.idle,
+                            super::restart_gate::Cause::Failover,
+                            self.held_expires_at,
+                        );
+                        return None;
+                    }
+                };
                 let _admission = match super::restart_gate::admission(&self.directory) {
                     Ok(lock) => lock,
                     Err(_) => {

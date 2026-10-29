@@ -22,6 +22,24 @@ pub(super) fn admission(directory: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Serialize hook publication with the final restart admission. Every caller acquires this
+/// lock before `restart.lock`, so a hook cannot publish between the final evidence sample and
+/// SIGTERM.
+pub(super) fn hook_admission(directory: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(directory.join("hook.lock"))?;
+    #[cfg(test)]
+    let _ = File::create(directory.join("hook.lock.opened"));
+    file.lock()?;
+    Ok(file)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Cause {
@@ -371,7 +389,18 @@ fn hook_pending(directory: &Path) -> Result<Option<u32>> {
         else {
             continue;
         };
-        let saved = serde_json::from_slice::<Value>(&private_read(&path)?)?["pid"]
+        let bytes = match private_read(&path) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let saved = serde_json::from_slice::<Value>(&bytes)?["pid"]
             .as_u64()
             .context("hook pending PID unavailable")?;
         let saved = u32::try_from(saved).context("hook pending PID invalid")?;
@@ -399,15 +428,38 @@ fn process_live(pid: u32) -> Result<bool> {
 }
 
 fn production_step(home: &Path) -> Result<bool> {
-    let Some(goal) =
-        std::env::var_os("LANE_GOAL_FILE").or_else(|| std::env::var_os("SAW_GOAL_FILE"))
-    else {
-        return Ok(false);
-    };
+    let goal = std::env::var_os("LANE_GOAL_FILE")
+        .or_else(|| std::env::var_os("SAW_GOAL_FILE"))
+        .map(PathBuf::from);
     let lane = std::env::var("HERDR_TAB_ID")
         .or_else(|_| std::env::var("HERDR_PANE_ID"))
-        .context("lane identity unavailable for production markers")?;
-    let mut sources = vec![PathBuf::from(goal)];
+        .ok();
+    production_step_with_lane(home, goal, lane)
+}
+
+fn production_step_with_lane(
+    home: &Path,
+    goal: Option<PathBuf>,
+    lane: Option<String>,
+) -> Result<bool> {
+    let has_goal = goal.is_some();
+    let sources = production_sources(home, goal);
+    if sources.is_empty() {
+        return Ok(false);
+    }
+    let Some(lane) = lane else {
+        // Machine-wide outboxes are meaningful only when this process identifies its lane.
+        // A standalone terminal with no goal file must retain the pre-marker behavior.
+        if !has_goal {
+            return Ok(false);
+        }
+        bail!("lane identity unavailable for production markers");
+    };
+    production_markers_from_paths(&lane, &sources)
+}
+
+fn production_sources(home: &Path, goal: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut sources = goal.into_iter().collect::<Vec<_>>();
     let root = home.join("Code/.fleet/voice-between");
     for name in ["agents-cases-outbox.md", "slack-outbox.md"] {
         let path = root.join(name);
@@ -415,7 +467,7 @@ fn production_step(home: &Path) -> Result<bool> {
             sources.push(path);
         }
     }
-    production_markers_from_paths(&lane, &sources)
+    sources
 }
 
 fn production_markers_from_paths(lane: &str, sources: &[PathBuf]) -> Result<bool> {
@@ -1074,6 +1126,30 @@ mod tests {
     fn unreadable_marker_sources_fail_closed() {
         let missing = PathBuf::from("/definitely/missing/FLT-553-goal.md");
         assert!(production_markers_from_paths("w28:t1", &[missing]).is_err());
+    }
+
+    #[test]
+    fn outbox_markers_are_considered_without_a_goal_file() {
+        let home = tempfile::tempdir().unwrap();
+        let outbox = home
+            .path()
+            .join("Code/.fleet/voice-between/agents-cases-outbox.md");
+        std::fs::create_dir_all(outbox.parent().unwrap()).unwrap();
+        std::fs::write(&outbox, "- w28:t1 [starting] FLT-553 migration\n").unwrap();
+        assert!(production_sources(home.path(), None).contains(&outbox));
+        assert!(production_markers_from_paths("w28:t1", &[outbox]).unwrap());
+    }
+
+    #[test]
+    fn outboxes_without_a_lane_do_not_block_standalone_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let outbox = home
+            .path()
+            .join("Code/.fleet/voice-between/agents-cases-outbox.md");
+        std::fs::create_dir_all(outbox.parent().unwrap()).unwrap();
+        std::fs::write(&outbox, "- w28:t1 [starting] FLT-553 migration\n").unwrap();
+        assert!(!production_step_with_lane(home.path(), None, None).unwrap());
+        assert!(production_step_with_lane(home.path(), None, Some("w28:t1".into())).unwrap());
     }
 
     #[test]

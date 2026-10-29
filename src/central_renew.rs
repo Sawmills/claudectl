@@ -399,6 +399,14 @@ pub(super) fn record_hook(
     use std::io::Write;
     let dir = session_dir(sessions, dir)?;
     let pending = dir.join(format!("hook-pending.{}", std::process::id()));
+    #[cfg(unix)]
+    let _hook_admission = match super::restart_gate::hook_admission(&dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            mark_hook_error(&dir);
+            return Err(error);
+        }
+    };
     if let Err(error) = atomic(&pending, &serde_json::json!({"pid": std::process::id()})) {
         mark_hook_error(&dir);
         let _ = std::fs::remove_file(&pending);
@@ -989,6 +997,44 @@ mod tests {
         );
         assert!(dir.join("hook-error").exists());
         assert!(!dir.join("events").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_publishes_pending_only_after_hook_admission_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let dir = sessions.join("run-hook-lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = super::super::restart_gate::hook_admission(&dir).unwrap();
+        std::fs::remove_file(dir.join("hook.lock.opened")).unwrap();
+        let worker = std::thread::spawn({
+            let sessions = sessions.clone();
+            let dir = dir.clone();
+            move || {
+                record_hook(
+                    &sessions,
+                    &dir,
+                    r#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#,
+                    1,
+                )
+            }
+        });
+        let opened = dir.join("hook.lock.opened");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !opened.exists() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(opened.exists(), "hook worker did not open hook.lock");
+        assert!(!std::fs::read_dir(&dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("hook-pending.")
+        }));
+        drop(lock);
+        assert!(worker.join().unwrap().is_ok());
     }
 
     #[test]
