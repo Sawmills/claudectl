@@ -1,6 +1,7 @@
 //! Admission for automatic renewal/failover. Workload evidence never authorizes a signal
 //! on an I/O failure, and an expired token never overrides active work.
 use super::*;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::os::unix::{
     ffi::OsStrExt,
@@ -99,6 +100,7 @@ pub(super) struct Gate {
     unknown_evidence: bool,
     quiet: Option<ObservedQuiet>,
     terminal: Option<PathBuf>,
+    production: ProductionEvidence,
 }
 
 impl Gate {
@@ -121,6 +123,7 @@ impl Gate {
             unknown_evidence: false,
             quiet: None,
             terminal: None,
+            production: ProductionEvidence::default(),
         }
     }
 
@@ -176,7 +179,7 @@ impl Gate {
         } else if held.is_err() || idle.session.is_none() || idle.ended.is_some() {
             Some(Reason::EvidenceUnknown)
         } else {
-            match production_step(&self.home) {
+            match self.production.check(&self.home) {
                 Ok(true) => Some(Reason::OpenProductionStep),
                 Err(_) => Some(Reason::EvidenceUnknown),
                 Ok(false) if idle.since.is_none() => Some(Reason::RunningTurn),
@@ -502,55 +505,105 @@ fn process_live(pid: u32) -> Result<bool> {
     }
 }
 
-fn production_step(home: &Path) -> Result<bool> {
-    let goal = std::env::var_os("LANE_GOAL_FILE")
-        .or_else(|| std::env::var_os("SAW_GOAL_FILE"))
-        .map(PathBuf::from);
-    let lane = std::env::var("HERDR_TAB_ID")
-        .or_else(|_| std::env::var("HERDR_PANE_ID"))
-        .ok();
-    production_step_with_lane(home, goal, lane)
+/// Per-child source history. Keep only fingerprints and open state, never source text.
+#[derive(Default)]
+struct ProductionEvidence {
+    sources: BTreeMap<PathBuf, Option<MarkerSnapshot>>,
 }
 
+struct MarkerSnapshot {
+    length: usize,
+    digest: [u8; 32],
+    open: bool,
+}
+
+impl ProductionEvidence {
+    fn check(&mut self, home: &Path) -> Result<bool> {
+        let goal = std::env::var_os("LANE_GOAL_FILE")
+            .or_else(|| std::env::var_os("SAW_GOAL_FILE"))
+            .map(PathBuf::from);
+        let lane = std::env::var("HERDR_TAB_ID")
+            .or_else(|_| std::env::var("HERDR_PANE_ID"))
+            .ok();
+        self.for_lane(home, goal, lane)
+    }
+
+    fn for_lane(
+        &mut self,
+        home: &Path,
+        goal: Option<PathBuf>,
+        lane: Option<String>,
+    ) -> Result<bool> {
+        // Standalone sessions do not consume machine-wide lane outboxes.
+        if goal.is_none() && lane.is_none() {
+            return Ok(false);
+        }
+        let lane = lane.context("lane identity unavailable for production markers")?;
+        let mut sources = goal.into_iter().collect::<Vec<_>>();
+        for path in &sources {
+            self.sources.entry(path.clone()).or_default();
+        }
+        let root = home.join("Code/.fleet/voice-between");
+        for name in ["agents-cases-outbox.md", "slack-outbox.md"] {
+            let path = root.join(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    self.sources.entry(path.clone()).or_default();
+                    sources.push(path);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    self.sources.entry(path).or_default();
+                    return Err(error.into());
+                }
+            }
+        }
+        // Once observed, a source cannot silently become optional again.
+        sources.extend(self.sources.keys().cloned());
+        sources.sort();
+        sources.dedup();
+        let mut open = false;
+        for path in sources {
+            let text = std::fs::read_to_string(&path)?;
+            if let Some(Some(previous)) = self.sources.get(&path) {
+                let same_prefix = text
+                    .as_bytes()
+                    .get(..previous.length)
+                    .is_some_and(|prefix| {
+                        let digest: [u8; 32] = Sha256::digest(prefix).into();
+                        digest == previous.digest
+                    });
+                if previous.open && !same_prefix {
+                    // Do not replace this checkpoint: another poll must not accept
+                    // rewritten or truncated evidence as proof of completion.
+                    bail!("open production marker history was replaced");
+                }
+            }
+            let source_open = production_markers(&lane, std::slice::from_ref(&text));
+            self.sources.insert(
+                path,
+                Some(MarkerSnapshot {
+                    length: text.len(),
+                    digest: Sha256::digest(text.as_bytes()).into(),
+                    open: source_open,
+                }),
+            );
+            open |= source_open;
+        }
+        Ok(open)
+    }
+}
+
+#[cfg(test)]
 fn production_step_with_lane(
     home: &Path,
     goal: Option<PathBuf>,
     lane: Option<String>,
 ) -> Result<bool> {
-    let has_goal = goal.is_some();
-    // Standalone sessions do not consume machine-wide lane outboxes.
-    if !has_goal && lane.is_none() {
-        return Ok(false);
-    }
-    let sources = production_sources(home, goal)?;
-    if sources.is_empty() {
-        return Ok(false);
-    }
-    let Some(lane) = lane else {
-        // Machine-wide outboxes are meaningful only when this process identifies its lane.
-        // A standalone terminal with no goal file must retain the pre-marker behavior.
-        if !has_goal {
-            return Ok(false);
-        }
-        bail!("lane identity unavailable for production markers");
-    };
-    production_markers_from_paths(&lane, &sources)
+    ProductionEvidence::default().for_lane(home, goal, lane)
 }
 
-fn production_sources(home: &Path, goal: Option<PathBuf>) -> Result<Vec<PathBuf>> {
-    let mut sources = goal.into_iter().collect::<Vec<_>>();
-    let root = home.join("Code/.fleet/voice-between");
-    for name in ["agents-cases-outbox.md", "slack-outbox.md"] {
-        let path = root.join(name);
-        match std::fs::symlink_metadata(&path) {
-            Ok(_) => sources.push(path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(sources)
-}
-
+#[cfg(test)]
 fn production_markers_from_paths(lane: &str, sources: &[PathBuf]) -> Result<bool> {
     let mut texts = Vec::new();
     for path in sources {
@@ -560,8 +613,10 @@ fn production_markers_from_paths(lane: &str, sources: &[PathBuf]) -> Result<bool
 }
 
 fn production_markers(lane: &str, texts: &[String]) -> bool {
-    let mut open = HashSet::new();
-    for text in texts {
+    // File order is not event order. A DONE in another source cannot prove
+    // that this source's current production step completed.
+    texts.iter().any(|text| {
+        let mut open = HashSet::new();
         for line in text.lines() {
             if !line_has_lane(line, lane) {
                 continue;
@@ -575,8 +630,8 @@ fn production_markers(lane: &str, texts: &[String]) -> bool {
                 open.remove(&key);
             }
         }
-    }
-    !open.is_empty()
+        !open.is_empty()
+    })
 }
 
 fn line_has_lane(line: &str, lane: &str) -> bool {
@@ -1481,7 +1536,7 @@ mod tests {
             "- w28:t1 [done] FLT-553 migration\n".to_string(),
         ];
         assert!(production_markers("w28:t1", &texts[..1]));
-        assert!(!production_markers("w28:t1", &texts));
+        assert!(!production_markers("w28:t1", &[texts.concat()]));
 
         let repeated = vec![
             "- w28:t1 [done] FLT-553 migration\n".to_string(),
@@ -1526,6 +1581,135 @@ mod tests {
     fn unreadable_marker_sources_fail_closed() {
         let missing = PathBuf::from("/definitely/missing/FLT-553-goal.md");
         assert!(production_markers_from_paths("w28:t1", &[missing]).is_err());
+    }
+
+    #[test]
+    fn rewritten_open_marker_history_stays_unknown_across_repeated_samples() {
+        for replacement in ["", "w28:t1 [done] FLT-553 migration\n"] {
+            let home = tempfile::tempdir().unwrap();
+            let folder = home.path().join("Code/.fleet/voice-between");
+            private_dir(&folder).unwrap();
+            let outbox = folder.join("agents-cases-outbox.md");
+            let starting = "w28:t1 [starting] FLT-553 migration\n";
+            std::fs::write(&outbox, starting).unwrap();
+            let mut evidence = ProductionEvidence::default();
+            assert!(
+                evidence
+                    .for_lane(home.path(), None, Some("w28:t1".into()))
+                    .unwrap()
+            );
+            std::fs::write(&outbox, replacement).unwrap();
+            for _ in 0..2 {
+                assert!(
+                    evidence
+                        .for_lane(home.path(), None, Some("w28:t1".into()))
+                        .is_err(),
+                    "rewrites must not replace the trusted open checkpoint"
+                );
+            }
+            std::fs::write(
+                &outbox,
+                format!("{starting}w28:t1 [done] FLT-553 migration\n"),
+            )
+            .unwrap();
+            assert!(
+                !evidence
+                    .for_lane(home.path(), None, Some("w28:t1".into()))
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn an_observed_unreadable_outbox_cannot_become_optional_by_disappearing() {
+        let home = tempfile::tempdir().unwrap();
+        let outbox = home
+            .path()
+            .join("Code/.fleet/voice-between/agents-cases-outbox.md");
+        private_dir(&outbox).unwrap(); // A directory cannot be read as marker text.
+        let mut evidence = ProductionEvidence::default();
+        assert!(
+            evidence
+                .for_lane(home.path(), None, Some("w28:t1".into()))
+                .is_err()
+        );
+        std::fs::remove_dir(&outbox).unwrap();
+        assert!(
+            evidence
+                .for_lane(home.path(), None, Some("w28:t1".into()))
+                .is_err()
+        );
+        std::fs::write(&outbox, "").unwrap();
+        assert!(
+            !evidence
+                .for_lane(home.path(), None, Some("w28:t1".into()))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn known_outbox_loss_keeps_production_evidence_unknown_until_history_is_restored() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("Code/.fleet/voice-between");
+        private_dir(&folder).unwrap();
+        let outbox = folder.join("agents-cases-outbox.md");
+        let starting = "w28:t1 [starting] FLT-553 migration\n";
+        std::fs::write(&outbox, starting).unwrap();
+        let mut evidence = ProductionEvidence::default();
+        assert!(
+            evidence
+                .for_lane(home.path(), None, Some("w28:t1".into()))
+                .unwrap()
+        );
+        std::fs::remove_file(&outbox).unwrap();
+        for _ in 0..2 {
+            assert!(
+                evidence
+                    .for_lane(home.path(), None, Some("w28:t1".into()))
+                    .is_err(),
+                "losing an observed source cannot close its production step"
+            );
+        }
+        std::fs::write(
+            &outbox,
+            format!("{starting}w28:t1 [done] FLT-553 migration\n"),
+        )
+        .unwrap();
+        assert!(
+            !evidence
+                .for_lane(home.path(), None, Some("w28:t1".into()))
+                .unwrap(),
+            "restoring history with an appended matching DONE permits recovery"
+        );
+    }
+
+    #[test]
+    fn historical_done_in_another_source_does_not_clear_a_current_step() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("Code/.fleet/voice-between");
+        private_dir(&folder).unwrap();
+        std::fs::write(
+            folder.join("slack-outbox.md"),
+            "w28:t1 [done] FLT-553 migration 2026-11-06T23:00Z\n",
+        )
+        .unwrap();
+        let goal = home.path().join("goal.md");
+        let starting = "w28:t1 [starting] FLT-553 migration 2026-11-07T01:20Z\n";
+        std::fs::write(&goal, starting).unwrap();
+        assert!(
+            production_step_with_lane(home.path(), Some(goal.clone()), Some("w28:t1".into()))
+                .unwrap(),
+            "an old DONE elsewhere cannot clear this source's newer START"
+        );
+        std::fs::write(
+            &goal,
+            format!("{starting}w28:t1 [done] FLT-553 migration\n"),
+        )
+        .unwrap();
+        assert!(
+            !production_step_with_lane(home.path(), Some(goal), Some("w28:t1".into())).unwrap(),
+            "completion in the same source must retain idle recovery"
+        );
     }
 
     #[test]
@@ -1577,11 +1761,7 @@ mod tests {
             .join("Code/.fleet/voice-between/agents-cases-outbox.md");
         std::fs::create_dir_all(outbox.parent().unwrap()).unwrap();
         std::fs::write(&outbox, "- w28:t1 [starting] FLT-553 migration\n").unwrap();
-        assert!(
-            production_sources(home.path(), None)
-                .unwrap()
-                .contains(&outbox)
-        );
+        assert!(production_step_with_lane(home.path(), None, Some("w28:t1".into())).unwrap());
         assert!(production_markers_from_paths("w28:t1", &[outbox]).unwrap());
     }
 

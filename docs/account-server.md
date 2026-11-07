@@ -357,6 +357,14 @@ even when no goal file is configured. An open marker defers admission even when 
 no local task-output child. Missing or unreadable marker evidence is reported as
 `evidence_unknown` and keeps admission closed. Restoring clear workload evidence starts a new quiet window; it does not provide
 input-admission proof. Explicit holds remain the preferred production boundary.
+
+Marker history is tracked independently in each source. Append a matching DONE to the same
+file that contains START; a DONE in another file cannot prove which start it completes.
+A previously observed source that disappears stays unknown until restored. Replacing or
+truncating a source while it has an open step also stays unknown across repeated samples.
+Restore the trusted history and append its completion to recover automatic admission.
+If that history cannot be restored, end and relaunch only after the work and cleanup finish.
+The wrapper retains only source paths, lengths, hashes and open state, never the source text.
 An older running wrapper cannot enforce a hold. The command checks the wrapper's recorded
 gate capability and refuses the start if it is absent; installing a new CLI alone does not
 upgrade a wrapper that is already running.
