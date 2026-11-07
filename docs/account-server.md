@@ -353,8 +353,10 @@ starting the production step. Lane skill/runbook adoption is a separate rollout.
 When the lane exports `HERDR_TAB_ID` (or `HERDR_PANE_ID`), the monitor consumes that lane's
 `[starting]`/`STARTING NOW` and matching `[done]`/`DONE` markers from the optional goal file
 (`LANE_GOAL_FILE` or `SAW_GOAL_FILE`) and fleet voice outboxes. Outbox markers are checked
-even when no goal file is configured. An open marker defers admission even when Claude has
-no local task-output child. Missing or unreadable marker evidence is reported as
+even when no goal file is configured. A usable tab ID takes precedence; a blank or unusable
+`HERDR_TAB_ID` falls back to a usable `HERDR_PANE_ID`. Supplied IDs that cannot identify a
+lane report unknown evidence. A standalone session with neither ID and no goal file skips
+lane outboxes. An open marker defers admission even when Claude has no local task-output child. Missing or unreadable marker evidence is reported as
 `evidence_unknown` and keeps admission closed. Restoring clear workload evidence starts a new quiet window; it does not provide
 input-admission proof. Explicit holds remain the preferred production boundary.
 
@@ -411,11 +413,12 @@ Conversations that a `server run` before this model stored in
 `<project>/<session>.jsonl` into `~/.claude/projects/<project>/`; otherwise delete the
 directory.
 
-While Claude runs, the client reads usage every five minutes. It never changes the token
-of the running process. Hook-only sessions defer before token observations, account
-reservations and automatic restart; they do not refresh or replace the held token. Another
-client can still rotate the account's token, so a deferred session may lose API access.
-Plan an owner-controlled exit and relaunch only after its work and cleanup are complete.
+While Claude runs, the client reads usage every five minutes without changing the token
+inside the running process. Automatic renewal and failover wait for ten continuous minutes
+of observed quiet and fresh workload checks. Once eligible, the wrapper can observe the
+available token, reserve a failover account if needed, and restart Claude with the new login.
+Busy or unknown sessions keep the held token, which can expire or be rotated by another
+client. If a session must be ended explicitly, finish its work and cleanup before relaunch.
 The client never replays tools. On server outage, the token of a running session stays
 valid until provider expiry or rejection. Revocation
 stops new acquisitions; it cannot revoke an access token already delivered.

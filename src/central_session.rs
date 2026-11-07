@@ -451,7 +451,7 @@ struct Outcome {
     notice: Option<String>,
 }
 /// Watches one Claude process and publishes workload/expiry status. Automatic renewal
-/// and failover stay deferred while input-owner admission is unproved.
+/// and failover require observed quiet and fresh workload evidence.
 #[cfg(unix)]
 struct Monitor {
     client: Client,

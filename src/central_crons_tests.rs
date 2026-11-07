@@ -1,4 +1,4 @@
-//! Recovery-module coverage retained while hook-only automatic restarts are deferred.
+//! Recovery-module coverage for cron restoration after a renewal restart.
 use super::*;
 use std::ffi::OsStr;
 

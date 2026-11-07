@@ -522,9 +522,33 @@ impl ProductionEvidence {
         let goal = std::env::var_os("LANE_GOAL_FILE")
             .or_else(|| std::env::var_os("SAW_GOAL_FILE"))
             .map(PathBuf::from);
-        let lane = std::env::var("HERDR_TAB_ID")
-            .or_else(|_| std::env::var("HERDR_PANE_ID"))
-            .ok();
+        self.for_environment(
+            home,
+            goal,
+            std::env::var_os("HERDR_TAB_ID"),
+            std::env::var_os("HERDR_PANE_ID"),
+        )
+    }
+
+    fn for_environment(
+        &mut self,
+        home: &Path,
+        goal: Option<PathBuf>,
+        tab: Option<std::ffi::OsString>,
+        pane: Option<std::ffi::OsString>,
+    ) -> Result<bool> {
+        let supplied = tab.is_some() || pane.is_some();
+        let lane = [tab, pane].into_iter().flatten().find_map(|value| {
+            let value = value.into_string().ok()?;
+            let lane = value.trim();
+            let usable = lane.chars().any(|c| c.is_ascii_alphanumeric())
+                && !lane.chars().any(|c| c.is_whitespace() || c.is_control())
+                && lane_token(lane) == lane;
+            usable.then(|| lane.to_owned())
+        });
+        if supplied && lane.is_none() {
+            bail!("usable lane identity unavailable for production markers");
+        }
         self.for_lane(home, goal, lane)
     }
 
@@ -634,11 +658,12 @@ fn production_markers(lane: &str, texts: &[String]) -> bool {
     })
 }
 
+fn lane_token(word: &str) -> &str {
+    word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != ':' && c != '_' && c != '-')
+}
+
 fn line_has_lane(line: &str, lane: &str) -> bool {
-    line.split_whitespace().any(|word| {
-        word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != ':' && c != '_' && c != '-')
-            == lane
-    })
+    line.split_whitespace().any(|word| lane_token(word) == lane)
 }
 
 fn marker_key(line: &str) -> Option<String> {
@@ -1580,6 +1605,100 @@ mod tests {
     fn unreadable_marker_sources_fail_closed() {
         let missing = PathBuf::from("/definitely/missing/FLT-553-goal.md");
         assert!(production_markers_from_paths("w28:t1", &[missing]).is_err());
+    }
+
+    #[test]
+    fn configured_unusable_lane_ids_leave_production_evidence_unknown() {
+        use std::os::unix::ffi::OsStringExt;
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("Code/.fleet/voice-between");
+        private_dir(&folder).unwrap();
+        std::fs::write(
+            folder.join("agents-cases-outbox.md"),
+            "w28:p1 [starting] FLT-553 migration\n",
+        )
+        .unwrap();
+        let mut cases: Vec<(Option<std::ffi::OsString>, Option<std::ffi::OsString>)> = vec![
+            (Some("".into()), None),
+            (Some(" ".into()), Some("\t".into())),
+            (Some("invalid lane".into()), Some("invalid pane".into())),
+            (Some("?".into()), None),
+            (Some("w28:p1,".into()), None),
+        ];
+        cases.push((Some(std::ffi::OsString::from_vec(vec![0xff])), None));
+        for (tab, pane) in cases {
+            assert!(
+                ProductionEvidence::default()
+                    .for_environment(home.path(), None, tab, pane)
+                    .is_err(),
+                "supplied unusable IDs must not be mistaken for a standalone session"
+            );
+        }
+    }
+
+    #[test]
+    fn usable_tab_precedence_pane_fallback_and_standalone_behavior_are_preserved() {
+        use std::os::unix::ffi::OsStringExt;
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("Code/.fleet/voice-between");
+        private_dir(&folder).unwrap();
+        std::fs::write(
+            folder.join("agents-cases-outbox.md"),
+            "w28:p1 [starting] FLT-553 migration\n",
+        )
+        .unwrap();
+        for (tab, pane, open) in [
+            (Some("w28:p1"), Some("w28:p2"), true),
+            (Some("w28:p2"), Some("w28:p1"), false),
+            (Some(" w28:p1 "), Some("w28:p2"), true),
+            (None, Some("w28:p1"), true),
+            (None, None, false),
+        ] {
+            assert_eq!(
+                ProductionEvidence::default()
+                    .for_environment(home.path(), None, tab.map(Into::into), pane.map(Into::into))
+                    .unwrap(),
+                open
+            );
+        }
+        assert!(
+            ProductionEvidence::default()
+                .for_environment(
+                    home.path(),
+                    None,
+                    Some(std::ffi::OsString::from_vec(vec![0xff])),
+                    Some("w28:p1".into())
+                )
+                .unwrap()
+        );
+        let goal = home.path().join("goal.md");
+        std::fs::write(&goal, "w28:p1 [starting] FLT-553 migration\n").unwrap();
+        assert!(
+            ProductionEvidence::default()
+                .for_environment(home.path(), Some(goal), None, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn blank_tab_uses_the_pane_identity_to_keep_production_steps_open() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("Code/.fleet/voice-between");
+        private_dir(&folder).unwrap();
+        std::fs::write(
+            folder.join("agents-cases-outbox.md"),
+            "w28:p1 [starting] FLT-553 migration\n",
+        )
+        .unwrap();
+        for tab in ["", " ", "\t", "invalid lane"] {
+            let mut evidence = ProductionEvidence::default();
+            assert!(
+                evidence
+                    .for_environment(home.path(), None, Some(tab.into()), Some("w28:p1".into()))
+                    .unwrap(),
+                "unusable tab {tab:?} must not hide the pane's open production step"
+            );
+        }
     }
 
     #[test]
