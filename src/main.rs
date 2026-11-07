@@ -19,7 +19,7 @@ pub struct Cli {
 const RUN_EXAMPLES: &str = "Examples:
   claudectl run                 start Claude on the account whose week resets first
   claudectl run amir2           start on amir2 (full name, email name, or a unique prefix)
-  claudectl run amir2 --failover   request failover (currently deferred)
+  claudectl run amir2 --failover   fail over after 10 minutes of observed quiet
   claudectl run -- --resume ID  pass arguments to Claude after --";
 
 #[derive(Subcommand)]

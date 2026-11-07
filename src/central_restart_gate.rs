@@ -1538,7 +1538,7 @@ mod tests {
             "w28:t1 [starting] FLT-553 migration\n",
         )
         .unwrap();
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
         let lane = production_step_with_lane(home.path(), None, Some("w28:t1".into()));
         let standalone = production_step_with_lane(home.path(), None, None);
         std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();

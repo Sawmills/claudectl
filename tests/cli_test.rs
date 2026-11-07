@@ -389,6 +389,7 @@ fn run_help_discloses_quiet_window_and_residual_race() {
         let help = String::from_utf8(output.stdout).unwrap();
         assert!(help.contains("Automatic restart requires ten minutes of observed quiet"));
         assert!(help.contains("Request failover after ten minutes of observed quiet"));
+        assert!(!help.contains("currently deferred"));
         assert!(help.contains("held token may expire"));
         assert!(help.contains("a late prompt can be cut off at SIGTERM"));
         assert!(help.contains("No prompt collection or replay"));
