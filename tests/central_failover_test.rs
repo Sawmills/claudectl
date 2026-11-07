@@ -30,6 +30,7 @@ struct Fake {
     renew_work: bool,
     /// Every usage read: (account id, cached).
     usage_reads: Vec<(String, String)>,
+    token_requests: Vec<String>,
 }
 type Shared = Arc<Mutex<Fake>>;
 
@@ -72,6 +73,7 @@ async fn usage(
 
 async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Value> {
     let id = body["account_id"].as_str().unwrap_or_default().to_string();
+    shared.lock().unwrap().token_requests.push(id.clone());
     let renewed = id == WORK && body["observe"] == true && shared.lock().unwrap().renew_work;
     let (name, org) = if id == WORK {
         shared.lock().unwrap().work_used = true;
@@ -112,7 +114,7 @@ token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
 settings = args[args.index("--settings") + 1]
 config = json.load(open(settings))
 with open(os.environ["FAKE_LOG"], "a") as log:
-    log.write(json.dumps({"token": token, "args": args, "settings": config}) + "\n")
+    log.write(json.dumps({"token": token, "args": args, "settings": config, "run": os.environ.get("CLAUDECTL_SERVER_RUN")}) + "\n")
 command = config["hooks"]["StopFailure"][0]["hooks"][0]["command"]
 if token != "token-work":
     # A resumed Claude reports its session start, then this fake exits 7.
@@ -120,6 +122,18 @@ if token != "token-work":
     subprocess.run(["/bin/sh", "-c", command], check=True, input=json.dumps(
         {"hook_event_name": "SessionStart", "session_id": resumed}).encode())
     sys.exit(7)
+if os.environ.get("FAKE_TASK_CHILD"):
+    task_dir = os.path.join(os.environ["TMPDIR"], "claude-" + str(os.getuid()), "project", "tasks")
+    os.makedirs(task_dir, exist_ok=True)
+    with open(os.path.join(task_dir, "monitor.output"), "w") as output:
+        subprocess.Popen([sys.executable, "-c", '''
+import os, time
+deadline = time.monotonic() + 15
+while not os.path.exists(os.environ["FAKE_LOG"] + ".release") and time.monotonic() < deadline:
+    time.sleep(0.02)
+if os.path.exists(os.environ["FAKE_LOG"] + ".release"):
+    open(os.environ["FAKE_LOG"] + ".task-done", "w").close()
+'''], stdout=output, stderr=output)
 for event in ({"hook_event_name": "SessionStart", "session_id": "sess-1"},
               {"hook_event_name": "UserPromptSubmit", "session_id": "sess-1"},
               {"hook_event_name": "StopFailure", "session_id": "sess-1", "error": "rate_limit",
@@ -129,6 +143,9 @@ signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 deadline = time.time() + float(os.environ.get("FAKE_WATCHDOG_S", "20"))
 while time.time() < deadline:
     time.sleep(0.05)
+# Preserve only the native status metadata before the wrapper cleans its run directory.
+with open(os.environ["FAKE_LOG"] + ".deferred", "w") as out:
+    json.dump(json.load(open(os.path.join(os.environ["CLAUDECTL_SERVER_RUN"], "restart-status.json"))), out)
 sys.exit(99)
 "#;
 
@@ -137,6 +154,64 @@ struct Env {
     fake: Shared,
     claude: std::path::PathBuf,
     log: std::path::PathBuf,
+}
+
+#[test]
+fn a_usage_limit_does_not_move_an_account_while_a_task_is_live() {
+    let env = Env::new();
+    let temporary = env.home.path().join("tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+    command
+        .env_clear()
+        .env("HOME", env.home.path())
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env("CLAUDECTL_TEST_RENEW_FAST", "1")
+        .env("FAKE_LOG", &env.log)
+        .env("TMPDIR", temporary)
+        .env("FAKE_TASK_CHILD", "1")
+        .env("FAKE_WATCHDOG_S", "3")
+        .args(["run", "work", "--failover", "--claude"])
+        .arg(&env.claude)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut deferred = false;
+    while std::time::Instant::now() < deadline {
+        // The journal keeps the first cause for a stage. Sample the live current status.
+        deferred = env
+            .runs()
+            .first()
+            .and_then(|run| run["run"].as_str())
+            .and_then(|run| std::fs::read(Path::new(run).join("restart-status.json")).ok())
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|status| {
+                status["reason"] == "background_task" && status["cause"] == "failover"
+            });
+        if deferred || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let records_while_live = env.records();
+    std::fs::write(env.log.with_extension("log.release"), "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        deferred,
+        "failover killed the task: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        records_while_live.is_empty(),
+        "account move was recorded while busy"
+    );
+    assert!(env.log.with_extension("log.task-done").exists());
+    assert_eq!(output.status.code(), Some(99));
+    assert!(env.records().is_empty());
+    assert_eq!(env.runs().len(), 1);
+    assert_eq!(env.fake.lock().unwrap().token_requests, [WORK]);
 }
 
 impl Env {
@@ -230,144 +305,100 @@ impl Env {
     }
 }
 
-#[test]
-fn a_usage_limit_moves_the_session_to_the_account_with_room() {
-    let env = Env::new();
-    let output = env.run_with(&["run"], "20", &["--settings", r#"{"crossSessionInbound":"accept","isolatePeerMachines":true,"hooks":{"StopFailure":[{"hooks":[{"type":"command","command":"echo user-hook"}]}]}}"#]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // The second Claude's own exit code ends the run.
-    assert_eq!(output.status.code(), Some(7), "{stderr}");
-    let runs = env.runs();
-    assert_eq!(runs.len(), 2, "{runs:?}");
-    assert_eq!(runs[0]["token"], "token-work");
-    assert_eq!(runs[1]["token"], "token-spare");
-    for run in &runs {
-        assert_eq!(run["settings"]["crossSessionInbound"], "accept");
-        assert_eq!(run["settings"]["isolatePeerMachines"], true);
-        let hooks = run["settings"]["hooks"]["StopFailure"].as_array().unwrap();
-        assert_eq!(hooks.len(), 2);
-        assert!(
-            hooks[0]["hooks"][0]["command"]
-                .as_str()
-                .unwrap()
-                .contains(" server hook ")
-        );
-        assert_eq!(hooks[1]["hooks"][0]["command"], "echo user-hook");
-        assert_eq!(
-            run["args"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|arg| *arg == "--settings")
-                .count(),
-            1
-        );
-    }
-    let args: Vec<String> = serde_json::from_value(runs[1]["args"].clone()).unwrap();
-    let settings = args.iter().position(|a| a == "--settings").unwrap();
-    let mut user: Vec<&str> = args.iter().map(String::as_str).collect();
-    user.drain(settings..settings + 2);
-    assert_eq!(
-        user,
-        [
-            "--model",
-            "opus",
-            "--resume",
-            "sess-1",
-            "Continue the previous request."
-        ]
-    );
-    assert!(
-        stderr.contains("work reached its usage limit; resuming session sess-1 on spare"),
-        "{stderr}"
-    );
-    // The limit was confirmed by a fresh (not cached) read of `work`.
-    let reads = env.fake.lock().unwrap().usage_reads.clone();
-    assert!(
-        reads
-            .iter()
-            .any(|(id, cached)| id == WORK && cached == "false"),
-        "{reads:?}"
-    );
-    let records = env.records();
-    assert_eq!(records.len(), 1, "{records:?}");
-    assert_eq!(records[0]["from"], "work");
-    assert_eq!(records[0]["to"], "spare");
-    assert_eq!(records[0]["session_id"], "sess-1");
-    // The hook kept the error type only.
-    let sessions = env.home.path().join(".claudectl/server/sessions");
-    for entry in std::fs::read_dir(sessions).unwrap().flatten() {
-        let events = std::fs::read_to_string(entry.path().join("events")).unwrap_or_default();
-        assert!(!events.contains("secret"), "{events}");
-    }
-}
-
-#[test]
-fn a_named_account_keeps_its_session_unless_failover_is_asked_for() {
-    let env = Env::new();
-    let output = env.run(&["run", "work"], "3");
+fn assert_deferred(env: &Env, output: &std::process::Output, cause: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(99), "{stderr}");
-    assert_eq!(env.runs().len(), 1);
+    let runs = env.runs();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["token"], "token-work");
     assert!(env.records().is_empty());
-
-    let env = Env::new();
-    let output = env.run(&["run", "work", "--failover"], "20");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(7), "{stderr}");
-    assert_eq!(env.runs()[1]["token"], "token-spare");
+    assert_eq!(env.fake.lock().unwrap().token_requests, [WORK]);
+    assert!(!stderr.contains("resuming session"));
+    let rows: Vec<Value> = std::fs::read_to_string(
+        env.home
+            .path()
+            .join(".claudectl/server/restart-decisions.jsonl"),
+    )
+    .unwrap()
+    .lines()
+    .map(|line| serde_json::from_str(line).unwrap())
+    .collect();
+    assert!(!rows.is_empty());
+    let status: Value =
+        serde_json::from_slice(&std::fs::read(env.log.with_extension("log.deferred")).unwrap())
+            .unwrap();
+    // Stage-deduplicated journal rows retain the first cause; current status tracks the latest.
+    assert_eq!(status["reason"], "quiet_window");
+    assert_eq!(status["cause"], cause);
 }
 
 #[test]
-fn without_an_account_with_room_the_session_stays_and_says_so() {
+fn a_usage_limit_defers_without_reserving_an_available_account() {
+    let env = Env::new();
+    let output = env.run_with(&["run"], "3", &["--settings", r#"{"crossSessionInbound":"accept","isolatePeerMachines":true,"hooks":{"StopFailure":[{"hooks":[{"type":"command","command":"echo user-hook"}]}]}}"#]);
+    assert_deferred(&env, &output, "failover");
+    let runs = env.runs();
+    let run = &runs[0];
+    assert_eq!(run["settings"]["crossSessionInbound"], "accept");
+    assert_eq!(run["settings"]["isolatePeerMachines"], true);
+    let hooks = run["settings"]["hooks"]["StopFailure"].as_array().unwrap();
+    assert_eq!(hooks.len(), 2);
+    assert_eq!(hooks[1]["hooks"][0]["command"], "echo user-hook");
+    assert_eq!(
+        run["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|arg| *arg == "--settings")
+            .count(),
+        1
+    );
+    assert!(
+        !env.home
+            .path()
+            .join(".claudectl/server/failovers.lock")
+            .exists()
+    );
+}
+
+#[test]
+fn neither_named_nor_automatic_account_selection_bypasses_input_admission() {
+    for (args, cause) in [
+        (&["run", "work"][..], "renewal"),
+        (&["run", "work", "--failover"][..], "failover"),
+    ] {
+        let env = Env::new();
+        let output = env.run(args, "3");
+        assert_deferred(&env, &output, cause);
+    }
+}
+
+#[test]
+fn a_full_pool_does_not_turn_unknown_admission_into_a_claimed_failover() {
     let env = Env::new();
     env.fake.lock().unwrap().spare_full = true;
-    let output = env.run(&["run", "work", "--failover"], "4");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(99), "{stderr}");
-    assert_eq!(env.runs().len(), 1);
-    assert!(
-        stderr.contains("work reached its usage limit and no other account has room now"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("Try: claudectl status"), "{stderr}");
-    assert!(env.records().is_empty());
+    let output = env.run(&["run", "work", "--failover"], "3");
+    assert_deferred(&env, &output, "failover");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("no other account has room"));
 }
 
 #[test]
-fn a_throttle_without_a_full_window_never_moves_the_session() {
+fn a_throttle_cannot_bypass_unknown_input_admission() {
     let env = Env::new();
     env.fake.lock().unwrap().throttle = true;
-    let output = env.run(&["run", "work", "--failover"], "4");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(99), "{stderr}");
-    assert_eq!(env.runs().len(), 1);
-    assert!(env.records().is_empty());
-    assert!(!stderr.contains("usage limit"), "{stderr}");
+    let output = env.run(&["run", "work", "--failover"], "3");
+    assert_deferred(&env, &output, "failover");
 }
 
-/// The no-room notice waits for the terminal: when a renewal restarts Claude afterwards, it
-/// is printed after the terminal was restored, before the next Claude starts.
 #[test]
-fn a_no_room_notice_before_a_renewal_is_printed_between_the_two_claudes() {
+fn a_new_revision_does_not_bypass_unknown_failover_admission() {
     let env = Env::new();
     {
         let mut fake = env.fake.lock().unwrap();
         fake.spare_full = true;
         fake.renew_work = true;
     }
-    let output = env.run(&["run", "work", "--failover"], "20");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // The renewed Claude (token-work-2) exits 7 at once.
-    assert_eq!(output.status.code(), Some(7), "{stderr}");
-    let runs = env.runs();
-    assert_eq!(runs.len(), 2, "{runs:?}");
-    assert_eq!(runs[1]["token"], "token-work-2");
-    let notice = stderr
-        .find("no other account has room now")
-        .unwrap_or_else(|| panic!("{stderr}"));
-    let renewed = stderr
-        .find("server token renewed")
-        .unwrap_or_else(|| panic!("{stderr}"));
-    assert!(notice < renewed, "{stderr}");
+    let output = env.run(&["run", "work", "--failover"], "3");
+    assert_deferred(&env, &output, "failover");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("server token renewed"));
 }

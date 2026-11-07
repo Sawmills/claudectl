@@ -376,3 +376,22 @@ fn rate_without_lanes_reports_no_activity() {
     assert_eq!(report["accounts"], serde_json::json!([]));
     assert_eq!(report["skipped"], 0);
 }
+
+#[test]
+fn run_help_discloses_quiet_window_and_residual_race() {
+    for args in [vec!["run", "--help"], vec!["server", "run", "--help"]] {
+        let output = Command::cargo_bin("claudectl")
+            .unwrap()
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let help = String::from_utf8(output.stdout).unwrap();
+        assert!(help.contains("Automatic restart requires ten minutes of observed quiet"));
+        assert!(help.contains("Request failover after ten minutes of observed quiet"));
+        assert!(!help.contains("currently deferred"));
+        assert!(help.contains("held token may expire"));
+        assert!(help.contains("a late prompt can be cut off at SIGTERM"));
+        assert!(help.contains("No prompt collection or replay"));
+    }
+}

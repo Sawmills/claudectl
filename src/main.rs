@@ -19,7 +19,7 @@ pub struct Cli {
 const RUN_EXAMPLES: &str = "Examples:
   claudectl run                 start Claude on the account whose week resets first
   claudectl run amir2           start on amir2 (full name, email name, or a unique prefix)
-  claudectl run amir2 --failover   on a usage limit, move the session to another account
+  claudectl run amir2 --failover   fail over after 10 minutes of observed quiet
   claudectl run -- --resume ID  pass arguments to Claude after --";
 
 #[derive(Subcommand)]
@@ -32,7 +32,7 @@ enum Commands {
         /// Claude executable to run (default: `claude` on PATH)
         #[arg(long, default_value = "claude")]
         claude: std::path::PathBuf,
-        /// On a usage limit, resume the session on another account (default without an account)
+        /// Request failover after ten minutes of observed quiet
         #[arg(long, conflicts_with = "no_failover")]
         failover: bool,
         /// Stay on the account at a usage limit (default with a named account)
@@ -71,6 +71,12 @@ enum Commands {
     Server {
         #[command(subcommand)]
         command: claudectl::central::Command,
+    },
+    /// Prevent automatic renewal/failover during a production step in this run
+    #[cfg(unix)]
+    Hold {
+        #[command(subcommand)]
+        command: claudectl::central::restart_gate::HoldCommand,
     },
     /// Make plain `claude` run through `claudectl server run` (a PATH shim)
     #[cfg(unix)]
@@ -277,6 +283,9 @@ fn main() {
         }),
         Commands::Rm { account, yes } => claudectl::central::remove_confirmed(&account, yes),
         Commands::Server { command } => claudectl::central::dispatch(command),
+        #[cfg(unix)]
+        Commands::Hold { command } => config::default_paths()
+            .and_then(|paths| claudectl::central::restart_gate::hold(&paths, command)),
         #[cfg(unix)]
         Commands::Shim { command } => claudectl::central::shim::dispatch(command),
         Commands::Status {

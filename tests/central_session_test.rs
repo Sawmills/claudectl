@@ -30,6 +30,210 @@ fn account_for(access: &Access) -> Account {
     }
 }
 
+#[cfg(unix)]
+fn hold_command(session: &Session, args: &[&str]) -> std::process::Output {
+    let home = session
+        .directory()
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .expect("session home");
+    session
+        .command(
+            &assert_cmd::cargo::cargo_bin("claudectl"),
+            &args
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+        .env("HOME", home)
+        .output()
+        .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn hold_start_refuses_an_older_running_wrapper_that_cannot_enforce_it() {
+    let home = tempfile::tempdir().unwrap();
+    let paths = Paths::from_home(home.path().to_path_buf());
+    let access = grant("synthetic", 1);
+    let session = Session::new(&paths, &account_for(&access), access).unwrap();
+    let path = session.directory().join("session.json");
+    let mut status: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    status
+        .as_object_mut()
+        .unwrap()
+        .remove("restart_gate_version");
+    std::fs::write(path, serde_json::to_vec(&status).unwrap()).unwrap();
+    let output = hold_command(&session, &["hold", "start", "--reason", "FLT-553 prod"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not support holds"));
+    assert!(!home.path().join(".claudectl/server/holds").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn ending_another_runs_hold_does_not_clear_a_production_hold() {
+    let home = tempfile::tempdir().unwrap();
+    let paths = Paths::from_home(home.path().to_path_buf());
+    let access = grant("synthetic", 1);
+    let first = Session::new(&paths, &account_for(&access), access.clone()).unwrap();
+    let second = Session::new(&paths, &account_for(&access), access).unwrap();
+    assert!(
+        hold_command(&first, &["hold", "start", "--reason", "FLT-553 prod"])
+            .status
+            .success()
+    );
+    let run = first.directory().file_name().unwrap().to_str().unwrap();
+    let live_end = hold_command(&first, &["hold", "end", "--run", run]);
+    assert!(!live_end.status.success());
+    assert!(hold_command(&second, &["hold", "end"]).status.success());
+    let path = home.path().join(".claudectl/server/holds").join(format!(
+        "{}.json",
+        first.directory().file_name().unwrap().to_str().unwrap()
+    ));
+    assert!(path.exists());
+    assert!(
+        !hold_command(&first, &["hold", "start", "--reason", "another step"])
+            .status
+            .success()
+    );
+    assert!(hold_command(&first, &["hold", "end"]).status.success());
+    assert!(!path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_abandoned_hold_survives_run_cleanup_until_explicit_end() {
+    let home = tempfile::tempdir().unwrap();
+    let paths = Paths::from_home(home.path().to_path_buf());
+    let access = grant("synthetic", 1);
+    let session = Session::new(&paths, &account_for(&access), access).unwrap();
+    let run = session
+        .directory()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        hold_command(&session, &["hold", "start", "--reason", "FLT-553 prod"])
+            .status
+            .success()
+    );
+    drop(session);
+    let hold = home
+        .path()
+        .join(".claudectl/server/holds")
+        .join(format!("{run}.json"));
+    assert!(hold.exists());
+    let output = assert_cmd::Command::cargo_bin("claudectl")
+        .unwrap()
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .args(["status", "--cached", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["sessions"][0]["run"], run);
+    assert_eq!(status["sessions"][0]["reason"], "stale_hold");
+    assert_eq!(status["sessions"][0]["stage"], "blocked");
+    let output = assert_cmd::Command::cargo_bin("claudectl")
+        .unwrap()
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .args(["hold", "end", "--run", &run])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!hold.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stale_hold_overrides_cached_deferred_status_without_losing_its_counter() {
+    let home = tempfile::tempdir().unwrap();
+    let paths = Paths::from_home(home.path().to_path_buf());
+    let access = grant("synthetic", 1);
+    let session = Session::new(&paths, &account_for(&access), access).unwrap();
+    assert!(
+        hold_command(&session, &["hold", "start", "--reason", "FLT-553 prod"])
+            .status
+            .success()
+    );
+    let run = session.directory().file_name().unwrap().to_str().unwrap();
+    let hold = home
+        .path()
+        .join(".claudectl/server/holds")
+        .join(format!("{run}.json"));
+    let mut saved: Value = serde_json::from_slice(&std::fs::read(&hold).unwrap()).unwrap();
+    saved["owner_started"] = "previous process incarnation".into();
+    std::fs::write(&hold, serde_json::to_vec(&saved).unwrap()).unwrap();
+    std::fs::write(
+        session.directory().join("restart-status.json"),
+        serde_json::to_vec(
+            &serde_json::json!({"run":run,"session_id":"sess-1","alias":"work",
+            "deferred":true,"reason":"explicit_hold","stage":"deferred",
+            "restart_deferred_total":7}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        session.directory().join("restart-status.json"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    let output = hold_command(&session, &["status", "--cached", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let row = &status["sessions"][0];
+    assert_eq!(row["reason"], "stale_hold");
+    assert_eq!(row["stage"], "blocked");
+    assert_eq!(row["restart_deferred_total"], 7);
+    assert_eq!(row["session_id"], "sess-1");
+    assert_eq!(row["run"], run);
+    assert!(hold.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn damaged_restart_diagnostics_report_attention_without_hiding_account_status() {
+    let home = tempfile::tempdir().unwrap();
+    let paths = Paths::from_home(home.path().to_path_buf());
+    let access = grant("synthetic", 1);
+    let session = Session::new(&paths, &account_for(&access), access).unwrap();
+    std::fs::write(session.directory().join("restart-status.json"), "damaged").unwrap();
+    std::fs::set_permissions(
+        session.directory().join("restart-status.json"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    let output = hold_command(&session, &["status", "--cached", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["sessions"][0]["reason"], "evidence_unknown");
+    assert_eq!(status["sessions"][0]["stage"], "blocked");
+    assert_eq!(status["sessions"][0]["attention_required"], true);
+}
+
 /// Run the launch seam in its own process so PATH tests do not mutate global test state.
 #[test]
 fn session_path_helper() {

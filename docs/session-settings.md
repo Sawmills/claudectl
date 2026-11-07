@@ -32,6 +32,21 @@ Verified, missing, duplicate, skipped, and unverified results stay in this log
 after the run exits. They never print over Claude's terminal or enter its input.
 The log contains no tokens or saved prompt contents.
 
+Automatic renewal and failover require ten continuous minutes of observed quiet.
+Running turns, live task-output children, open production steps, pending hooks and holds
+reset that window. Unknown or damaged evidence keeps restart blocked. Expiry or an
+authentication failure does not shorten the wait; the held token can expire while deferred.
+After quiet and fresh workload checks pass, claudectl can send SIGTERM and resume the
+session on the new token or account. Quiet does not close all input sources: a late or
+invisible prompt can still be cut off. Claudectl does not collect or replay prompts.
+
+Renewal and failover also write deferred restart decisions to
+`~/.claudectl/server/restart-decisions.jsonl`. A running turn, live Claude task-output
+child or explicit run hold prevents a restart. `claudectl status`, `status --json` and
+the session's status line show the reason. Five minutes before token expiry the wrapper
+warns; expiry or authentication failure reports blocked status without killing the work.
+See [production holds and deferred restarts](account-server.md#production-holds-and-deferred-restarts).
+
 Most failures name the next command on a last line that starts with `Try:`. Setup
 failures, such as a `~/.claudectl` directory that cannot be created, print only the
 error.

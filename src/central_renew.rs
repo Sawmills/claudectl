@@ -3,10 +3,12 @@
 //! `--resume <session>` on the new token, only at an idle point.
 use std::ffi::{OsStr, OsString};
 
+use super::atomic;
+
 /// Idle time after the last turn before a restart (ms).
-pub(super) const IDLE_AFTER_STOP_MS: i64 = 60_000;
+pub(super) const IDLE_AFTER_STOP_MS: i64 = 600_000;
 /// No terminal input for this long before a restart (ms): protects a draft being typed.
-pub(super) const TTY_IDLE_MS: i64 = 5 * 60_000;
+pub(super) const TTY_IDLE_MS: i64 = 600_000;
 /// The first prompt of a renewal resume only (never a first launch, a manual resume or a
 /// failover). Claude Code can keep session cron jobs listed after a resume but stop firing
 /// them (SAW-12610, 10-09): the session creates them again, catches up each missed job once,
@@ -128,7 +130,7 @@ pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
     out
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct Idle {
     /// The current session: the latest SessionStart, or a later hook event of another
     /// session (a fork).
@@ -144,6 +146,8 @@ pub(super) struct Idle {
     /// nothing the user types can succeed until a restart. A new session in the same process
     /// (`/clear`, `/resume`) keeps the token, so only a relaunch (a new event log) clears it.
     pub auth_failed: Option<i64>,
+    /// Count metadata events, including idle notifications, without storing prompt text.
+    pub observed_events: u64,
 }
 
 #[cfg(test)]
@@ -156,6 +160,10 @@ pub(super) fn idle_state(events: &[(i64, Event)]) -> Idle {
 /// Apply newly read events to the idle state (the monitor reads the log incrementally).
 pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
     for (at, event) in events {
+        // Session is a synthetic parser transition, not another hook record.
+        if !matches!(event, Event::Session(_)) {
+            idle.observed_events = idle.observed_events.saturating_add(1);
+        }
         match event {
             Event::SessionStart(session) => {
                 idle.session = Some(session.clone());
@@ -292,22 +300,19 @@ pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     if i.idle.ended.is_some() {
         return Err("Claude is ending the session");
     }
-    // With a dead held token every turn fails, so the waits that protect a turn or a draft
-    // only keep the tab dead: a user who retries resets them for good (SAW-12610 10-09).
-    let dead = held_token_dead(i);
+    // Expiry and authentication failure never bypass the observed quiet window.
     match i.idle.since {
         None => return Err("a turn is running"),
-        Some(since) if !dead && i.now - since < i.idle_after_ms => {
-            return Err("the last turn ended less than 60 s ago");
+        Some(since) if i.now - since < i.idle_after_ms => {
+            return Err("the last turn ended less than 10 min ago");
         }
         Some(_) => {}
     }
-    if !dead && i.tty_idle_ms.is_some_and(|ms| ms < i.tty_gate_ms) {
-        return Err("terminal input in the last 5 min");
+    if i.tty_idle_ms.is_some_and(|ms| ms < i.tty_gate_ms) {
+        return Err("terminal input in the last 10 min");
     }
-    // Extra processes (an LSP, caffeinate, background shells) do not block: a restart happens
-    // only when the held token was superseded or expired, so it is dead for every holder, and
-    // a gate on them left idle tabs on a dead token for good (SAW-12610).
+    // restart_gate separately protects task-output descendants and explicit holds.
+    // MCP/LSP/caffeinate helpers without task output never block admission.
     if i.restarts_last_hour >= RESTARTS_PER_HOUR {
         return Err("restart budget used up for this hour");
     }
@@ -397,10 +402,36 @@ pub(super) fn record_hook(
 ) -> anyhow::Result<()> {
     use std::io::Write;
     let dir = session_dir(sessions, dir)?;
+    let pending = dir.join(format!("hook-pending.{}", std::process::id()));
+    // Publish intent before either lock so final admission can see a waiting hook.
+    if let Err(error) = atomic(&pending, &serde_json::json!({"pid": std::process::id()})) {
+        mark_hook_error(&dir);
+        let _ = std::fs::remove_file(&pending);
+        return Err(error);
+    }
+    #[cfg(unix)]
+    let _hook_admission = match super::restart_gate::hook_admission(&dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            mark_hook_error(&dir);
+            let _ = std::fs::remove_file(&pending);
+            return Err(error);
+        }
+    };
+    #[cfg(unix)]
+    let _admission = match super::restart_gate::admission(&dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            mark_hook_error(&dir);
+            let _ = std::fs::remove_file(&pending);
+            return Err(error);
+        }
+    };
     let v: serde_json::Value = match serde_json::from_str(input) {
         Ok(v) => v,
         Err(error) => {
             mark_hook_error(&dir);
+            let _ = std::fs::remove_file(&pending);
             return Err(error.into());
         }
     };
@@ -423,6 +454,7 @@ pub(super) fn record_hook(
     #[cfg(unix)]
     if let Err(error) = super::crons::record_transcript(&dir, &v) {
         mark_hook_error(&dir);
+        let _ = std::fs::remove_file(&pending);
         return Err(error);
     }
     let path = dir.join("events");
@@ -438,8 +470,10 @@ pub(super) fn record_hook(
         .and_then(|mut file| writeln!(file, "{line}"));
     if let Err(error) = written {
         mark_hook_error(&dir);
+        let _ = std::fs::remove_file(&pending);
         return Err(error.into());
     }
+    std::fs::remove_file(pending).ok();
     Ok(())
 }
 
@@ -643,6 +677,7 @@ mod tests {
                 limited: None,
                 ended: None,
                 auth_failed: None,
+                observed_events: 2,
             }
         );
         let idle = [(1, SessionStart("a".into())), (2, Prompt), (3, Stop)];
@@ -654,6 +689,7 @@ mod tests {
                 limited: None,
                 ended: None,
                 auth_failed: None,
+                observed_events: 3,
             }
         );
         // A new session (/clear, /resume) replaces the old one and starts idle.
@@ -670,6 +706,7 @@ mod tests {
                 limited: None,
                 ended: None,
                 auth_failed: None,
+                observed_events: 3,
             }
         );
         // idle_prompt keeps the earlier idle start.
@@ -759,6 +796,7 @@ mod tests {
                 limited: None,
                 ended: None,
                 auth_failed: None,
+                observed_events: 3,
             }
         );
     }
@@ -771,6 +809,7 @@ mod tests {
             limited: None,
             ended: None,
             auth_failed: None,
+            observed_events: 0,
         };
         assert_eq!(decide(&inputs(&idle)), Decision::Restart);
         // Same revision: the held token is still the live one.
@@ -785,6 +824,7 @@ mod tests {
             limited: None,
             ended: None,
             auth_failed: None,
+            observed_events: 0,
         };
         assert!(matches!(decide(&inputs(&busy)), Decision::Wait(_)));
         let recent = Idle {
@@ -793,6 +833,7 @@ mod tests {
             limited: None,
             ended: None,
             auth_failed: None,
+            observed_events: 0,
         };
         assert!(matches!(decide(&inputs(&recent)), Decision::Wait(_)));
         let mut typing = inputs(&idle);
@@ -804,6 +845,7 @@ mod tests {
             limited: None,
             ended: None,
             auth_failed: None,
+            observed_events: 0,
         };
         assert!(matches!(decide(&inputs(&nosession)), Decision::Wait(_)));
         let mut budget = inputs(&idle);
@@ -816,21 +858,46 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_held_token_restarts_even_while_the_user_types() {
-        // SAW-12610 10-09 19:12Z: the held token expired while the user typed; every prompt
-        // failed with authentication_failed, and each try reset the 5-min input gate, so the
-        // tab never restarted. A draft typed into a dead token cannot succeed.
+    fn option_b_expiry_and_auth_failure_do_not_bypass_recent_input() {
+        let idle = Idle {
+            session: Some("s".into()),
+            since: Some(9_999_000),
+            ..Default::default()
+        };
+        let mut expired = inputs(&idle);
+        expired.held_expires_at = expired.now - 1;
+        expired.tty_idle_ms = Some(1_000);
+        assert!(
+            matches!(decide(&expired), Decision::Wait(_)),
+            "expiry cannot skip quiet"
+        );
+        let auth = Idle {
+            auth_failed: Some(9_999_000),
+            ..idle
+        };
+        let mut revoked = inputs(&auth);
+        revoked.tty_idle_ms = Some(1_000);
+        assert!(
+            matches!(decide(&revoked), Decision::Wait(_)),
+            "401 cannot skip quiet"
+        );
+    }
+
+    #[test]
+    fn a_dead_held_token_waits_while_the_user_types() {
+        // Option B preserves drafts even when the held token has stopped working.
         let idle = Idle {
             session: Some("s".into()),
             since: Some(10_000_000 - 1_000),
             limited: None,
             ended: None,
             auth_failed: None,
+            observed_events: 0,
         };
         let mut expired = inputs(&idle);
         expired.held_expires_at = expired.now - 1;
         expired.tty_idle_ms = Some(5_000);
-        assert_eq!(decide(&expired), Decision::Restart);
+        assert!(matches!(decide(&expired), Decision::Wait(_)));
         // A running turn, an exiting session and the budget still hold.
         let busy = Idle {
             session: Some("s".into()),
@@ -838,6 +905,7 @@ mod tests {
             limited: None,
             ended: None,
             auth_failed: None,
+            observed_events: 0,
         };
         let mut running = inputs(&busy);
         running.held_expires_at = running.now - 1;
@@ -865,7 +933,7 @@ mod tests {
         typing.now = 6;
         typing.tty_idle_ms = Some(1_000);
         assert!(held_token_dead(&typing));
-        assert_eq!(decide(&typing), Decision::Restart);
+        assert!(matches!(decide(&typing), Decision::Wait(_)));
         // Same revision: the server has no newer token yet, so nothing to follow.
         typing.server_revision = "r1";
         assert_eq!(decide(&typing), Decision::Keep);
@@ -894,6 +962,7 @@ mod tests {
             limited: None,
             ended: None,
             auth_failed: None,
+            observed_events: 0,
         };
         let mut older = inputs(&idle);
         older.server_expires_at = older.held_expires_at;
@@ -948,6 +1017,230 @@ mod tests {
         let input = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#;
         assert!(record_hook(&sessions, &dir, input, 1).is_err());
         assert!(dir.join("hook-error").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_that_cannot_lock_admission_leaves_the_error_marker() {
+        for lock in ["hook.lock", "restart.lock"] {
+            let home = tempfile::tempdir().unwrap();
+            let sessions = home.path().join("sessions");
+            let dir = sessions.join("run-test");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::create_dir(dir.join(lock)).unwrap();
+            assert!(
+                record_hook(
+                    &sessions,
+                    &dir,
+                    r#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#,
+                    1
+                )
+                .is_err()
+            );
+            assert!(dir.join("hook-error").exists());
+            assert!(!dir.join("events").exists());
+            assert!(
+                !dir.join(format!("hook-pending.{}", std::process::id()))
+                    .exists()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn option_b_quiet_defers_a_hook_waiting_for_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join(".claudectl/server/sessions");
+        let dir = sessions.join("run-hook-lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = super::super::restart_gate::hook_admission(&dir).unwrap();
+        std::fs::remove_file(dir.join("hook.lock.opened")).unwrap();
+        let worker = std::thread::spawn({
+            let sessions = sessions.clone();
+            let dir = dir.clone();
+            move || {
+                record_hook(
+                    &sessions,
+                    &dir,
+                    r#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#,
+                    1,
+                )
+            }
+        });
+        let opened = dir.join("hook.lock.opened");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !opened.exists() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(opened.exists(), "hook worker did not open hook.lock");
+        assert!(std::fs::read_dir(&dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("hook-pending.")
+        }));
+        let (mut child, mut gate, idle) = idle_hook_gate(root.path(), &dir);
+        let start = std::time::Instant::now();
+        assert!(!gate.check_at(
+            &idle,
+            super::super::restart_gate::Cause::Renewal,
+            i64::MAX,
+            start
+        ));
+        let admitted = gate.check_at(
+            &idle,
+            super::super::restart_gate::Cause::Renewal,
+            i64::MAX,
+            start + std::time::Duration::from_secs(600),
+        );
+        drop(lock);
+        assert!(worker.join().unwrap().is_ok());
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert!(
+            !admitted,
+            "a hook waiting for admission must remain visible after the quiet window"
+        );
+        let status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("restart-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["deferred"], true);
+        assert_eq!(status["reason"], "queued_hook");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_waiting_prompt_blocks_restart_after_the_quiet_window() {
+        use super::super::restart_gate::{Cause, hook_admission};
+        for cause in [Cause::Renewal, Cause::Failover] {
+            let root = tempfile::tempdir().unwrap();
+            let sessions = root.path().join(".claudectl/server/sessions");
+            let dir = sessions.join("run-waiting-prompt");
+            std::fs::create_dir_all(&dir).unwrap();
+            let (mut child, mut gate, idle) = idle_hook_gate(root.path(), &dir);
+            let start = std::time::Instant::now();
+            assert!(!gate.check_at(&idle, cause, i64::MAX, start));
+            let ready = start + std::time::Duration::from_secs(600);
+            assert!(gate.check_at(&idle, cause, i64::MAX, ready));
+            let lock = hook_admission(&dir).unwrap();
+            let opened = dir.join("hook.lock.opened");
+            std::fs::remove_file(&opened).unwrap();
+            let worker = std::thread::spawn({
+                let sessions = sessions.clone();
+                let dir = dir.clone();
+                move || {
+                    record_hook(
+                        &sessions,
+                        &dir,
+                        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#,
+                        1,
+                    )
+                }
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !opened.exists() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let waiting = opened.exists();
+            let admitted = gate.check_at(&idle, cause, i64::MAX, ready);
+            let status: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.join("restart-status.json")).unwrap())
+                    .unwrap();
+            drop(lock);
+            let recorded = worker.join().unwrap();
+            drop(child.stdin.take());
+            child.wait().unwrap();
+            assert!(waiting, "hook worker did not reach hook admission");
+            assert!(recorded.is_ok());
+            assert!(
+                !admitted,
+                "a prompt waiting for hook admission must block {cause:?}"
+            );
+            assert_eq!(status["reason"], "queued_hook");
+            assert_eq!(status["deferred"], true);
+        }
+    }
+
+    #[cfg(unix)]
+    fn idle_hook_gate(
+        home: &std::path::Path,
+        dir: &std::path::Path,
+    ) -> (std::process::Child, super::super::restart_gate::Gate, Idle) {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read -r _"])
+            .stdin(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let gate = super::super::restart_gate::Gate::new(home, dir, child.id(), "work");
+        let idle = Idle {
+            session: Some("s".into()),
+            since: Some(1),
+            ..Default::default()
+        };
+        (child, gate, idle)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_reading_input_does_not_bypass_the_quiet_window() {
+        struct WaitingInput {
+            started: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+            input: std::io::Cursor<Vec<u8>>,
+        }
+        impl std::io::Read for WaitingInput {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.input.position() == 0 {
+                    self.started.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                self.input.read(buffer)
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join(".claudectl/server/sessions");
+        let dir = sessions.join("run-input");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (started, reading) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn({
+            let sessions = sessions.clone();
+            let dir = dir.clone();
+            move || {
+                hook_from(
+                    &sessions,
+                    &dir,
+                    WaitingInput {
+                        started,
+                        release: resume,
+                        input: std::io::Cursor::new(
+                            br#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#.to_vec(),
+                        ),
+                    },
+                    1,
+                )
+            }
+        });
+        reading
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let (mut child, mut gate, idle) = idle_hook_gate(root.path(), &dir);
+        let admitted = gate.check(&idle, super::super::restart_gate::Cause::Failover, i64::MAX);
+        release.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert!(
+            !admitted,
+            "a hook reading input must not bypass the quiet window"
+        );
+        let status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("restart-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["reason"], "quiet_window");
     }
 
     #[test]

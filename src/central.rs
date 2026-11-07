@@ -16,7 +16,12 @@ pub const RUN_SETTINGS_HELP: &str =
 Objects merge in argument order; hooks append to claudectl's generated hooks.
 Claude validates the settings schema. An invalid value such as model: 5 can make
 Claude ignore the WHOLE settings file, including claudectl's renewal/failover hooks.
-Test settings with your installed Claude version before rollout.";
+Test settings with your installed Claude version before rollout.
+
+Automatic restart requires ten minutes of observed quiet.
+Quiet does not prove all inputs are closed: a late prompt can be cut off at SIGTERM.
+Expiry does not bypass quiet; unknown evidence defers. The held token may expire.
+No prompt collection or replay.";
 
 #[cfg(unix)]
 #[path = "central_crons.rs"]
@@ -29,6 +34,9 @@ mod migration;
 mod qualify;
 #[path = "central_renew.rs"]
 mod renew;
+#[cfg(unix)]
+#[path = "central_restart_gate.rs"]
+pub mod restart_gate;
 #[path = "service_account.rs"]
 pub mod service_account;
 #[path = "central_session.rs"]
@@ -1113,7 +1121,7 @@ pub enum Command {
         /// Claude executable to run (default: `claude` on PATH)
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
-        /// On a usage limit, resume the session on another account
+        /// Request failover after ten minutes of observed quiet
         #[arg(long)]
         failover: bool,
         /// Arguments for Claude, after `--`
