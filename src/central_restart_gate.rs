@@ -656,7 +656,6 @@ fn marker_key(line: &str) -> Option<String> {
     Some(
         words[ticket..]
             .iter()
-            .take(2)
             .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
             .collect::<Vec<_>>()
             .join(" ")
@@ -1584,6 +1583,41 @@ mod tests {
     }
 
     #[test]
+    fn completing_one_step_cannot_clear_another_step_with_the_same_first_word() {
+        let home = tempfile::tempdir().unwrap();
+        let goal = home.path().join("goal.md");
+        let starting = concat!(
+            "w28:t1 [starting] FLT-553 migration account-a\n",
+            "w28:t1 [starting] FLT-553 migration account-b\n"
+        );
+        std::fs::write(&goal, starting).unwrap();
+        let mut evidence = ProductionEvidence::default();
+        assert!(
+            evidence
+                .for_lane(home.path(), Some(goal.clone()), Some("w28:t1".into()))
+                .unwrap()
+        );
+        let one_done = format!("{starting}w28:t1 [done] FLT-553 migration account-a\n");
+        std::fs::write(&goal, &one_done).unwrap();
+        assert!(
+            evidence
+                .for_lane(home.path(), Some(goal.clone()), Some("w28:t1".into()))
+                .unwrap(),
+            "account-b must remain open after completing account-a"
+        );
+        std::fs::write(
+            &goal,
+            format!("{one_done}w28:t1 [done] FLT-553 migration account-b\n"),
+        )
+        .unwrap();
+        assert!(
+            !evidence
+                .for_lane(home.path(), Some(goal), Some("w28:t1".into()))
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn rewritten_open_marker_history_stays_unknown_across_repeated_samples() {
         for replacement in ["", "w28:t1 [done] FLT-553 migration\n"] {
             let home = tempfile::tempdir().unwrap();
@@ -1690,11 +1724,11 @@ mod tests {
         private_dir(&folder).unwrap();
         std::fs::write(
             folder.join("slack-outbox.md"),
-            "w28:t1 [done] FLT-553 migration 2026-11-06T23:00Z\n",
+            "2026-11-06T23:00Z w28:t1 [done] FLT-553 migration\n",
         )
         .unwrap();
         let goal = home.path().join("goal.md");
-        let starting = "w28:t1 [starting] FLT-553 migration 2026-11-07T01:20Z\n";
+        let starting = "2026-11-07T01:20Z w28:t1 [starting] FLT-553 migration\n";
         std::fs::write(&goal, starting).unwrap();
         assert!(
             production_step_with_lane(home.path(), Some(goal.clone()), Some("w28:t1".into()))
