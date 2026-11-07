@@ -18,7 +18,7 @@ Claude validates the settings schema. An invalid value such as model: 5 can make
 Claude ignore the WHOLE settings file, including claudectl's renewal/failover hooks.
 Test settings with your installed Claude version before rollout.
 
-Local option B: automatic restart requires ten minutes of observed quiet.
+Automatic restart requires ten minutes of observed quiet.
 Quiet does not prove all inputs are closed: a late prompt can be cut off at SIGTERM.
 Expiry does not bypass quiet; unknown evidence defers. The held token may expire.
 No prompt collection or replay.";

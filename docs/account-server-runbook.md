@@ -114,7 +114,7 @@ while one runs). Read the summary table: rerun for `lost-reply` and `failed:fenc
 for `unrotated`. A row `migrated (log out the live login)` means the live login on that
 machine holds a retired grant: run `claude auth logout` there; claudectl never deletes it.
 
-7. **Local option B verification, pending owner decision:** use isolated fixtures for
+7. **Verify renewal and failover:** use isolated fixtures for
    the ten-minute quiet window. Confirm every turn, task-output child, hold, open production
    marker and pending hook blocks admission and restarts the window. Expiry and a 401 must
    not shorten it. Check warning journal/metric/status five minutes before expiry and blocked
@@ -122,7 +122,7 @@ machine holds a retired grant: run `claude auth logout` there; claudectl never d
    Do not start a test session on a shared account or force a shared account refresh.
    Quiet does not close all inputs: a late or invisible hook can still lose a prompt at
    SIGTERM. No prompt collection/replay or forced kill deadline is provided. Live acceptance
-   and rollout require a separate order after the pending owner decision.
+   and rollout follow the normal release and installation gates.
 
 ## Alerts
 

@@ -239,7 +239,7 @@ forces a refresh: it takes the current token, and the server refreshes on demand
 `claudectl server refresh-access` forces one and ends every running session of that account
 (relaunch each with `--resume`).
 
-**Local option B candidate, pending owner acceptance:** automatic renewal and failover
+Automatic renewal and failover
 require ten continuous minutes of observed quiet. The clock starts with the first clear
 workload sample and resets on an observed blocker, hook event, session change or terminal
 input. Startup never inherits old quiet time. Expiry or authentication failure does not
@@ -249,8 +249,7 @@ shorten the window. Unknown or damaged evidence still blocks restart.
 every submitted prompt is safe to hand over. A waiting hook may be invisible before
 publication; a new prompt, peer message, scheduled job or task can arrive after the final
 sample but before SIGTERM. Sampling can also miss brief activity. Quiet is a heuristic,
-not all-input closure. No prompts are collected, stored or replayed. Option A, which
-always defers absent input-owner proof, remains preserved as a separate local ref.
+not all-input closure. No prompts are collected, stored or replayed.
 
 `server run` registers Claude hooks for `SessionStart`, `UserPromptSubmit`, `Stop`,
 `StopFailure`, `SessionEnd` and the `idle_prompt` notification. They record only the event,
@@ -318,7 +317,7 @@ This remains a best-effort workaround for Claude Code's resume behavior, with th
 - The defect belongs to Claude Code; an upstream report waits on the owner's decision. Remove
   the note once Claude Code fires restored jobs reliably.
 
-Option B requires the quiet window and fresh workload evidence before provider selection,
+Automatic restart requires the quiet window and fresh workload evidence before provider selection,
 failover reservation and the final signal. Foreground turns, live background tasks,
 production markers, pending hooks and explicit holds prevent renewal and failover, even
 after token expiry. The task check reads live descendants' stdout/stderr: a Claude task
