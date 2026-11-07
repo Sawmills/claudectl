@@ -403,19 +403,21 @@ pub(super) fn record_hook(
     use std::io::Write;
     let dir = session_dir(sessions, dir)?;
     let pending = dir.join(format!("hook-pending.{}", std::process::id()));
-    #[cfg(unix)]
-    let _hook_admission = match super::restart_gate::hook_admission(&dir) {
-        Ok(lock) => lock,
-        Err(error) => {
-            mark_hook_error(&dir);
-            return Err(error);
-        }
-    };
+    // Publish intent before either lock so final admission can see a waiting hook.
     if let Err(error) = atomic(&pending, &serde_json::json!({"pid": std::process::id()})) {
         mark_hook_error(&dir);
         let _ = std::fs::remove_file(&pending);
         return Err(error);
     }
+    #[cfg(unix)]
+    let _hook_admission = match super::restart_gate::hook_admission(&dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            mark_hook_error(&dir);
+            let _ = std::fs::remove_file(&pending);
+            return Err(error);
+        }
+    };
     #[cfg(unix)]
     let _admission = match super::restart_gate::admission(&dir) {
         Ok(lock) => lock,
@@ -1020,27 +1022,33 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_hook_that_cannot_lock_admission_leaves_the_error_marker() {
-        let home = tempfile::tempdir().unwrap();
-        let sessions = home.path().join("sessions");
-        let dir = sessions.join("run-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::create_dir(dir.join("restart.lock")).unwrap();
-        assert!(
-            record_hook(
-                &sessions,
-                &dir,
-                r#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#,
-                1
-            )
-            .is_err()
-        );
-        assert!(dir.join("hook-error").exists());
-        assert!(!dir.join("events").exists());
+        for lock in ["hook.lock", "restart.lock"] {
+            let home = tempfile::tempdir().unwrap();
+            let sessions = home.path().join("sessions");
+            let dir = sessions.join("run-test");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::create_dir(dir.join(lock)).unwrap();
+            assert!(
+                record_hook(
+                    &sessions,
+                    &dir,
+                    r#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#,
+                    1
+                )
+                .is_err()
+            );
+            assert!(dir.join("hook-error").exists());
+            assert!(!dir.join("events").exists());
+            assert!(
+                !dir.join(format!("hook-pending.{}", std::process::id()))
+                    .exists()
+            );
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn option_b_quiet_does_not_close_an_invisible_hook_waiter() {
+    fn option_b_quiet_defers_a_hook_waiting_for_admission() {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join(".claudectl/server/sessions");
         let dir = sessions.join("run-hook-lock");
@@ -1065,7 +1073,7 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(opened.exists(), "hook worker did not open hook.lock");
-        assert!(!std::fs::read_dir(&dir).unwrap().any(|entry| {
+        assert!(std::fs::read_dir(&dir).unwrap().any(|entry| {
             entry
                 .unwrap()
                 .file_name()
@@ -1091,13 +1099,67 @@ mod tests {
         drop(child.stdin.take());
         child.wait().unwrap();
         assert!(
-            admitted,
-            "documented B residual race: quiet cannot see the hook waiting before publication"
+            !admitted,
+            "a hook waiting for admission must remain visible after the quiet window"
         );
         let status: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("restart-status.json")).unwrap())
                 .unwrap();
-        assert_eq!(status["deferred"], false);
+        assert_eq!(status["deferred"], true);
+        assert_eq!(status["reason"], "queued_hook");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_waiting_prompt_blocks_restart_after_the_quiet_window() {
+        use super::super::restart_gate::{Cause, hook_admission};
+        for cause in [Cause::Renewal, Cause::Failover] {
+            let root = tempfile::tempdir().unwrap();
+            let sessions = root.path().join(".claudectl/server/sessions");
+            let dir = sessions.join("run-waiting-prompt");
+            std::fs::create_dir_all(&dir).unwrap();
+            let (mut child, mut gate, idle) = idle_hook_gate(root.path(), &dir);
+            let start = std::time::Instant::now();
+            assert!(!gate.check_at(&idle, cause, i64::MAX, start));
+            let ready = start + std::time::Duration::from_secs(600);
+            assert!(gate.check_at(&idle, cause, i64::MAX, ready));
+            let lock = hook_admission(&dir).unwrap();
+            let opened = dir.join("hook.lock.opened");
+            std::fs::remove_file(&opened).unwrap();
+            let worker = std::thread::spawn({
+                let sessions = sessions.clone();
+                let dir = dir.clone();
+                move || {
+                    record_hook(
+                        &sessions,
+                        &dir,
+                        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s"}"#,
+                        1,
+                    )
+                }
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !opened.exists() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let waiting = opened.exists();
+            let admitted = gate.check_at(&idle, cause, i64::MAX, ready);
+            let status: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.join("restart-status.json")).unwrap())
+                    .unwrap();
+            drop(lock);
+            let recorded = worker.join().unwrap();
+            drop(child.stdin.take());
+            child.wait().unwrap();
+            assert!(waiting, "hook worker did not reach hook admission");
+            assert!(recorded.is_ok());
+            assert!(
+                !admitted,
+                "a prompt waiting for hook admission must block {cause:?}"
+            );
+            assert_eq!(status["reason"], "queued_hook");
+            assert_eq!(status["deferred"], true);
+        }
     }
 
     #[cfg(unix)]

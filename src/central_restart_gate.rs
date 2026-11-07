@@ -23,9 +23,8 @@ pub(super) fn admission(directory: &Path) -> Result<File> {
     Ok(file)
 }
 
-/// Serialize hook publication with the final restart admission. Every caller acquires this
-/// lock before `restart.lock`, so a hook cannot publish between the final evidence sample and
-/// SIGTERM.
+/// Serialize recorded hook events with final restart admission, before `restart.lock`.
+/// Pending intent is published before this lock so admission can see waiting hooks.
 pub(super) fn hook_admission(directory: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)

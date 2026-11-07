@@ -246,10 +246,10 @@ input. Startup never inherits old quiet time. Expiry or authentication failure d
 shorten the window. Unknown or damaged evidence still blocks restart.
 
 **Residual race:** command hooks cannot acknowledge that all input sources are closed and
-every submitted prompt is safe to hand over. A waiting hook may be invisible before
-publication; a new prompt, peer message, scheduled job or task can arrive after the final
-sample but before SIGTERM. Sampling can also miss brief activity. Quiet is a heuristic,
-not all-input closure. No prompts are collected, stored or replayed.
+every submitted prompt is safe to hand over. Hook input may be invisible while it is being
+read, before pending intent is published. A new prompt, peer message, scheduled job or task
+can arrive after the final sample but before SIGTERM. Sampling can also miss brief activity.
+Quiet is a heuristic, not all-input closure. No prompts are collected, stored or replayed.
 
 `server run` registers Claude hooks for `SessionStart`, `UserPromptSubmit`, `Stop`,
 `StopFailure`, `SessionEnd` and the `idle_prompt` notification. They record only the event,
@@ -329,9 +329,10 @@ After quiet completes, `restart_pending` retains expiry attention while a token 
 restart budget or account choice still prevents a restart. Gate eligibility does not clear
 that alert. During the window the status reason is `quiet_window`; damaged or missing evidence is
 `evidence_unknown`. No failover reservation or restart budget is consumed while blocked.
-The signal path checks again before waiting on hook locks and before publishing
-`renewal=renewing`, then samples workload once more before SIGTERM. These locks and
-samples do not close all input sources. Any explicit child exit ends `server run` with
+Hooks publish pending intent before waiting for either admission lock, so a waiting hook
+blocks the final workload check. The signal path checks again before waiting on hook locks
+and before publishing `renewal=renewing`, then samples workload once more before SIGTERM.
+These locks and samples do not close all input sources. Any explicit child exit ends `server run` with
 that child's exit code. A `-p`/`--print` run is never automatically restarted either.
 `session.json` records the alias, account, held `expires_at`, pid and renewal state without
 the token. The run's deferred status identifies warnings and blocked sessions for Operators.
