@@ -258,8 +258,9 @@ turns, background tasks and holds, but a clear workload sample is not input-admi
 Every deferred session is checked each monitor tick, even before hooks arrive, during a
 running turn, or when no server revision has changed. Five minutes before token expiry its
 status and structured alert change to `warn`; expiry or an authentication failure changes
-them to `blocked`. The child and its work stay alive, without a forced timeout. The held
-token can stop working before you can safely end and relaunch the session.
+them to `blocked`. While restart is deferred, the child and its work stay alive without
+a forced timeout; the held token can stop working. Once quiet and fresh workload checks
+permit admission, the wrapper can send SIGTERM and resume with the available new token.
 
 After the quiet window and fresh workload checks pass, the retained restart and cron
 recovery path below can run. No timeout forces a restart while blocked, and no forced

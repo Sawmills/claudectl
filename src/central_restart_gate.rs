@@ -518,7 +518,11 @@ fn production_step_with_lane(
     lane: Option<String>,
 ) -> Result<bool> {
     let has_goal = goal.is_some();
-    let sources = production_sources(home, goal);
+    // Standalone sessions do not consume machine-wide lane outboxes.
+    if !has_goal && lane.is_none() {
+        return Ok(false);
+    }
+    let sources = production_sources(home, goal)?;
     if sources.is_empty() {
         return Ok(false);
     }
@@ -533,16 +537,18 @@ fn production_step_with_lane(
     production_markers_from_paths(&lane, &sources)
 }
 
-fn production_sources(home: &Path, goal: Option<PathBuf>) -> Vec<PathBuf> {
+fn production_sources(home: &Path, goal: Option<PathBuf>) -> Result<Vec<PathBuf>> {
     let mut sources = goal.into_iter().collect::<Vec<_>>();
     let root = home.join("Code/.fleet/voice-between");
     for name in ["agents-cases-outbox.md", "slack-outbox.md"] {
         let path = root.join(name);
-        if path.exists() {
-            sources.push(path);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => sources.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
-    sources
+    Ok(sources)
 }
 
 fn production_markers_from_paths(lane: &str, sources: &[PathBuf]) -> Result<bool> {
@@ -1523,6 +1529,47 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_outbox_discovery_cannot_clear_production_evidence() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("Code/.fleet/voice-between");
+        private_dir(&folder).unwrap();
+        std::fs::write(
+            folder.join("agents-cases-outbox.md"),
+            "w28:t1 [starting] FLT-553 migration\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0)).unwrap();
+        let lane = production_step_with_lane(home.path(), None, Some("w28:t1".into()));
+        let standalone = production_step_with_lane(home.path(), None, None);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            lane.is_err(),
+            "an unreadable outbox must leave evidence unknown"
+        );
+        assert!(
+            !standalone.unwrap(),
+            "standalone sessions do not consume lane outboxes"
+        );
+    }
+
+    #[test]
+    fn an_absent_outbox_is_optional_but_a_broken_source_is_not_clear() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!production_step_with_lane(home.path(), None, Some("w28:t1".into())).unwrap());
+        let folder = home.path().join("Code/.fleet/voice-between");
+        private_dir(&folder).unwrap();
+        std::os::unix::fs::symlink(
+            folder.join("missing-target"),
+            folder.join("agents-cases-outbox.md"),
+        )
+        .unwrap();
+        assert!(
+            production_step_with_lane(home.path(), None, Some("w28:t1".into())).is_err(),
+            "an existing broken source must leave evidence unknown"
+        );
+    }
+
+    #[test]
     fn outbox_markers_are_considered_without_a_goal_file() {
         let home = tempfile::tempdir().unwrap();
         let outbox = home
@@ -1530,7 +1577,11 @@ mod tests {
             .join("Code/.fleet/voice-between/agents-cases-outbox.md");
         std::fs::create_dir_all(outbox.parent().unwrap()).unwrap();
         std::fs::write(&outbox, "- w28:t1 [starting] FLT-553 migration\n").unwrap();
-        assert!(production_sources(home.path(), None).contains(&outbox));
+        assert!(
+            production_sources(home.path(), None)
+                .unwrap()
+                .contains(&outbox)
+        );
         assert!(production_markers_from_paths("w28:t1", &[outbox]).unwrap());
     }
 

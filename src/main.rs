@@ -32,7 +32,7 @@ enum Commands {
         /// Claude executable to run (default: `claude` on PATH)
         #[arg(long, default_value = "claude")]
         claude: std::path::PathBuf,
-        /// Request failover (currently deferred: input admission is unproved)
+        /// Request failover after ten minutes of observed quiet
         #[arg(long, conflicts_with = "no_failover")]
         failover: bool,
         /// Stay on the account at a usage limit (default with a named account)

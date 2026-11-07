@@ -32,10 +32,13 @@ Verified, missing, duplicate, skipped, and unverified results stay in this log
 after the run exits. They never print over Claude's terminal or enter its input.
 The log contains no tokens or saved prompt contents.
 
-Current hook-only sessions no longer automatically restart at idle for renewal or failover.
-The supported hooks cannot prove that input admission is closed, so an otherwise idle
-session defers with `evidence_unknown`. Claudectl does not collect or replay prompts.
-The existing child and token stay in use, including past expiry, until its owner ends it.
+Automatic renewal and failover require ten continuous minutes of observed quiet.
+Running turns, live task-output children, open production steps, pending hooks and holds
+reset that window. Unknown or damaged evidence keeps restart blocked. Expiry or an
+authentication failure does not shorten the wait; the held token can expire while deferred.
+After quiet and fresh workload checks pass, claudectl can send SIGTERM and resume the
+session on the new token or account. Quiet does not close all input sources: a late or
+invisible prompt can still be cut off. Claudectl does not collect or replay prompts.
 
 Renewal and failover also write deferred restart decisions to
 `~/.claudectl/server/restart-decisions.jsonl`. A running turn, live Claude task-output

@@ -1121,7 +1121,7 @@ pub enum Command {
         /// Claude executable to run (default: `claude` on PATH)
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
-        /// Request failover (currently deferred: input admission is unproved)
+        /// Request failover after ten minutes of observed quiet
         #[arg(long)]
         failover: bool,
         /// Arguments for Claude, after `--`
