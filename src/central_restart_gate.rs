@@ -1531,7 +1531,7 @@ mod tests {
 
     #[test]
     fn a_marker_only_production_step_defers_until_matching_done() {
-        let texts = vec![
+        let texts = [
             "- w28:t1 [starting] FLT-553 migration\n".to_string(),
             "- w28:t1 [done] FLT-553 migration\n".to_string(),
         ];
