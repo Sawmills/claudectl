@@ -354,9 +354,10 @@ When the lane exports `HERDR_TAB_ID` (or `HERDR_PANE_ID`), the monitor consumes 
 `[starting]`/`STARTING NOW` and matching `[done]`/`DONE` markers from the optional goal file
 (`LANE_GOAL_FILE` or `SAW_GOAL_FILE`) and fleet voice outboxes. Outbox markers are checked
 even when no goal file is configured. A usable tab ID takes precedence; a blank or unusable
-`HERDR_TAB_ID` falls back to a usable `HERDR_PANE_ID`. Supplied IDs that cannot identify a
-lane report unknown evidence. A standalone session with neither ID and no goal file skips
-lane outboxes. An open marker defers admission even when Claude has no local task-output child. Missing or unreadable marker evidence is reported as
+`HERDR_TAB_ID` falls back to a usable `HERDR_PANE_ID`. Lane IDs use ASCII letters,
+digits, `:`, `_`, `-`, and internal `/` or `.` qualifiers; other internal punctuation or
+Unicode makes an ID unusable. Supplied IDs that cannot identify a lane report unknown
+evidence. A standalone session with neither ID and no goal file skips lane outboxes. An open marker defers admission even when Claude has no local task-output child. Missing or unreadable marker evidence is reported as
 `evidence_unknown` and keeps admission closed. Restoring clear workload evidence starts a new quiet window; it does not provide
 input-admission proof. Explicit holds remain the preferred production boundary.
 

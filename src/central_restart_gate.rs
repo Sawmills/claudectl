@@ -542,7 +542,9 @@ impl ProductionEvidence {
             let value = value.into_string().ok()?;
             let lane = value.trim();
             let usable = lane.chars().any(|c| c.is_ascii_alphanumeric())
-                && !lane.chars().any(|c| c.is_whitespace() || c.is_control())
+                && lane
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || ":_-./".contains(c))
                 && lane_token(lane) == lane;
             usable.then(|| lane.to_owned())
         });
@@ -1698,6 +1700,109 @@ mod tests {
                     .unwrap(),
                 "unusable tab {tab:?} must not hide the pane's open production step"
             );
+        }
+    }
+
+    #[test]
+    fn malformed_lane_alphabet_cannot_hide_a_valid_panes_production_step() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("Code/.fleet/voice-between");
+        private_dir(&folder).unwrap();
+        std::fs::write(
+            folder.join("agents-cases-outbox.md"),
+            "w28:p1 [starting] FLT-553 migration\n",
+        )
+        .unwrap();
+        // Include every ASCII byte, plus non-ASCII letters, punctuation and format characters.
+        for c in (0..=127)
+            .map(char::from)
+            .chain(['é', '中', '，', '\u{200b}', '\u{a0}'])
+        {
+            if "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:_-./".contains(c) {
+                continue;
+            }
+            let malformed = format!("w28:p1{c}junk");
+            assert!(
+                ProductionEvidence::default()
+                    .for_environment(
+                        home.path(),
+                        None,
+                        Some(malformed.clone().into()),
+                        Some("w28:p1".into())
+                    )
+                    .unwrap(),
+                "malformed TAB {malformed:?} must fall back to the protected PANE"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_lane_alphabet_without_usable_fallback_remains_unknown() {
+        let home = tempfile::tempdir().unwrap();
+        for c in (0..=127)
+            .map(char::from)
+            .chain(['é', '中', '，', '\u{200b}', '\u{a0}'])
+        {
+            if "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:_-./".contains(c) {
+                continue;
+            }
+            let malformed = format!("w28:p1{c}junk");
+            for (tab, pane) in [
+                (Some(malformed.clone().into()), None),
+                (None, Some(malformed.clone().into())),
+                (
+                    Some(malformed.clone().into()),
+                    Some(malformed.clone().into()),
+                ),
+            ] {
+                assert!(
+                    ProductionEvidence::default()
+                        .for_environment(home.path(), None, tab, pane)
+                        .is_err(),
+                    "malformed identity {malformed:?} without fallback must remain unknown"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn supported_lane_alphabet_and_legacy_and_current_forms_keep_marker_protection() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("Code/.fleet/voice-between");
+        private_dir(&folder).unwrap();
+        for lane in [
+            "w28:t1",
+            "w28:p1",
+            "t1v",
+            "amir-dev/t1v",
+            "host.example/t1v",
+            "wABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:tab_ID-2/child.3",
+        ] {
+            std::fs::write(
+                folder.join("agents-cases-outbox.md"),
+                format!("{lane} [starting] FLT-553 migration\n"),
+            )
+            .unwrap();
+            for (tab, pane, open) in [
+                (Some(lane.to_owned()), Some("other".to_owned()), true),
+                (Some(format!(" {lane} ")), None, true),
+                (None, Some(lane.to_owned()), true),
+                (Some("other".to_owned()), Some(lane.to_owned()), false),
+                (None, None, false),
+            ] {
+                assert_eq!(
+                    ProductionEvidence::default()
+                        .for_environment(
+                            home.path(),
+                            None,
+                            tab.map(Into::into),
+                            pane.map(Into::into)
+                        )
+                        .unwrap(),
+                    open,
+                    "lane {lane:?}"
+                );
+            }
         }
     }
 
