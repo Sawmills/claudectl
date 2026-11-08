@@ -10,9 +10,10 @@ use axum::{
 use claudectl::server::{app, engine::Endpoints};
 use serde_json::json;
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -22,6 +23,7 @@ const AMIR: &str = "amir@sawmills.ai";
 struct Running {
     origin: String,
     api: String,
+    seed_expires_at: i64,
     refreshes: Arc<AtomicUsize>,
     server: Arc<app::Server>,
     runtime: tokio::runtime::Runtime,
@@ -39,6 +41,7 @@ fn start(state: &Path, key: &Path) -> Running {
 }
 
 fn start_with_lifetime(state: &Path, key: &Path, lifetime: i64) -> Running {
+    let seed_expires_at = chrono::Utc::now().timestamp_millis() + lifetime * 1_000;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -47,6 +50,11 @@ fn start_with_lifetime(state: &Path, key: &Path, lifetime: i64) -> Running {
     let refreshes = Arc::new(AtomicUsize::new(0));
     let counter = refreshes.clone();
     let inference_counter = refreshes.clone();
+    let grants = Arc::new(Mutex::new(HashMap::from([(
+        "synthetic-seed".to_string(),
+        seed_expires_at,
+    )])));
+    let token_grants = grants.clone();
     let (origin, server, api) = runtime.block_on(async {
         let provider = Router::new()
             .route(
@@ -57,7 +65,12 @@ fn start_with_lifetime(state: &Path, key: &Path, lifetime: i64) -> Running {
                 "/token",
                 post(move || {
                     let n = counter.fetch_add(1, Ordering::SeqCst);
+                    let grants = token_grants.clone();
                     async move {
+                        grants.lock().unwrap().insert(
+                            format!("synthetic-{n}"),
+                            chrono::Utc::now().timestamp_millis() + lifetime * 1_000,
+                        );
                         Json(json!({"access_token":format!("synthetic-{n}"),"refresh_token":format!("synthetic-refresh-{n}"),"expires_in":lifetime,"scope":"user:inference user:profile"}))
                     }
                 }),
@@ -70,18 +83,25 @@ fn start_with_lifetime(state: &Path, key: &Path, lifetime: i64) -> Running {
                 "/synthetic/inference",
                 get(move |headers: HeaderMap| {
                     let counter = inference_counter.clone();
+                    let grants = grants.clone();
                     async move {
                         let generation = counter.load(Ordering::SeqCst);
                         let current = match generation.checked_sub(1) {
                             Some(n) => format!("Bearer synthetic-{n}"),
                             None => "Bearer synthetic-seed".into(),
                         };
-                        if headers.get("authorization").and_then(|h| h.to_str().ok())
-                            == Some(current.as_str())
-                        {
-                            return Json(json!({"ok":true})).into_response();
-                        }
-                        (StatusCode::UNAUTHORIZED, Json(json!({"error":{"type":"authentication_error","message":"OAuth token revoked · Please run /login"}}))).into_response()
+                        let authorization = headers.get("authorization").and_then(|h| h.to_str().ok());
+                        let expires_at = authorization
+                            .and_then(|h| h.strip_prefix("Bearer "))
+                            .and_then(|token| grants.lock().unwrap().get(token).copied());
+                        let at = chrono::Utc::now().timestamp_millis();
+                        let reason = match expires_at {
+                            Some(expiry) if expiry <= at => "synthetic_expired",
+                            Some(_) if authorization != Some(current.as_str()) => "synthetic_revoked_pre_expiry",
+                            Some(_) => return Json(json!({"ok":true,"at":at,"expires_at":expires_at})).into_response(),
+                            None => "synthetic_unknown_grant",
+                        };
+                        (StatusCode::UNAUTHORIZED, Json(json!({"error":{"type":"authentication_error","message":"OAuth token revoked · Please run /login","reason":reason},"at":at,"expires_at":expires_at}))).into_response()
                     }
                 }),
             );
@@ -110,6 +130,7 @@ fn start_with_lifetime(state: &Path, key: &Path, lifetime: i64) -> Running {
     Running {
         origin,
         api,
+        seed_expires_at,
         refreshes,
         server,
         runtime,
@@ -130,9 +151,9 @@ def hook(event):
 def sample(stage):
     request=urllib.request.Request(os.environ['D3_PROVIDER']+'/synthetic/inference',headers={'Authorization':'Bearer '+os.environ['CLAUDE_CODE_OAUTH_TOKEN']})
     try:
-        with urllib.request.urlopen(request,timeout=3) as response: status=response.status
-    except urllib.error.HTTPError as error: status=error.code
-    result={'pid':os.getpid(),'status':status,'token_sha256':hashlib.sha256(os.environ['CLAUDE_CODE_OAUTH_TOKEN'].encode()).hexdigest()}
+        with urllib.request.urlopen(request,timeout=3) as response: status=response.status; body=json.load(response)
+    except urllib.error.HTTPError as error: status=error.code; body=json.load(error)
+    result={'pid':os.getpid(),'status':status,'token_sha256':hashlib.sha256(os.environ['CLAUDE_CODE_OAUTH_TOKEN'].encode()).hexdigest(),'provider_at':body['at'],'provider_expires_at':body['expires_at'],'provider_reason':body.get('error',{}).get('reason')}
     (control/(name+'-'+stage+'.json')).write_text(json.dumps(result))
 def terminated(*_):
     (control/(name+'-terminated')).touch()
@@ -141,7 +162,7 @@ signal.signal(signal.SIGTERM,terminated)
 hook('SessionStart'); hook('UserPromptSubmit')
 sample('before')
 if name=='live':
-    deadline=time.monotonic()+20
+    deadline=time.monotonic()+float(os.environ.get('D3_LIVE_SECONDS','20'))
     sampled=set()
     while not (control/'release').exists() and time.monotonic()<deadline:
         for stage in ('status','after'):
@@ -213,7 +234,16 @@ fn wait_for_token_sample(path: &Path) -> serde_json::Value {
 }
 
 #[cfg(unix)]
-fn live_child_token_case(lifetime: i64) {
+#[derive(Clone, Copy, Debug)]
+enum Peer {
+    Launch43,
+    Acquire41,
+    Observe43,
+    Observe43AfterExpiry,
+}
+
+#[cfg(unix)]
+fn live_child_token_case(lifetime: i64, peer: Peer) {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let state = root.path().join("state");
@@ -238,7 +268,7 @@ fn live_child_token_case(lifetime: i64) {
             claudectl::server::engine::Grant {
                 access_token: "synthetic-seed".into(),
                 refresh_token: "synthetic-seed-refresh".into(),
-                expires_at: chrono::Utc::now().timestamp_millis() + lifetime * 1_000,
+                expires_at: server.seed_expires_at,
                 scopes: vec!["user:inference".into(), "user:profile".into()],
             },
             None,
@@ -253,12 +283,12 @@ fn live_child_token_case(lifetime: i64) {
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
     let control = root.path().join("control");
     std::fs::create_dir(&control).unwrap();
+    let mut command = live_token_command(live_home.path(), &binary, &control, &server.api, "live");
+    if matches!(peer, Peer::Observe43AfterExpiry) {
+        command.env("D3_LIVE_SECONDS", "90");
+    }
     let mut live = LiveTokenChild {
-        process: Some(
-            live_token_command(live_home.path(), &binary, &control, &server.api, "live")
-                .spawn()
-                .unwrap(),
-        ),
+        process: Some(command.spawn().unwrap()),
         release: control.join("release"),
     };
     let before = wait_for_token_sample(&control.join("live-before.json"));
@@ -304,14 +334,57 @@ fn live_child_token_case(lifetime: i64) {
     eprintln!(
         "synthetic status --refresh: lifetime={lifetime}s, exchanges={exchanges_after_start} unchanged, revision unchanged, same live child/token, HTTP 200; no local profiles"
     );
-    let next = live_token_command(next_home.path(), &binary, &control, &server.api, "next")
-        .output()
-        .unwrap();
-    assert!(
-        next.status.success(),
-        "{}",
-        String::from_utf8_lossy(&next.stderr)
-    );
+    let expired_control = matches!(peer, Peer::Observe43AfterExpiry);
+    if expired_control {
+        let remaining = server.seed_expires_at - chrono::Utc::now().timestamp_millis();
+        if remaining > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(remaining as u64 + 100));
+        }
+    }
+    let request_at = chrono::Utc::now().timestamp_millis();
+    let latest = match peer {
+        Peer::Launch43 => {
+            let next = live_token_command(next_home.path(), &binary, &control, &server.api, "next")
+                .output()
+                .unwrap();
+            assert!(
+                next.status.success(),
+                "{}",
+                String::from_utf8_lossy(&next.stderr)
+            );
+            wait_for_token_sample(&control.join("next-before.json"))
+        }
+        Peer::Acquire41 | Peer::Observe43 | Peer::Observe43AfterExpiry => {
+            let legacy = matches!(peer, Peer::Acquire41);
+            let (_, peer_machine) = server.register(if legacy {
+                "synthetic-v041-caller"
+            } else {
+                "synthetic-v043-caller"
+            });
+            // v0.1.41 Client::acquire(id, None), unchanged on that released tag.
+            let request = if legacy {
+                json!({"account_id":receipt.account_id,"previous_revision":null})
+            } else {
+                json!({"account_id":receipt.account_id,"observe":true})
+            };
+            let access: serde_json::Value = http
+                .post(format!("{}/v2/anthropic/token", server.origin))
+                .bearer_auth(peer_machine)
+                .json(&request)
+                .send()
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .unwrap();
+            let response = http
+                .get(format!("{}/synthetic/inference", server.api))
+                .bearer_auth(access["access_token"].as_str().unwrap())
+                .send()
+                .unwrap();
+            json!({"status":response.status().as_u16()})
+        }
+    };
     let exchanges_after_next = server.refreshes.load(Ordering::SeqCst);
     let current = observe();
     std::fs::write(control.join("sample-after"), "").unwrap();
@@ -330,7 +403,6 @@ fn live_child_token_case(lifetime: i64) {
     assert_eq!(before["pid"], after["pid"]);
     assert_eq!(before["token_sha256"], after["token_sha256"]);
     assert!(!control.join("live-terminated").exists());
-    let latest = wait_for_token_sample(&control.join("next-before.json"));
     assert_eq!(latest["status"], 200);
     let revision_changed = held["revision"] != current["revision"];
     let metrics = http
@@ -343,28 +415,71 @@ fn live_child_token_case(lifetime: i64) {
         .lines()
         .filter(|line| line.starts_with("claudectl_token_rotations_total{"))
         .collect();
-    for reason in ["forced", "migration", "expired"] {
+    for reason in ["forced", "migration"] {
         assert!(rotations.contains(
             &format!("claudectl_token_rotations_total{{reason=\"{reason}\"}} 0").as_str()
         ));
     }
+    assert!(
+        rotations.contains(
+            &format!(
+                "claudectl_token_rotations_total{{reason=\"expired\"}} {}",
+                u8::from(expired_control)
+            )
+            .as_str()
+        )
+    );
+    eprintln!(
+        "{}",
+        json!({"case":"D3-FAIL-0143","version":env!("CARGO_PKG_VERSION"),"peer":format!("{peer:?}"),"request_at":request_at,"held_expires_at":held["expires_at"],"before":before,"after":after,"successor_status":latest["status"],"held_revision":held["revision"],"current_revision":current["revision"],"revision_changed":revision_changed,"server_error":status["error"],"server_stale":status["stale"],"exchanges_before":exchanges_after_start,"exchanges_after":exchanges_after_next,"rotations":rotations})
+    );
     drop(live); // Release the synthetic child normally before the RED assertion.
+    if expired_control {
+        assert_eq!(after["provider_reason"], "synthetic_expired");
+        assert!(after["provider_at"].as_i64().unwrap() >= server.seed_expires_at);
+    }
     assert_eq!(
-        after["status"], 200,
-        "a normal new session invalidated a still-live child's grant while server status remained OK: lifetime={lifetime}, revision_changed={revision_changed}, exchanges={exchanges_after_start}->{exchanges_after_next}, rotations={rotations:?}"
+        after["status"],
+        if expired_control { 401 } else { 200 },
+        "a same-account caller invalidated a still-live child's grant while server status remained OK: peer={peer:?}, lifetime={lifetime}, revision_changed={revision_changed}, exchanges={exchanges_after_start}->{exchanges_after_next}, rotations={rotations:?}"
     );
 }
 
 #[test]
 #[cfg(unix)]
 fn a_new_session_does_not_revoke_the_grant_a_live_child_holds() {
-    live_child_token_case(120);
+    live_child_token_case(120, Peer::Launch43);
 }
 
 #[test]
 #[cfg(unix)]
 fn a_new_session_outside_the_margin_keeps_the_live_child_usable() {
-    live_child_token_case(3600);
+    live_child_token_case(3600, Peer::Launch43);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_legacy_same_account_request_does_not_revoke_a_busy_current_child() {
+    live_child_token_case(120, Peer::Acquire41);
+}
+
+#[test]
+#[cfg(unix)]
+fn an_observing_same_account_request_keeps_a_busy_current_child_usable() {
+    live_child_token_case(120, Peer::Observe43);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_legacy_request_outside_the_margin_keeps_the_busy_current_child_usable() {
+    live_child_token_case(3600, Peer::Acquire41);
+}
+
+#[test]
+#[cfg(unix)]
+fn natural_expiry_rejects_a_busy_snapshot_without_a_legacy_caller() {
+    // Real admission requires more than 60 seconds of remaining lifetime.
+    live_child_token_case(65, Peer::Observe43AfterExpiry);
 }
 
 /// Write the files `claudectl server connect` leaves behind, without the browser step.

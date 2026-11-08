@@ -234,13 +234,19 @@ credentials file and the process environment all behave the same), while a new p
 `--resume <session>` continues the same session.
 
 Token lifetime is therefore the session limit. A provider refresh revokes the access token
-issued before it, and every `server run` of an account shares that token. Automatic launches
-and failovers take the current unexpired token without refreshing it inside the server's
-five-minute margin. An expired token is refreshed on demand. A new child can therefore start
-near token expiry; expiry alerts and the ten-minute quiet requirement still apply.
-Explicit refreshes and migration keep their existing rotation rules.
-`claudectl server refresh-access` forces one and ends every running session of that account
-(relaunch each with `--resume`).
+issued before it, and every `server run` of an account shares that token. The Engine returns
+the current Ready, unexpired grant for ordinary acquisitions, including older callers that
+omit `observe`. It no longer rotates an ordinary grant inside the former five-minute margin.
+An expired grant or pending migration still follows the existing leased refresh and
+verification path. Supplying the exact current `previous_revision` still forces rotation;
+a stale revision returns the available unexpired successor.
+
+A new child can therefore start near token expiry. Expiry alerts and the ten-minute quiet
+requirement still apply; this does not guarantee continuous authentication for a busy child.
+`claudectl server refresh-access` deliberately rotates the shared grant, so existing child
+snapshots can be rejected until restart is permitted. The historical `margin` rotation
+metric label remains exported at zero for compatibility; explicit force, migration and
+expiry retain their existing reason labels.
 
 Automatic renewal and failover
 require ten continuous minutes of observed quiet. The clock starts with the first clear

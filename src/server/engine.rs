@@ -28,10 +28,6 @@ pub use login::Login;
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const BETA: &str = "oauth-2025-04-20";
 const PROVIDER: &str = "anthropic";
-/// Refresh when less than this remains, so machines always hold a token with room to work.
-/// Keep it short: a refresh revokes the token every `server run` of the account holds, and
-/// the client avoids asking inside this window (claudectl renew::NO_POLL_MS, SAW-12610).
-const MARGIN: i64 = 300_000;
 /// Why a login could not finish, as a bounded reason the machine is told. The response
 /// stays retained either way.
 #[derive(Debug)]
@@ -55,12 +51,13 @@ pub fn login_reason(error: &anyhow::Error) -> &'static str {
         .downcast_ref::<LoginRefused>()
         .map_or("login_incomplete_grant_retained", |refused| refused.0)
 }
-/// Every value `rotation_reason` returns. `/metrics` exports each from startup, so the first
-/// refresh of a reason shows as an increase.
+/// Stable rotation labels, including historical `margin`. `/metrics` exports each from
+/// startup, so the first refresh of a reason shows as an increase.
 pub(crate) const ROTATION_REASONS: [&str; 4] = ["expired", "forced", "margin", "migration"];
 /// Why a refresh ran: a client that sent the current revision forced it; a token that had
 /// already expired revoked nothing; a pending migration rotates a token that may have hours
-/// left; otherwise the held token was inside the margin.
+/// left. The legacy `margin` fallback remains for metric compatibility; ordinary reads no
+/// longer rotate an unexpired grant.
 pub(crate) fn rotation_reason(
     previous: Option<&str>,
     revision: &str,
@@ -220,7 +217,7 @@ impl Loaded {
         let r = &self.record;
         r.phase != Phase::Ready
             || matches!(r.rotation, Rotation::Pending { .. })
-            || r.grant.expires_at <= now() + MARGIN
+            || r.grant.expires_at <= now()
             || previous == Some(r.revision.as_str())
     }
     fn access(&self) -> Access {

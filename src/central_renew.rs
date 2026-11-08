@@ -289,9 +289,7 @@ pub(super) fn decide(i: &Inputs) -> Decision {
     }
 }
 
-/// Whether Claude is idle enough to be restarted. The monitor also asks the server for the
-/// token only when this holds: inside the server's margin that request refreshes the grant,
-/// which revokes the token a running turn uses.
+/// Whether Claude is idle enough to be restarted. Token expiry never bypasses this gate.
 pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     if i.idle.session.is_none() {
         return Err("no session id from Claude yet");
