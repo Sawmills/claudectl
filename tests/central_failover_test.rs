@@ -26,7 +26,7 @@ struct Fake {
     spare_full: bool,
     /// `work` keeps room: the failed turn was a short throttle.
     throttle: bool,
-    /// An observing token read of `work` returns a newer token (a renewal follows).
+    /// An observing read after the first grant returns a newer token (a renewal follows).
     renew_work: bool,
     /// Every usage read: (account id, cached).
     usage_reads: Vec<(String, String)>,
@@ -74,7 +74,10 @@ async fn usage(
 async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Value> {
     let id = body["account_id"].as_str().unwrap_or_default().to_string();
     shared.lock().unwrap().token_requests.push(id.clone());
-    let renewed = id == WORK && body["observe"] == true && shared.lock().unwrap().renew_work;
+    let renewed = {
+        let fake = shared.lock().unwrap();
+        id == WORK && body["observe"] == true && fake.work_used && fake.renew_work
+    };
     let (name, org) = if id == WORK {
         shared.lock().unwrap().work_used = true;
         ("work", "org-work")

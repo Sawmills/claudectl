@@ -3,6 +3,8 @@
 use assert_cmd::Command;
 use axum::{
     Json, Router,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
     routing::{get, post},
 };
 use claudectl::server::{app, engine::Endpoints};
@@ -19,6 +21,7 @@ const AMIR: &str = "amir@sawmills.ai";
 
 struct Running {
     origin: String,
+    api: String,
     refreshes: Arc<AtomicUsize>,
     server: Arc<app::Server>,
     runtime: tokio::runtime::Runtime,
@@ -32,6 +35,10 @@ impl Running {
 }
 
 fn start(state: &Path, key: &Path) -> Running {
+    start_with_lifetime(state, key, 3600)
+}
+
+fn start_with_lifetime(state: &Path, key: &Path, lifetime: i64) -> Running {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -39,7 +46,8 @@ fn start(state: &Path, key: &Path) -> Running {
         .unwrap();
     let refreshes = Arc::new(AtomicUsize::new(0));
     let counter = refreshes.clone();
-    let (origin, server) = runtime.block_on(async {
+    let inference_counter = refreshes.clone();
+    let (origin, server, api) = runtime.block_on(async {
         let provider = Router::new()
             .route(
                 "/api/oauth/profile",
@@ -50,7 +58,30 @@ fn start(state: &Path, key: &Path) -> Running {
                 post(move || {
                     let n = counter.fetch_add(1, Ordering::SeqCst);
                     async move {
-                        Json(json!({"access_token":format!("synthetic-{n}"),"refresh_token":format!("synthetic-refresh-{n}"),"expires_in":3600,"scope":"user:inference user:profile"}))
+                        Json(json!({"access_token":format!("synthetic-{n}"),"refresh_token":format!("synthetic-refresh-{n}"),"expires_in":lifetime,"scope":"user:inference user:profile"}))
+                    }
+                }),
+            )
+            .route(
+                "/api/oauth/usage",
+                get(|| async { Json(json!({"five_hour":{"utilization":1},"seven_day":{"utilization":3},"extra_usage":{"is_enabled":false}})) }),
+            )
+            .route(
+                "/synthetic/inference",
+                get(move |headers: HeaderMap| {
+                    let counter = inference_counter.clone();
+                    async move {
+                        let generation = counter.load(Ordering::SeqCst);
+                        let current = match generation.checked_sub(1) {
+                            Some(n) => format!("Bearer synthetic-{n}"),
+                            None => "Bearer synthetic-seed".into(),
+                        };
+                        if headers.get("authorization").and_then(|h| h.to_str().ok())
+                            == Some(current.as_str())
+                        {
+                            return Json(json!({"ok":true})).into_response();
+                        }
+                        (StatusCode::UNAUTHORIZED, Json(json!({"error":{"type":"authentication_error","message":"OAuth token revoked · Please run /login"}}))).into_response()
                     }
                 }),
             );
@@ -74,14 +105,241 @@ fn start(state: &Path, key: &Path) -> Running {
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let router = app::router(server.clone());
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        (origin, server)
+        (origin, server, api)
     });
     Running {
         origin,
+        api,
         refreshes,
         server,
         runtime,
     }
+}
+
+#[cfg(unix)]
+const LIVE_TOKEN_CHILD: &str = r#"#!/usr/bin/env python3
+import hashlib, json, os, signal, subprocess, sys, time, urllib.error, urllib.request
+from pathlib import Path
+control=Path(os.environ['D3_CONTROL'])
+name=os.environ['D3_CHILD']
+args=sys.argv[1:]
+settings=json.load(open(args[args.index('--settings')+1]))
+command=settings['hooks']['Stop'][0]['hooks'][0]['command']
+def hook(event):
+    subprocess.run(['/bin/sh','-c',command],input=json.dumps({'hook_event_name':event,'session_id':'synthetic-'+name}).encode(),check=True)
+def sample(stage):
+    request=urllib.request.Request(os.environ['D3_PROVIDER']+'/synthetic/inference',headers={'Authorization':'Bearer '+os.environ['CLAUDE_CODE_OAUTH_TOKEN']})
+    try:
+        with urllib.request.urlopen(request,timeout=3) as response: status=response.status
+    except urllib.error.HTTPError as error: status=error.code
+    result={'pid':os.getpid(),'status':status,'token_sha256':hashlib.sha256(os.environ['CLAUDE_CODE_OAUTH_TOKEN'].encode()).hexdigest()}
+    (control/(name+'-'+stage+'.json')).write_text(json.dumps(result))
+def terminated(*_):
+    (control/(name+'-terminated')).touch()
+    sys.exit(143)
+signal.signal(signal.SIGTERM,terminated)
+hook('SessionStart'); hook('UserPromptSubmit')
+sample('before')
+if name=='live':
+    deadline=time.monotonic()+20
+    sampled=False
+    while not (control/'release').exists() and time.monotonic()<deadline:
+        if (control/'sample-again').exists() and not sampled:
+            sample('after'); sampled=True
+        time.sleep(.02)
+hook('Stop'); hook('SessionEnd')
+"#;
+
+#[cfg(unix)]
+struct LiveTokenChild {
+    process: Option<std::process::Child>,
+    release: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for LiveTokenChild {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, "");
+        if let Some(child) = self.process.take() {
+            let _ = child.wait_with_output();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn live_token_command(
+    home: &Path,
+    binary: &Path,
+    control: &Path,
+    api: &str,
+    name: &str,
+) -> std::process::Command {
+    use std::os::unix::fs::PermissionsExt;
+    let qualified = home.join(".claudectl/server/qualified-host-config-builds.json");
+    std::fs::write(&qualified, json!([{"sha256":claudectl::exec::sha256_file(binary).unwrap(),"platform":std::env::consts::OS,"qualified_at":"test","check":"supervised_host_config"}]).to_string()).unwrap();
+    std::fs::set_permissions(&qualified, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
+    command
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env("CLAUDECTL_TEST_RENEW_FAST", "1")
+        .env("D3_CONTROL", control)
+        .env("D3_PROVIDER", api)
+        .env("D3_CHILD", name)
+        .args(["server", "run", "work", "--claude"])
+        .arg(binary)
+        .args(["--", "--resume", "synthetic-session"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    command
+}
+
+#[cfg(unix)]
+fn wait_for_token_sample(path: &Path) -> serde_json::Value {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < end {
+        if let Ok(bytes) = std::fs::read(path)
+            && let Ok(result) = serde_json::from_slice(&bytes)
+        {
+            return result;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("synthetic child did not publish {}", path.display());
+}
+
+#[cfg(unix)]
+fn live_child_token_case(lifetime: i64) {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let key = root.path().join("key");
+    app::setup(&state, &key).unwrap();
+    let server = start_with_lifetime(&state, &key, lifetime);
+    let (_, machine) = server.register("synthetic-live-child");
+    let http = reqwest::blocking::Client::new();
+    let me: serde_json::Value = http
+        .get(format!("{}/v1/me", server.origin))
+        .bearer_auth(&machine)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let receipt = server
+        .runtime
+        .block_on(server.server.engine().admit(
+            me["id"].as_str().unwrap(),
+            "work",
+            "synthetic-login",
+            claudectl::server::engine::Grant {
+                access_token: "synthetic-seed".into(),
+                refresh_token: "synthetic-seed-refresh".into(),
+                expires_at: chrono::Utc::now().timestamp_millis() + lifetime * 1_000,
+                scopes: vec!["user:inference".into(), "user:profile".into()],
+            },
+            None,
+        ))
+        .unwrap();
+    let live_home = tempfile::tempdir().unwrap();
+    let next_home = tempfile::tempdir().unwrap();
+    connect(live_home.path(), &server.origin, &machine);
+    connect(next_home.path(), &server.origin, &machine);
+    let binary = root.path().join("synthetic-claude");
+    std::fs::write(&binary, LIVE_TOKEN_CHILD).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let control = root.path().join("control");
+    std::fs::create_dir(&control).unwrap();
+    let mut live = LiveTokenChild {
+        process: Some(
+            live_token_command(live_home.path(), &binary, &control, &server.api, "live")
+                .spawn()
+                .unwrap(),
+        ),
+        release: control.join("release"),
+    };
+    let before = wait_for_token_sample(&control.join("live-before.json"));
+    assert_eq!(before["status"], 200);
+    let exchanges_after_start = server.refreshes.load(Ordering::SeqCst);
+    let observe = || -> serde_json::Value {
+        http.post(format!("{}/v2/anthropic/token", server.origin))
+            .bearer_auth(&machine)
+            .json(&json!({"account_id":receipt.account_id,"observe":true}))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap()
+    };
+    let held = observe();
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    assert_eq!(
+        server.refreshes.load(Ordering::SeqCst),
+        exchanges_after_start,
+        "an observing request or the busy monitor refreshed the grant"
+    );
+    let next = live_token_command(next_home.path(), &binary, &control, &server.api, "next")
+        .output()
+        .unwrap();
+    assert!(
+        next.status.success(),
+        "{}",
+        String::from_utf8_lossy(&next.stderr)
+    );
+    let exchanges_after_next = server.refreshes.load(Ordering::SeqCst);
+    let current = observe();
+    std::fs::write(control.join("sample-again"), "").unwrap();
+    let after = wait_for_token_sample(&control.join("live-after.json"));
+    let status = claudectl(live_home.path(), &["server", "status", "work", "--json"]);
+    let status: serde_json::Value = serde_json::from_str(&ok(&status)).unwrap();
+    assert_eq!(status.get("error"), Some(&serde_json::Value::Null));
+    assert_eq!(status["stale"], false);
+    assert_eq!(status["data"]["seven_day"]["utilization"], 3);
+    assert_eq!(
+        server.refreshes.load(Ordering::SeqCst),
+        exchanges_after_next,
+        "status or observing a successor refreshed the grant"
+    );
+    assert!(live.process.as_mut().unwrap().try_wait().unwrap().is_none());
+    assert_eq!(before["pid"], after["pid"]);
+    assert_eq!(before["token_sha256"], after["token_sha256"]);
+    assert!(!control.join("live-terminated").exists());
+    let latest = wait_for_token_sample(&control.join("next-before.json"));
+    assert_eq!(latest["status"], 200);
+    let revision_changed = held["revision"] != current["revision"];
+    let metrics = http
+        .get(format!("{}/metrics", server.origin))
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    let rotations: Vec<_> = metrics
+        .lines()
+        .filter(|line| line.starts_with("claudectl_token_rotations_total{"))
+        .collect();
+    for reason in ["forced", "migration", "expired"] {
+        assert!(rotations.contains(
+            &format!("claudectl_token_rotations_total{{reason=\"{reason}\"}} 0").as_str()
+        ));
+    }
+    drop(live); // Release the synthetic child normally before the RED assertion.
+    assert_eq!(
+        after["status"], 200,
+        "a normal new session invalidated a still-live child's grant while server status remained OK: lifetime={lifetime}, revision_changed={revision_changed}, exchanges={exchanges_after_start}->{exchanges_after_next}, rotations={rotations:?}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_new_session_does_not_revoke_the_grant_a_live_child_holds() {
+    live_child_token_case(120);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_new_session_outside_the_margin_keeps_the_live_child_usable() {
+    live_child_token_case(3600);
 }
 
 /// Write the files `claudectl server connect` leaves behind, without the browser step.
@@ -115,7 +373,9 @@ fn connect(home: &Path, origin: &str, token: &str) {
 fn claudectl(home: &Path, args: &[&str]) -> std::process::Output {
     Command::cargo_bin("claudectl")
         .unwrap()
+        .env_clear()
         .env("HOME", home)
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
         .args(args)
         .output()
