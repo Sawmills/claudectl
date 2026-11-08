@@ -53,6 +53,7 @@ pub(super) struct Recovery {
     previous: Vec<(PathBuf, u64)>,
     session_id: String,
     attempt: String,
+    continue_request: bool,
 }
 
 impl Recovery {
@@ -94,6 +95,7 @@ impl Recovery {
             previous: Vec::new(),
             session_id: String::new(),
             attempt: format!("{:032x}", rand::random::<u128>()),
+            continue_request: false,
         };
         for directory in directories {
             let directory = directory?;
@@ -371,6 +373,10 @@ impl Recovery {
         Ok(jobs)
     }
 
+    pub(super) fn continue_request(&mut self) {
+        self.continue_request = true;
+    }
+
     pub(super) fn prompt(&self) -> String {
         let mut prompt = format!(
             "claudectl cron recovery attempt {}. claudectl restarted this session. Restore the saved \
@@ -400,8 +406,13 @@ impl Recovery {
              A shared file and schedule uses the same ID on every owning card. \
              Update claude_session_file on each card \
              to this session's actual transcript path. Do not replay missed fires or run \
-             any saved job's prompt as part of recovery. Do not create duplicate jobs.",
+             any saved job's prompt as part of recovery. Do not create duplicate jobs. ",
         );
+        prompt.push_str(if self.continue_request {
+            super::failover::RECOVERY_PROMPT
+        } else {
+            "Then stop: do no other work."
+        });
         prompt
     }
 }

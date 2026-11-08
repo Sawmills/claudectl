@@ -117,6 +117,32 @@ fn recovery_restores_only_missing_jobs_without_replaying_missed_fires() {
 }
 
 #[test]
+fn renewal_recovery_verifies_the_complete_launch_prompt() {
+    let f = Fixture::new();
+    let recovery = f.prepare().unwrap().unwrap();
+    let prompt = recovery.prompt();
+    assert!(prompt.ends_with("Then stop: do no other work."));
+    assert_eq!(
+        f.report(&recovery, f.jobs(), &prompt),
+        "cron recovery verified: 2/2 saved jobs"
+    );
+}
+
+#[test]
+fn failover_recovery_verifies_its_continuation_prompt() {
+    let f = Fixture::new();
+    let mut recovery = f.prepare().unwrap().unwrap();
+    recovery.continue_request();
+    let prompt = recovery.prompt();
+    assert!(prompt.ends_with(super::super::failover::RECOVERY_PROMPT));
+    assert!(!prompt.contains("Then stop: do no other work."));
+    assert_eq!(
+        f.report(&recovery, f.jobs(), &prompt),
+        "cron recovery verified: 2/2 saved jobs"
+    );
+}
+
+#[test]
 fn recovery_accepts_kept_jobs_with_their_existing_ids() {
     let f = Fixture::new();
     let recovery = f.prepare().unwrap().unwrap();

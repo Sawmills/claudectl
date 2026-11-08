@@ -330,13 +330,8 @@ fn automatic_selection_accepts_an_unopened_five_hour_window() {
         "observed_at": chrono::Utc::now().timestamp_millis(),
         "next_retry_at": 0, "stale": false, "error": null,
     })));
-    // `run` and `use` share this server picker. `use` also exercises its CLI path
-    // without acquiring a provider token or launching a real Claude session.
-    let paths = claudectl::config::Paths::from_home(env.home.path().into());
-    assert_eq!(
-        claudectl::central::pick_account(&paths).unwrap(),
-        "amir2@sawmills.ai"
-    );
+    // `run` and `use` share the server picker. Exercise it in a child CLI with
+    // the fixture's loopback opt-in, without acquiring a provider token.
     let output = env.with_path(&["use"], &env.claude_path(true));
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("amir2@sawmills.ai"));

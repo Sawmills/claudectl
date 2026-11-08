@@ -1213,7 +1213,7 @@ pub fn run(
         }
         // Renewing until the next Claude runs.
         session.set_renewal("renewing")?;
-        let after_recovery = match kind {
+        let continue_request = match kind {
             RestartKind::Renew(access) => {
                 launch_args =
                     super::failover::prompted_resume(args, &session_id, super::renew::CRON_NOTE)
@@ -1221,7 +1221,7 @@ pub fn run(
                 session.renew(access)?;
                 restarts.push(now());
                 eprintln!("claudectl: server token renewed; resuming session {session_id}");
-                "Then stop: do no other work."
+                false
             }
             RestartKind::Failover { account, access } => {
                 // A new session for the new account: its session.json names the new alias
@@ -1243,7 +1243,7 @@ pub fn run(
                     "claudectl: {from} reached its usage limit; resuming session {session_id} on {}",
                     account.alias
                 );
-                super::failover::RECOVERY_PROMPT
+                true
             }
         };
         // Failover moves the hooks and settings into a new run directory. Arm cron
@@ -1263,9 +1263,11 @@ pub fn run(
                     None
                 }
             };
-        if let Some(recovery) = &cron_recovery {
-            let prompt = format!("{} {after_recovery}", recovery.prompt());
-            launch_args = super::failover::prompted_resume(args, &session_id, &prompt)
+        if let Some(recovery) = &mut cron_recovery {
+            if continue_request {
+                recovery.continue_request();
+            }
+            launch_args = super::failover::prompted_resume(args, &session_id, &recovery.prompt())
                 .context("cron recovery of a one-shot run")?;
         }
         first = false;

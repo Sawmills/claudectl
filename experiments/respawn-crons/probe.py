@@ -181,7 +181,7 @@ class Core:
         expected = "working" if name == "working" else "idle"
         while time.monotonic() < deadline:
             current = self.call("get", terminal)
-            if (home / name).exists() and current.get("status", {}).get("state") == expected:
+            if (home / name).exists() and (current.get("status") or {}).get("state") == expected:
                 return
             if current["state"] == "finished":
                 break
