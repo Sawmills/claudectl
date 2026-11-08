@@ -69,7 +69,7 @@ jobs:
     name: Build ${{ matrix.label }}
     needs: setup
     # trunk-ignore(actionlint/runner-label): Existing Namespace profile
-    runs-on: ${{ fromJSON('{"macos-14":"macos-14","macos-15-intel":"macos-15-intel","ubuntu-latest":"namespace-profile-sawmills-runner","ubuntu-22.04-arm":"namespace-profile-sawmills-runner-arm64"}')[matrix.os] }}
+    runs-on: ${{ fromJSON('{"macos-15":"macos-15","macos-15-intel":"macos-15-intel","ubuntu-latest":"namespace-profile-sawmills-runner","ubuntu-22.04-arm":"namespace-profile-sawmills-runner-arm64"}')[matrix.os] }}
     container: ${{ matrix.container || '' }}
     defaults:
       run:
@@ -79,7 +79,7 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             label: Darwin_arm64
           # trunk-ignore(actionlint/runner-label): Current GitHub Intel macOS runner label.
