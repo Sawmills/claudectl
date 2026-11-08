@@ -293,8 +293,9 @@ Extra copies of saved jobs prevent a verified result; unrelated jobs are preserv
 outside the saved-job count.
 The transcript read is limited to 8 MiB after the previous recorded position. An ambiguous
 card, an unreadable saved prompt, a malformed entry, or a recovery-arm failure prints
-`cron recovery skipped: <reason>` and falls back to the existing note for that restart:
-the cron note for renewal, or "Continue the previous request" for failover. Optional
+`cron recovery skipped: <reason>` and falls back to the ordinary resume arguments.
+When those arguments leave an unambiguous empty prompt slot, renewal adds its existing
+cron note and failover adds "Continue the previous request". Optional
 cron recovery never aborts a restart. Sessions with no matching card keep their existing
 renewal or failover note; first launches and manual resumes do not use this recovery.
 Cards with no saved crons also keep the existing note. Unreadable unrelated cards produce a
