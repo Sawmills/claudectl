@@ -226,12 +226,13 @@ pub(super) fn prompted_resume(
 }
 
 /// Card recovery requires a delivered prompt, even with variadic flags or an initial
-/// user prompt. Keep option values intact and combine the two texts into one positional
-/// prompt, after `--`. The caller verifies this exact delivered text.
+/// user prompt. Keep option values intact and deliver one positional prompt after `--`.
+/// Forward the original task only when continuing it. The caller verifies the exact text.
 pub(super) fn required_prompted_resume(
     args: &[OsString],
     session: &str,
     recovery: &str,
+    continue_request: bool,
 ) -> Result<(Vec<OsString>, String)> {
     // Claude Code 2.1.319 --help: these consume all following non-option values.
     const MANY: &[&str] = &[
@@ -304,7 +305,7 @@ pub(super) fn required_prompted_resume(
             }
         }
     }
-    let prompt = match original {
+    let prompt = match original.filter(|_| continue_request) {
         Some(original) => format!(
             "{recovery}\n\nOriginal user prompt (verbatim):\n{}",
             original

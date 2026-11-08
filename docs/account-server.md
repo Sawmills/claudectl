@@ -285,7 +285,8 @@ continues the previous request. claudectl prints
 `cron recovery verified: N/N saved jobs`, `missing cron: <file> (<schedule>)`, or an explicit
 unverified notice if evidence is absent or unreadable. Prompt contents are not printed.
 Recovery preserves option values, including multi-value `--add-dir` and `--allowedTools`.
-A real initial prompt is included verbatim in the single delivered recovery prompt.
+Failover includes the original task verbatim in its single delivered recovery prompt.
+Renewal omits the original task and stops after restoring crons.
 Verification matches that delivered text using a digest held in memory. If launch
 arguments cannot be classified as one prompt, recovery is disarmed with a skipped notice
 and the ordinary resume path continues.
