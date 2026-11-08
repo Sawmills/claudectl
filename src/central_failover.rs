@@ -225,6 +225,103 @@ pub(super) fn prompted_resume(
     Some(resumed)
 }
 
+/// Card recovery requires a delivered prompt, even with variadic flags or an initial
+/// user prompt. Keep option values intact and combine the two texts into one positional
+/// prompt, after `--`. The caller verifies this exact delivered text.
+pub(super) fn required_prompted_resume(
+    args: &[OsString],
+    session: &str,
+    recovery: &str,
+) -> Result<(Vec<OsString>, String)> {
+    // Claude Code 2.1.319 --help: these consume all following non-option values.
+    const MANY: &[&str] = &[
+        "--add-dir",
+        "--allowedTools",
+        "--allowed-tools",
+        "--disallowedTools",
+        "--disallowed-tools",
+        "--betas",
+        "--file",
+        "--mcp-config",
+        "--tools",
+    ];
+    const OPTIONAL: &[&str] = &[
+        "--cloud",
+        "-d",
+        "--debug",
+        "--from-pr",
+        "--prompt-suggestions",
+        "--remote-control",
+        "--teleport",
+        "-w",
+        "--worktree",
+    ];
+    let end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let mut user = super::renew::relaunch_args(&args[..end], session)
+        .context("cron recovery cannot restart a one-shot run")?;
+    user.truncate(user.len() - 2);
+    let mut options = Vec::new();
+    let mut original = None;
+    let mut rest = user.iter().peekable();
+    while let Some(arg) = rest.next() {
+        let text = arg.to_string_lossy();
+        if text.starts_with('-') {
+            options.push(arg.clone());
+            let (flag, assigned) = text
+                .split_once('=')
+                .map_or((text.as_ref(), false), |(flag, _)| (flag, true));
+            if MANY.contains(&flag) {
+                while rest
+                    .peek()
+                    .is_some_and(|next| !next.to_string_lossy().starts_with('-'))
+                {
+                    options.push(rest.next().unwrap().clone());
+                }
+            } else if !assigned
+                && (VALUE_FLAGS.contains(&flag)
+                    || matches!(flag, "--settings" | "--setting-sources"))
+            {
+                options.push(rest.next().context("Claude option has no value")?.clone());
+            } else if !assigned
+                && OPTIONAL.contains(&flag)
+                && rest
+                    .peek()
+                    .is_some_and(|next| !next.to_string_lossy().starts_with('-'))
+            {
+                options.push(rest.next().unwrap().clone());
+            }
+        } else if original.replace(arg).is_some() {
+            bail!("Claude launch has more than one positional prompt");
+        }
+    }
+    if end < args.len() {
+        for arg in &args[end + 1..] {
+            if original.replace(arg).is_some() {
+                bail!("Claude launch has more than one positional prompt");
+            }
+        }
+    }
+    let prompt = match original {
+        Some(original) => format!(
+            "{recovery}\n\nOriginal user prompt (verbatim):\n{}",
+            original
+                .to_str()
+                .context("Claude prompt is not valid UTF-8")?
+        ),
+        None => recovery.to_owned(),
+    };
+    options.extend([
+        "--resume".into(),
+        session.into(),
+        "--".into(),
+        prompt.clone().into(),
+    ]);
+    Ok((options, prompt))
+}
+
 /// The time limit for confirming one limit. It starts when Claude is first idle enough to
 /// move (the idle gate), not at the failure: a user who typed after the error still gets the
 /// full window once the terminal is quiet. It keeps running if the gate closes again.

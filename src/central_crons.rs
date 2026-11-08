@@ -1,6 +1,7 @@
 //! Operator-card cron recovery after renewal or failover. Ordinary sessions keep their
 //! existing resume note; only the owning HerdR tab can select cards with saved jobs.
 use super::*;
+use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
 
 const ARMED: &str = "cron-recovery";
@@ -54,6 +55,7 @@ pub(super) struct Recovery {
     session_id: String,
     attempt: String,
     continue_request: bool,
+    launched_prompt: Option<[u8; 32]>,
 }
 
 impl Recovery {
@@ -96,6 +98,7 @@ impl Recovery {
             session_id: String::new(),
             attempt: format!("{:032x}", rand::random::<u128>()),
             continue_request: false,
+            launched_prompt: None,
         };
         for directory in directories {
             let directory = directory?;
@@ -307,7 +310,11 @@ impl Recovery {
     }
 
     fn inventory(&self, bytes: &[u8]) -> Result<Option<Vec<Value>>> {
-        let prompt = self.prompt();
+        let prompt = self
+            .launched_prompt
+            .unwrap_or_else(|| Sha256::digest(self.prompt().as_bytes()).into());
+        let matches_prompt =
+            |text: &str| <[u8; 32]>::from(Sha256::digest(text.as_bytes())) == prompt;
         let mut anchored = false;
         let mut call: Option<(String, String)> = None;
         let mut jobs = None;
@@ -321,11 +328,12 @@ impl Recovery {
             }
             let content = &row["message"]["content"];
             if row["type"] == "user"
-                && (content.as_str() == Some(prompt.as_str())
+                && (content.as_str().is_some_and(&matches_prompt)
                     || content.as_array().is_some_and(|blocks| {
-                        blocks
-                            .iter()
-                            .any(|block| block["type"] == "text" && block["text"] == prompt)
+                        blocks.iter().any(|block| {
+                            block["type"] == "text"
+                                && block["text"].as_str().is_some_and(&matches_prompt)
+                        })
                     }))
             {
                 anchored = true;
@@ -375,6 +383,22 @@ impl Recovery {
 
     pub(super) fn continue_request(&mut self) {
         self.continue_request = true;
+    }
+
+    pub(super) fn resume_args(
+        &mut self,
+        args: &[std::ffi::OsString],
+        session: &str,
+    ) -> Result<Vec<std::ffi::OsString>> {
+        let (args, prompt) =
+            super::failover::required_prompted_resume(args, session, &self.prompt())?;
+        self.launched_prompt = Some(Sha256::digest(prompt.as_bytes()).into());
+        Ok(args)
+    }
+
+    pub(super) fn disarm(&self, directory: &Path) -> Result<()> {
+        std::fs::remove_file(directory.join(ARMED))?;
+        Ok(())
     }
 
     pub(super) fn prompt(&self) -> String {

@@ -1263,12 +1263,29 @@ pub fn run(
                     None
                 }
             };
-        if let Some(recovery) = &mut cron_recovery {
+        if let Some(mut recovery) = cron_recovery.take() {
             if continue_request {
                 recovery.continue_request();
             }
-            launch_args = super::failover::prompted_resume(args, &session_id, &recovery.prompt())
-                .context("cron recovery of a one-shot run")?;
+            match recovery.resume_args(args, &session_id) {
+                Ok(resumed_args) => {
+                    launch_args = resumed_args;
+                    cron_recovery = Some(recovery);
+                }
+                Err(error) => {
+                    let message = match recovery.disarm(session.directory()) {
+                        Ok(()) => format!("cron recovery skipped: {error:#}"),
+                        Err(cleanup) => format!(
+                            "cron recovery skipped: {error:#}; could not disarm: {cleanup:#}"
+                        ),
+                    };
+                    if let Err(error) =
+                        super::crons::log_notice(&paths.home, session.directory(), &message)
+                    {
+                        eprintln!("claudectl: could not record cron recovery: {error:#}");
+                    }
+                }
+            }
         }
         first = false;
     }

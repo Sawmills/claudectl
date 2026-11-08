@@ -284,6 +284,11 @@ replay missed fires or run saved prompts. After recovery, a renewal stops; a fai
 continues the previous request. claudectl prints
 `cron recovery verified: N/N saved jobs`, `missing cron: <file> (<schedule>)`, or an explicit
 unverified notice if evidence is absent or unreadable. Prompt contents are not printed.
+Recovery preserves option values, including multi-value `--add-dir` and `--allowedTools`.
+A real initial prompt is included verbatim in the single delivered recovery prompt.
+Verification matches that delivered text using a digest held in memory. If launch
+arguments cannot be classified as one prompt, recovery is disarmed with a skipped notice
+and the ordinary resume path continues.
 Extra copies of saved jobs prevent a verified result; unrelated jobs are preserved and are
 outside the saved-job count.
 The transcript read is limited to 8 MiB after the previous recorded position. An ambiguous

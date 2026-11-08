@@ -223,7 +223,10 @@ def case(core, binary, mode, output):
         program = [str(fake)] if mode == "control" else [
             str(binary), "server", "run", "work", "--claude", str(fake)]
         if mode == "failover":
-            program += ["--failover"]
+            program += ["--failover", "--", "Keep the fixture task intact.",
+                        "--allowedTools", "Bash", "Read"]
+        elif mode == "renewal":
+            program += ["--", "--add-dir", "../lib", "../shared"]
         launched = core.call("run", "--bg", "--no-parent", "--no-notify",
                              "--name", "flt675-" + mode, "--label", "task=FLT675-offline",
                              "--cwd", str(home), "--", "/usr/bin/env", "-i",
@@ -260,6 +263,16 @@ def case(core, binary, mode, output):
                       asks_missed_fire_replay=jobs["asks_missed_fire_replay"])
         if mode != "control":
             assert len(launches) == 2 and launches[1]["resumed"]
+            resumed_args = launches[1]["args"]
+            assert resumed_args[-2] == "--"
+            if mode == "renewal":
+                offset = resumed_args.index("--add-dir")
+                assert resumed_args[offset + 1:offset + 3] == ["../lib", "../shared"]
+            else:
+                offset = resumed_args.index("--allowedTools")
+                assert resumed_args[offset + 1:offset + 3] == ["Bash", "Read"]
+                assert resumed_args[-1].endswith("Keep the fixture task intact.")
+                assert "Keep the fixture task intact." not in resumed_args[:-1]
             assert len(jobs["jobs"]) == 2
             assert {x["cron"] for x in jobs["jobs"]} == {"*/5 * * * *", "24 8 * * *"}
             original = json.loads((home / "initial-jobs.json").read_text())

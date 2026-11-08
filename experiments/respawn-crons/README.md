@@ -8,8 +8,10 @@ scheduled fires. Jobs without an Operator card remain unverified.
 
 Use Linux, Python 3 and native `hc` (tested with 0.1.14). Build claudectl in the
 task's admitted target directory. Each restart case waits the normal 600-second
-quiet window. The renewal case keeps one existing job and restores one missing
-job; the failover case restores both in the new run directory. Both compare the
+quiet window. Renewal passes multi-value `--add-dir` arguments, keeps one existing
+job and restores one missing job. Failover passes `--allowedTools` plus a real
+initial prompt, and restores both jobs in the new run directory. Flag values stay
+intact, with one delivered positional prompt. Both compare the
 two definitions and schedules, require verified CronList evidence, and check
 native `idle` and `working` after resume. The control case runs without claudectl.
 
