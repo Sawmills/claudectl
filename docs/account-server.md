@@ -509,9 +509,10 @@ claudectl-server audit --key-file /keys/vault-key
   `allowed_domains`), and `email_verified` must be true. Users key on issuer and subject.
   Enrollment state lives in the store and is consumed once, so any replica can serve it.
 - **Refresh.** The server refreshes when a machine reports the current revision as rejected,
-  or when less than five minutes remain. A fresh usage read refreshes only an expired token
-  of a Ready account (that token is dead for every holder). It never refreshes a token that
-  sessions still use, so an idle account does not report `login_required` while its refresh
+  a pending migration needs rotation, or the grant has expired. Ordinary acquisitions keep
+  a Ready, unexpired grant even near expiry. A fresh usage read refreshes only an expired
+  token of a Ready account (that token is dead for every holder). It never refreshes an
+  unexpired grant, so an idle account does not report `login_required` while its refresh
   grant is good. If that refresh fails, or its audit row cannot be stored, the read fails.
   A cached usage read never contacts the provider.
 - **Revoke.** `server revoke` stops a machine, also during a refresh in progress.

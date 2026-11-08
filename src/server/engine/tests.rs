@@ -2898,28 +2898,51 @@ async fn a_stale_migration_marker_resolves_gone_across_replicas() {
 
 #[tokio::test]
 async fn an_oversized_refresh_response_is_not_kept_and_the_account_stays_readable() {
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let counted = refreshes.clone();
     let app = Router::new()
         .route("/api/oauth/profile", get(|| async { profile() }))
-        .route("/token", post(|| async { "x".repeat(MAX_RESPONSE + 1) }));
+        .route(
+            "/token",
+            post(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    "x".repeat(MAX_RESPONSE + 1)
+                }
+            }),
+        );
     let f = Fixture::new(app).await;
     let engine = f.engine().await;
-    // An access token close to expiry, so the next acquire refreshes.
     let receipt = engine
         .admit(
             "person",
             "work",
             "m-1",
-            grant_until("first", now() + USABLE + 1_000),
+            grant_until("first", now() + 3_600_000),
             None,
         )
         .await
         .unwrap();
+    let current = engine
+        .acquire("person", &receipt.account_id, None)
+        .await
+        .unwrap();
+    assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+    assert!(
+        engine
+            .acquire("person", &receipt.account_id, Some(&current.revision))
+            .await
+            .is_err()
+    );
+    // The uncertain exchange is not replayed and the old grant is not reissued.
     assert!(
         engine
             .acquire("person", &receipt.account_id, None)
             .await
             .is_err()
     );
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
     // The record still loads: the oversized body was never sealed into it.
     assert_eq!(engine.accounts("person").await.unwrap().len(), 1);
 }
