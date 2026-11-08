@@ -178,6 +178,53 @@ fn best_uses_weekly_room_when_all_reset_times_are_unknown() {
 }
 
 #[test]
+fn an_unopened_five_hour_window_is_zero_when_weekly_usage_is_known() {
+    for data in [
+        serde_json::json!({"seven_day": {"utilization": 40.0}}),
+        serde_json::json!({"five_hour": null, "seven_day": {"utilization": 40.0}}),
+    ] {
+        let usage = serde_json::from_value(data).unwrap();
+        let windows = accounts::windows(&usage);
+        assert_eq!(accounts::state(&windows), State::Ready);
+        assert_eq!(windows[0].used, Some(0.0));
+        assert_eq!(windows[0].resets_at, None);
+        let candidates = [Candidate {
+            name: "work".into(),
+            windows,
+            fresh: true,
+            billed: false,
+        }];
+        assert_eq!(accounts::best(&candidates), Some(0));
+    }
+}
+
+#[test]
+fn missing_or_invalid_usage_is_not_an_unopened_window() {
+    for data in [
+        serde_json::json!({}),
+        serde_json::json!({"seven_day": {}}),
+        serde_json::json!({"seven_day": {"utilization": -1.0}}),
+        serde_json::json!({"five_hour": {}, "seven_day": {"utilization": 40.0}}),
+        serde_json::json!({"five_hour": {"utilization": -1.0}, "seven_day": {"utilization": 40.0}}),
+        serde_json::json!({"five_hour": {"utilization": 0.0}}),
+    ] {
+        let usage = serde_json::from_value(data.clone()).unwrap();
+        let windows = accounts::windows(&usage);
+        assert_eq!(accounts::state(&windows), State::Unknown, "{data}");
+        assert_eq!(
+            accounts::best(&[Candidate {
+                name: "work".into(),
+                windows,
+                fresh: true,
+                billed: false,
+            }]),
+            None,
+            "{data}"
+        );
+    }
+}
+
+#[test]
 fn windows_come_from_a_usage_response_including_fable() {
     let usage: claudectl::api::UsageResponse = serde_json::from_value(serde_json::json!({
         "five_hour": {"utilization": 2.0, "resets_at": "2099-01-01T00:00:00Z"},

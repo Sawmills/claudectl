@@ -21,10 +21,14 @@ pub fn windows(usage: &crate::api::UsageResponse) -> Vec<Window> {
             .filter(|n| n.is_finite() && *n >= 0.0),
         resets_at: w.and_then(crate::api::UsageWindow::reset_timestamp),
     };
-    let mut out = vec![
-        window("5h", usage.five_hour.as_ref()),
-        window("week", usage.seven_day.as_ref()),
-    ];
+    let week = window("week", usage.seven_day.as_ref());
+    let mut five_hour = window("5h", usage.five_hour.as_ref());
+    // A missing window has not opened yet; usable weekly data distinguishes it
+    // from an unavailable or partial usage response.
+    if usage.five_hour.is_none() && week.used.is_some() {
+        five_hour.used = Some(0.0);
+    }
+    let mut out = vec![five_hour, week];
     if let Some(fable) = usage.fable_weekly() {
         out.push(Window {
             name: "Fable",
@@ -100,12 +104,12 @@ pub enum State {
         window: &'static str,
         resets_at: Option<i64>,
     },
-    /// No figure for the 5h or the week window: partial usage is never a basis to pick.
+    /// No usable figure for 5h or week after interpreting an unopened window.
     Unknown,
 }
 
 /// The state of an account from its windows. A full window (Fable included) is a limit;
-/// otherwise a missing 5h or week figure makes the whole account unknown.
+/// otherwise an unusable 5h or week figure makes the whole account unknown.
 pub fn state(windows: &[Window]) -> State {
     let known: Vec<_> = windows.iter().filter(|w| w.used.is_some()).collect();
     if let Some(full) = known.iter().find(|w| w.used >= Some(100.0)) {

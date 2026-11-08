@@ -1597,6 +1597,37 @@ mod tests {
         );
     }
     #[test]
+    fn an_unopened_window_keeps_server_selection_guards() {
+        let data = serde_json::json!({"seven_day": {"utilization": 40.0},
+            "extra_usage": {"is_enabled": false}});
+        assert_eq!(
+            crate::accounts::best(&[candidate(&row("work", data.clone(), false))]),
+            Some(0)
+        );
+        let stale = row("stale", data.clone(), true);
+        let mut unavailable = row("unavailable", data.clone(), false);
+        unavailable.available = false;
+        for blocked in [stale, unavailable] {
+            assert_eq!(crate::accounts::best(&[candidate(&blocked)]), None);
+        }
+        for blocked in [
+            serde_json::json!({"seven_day": {"utilization": 40.0}}),
+            serde_json::json!({"seven_day": {"utilization": 40.0},
+                "extra_usage": {"is_enabled": true}}),
+            serde_json::json!({"seven_day": {"utilization": 95.0},
+                "extra_usage": {"is_enabled": false}}),
+            serde_json::json!({"seven_day": {"utilization": 40.0},
+                "seven_day_opus": {"utilization": 100.0},
+                "extra_usage": {"is_enabled": false}}),
+        ] {
+            assert_eq!(
+                crate::accounts::best(&[candidate(&row("work", blocked.clone(), false))]),
+                None,
+                "{blocked}"
+            );
+        }
+    }
+    #[test]
     fn a_grant_that_expired_in_transit_is_refused() {
         // An observing read returns a grant valid at the server's read time; one that
         // crossed expiry on the way is dead and goes to the retry path.
