@@ -142,10 +142,11 @@ hook('SessionStart'); hook('UserPromptSubmit')
 sample('before')
 if name=='live':
     deadline=time.monotonic()+20
-    sampled=False
+    sampled=set()
     while not (control/'release').exists() and time.monotonic()<deadline:
-        if (control/'sample-again').exists() and not sampled:
-            sample('after'); sampled=True
+        for stage in ('status','after'):
+            if (control/('sample-'+stage)).exists() and stage not in sampled:
+                sample(stage); sampled.add(stage)
         time.sleep(.02)
 hook('Stop'); hook('SessionEnd')
 "#;
@@ -279,6 +280,30 @@ fn live_child_token_case(lifetime: i64) {
         exchanges_after_start,
         "an observing request or the busy monitor refreshed the grant"
     );
+    // A top-level usage refresh must not rotate an unexpired server grant.
+    let status = claudectl(live_home.path(), &["status", "--refresh", "--json"]);
+    let status: serde_json::Value = serde_json::from_str(&ok(&status)).unwrap();
+    assert_eq!(status["server"]["state"], "connected");
+    assert_eq!(status["accounts"].as_array().unwrap().len(), 0);
+    let remote = status["server"]["accounts"].as_array().unwrap();
+    assert_eq!(remote.len(), 1);
+    assert_eq!(remote[0]["alias"], "work");
+    assert_eq!(remote[0]["error"], serde_json::Value::Null);
+    assert_eq!(remote[0]["fresh"], true);
+    std::fs::write(control.join("sample-status"), "").unwrap();
+    let after_status = wait_for_token_sample(&control.join("live-status.json"));
+    assert_eq!(after_status["status"], 200);
+    assert_eq!(after_status["pid"], before["pid"]);
+    assert_eq!(after_status["token_sha256"], before["token_sha256"]);
+    assert_eq!(
+        server.refreshes.load(Ordering::SeqCst),
+        exchanges_after_start,
+        "top-level status --refresh rotated the server-held grant"
+    );
+    assert_eq!(observe()["revision"], held["revision"]);
+    eprintln!(
+        "synthetic status --refresh: lifetime={lifetime}s, exchanges={exchanges_after_start} unchanged, revision unchanged, same live child/token, HTTP 200; no local profiles"
+    );
     let next = live_token_command(next_home.path(), &binary, &control, &server.api, "next")
         .output()
         .unwrap();
@@ -289,7 +314,7 @@ fn live_child_token_case(lifetime: i64) {
     );
     let exchanges_after_next = server.refreshes.load(Ordering::SeqCst);
     let current = observe();
-    std::fs::write(control.join("sample-again"), "").unwrap();
+    std::fs::write(control.join("sample-after"), "").unwrap();
     let after = wait_for_token_sample(&control.join("live-after.json"));
     let status = claudectl(live_home.path(), &["server", "status", "work", "--json"]);
     let status: serde_json::Value = serde_json::from_str(&ok(&status)).unwrap();
