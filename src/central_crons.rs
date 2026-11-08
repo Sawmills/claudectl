@@ -1,5 +1,5 @@
-//! Operator-card cron recovery for a server-token renewal. Ordinary sessions keep their
-//! existing renewal note; only the owning HerdR tab can select cards with saved jobs.
+//! Operator-card cron recovery after renewal or failover. Ordinary sessions keep their
+//! existing resume note; only the owning HerdR tab can select cards with saved jobs.
 use super::*;
 use std::io::{Read, Seek, SeekFrom};
 
@@ -209,7 +209,7 @@ impl Recovery {
         Ok((!owned.jobs.is_empty()).then_some(owned))
     }
 
-    /// Arm only for the renewal launch. The hook records a transcript location, never its
+    /// Arm only for the restart launch. The hook records a transcript location, never its
     /// contents, and only while this private marker exists.
     fn arm(&mut self, directory: &Path, session_id: &str) -> Result<()> {
         self.session_id = session_id.to_owned();
@@ -373,12 +373,12 @@ impl Recovery {
 
     pub(super) fn prompt(&self) -> String {
         let mut prompt = format!(
-            "claudectl cron recovery attempt {}. claudectl restarted this session on a renewed server token. Restore the saved \
+            "claudectl cron recovery attempt {}. claudectl restarted this session. Restore the saved \
              session crons from Operator cards {} even if CronList is empty. Run CronList \
-             first. Delete only card-owned IDs from the card's cron_ids, and only when \
-             their schedule and prompt match the saved jobs. Preserve every other listed job. \
-             Then use CronCreate for \
-             EACH saved job below, recurring=true, using its exact five-field schedule and \
+             first. Keep every matching listed job and its ID when its schedule and prompt \
+             match a saved job and it has recurring=true and durable=false. \
+             Preserve every other listed job. Create only missing jobs with CronCreate, \
+             recurring=true, using each job's exact five-field schedule and \
              the prompt read verbatim from its file (not a summary):\n",
             self.attempt,
             self.cards
@@ -396,13 +396,11 @@ impl Recovery {
         }
         prompt.push_str(
             "Run CronList again after all creations. Update cron_ids on EACH named Operator \
-             card to the newly created IDs for that card's cron_prompts, in the same order. \
-             A shared file and schedule uses the same new ID on every owning card. \
+             card to the kept or newly created IDs for that card's cron_prompts, in the same order. \
+             A shared file and schedule uses the same ID on every owning card. \
              Update claude_session_file on each card \
-             to this session's actual transcript path. After re-creating the jobs, compare \
-             each job's schedule with the time since this session's last turn. If one or more \
-             fires were missed for a job, run that job's prompt ONCE now, regardless of how \
-             many fires were missed. Then stop: do no other work.",
+             to this session's actual transcript path. Do not replay missed fires or run \
+             any saved job's prompt as part of recovery. Do not create duplicate jobs.",
         );
         prompt
     }

@@ -272,14 +272,16 @@ For a Fleet Operator, `HERDR_TAB_ID` selects the matching `operator_tab` in
 fields, separated by semicolons) are the source of truth, even when the resumed session's
 CronList is empty. Cards without saved jobs do not participate in discovery. When one tab
 owns several populated cards, their jobs are merged: the same resolved prompt file and
-schedule is created once, with its new ID recorded on every owning card. Different schedules
+schedule is restored once, with its ID recorded on every owning card. Different schedules
 for the same file across cards skip recovery with a conflict reason; a single card can
-still schedule one file at several times. The renewal prompt names every
+still schedule one file at several times. The renewal or failover prompt names every
 participating card, file and schedule, asks Claude to read
-each prompt verbatim, delete only matching card-owned IDs from `cron_ids` while preserving
-other session jobs, create the recurring jobs, run CronList again, and update
+each prompt verbatim, keep matching recurring jobs and their IDs, preserve other session
+jobs, create only missing jobs once, run CronList again, and update
 each card's `cron_ids` and `claude_session_file`. claudectl reads that final inventory from the
-renewed session transcript, matched to its tool call and renewal prompt. It prints
+resumed session transcript, matched to its tool call and recovery prompt. Recovery does not
+replay missed fires or run saved prompts. After recovery, a renewal stops; a failover
+continues the previous request. claudectl prints
 `cron recovery verified: N/N saved jobs`, `missing cron: <file> (<schedule>)`, or an explicit
 unverified notice if evidence is absent or unreadable. Prompt contents are not printed.
 Extra copies of saved jobs prevent a verified result; unrelated jobs are preserved and are
@@ -287,8 +289,8 @@ outside the saved-job count.
 The transcript read is limited to 8 MiB after the previous recorded position. An ambiguous
 card, an unreadable saved prompt, a malformed entry, or a recovery-arm failure prints
 `cron recovery skipped: <reason>` and falls back to the existing renewal note. Optional
-cron recovery never aborts token renewal. Sessions with no matching card keep the existing note; first
-launches, manual resumes, and account failovers do not use this recovery.
+cron recovery never aborts a restart. Sessions with no matching card keep their existing
+renewal or failover note; first launches and manual resumes do not use this recovery.
 Cards with no saved crons also keep the existing note. Unreadable unrelated cards produce a
 discovery warning and do not stop ordinary renewal. Saved paths support absolute paths,
 paths relative to the card, `~/`, `$HOME/`, and `${HOME}/`; other variables and `~user`
@@ -300,19 +302,16 @@ does not change the normal renewal-resume path.
 
 This remains a best-effort workaround for Claude Code's resume behavior, with these limits:
 
-- Missed one-shot crons and exact jitter are outside this workaround; a non-idempotent job can replay up to once per renewal.
-- Every listed job is reset on each renewal resume, not only a silent one: neither claudectl nor
-  the session can tell a silent job from a live one.
-- A reset can shift a job's fire time. Claude Code delays each recurring fire by an offset it
+- Arbitrary session jobs without a saved Operator card remain unverified. This recovery
+  verifies only the saved definitions, schedules and final inventory, not actual fires.
+- Matching listed jobs keep their IDs. Claude Code can leave a listed job silent after
+  resume; keeping its definition does not prove the scheduler still fires it.
+- Missed fires are not replayed. Exact jitter and missed one-shot jobs remain outside this slice.
+- A missing job gets a new ID, which can shift its fire time. Claude Code delays each recurring fire by an offset it
   derives from the job ID, and a re-created job gets a new ID, so the same cron expression can
   fire at a different minute ([how late a recurring task runs](https://code.claude.com/docs/en/scheduled-tasks#how-late-a-recurring-task-runs)).
   A watchdog that looks for a silent job must use the re-created job's timing, not the old
   job's fire times.
-- Without an Operator card, claudectl does not check that each `CronDelete` and `CronCreate` succeeded; the session's
-  transcript shows the result. If a call fails, a job stays as the resume left it (listed, and
-  maybe silent), or is gone.
-  The session decides whether fires were missed from the schedule and its last turn;
-  claudectl does not verify that judgment or the catch-up run.
 - Recovery: run `CronList` in the tab and create a missing job again by hand. Fleet Operators
   keep their own watchdog for a silent cron.
 - The defect belongs to Claude Code; an upstream report waits on the owner's decision. Remove

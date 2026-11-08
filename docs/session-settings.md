@@ -25,7 +25,7 @@ Use settings valid for your installed Claude version. A schema error such as `"m
 can make Claude ignore the entire merged file, including claudectl's renewal and failover
 hooks. Check Claude's startup settings warnings and correct invalid values.
 
-After token renewal, Operator-card cron recovery writes its results to
+After token renewal or account failover, Operator-card cron recovery writes its results to
 `~/.claudectl/server/cron-recovery.jsonl` (mode `0600`). Each JSON line has the
 time in milliseconds (`at`), the run directory name (`session`), and `message`.
 Verified, missing, duplicate, skipped, and unverified results stay in this log

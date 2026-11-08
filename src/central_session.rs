@@ -1213,37 +1213,15 @@ pub fn run(
         }
         // Renewing until the next Claude runs.
         session.set_renewal("renewing")?;
-        match kind {
+        let after_recovery = match kind {
             RestartKind::Renew(access) => {
-                let recovery = match super::crons::Recovery::prepare(
-                    &paths.home,
-                    session.directory(),
-                    &session_id,
-                ) {
-                    Ok(recovery) => recovery,
-                    Err(error) => {
-                        if let Err(error) = super::crons::log_notice(
-                            &paths.home,
-                            session.directory(),
-                            &format!("cron recovery skipped: {error:#}"),
-                        ) {
-                            // The old child is stopped and the next has not spawned.
-                            eprintln!("claudectl: could not record cron recovery: {error:#}");
-                        }
-                        None
-                    }
-                };
-                let prompt = recovery.as_ref().map(super::crons::Recovery::prompt);
-                cron_recovery = recovery;
-                launch_args = super::failover::prompted_resume(
-                    args,
-                    &session_id,
-                    prompt.as_deref().unwrap_or(super::renew::CRON_NOTE),
-                )
-                .context("renewal of a one-shot run")?;
+                launch_args =
+                    super::failover::prompted_resume(args, &session_id, super::renew::CRON_NOTE)
+                        .context("renewal of a one-shot run")?;
                 session.renew(access)?;
                 restarts.push(now());
                 eprintln!("claudectl: server token renewed; resuming session {session_id}");
+                "Then stop: do no other work."
             }
             RestartKind::Failover { account, access } => {
                 // A new session for the new account: its session.json names the new alias
@@ -1265,7 +1243,30 @@ pub fn run(
                     "claudectl: {from} reached its usage limit; resuming session {session_id} on {}",
                     account.alias
                 );
+                super::failover::RECOVERY_PROMPT
             }
+        };
+        // Failover moves the hooks and settings into a new run directory. Arm cron
+        // verification there, after either restart has selected its final session.
+        cron_recovery =
+            match super::crons::Recovery::prepare(&paths.home, session.directory(), &session_id) {
+                Ok(recovery) => recovery,
+                Err(error) => {
+                    if let Err(error) = super::crons::log_notice(
+                        &paths.home,
+                        session.directory(),
+                        &format!("cron recovery skipped: {error:#}"),
+                    ) {
+                        // The old child is stopped and the next has not spawned.
+                        eprintln!("claudectl: could not record cron recovery: {error:#}");
+                    }
+                    None
+                }
+            };
+        if let Some(recovery) = &cron_recovery {
+            let prompt = format!("{} {after_recovery}", recovery.prompt());
+            launch_args = super::failover::prompted_resume(args, &session_id, &prompt)
+                .context("cron recovery of a one-shot run")?;
         }
         first = false;
     }
