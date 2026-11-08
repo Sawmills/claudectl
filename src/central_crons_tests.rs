@@ -1,4 +1,4 @@
-//! Recovery-module coverage for cron restoration after a renewal restart.
+//! Recovery-module coverage for cron restoration after renewal or failover.
 use super::*;
 use std::ffi::OsStr;
 
@@ -90,7 +90,7 @@ fn recovery_names_saved_jobs_and_preserves_unrelated_inventory() {
         "*/5 * * * *",
         "24 8 * * *",
         "even if CronList is empty",
-        "Delete only card-owned IDs",
+        "Keep every matching listed job",
         "Preserve every other listed job",
         "cron_ids",
         "claude_session_file",
@@ -101,6 +101,144 @@ fn recovery_names_saved_jobs_and_preserves_unrelated_inventory() {
     jobs.as_array_mut().unwrap().push(json!({"id":"manual","cron":"0 9 * * *","prompt":"Manual reminder.","recurring":true,"durable":false}));
     assert_eq!(
         f.report(&recovery, jobs, &prompt),
+        "cron recovery verified: 2/2 saved jobs"
+    );
+}
+
+#[test]
+fn recovery_restores_only_missing_jobs_without_replaying_missed_fires() {
+    let f = Fixture::new();
+    let recovery = f.prepare().unwrap().unwrap();
+    let prompt = recovery.prompt();
+    assert!(prompt.contains("Keep every matching listed job"));
+    assert!(prompt.contains("Create only missing jobs"));
+    assert!(prompt.contains("Do not replay missed fires"));
+    assert!(!prompt.contains("run that job's prompt ONCE now"));
+}
+
+#[test]
+fn renewal_recovery_verifies_the_complete_launch_prompt() {
+    let f = Fixture::new();
+    let recovery = f.prepare().unwrap().unwrap();
+    let prompt = recovery.prompt();
+    assert!(prompt.ends_with("Then stop: do no other work."));
+    assert_eq!(
+        f.report(&recovery, f.jobs(), &prompt),
+        "cron recovery verified: 2/2 saved jobs"
+    );
+}
+
+#[test]
+fn failover_recovery_verifies_its_continuation_prompt() {
+    let f = Fixture::new();
+    let mut recovery = f.prepare().unwrap().unwrap();
+    recovery.continue_request();
+    let prompt = recovery.prompt();
+    assert!(prompt.ends_with(super::super::failover::RECOVERY_PROMPT));
+    assert!(!prompt.contains("Then stop: do no other work."));
+    assert_eq!(
+        f.report(&recovery, f.jobs(), &prompt),
+        "cron recovery verified: 2/2 saved jobs"
+    );
+}
+
+fn assert_recovery_resume(continue_request: bool) {
+    for (given, kept, original) in [
+        (
+            vec!["--add-dir", "../lib", "../shared"],
+            vec!["--add-dir", "../lib", "../shared"],
+            None,
+        ),
+        (
+            vec!["--allowedTools", "Bash", "Read"],
+            vec!["--allowedTools", "Bash", "Read"],
+            None,
+        ),
+        (
+            vec!["--add-dir=../lib", "../shared"],
+            vec!["--add-dir=../lib", "../shared"],
+            None,
+        ),
+        (
+            vec!["--debug", "hooks", "--allowed-tools", "Bash", "Read"],
+            vec!["--debug", "hooks", "--allowed-tools", "Bash", "Read"],
+            None,
+        ),
+        (
+            vec!["fix the tests", "--allowedTools", "Bash", "Read"],
+            vec!["--allowedTools", "Bash", "Read"],
+            Some("fix the tests"),
+        ),
+        (
+            vec!["--model", "opus", "fix the tests"],
+            vec!["--model", "opus"],
+            Some("fix the tests"),
+        ),
+        (
+            vec!["--add-dir", "../lib", "--", "-literal prompt"],
+            vec!["--add-dir", "../lib"],
+            Some("-literal prompt"),
+        ),
+    ] {
+        let f = Fixture::new();
+        let mut recovery = f.prepare().unwrap().unwrap();
+        if continue_request {
+            recovery.continue_request();
+        }
+        let prompt = recovery.prompt();
+        let args: Vec<_> = given.iter().map(std::ffi::OsString::from).collect();
+        let resumed = recovery.resume_args(&args, "s").unwrap();
+        let delivered = resumed.last().unwrap().to_str().unwrap();
+        assert!(delivered.contains(&prompt), "recovery omitted: {resumed:?}");
+        let mut expected: Vec<_> = kept.iter().map(std::ffi::OsString::from).collect();
+        expected.extend(["--resume".into(), "s".into(), "--".into()]);
+        assert_eq!(&resumed[..resumed.len() - 1], expected);
+        if let (true, Some(original)) = (continue_request, original) {
+            assert!(delivered.ends_with(original));
+            assert_eq!(delivered.matches(original).count(), 1);
+        } else {
+            assert_eq!(delivered, prompt);
+        }
+        assert_eq!(
+            f.report(&recovery, f.jobs(), delivered),
+            "cron recovery verified: 2/2 saved jobs"
+        );
+    }
+}
+
+#[test]
+fn renewal_recovery_does_not_resubmit_initial_task() {
+    assert_recovery_resume(false);
+}
+
+#[test]
+fn failover_recovery_preserves_initial_task_for_continuation() {
+    assert_recovery_resume(true);
+}
+
+#[test]
+fn a_different_positional_prompt_does_not_verify_failover_recovery() {
+    let f = Fixture::new();
+    let mut recovery = f.prepare().unwrap().unwrap();
+    recovery.continue_request();
+    recovery
+        .resume_args(&["original request".into()], "s")
+        .unwrap();
+    assert_eq!(
+        f.report(&recovery, f.jobs(), &recovery.prompt()),
+        "cron recovery unverified: no post-restart CronList"
+    );
+}
+
+#[test]
+fn recovery_accepts_kept_jobs_with_their_existing_ids() {
+    let f = Fixture::new();
+    let recovery = f.prepare().unwrap().unwrap();
+    let mut jobs = f.jobs();
+    jobs[0]["id"] = "old-one".into();
+    jobs[1]["id"] = "old-two".into();
+    assert_eq!(
+        f.report(&recovery, jobs, &recovery.prompt()),
         "cron recovery verified: 2/2 saved jobs"
     );
 }
@@ -133,7 +271,7 @@ fn recovery_merges_cards_deduplicates_jobs_and_keeps_distinct_local_schedules() 
             if second_schedule { 2 } else { 1 }
         );
         assert!(prompt.contains("EACH named Operator card"));
-        assert!(prompt.contains("same new ID on every owning card"));
+        assert!(prompt.contains("same ID on every owning card"));
         let mut jobs = f.jobs();
         jobs.as_array_mut().unwrap().push(json!({"id":"new-three","cron":"0 12 * * *","prompt":if second_schedule {"Check the owned lanes.\n"} else {"Check the other project.\n"},"recurring":true,"durable":false}));
         assert_eq!(

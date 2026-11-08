@@ -323,6 +323,21 @@ fn automatic_use_installs_a_server_account_and_status_marks_plain_claude() {
 }
 
 #[test]
+fn automatic_selection_accepts_an_unopened_five_hour_window() {
+    let env = Env::with_usage(Some(json!({
+        "data": {"seven_day": {"utilization": 40},
+            "extra_usage": {"is_enabled": false}},
+        "observed_at": chrono::Utc::now().timestamp_millis(),
+        "next_retry_at": 0, "stale": false, "error": null,
+    })));
+    // `run` and `use` share the server picker. Exercise it in a child CLI with
+    // the fixture's loopback opt-in, without acquiring a provider token.
+    let output = env.with_path(&["use"], &env.claude_path(true));
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("amir2@sawmills.ai"));
+}
+
+#[test]
 fn use_prints_one_path_line_without_editing_shell_startup() {
     let env = Env::new();
     let path = env.claude_path(false);

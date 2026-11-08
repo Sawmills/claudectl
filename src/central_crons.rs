@@ -1,6 +1,7 @@
-//! Operator-card cron recovery for a server-token renewal. Ordinary sessions keep their
-//! existing renewal note; only the owning HerdR tab can select cards with saved jobs.
+//! Operator-card cron recovery after renewal or failover. Ordinary sessions keep their
+//! existing resume note; only the owning HerdR tab can select cards with saved jobs.
 use super::*;
+use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
 
 const ARMED: &str = "cron-recovery";
@@ -53,6 +54,8 @@ pub(super) struct Recovery {
     previous: Vec<(PathBuf, u64)>,
     session_id: String,
     attempt: String,
+    continue_request: bool,
+    launched_prompt: Option<[u8; 32]>,
 }
 
 impl Recovery {
@@ -94,6 +97,8 @@ impl Recovery {
             previous: Vec::new(),
             session_id: String::new(),
             attempt: format!("{:032x}", rand::random::<u128>()),
+            continue_request: false,
+            launched_prompt: None,
         };
         for directory in directories {
             let directory = directory?;
@@ -209,7 +214,7 @@ impl Recovery {
         Ok((!owned.jobs.is_empty()).then_some(owned))
     }
 
-    /// Arm only for the renewal launch. The hook records a transcript location, never its
+    /// Arm only for the restart launch. The hook records a transcript location, never its
     /// contents, and only while this private marker exists.
     fn arm(&mut self, directory: &Path, session_id: &str) -> Result<()> {
         self.session_id = session_id.to_owned();
@@ -305,7 +310,11 @@ impl Recovery {
     }
 
     fn inventory(&self, bytes: &[u8]) -> Result<Option<Vec<Value>>> {
-        let prompt = self.prompt();
+        let prompt = self
+            .launched_prompt
+            .unwrap_or_else(|| Sha256::digest(self.prompt().as_bytes()).into());
+        let matches_prompt =
+            |text: &str| <[u8; 32]>::from(Sha256::digest(text.as_bytes())) == prompt;
         let mut anchored = false;
         let mut call: Option<(String, String)> = None;
         let mut jobs = None;
@@ -319,11 +328,12 @@ impl Recovery {
             }
             let content = &row["message"]["content"];
             if row["type"] == "user"
-                && (content.as_str() == Some(prompt.as_str())
+                && (content.as_str().is_some_and(matches_prompt)
                     || content.as_array().is_some_and(|blocks| {
-                        blocks
-                            .iter()
-                            .any(|block| block["type"] == "text" && block["text"] == prompt)
+                        blocks.iter().any(|block| {
+                            block["type"] == "text"
+                                && block["text"].as_str().is_some_and(matches_prompt)
+                        })
                     }))
             {
                 anchored = true;
@@ -371,14 +381,38 @@ impl Recovery {
         Ok(jobs)
     }
 
+    pub(super) fn continue_request(&mut self) {
+        self.continue_request = true;
+    }
+
+    pub(super) fn resume_args(
+        &mut self,
+        args: &[std::ffi::OsString],
+        session: &str,
+    ) -> Result<Vec<std::ffi::OsString>> {
+        let (args, prompt) = super::failover::required_prompted_resume(
+            args,
+            session,
+            &self.prompt(),
+            self.continue_request,
+        )?;
+        self.launched_prompt = Some(Sha256::digest(prompt.as_bytes()).into());
+        Ok(args)
+    }
+
+    pub(super) fn disarm(&self, directory: &Path) -> Result<()> {
+        std::fs::remove_file(directory.join(ARMED))?;
+        Ok(())
+    }
+
     pub(super) fn prompt(&self) -> String {
         let mut prompt = format!(
-            "claudectl cron recovery attempt {}. claudectl restarted this session on a renewed server token. Restore the saved \
+            "claudectl cron recovery attempt {}. claudectl restarted this session. Restore the saved \
              session crons from Operator cards {} even if CronList is empty. Run CronList \
-             first. Delete only card-owned IDs from the card's cron_ids, and only when \
-             their schedule and prompt match the saved jobs. Preserve every other listed job. \
-             Then use CronCreate for \
-             EACH saved job below, recurring=true, using its exact five-field schedule and \
+             first. Keep every matching listed job and its ID when its schedule and prompt \
+             match a saved job and it has recurring=true and durable=false. \
+             Preserve every other listed job. Create only missing jobs with CronCreate, \
+             recurring=true, using each job's exact five-field schedule and \
              the prompt read verbatim from its file (not a summary):\n",
             self.attempt,
             self.cards
@@ -396,14 +430,17 @@ impl Recovery {
         }
         prompt.push_str(
             "Run CronList again after all creations. Update cron_ids on EACH named Operator \
-             card to the newly created IDs for that card's cron_prompts, in the same order. \
-             A shared file and schedule uses the same new ID on every owning card. \
+             card to the kept or newly created IDs for that card's cron_prompts, in the same order. \
+             A shared file and schedule uses the same ID on every owning card. \
              Update claude_session_file on each card \
-             to this session's actual transcript path. After re-creating the jobs, compare \
-             each job's schedule with the time since this session's last turn. If one or more \
-             fires were missed for a job, run that job's prompt ONCE now, regardless of how \
-             many fires were missed. Then stop: do no other work.",
+             to this session's actual transcript path. Do not replay missed fires or run \
+             any saved job's prompt as part of recovery. Do not create duplicate jobs. ",
         );
+        prompt.push_str(if self.continue_request {
+            super::failover::RECOVERY_PROMPT
+        } else {
+            "Then stop: do no other work."
+        });
         prompt
     }
 }

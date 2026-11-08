@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn weekly_room_ranks_before_session_room_but_missing_session_usage_is_unavailable() {
+    fn weekly_room_ranks_before_session_room_including_an_unopened_window() {
         let accounts = [
             fetched(
                 "hot",
@@ -519,17 +519,24 @@ mod tests {
                 Some("max"),
             ),
             fetched(
-                "blind",
+                "unopened",
                 &format!(r#"{{"seven_day":{{"utilization":1}},{OFF}}}"#),
                 Some("max"),
             ),
         ];
-        assert_eq!(choose(&accounts, &[], None).as_deref(), Some("hot"));
+        assert_eq!(choose(&accounts, &[], None).as_deref(), Some("unopened"));
         assert_eq!(
-            choose(&accounts, &["hot".into()], None).as_deref(),
+            choose(&accounts, &["unopened".into()], None).as_deref(),
+            Some("hot")
+        );
+        assert_eq!(
+            choose(&accounts, &["unopened".into(), "hot".into()], None).as_deref(),
             Some("calm")
         );
-        assert_eq!(choose(&accounts[2..], &[], None), None, "missing 5h window");
+        assert_eq!(
+            choose(&accounts[2..], &[], None).as_deref(),
+            Some("unopened")
+        );
     }
 
     #[test]
