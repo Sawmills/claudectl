@@ -234,13 +234,19 @@ credentials file and the process environment all behave the same), while a new p
 `--resume <session>` continues the same session.
 
 Token lifetime is therefore the session limit. A provider refresh revokes the access token
-issued before it, and every `server run` of an account shares that token. Automatic launches
-and failovers take the current unexpired token without refreshing it inside the server's
-five-minute margin. An expired token is refreshed on demand. A new child can therefore start
-near token expiry; expiry alerts and the ten-minute quiet requirement still apply.
-Explicit refreshes and migration keep their existing rotation rules.
-`claudectl server refresh-access` forces one and ends every running session of that account
-(relaunch each with `--resume`).
+issued before it, and every `server run` of an account shares that token. The Engine returns
+the current Ready, unexpired grant for ordinary acquisitions, including older callers that
+omit `observe`. It no longer rotates an ordinary grant inside the former five-minute margin.
+An expired grant or pending migration still follows the existing leased refresh and
+verification path. Supplying the exact current `previous_revision` still forces rotation;
+a stale revision returns the available unexpired successor.
+
+A new child can therefore start near token expiry. Expiry alerts and the ten-minute quiet
+requirement still apply; this does not guarantee continuous authentication for a busy child.
+`claudectl server refresh-access` deliberately rotates the shared grant, so existing child
+snapshots can be rejected until restart is permitted. The historical `margin` rotation
+metric label remains exported at zero for compatibility; explicit force, migration and
+expiry retain their existing reason labels.
 
 Automatic renewal and failover
 require ten continuous minutes of observed quiet. The clock starts with the first clear
@@ -503,9 +509,10 @@ claudectl-server audit --key-file /keys/vault-key
   `allowed_domains`), and `email_verified` must be true. Users key on issuer and subject.
   Enrollment state lives in the store and is consumed once, so any replica can serve it.
 - **Refresh.** The server refreshes when a machine reports the current revision as rejected,
-  or when less than five minutes remain. A fresh usage read refreshes only an expired token
-  of a Ready account (that token is dead for every holder). It never refreshes a token that
-  sessions still use, so an idle account does not report `login_required` while its refresh
+  a pending migration needs rotation, or the grant has expired. Ordinary acquisitions keep
+  a Ready, unexpired grant even near expiry. A fresh usage read refreshes only an expired
+  token of a Ready account (that token is dead for every holder). It never refreshes an
+  unexpired grant, so an idle account does not report `login_required` while its refresh
   grant is good. If that refresh fails, or its audit row cannot be stored, the read fails.
   A cached usage read never contacts the provider.
 - **Revoke.** `server revoke` stops a machine, also during a refresh in progress.

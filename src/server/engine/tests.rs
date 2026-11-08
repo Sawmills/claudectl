@@ -1016,51 +1016,63 @@ async fn login_retries_a_kept_response_without_reusing_the_authorization_code() 
 }
 
 #[tokio::test]
-async fn the_server_refreshes_inside_five_minutes_of_expiry_and_not_before() {
-    let (_f, engine, refreshes) = synthetic(3600).await;
-    let early = engine
-        .admit(
-            "person",
-            "early",
-            "m-early",
-            grant_until("early", now() + 360_000),
-            None,
-        )
-        .await
-        .unwrap();
-    let access = engine
-        .acquire("person", &early.account_id, None)
-        .await
-        .unwrap();
-    assert_eq!(access.access_token, "early");
-    assert_eq!(refreshes.load(Ordering::SeqCst), 0);
-
-    let (_f, engine, refreshes) = synthetic(3600).await;
-    let due = engine
-        .admit(
-            "person",
-            "due",
-            "m-due",
-            grant_until("due", now() + 240_000),
-            None,
-        )
-        .await
-        .unwrap();
-    let access = engine
-        .acquire("person", &due.account_id, None)
-        .await
-        .unwrap();
-    assert_eq!(access.access_token, "successor-0");
-    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        engine.rotations(),
-        vec![
-            ("expired", 0),
-            ("forced", 0),
-            ("margin", 1),
-            ("migration", 0)
-        ]
-    );
+async fn ordinary_acquire_keeps_unexpired_grants_until_explicitly_rejected() {
+    for lifetime_ms in [240_000, 360_000] {
+        // A forced successor is also near expiry, so a retry of the old revision
+        // must return it without another implicit rotation.
+        let (_f, engine, refreshes) = synthetic(120).await;
+        let receipt = engine
+            .admit(
+                "person",
+                "work",
+                "m",
+                grant_until("held", now() + lifetime_ms),
+                None,
+            )
+            .await
+            .unwrap();
+        let held = engine
+            .observe_for("person", "holder", &receipt.account_id)
+            .await
+            .unwrap();
+        for previous in [None, Some("stale-revision")] {
+            let current = engine
+                .acquire_for("person", "ordinary", &receipt.account_id, previous)
+                .await
+                .unwrap();
+            assert_eq!(current.access_token, "held");
+            assert_eq!(current.revision, held.revision);
+            assert_eq!(current.expires_at, held.expires_at);
+            assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+        }
+        let successor = engine
+            .acquire_for(
+                "person",
+                "forced",
+                &receipt.account_id,
+                Some(&held.revision),
+            )
+            .await
+            .unwrap();
+        assert_eq!(successor.access_token, "successor-0");
+        assert_ne!(successor.revision, held.revision);
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+        let retry = engine
+            .acquire_for("person", "retry", &receipt.account_id, Some(&held.revision))
+            .await
+            .unwrap();
+        assert_eq!(retry.revision, successor.revision);
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            engine.rotations(),
+            vec![
+                ("expired", 0),
+                ("forced", 1),
+                ("margin", 0),
+                ("migration", 0)
+            ]
+        );
+    }
 }
 
 #[test]
@@ -1150,8 +1162,7 @@ async fn a_client_forced_refresh_is_counted_as_forced() {
 
 #[tokio::test]
 async fn an_observing_request_never_refreshes_a_usable_token() {
-    // Inside the refresh margin a normal request refreshes; an observing one returns the
-    // held token, so it can never revoke the token a running session uses (SAW-12610).
+    // Observing returns the usable held token, including near expiry (SAW-12610).
     let (_f, engine, refreshes) = synthetic(3600).await;
     let due = engine
         .admit(
@@ -1169,8 +1180,7 @@ async fn an_observing_request_never_refreshes_a_usable_token() {
         .unwrap();
     assert_eq!(seen.access_token, "due");
     assert_eq!(refreshes.load(Ordering::SeqCst), 0);
-    // In its last minute the token is too short for a new launch, but running sessions still
-    // use it until it expires: observing must not refresh it.
+    // Running sessions still use the token in its last minute: observing must not refresh it.
     let (_f, engine, refreshes) = synthetic(3600).await;
     let ending = engine
         .admit(
@@ -1259,9 +1269,13 @@ async fn a_refresh_reads_expires_in_as_seconds() {
         )
         .await
         .unwrap();
+    let held = engine
+        .observe_for("person", "holder", &receipt.account_id)
+        .await
+        .unwrap();
     let before = now();
     let access = engine
-        .acquire("person", &receipt.account_id, None)
+        .acquire("person", &receipt.account_id, Some(&held.revision))
         .await
         .unwrap();
     // One hour: 3,600 seconds is 3,600,000 milliseconds.
@@ -2884,28 +2898,51 @@ async fn a_stale_migration_marker_resolves_gone_across_replicas() {
 
 #[tokio::test]
 async fn an_oversized_refresh_response_is_not_kept_and_the_account_stays_readable() {
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let counted = refreshes.clone();
     let app = Router::new()
         .route("/api/oauth/profile", get(|| async { profile() }))
-        .route("/token", post(|| async { "x".repeat(MAX_RESPONSE + 1) }));
+        .route(
+            "/token",
+            post(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    "x".repeat(MAX_RESPONSE + 1)
+                }
+            }),
+        );
     let f = Fixture::new(app).await;
     let engine = f.engine().await;
-    // An access token close to expiry, so the next acquire refreshes.
     let receipt = engine
         .admit(
             "person",
             "work",
             "m-1",
-            grant_until("first", now() + USABLE + 1_000),
+            grant_until("first", now() + 3_600_000),
             None,
         )
         .await
         .unwrap();
+    let current = engine
+        .acquire("person", &receipt.account_id, None)
+        .await
+        .unwrap();
+    assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+    assert!(
+        engine
+            .acquire("person", &receipt.account_id, Some(&current.revision))
+            .await
+            .is_err()
+    );
+    // The uncertain exchange is not replayed and the old grant is not reissued.
     assert!(
         engine
             .acquire("person", &receipt.account_id, None)
             .await
             .is_err()
     );
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
     // The record still loads: the oversized body was never sealed into it.
     assert_eq!(engine.accounts("person").await.unwrap().len(), 1);
 }
