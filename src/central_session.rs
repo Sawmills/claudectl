@@ -964,8 +964,9 @@ impl Monitor {
             &session_id,
             |to| {
                 let account = self.client.account(to).ok()?;
-                // Never a forced refresh: that revokes the token other sessions of `to` hold.
-                let access = self.client.acquire(&account.account_id, None).ok()?;
+                // The target may have live children. A margin refresh would revoke their
+                // unexpired snapshots, so automatic failover only observes the current grant.
+                let access = self.client.observe(&account.account_id).ok()?;
                 // All remote reads have completed. Do not reserve an account for work
                 // that became busy during them; the signal still has its final admission.
                 let _hook_admission = match super::restart_gate::hook_admission(&self.directory) {
@@ -1054,10 +1055,10 @@ pub fn run(
         Some(account) => account,
         None => client.account(alias)?,
     };
-    // Never force a refresh here: a provider refresh revokes the access token that every
-    // other `server run` of this account is using (SAW-12610). The server refreshes on demand
-    // near expiry.
-    let access = client.acquire(&account.account_id, None)?;
+    // Even an unforced acquisition can refresh inside the server's margin and revoke
+    // another live child's snapshot. Observe instead; expiry and pending migration still
+    // follow the server's existing rotation path.
+    let access = client.observe(&account.account_id)?;
     let mut session = Session::new(paths, &account, access)?;
     // The checked copy itself runs (same filesystem, so the rename keeps the file).
     let mut snapshot = session.directory().join("claude");

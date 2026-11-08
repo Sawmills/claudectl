@@ -234,8 +234,11 @@ credentials file and the process environment all behave the same), while a new p
 `--resume <session>` continues the same session.
 
 Token lifetime is therefore the session limit. A provider refresh revokes the access token
-issued before it, and every `server run` of an account shares that token, so a launch never
-forces a refresh: it takes the current token, and the server refreshes on demand near expiry.
+issued before it, and every `server run` of an account shares that token. Automatic launches
+and failovers take the current unexpired token without refreshing it inside the server's
+five-minute margin. An expired token is refreshed on demand. A new child can therefore start
+near token expiry; expiry alerts and the ten-minute quiet requirement still apply.
+Explicit refreshes and migration keep their existing rotation rules.
 `claudectl server refresh-access` forces one and ends every running session of that account
 (relaunch each with `--resume`).
 
