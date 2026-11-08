@@ -58,7 +58,7 @@ import sys
 from pathlib import Path
 from probe import Core
 core = Core(Path(sys.argv[1]))
-assert not core.call("list", "--all")["terminals"]
+assert not core.call("ls", "--all")["terminals"]
 core.call("server", "stop")
 PY
 ```
