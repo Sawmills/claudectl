@@ -98,6 +98,8 @@ account, local and server, also has:
   means a window is full, and `unknown` means a required figure is unusable. An absent
   or null 5h window counts as 0% when weekly utilization is known; an incomplete
   5h object stays unknown. Freshness, billing and weekly headroom checks still apply.
+  This interpretation cannot distinguish an unopened window from a partial successful
+  response that omits only the 5h window; it is not a provider completeness guarantee.
 - `billed`: true when the account may bill extra usage, and on any doubt. For a server
   account it is false only when the usage reports extra usage off. For a local
   profile it is false only when `billing_class` is `rate_limited`: extra usage off,

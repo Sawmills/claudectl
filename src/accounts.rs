@@ -23,8 +23,7 @@ pub fn windows(usage: &crate::api::UsageResponse) -> Vec<Window> {
     };
     let week = window("week", usage.seven_day.as_ref());
     let mut five_hour = window("5h", usage.five_hour.as_ref());
-    // A missing window has not opened yet; usable weekly data distinguishes it
-    // from an unavailable or partial usage response.
+    // Interpret an absent five-hour window as unopened when weekly usage is known.
     if usage.five_hour.is_none() && week.used.is_some() {
         five_hour.used = Some(0.0);
     }
