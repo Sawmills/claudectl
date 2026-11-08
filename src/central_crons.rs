@@ -328,11 +328,11 @@ impl Recovery {
             }
             let content = &row["message"]["content"];
             if row["type"] == "user"
-                && (content.as_str().is_some_and(&matches_prompt)
+                && (content.as_str().is_some_and(matches_prompt)
                     || content.as_array().is_some_and(|blocks| {
                         blocks.iter().any(|block| {
                             block["type"] == "text"
-                                && block["text"].as_str().is_some_and(&matches_prompt)
+                                && block["text"].as_str().is_some_and(matches_prompt)
                         })
                     }))
             {
