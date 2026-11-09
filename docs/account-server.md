@@ -241,22 +241,24 @@ An expired grant or pending migration still follows the existing leased refresh 
 verification path. Supplying the exact current `previous_revision` still forces rotation;
 a stale revision returns the available unexpired successor.
 
-A new child can therefore start near token expiry. Expiry alerts and the ten-minute quiet
-requirement still apply; this does not guarantee continuous authentication for a busy child.
+A new child can therefore start near token expiry. Expiry alerts and workload blockers
+still apply; recovery after expiry uses the next verified idle point described below.
+This does not guarantee continuous authentication for a busy child.
 `claudectl server refresh-access` deliberately rotates the shared grant, so existing child
 snapshots can be rejected until restart is permitted. The historical `margin` rotation
 metric label remains exported at zero for compatibility; explicit force, migration and
 expiry retain their existing reason labels.
 
-Automatic renewal and failover
+Renewal while the held token is valid and account failover
 require ten continuous minutes of observed quiet. The clock starts with the first clear
 workload sample and resets on an observed blocker, hook event, session change or terminal
-input. Startup never inherits old quiet time. Expiry or authentication failure does not
-shorten the window. Unknown or damaged evidence still blocks restart.
+input. Startup never inherits old quiet time. Authentication failure or expiry instead
+recovers at the next verified idle point, on the same session and account. Unknown or
+damaged evidence still blocks restart.
 
 **Residual race:** command hooks cannot acknowledge that all input sources are closed and
-every submitted prompt is safe to hand over. Hook input may be invisible while it is being
-read, before pending intent is published. A new prompt, peer message, scheduled job or task
+every submitted prompt is safe to hand over. Hooks publish pending intent before reading
+input. A prompt not yet represented by a hook, peer message, scheduled job or task
 can arrive after the final sample but before SIGTERM. Sampling can also miss brief activity.
 Quiet is a heuristic, not all-input closure. No prompts are collected, stored or replayed.
 
@@ -268,10 +270,10 @@ Every deferred session is checked each monitor tick, even before hooks arrive, d
 running turn, or when no server revision has changed. Five minutes before token expiry its
 status and structured alert change to `warn`; expiry or an authentication failure changes
 them to `blocked`. While restart is deferred, the child and its work stay alive without
-a forced timeout; the held token can stop working. Once quiet and fresh workload checks
+a forced timeout; the held token can stop working. Once the applicable idle/quiet and fresh workload checks
 permit admission, the wrapper can send SIGTERM and resume with the available new token.
 
-After the quiet window and fresh workload checks pass, the retained restart and cron
+After admission and fresh workload checks pass, the retained restart and cron
 recovery path below can run. No timeout forces a restart while blocked, and no forced
 kill deadline follows SIGTERM. A child that does not exit keeps its current token and
 work. Installing a new CLI does not upgrade a running wrapper.
@@ -304,18 +306,19 @@ outside the saved-job count.
 The transcript read is limited to 8 MiB after the previous recorded position. An ambiguous
 card, an unreadable saved prompt, a malformed entry, or a recovery-arm failure prints
 `cron recovery skipped: <reason>` and falls back to the ordinary resume arguments.
-When those arguments leave an unambiguous empty prompt slot, renewal adds its existing
-cron note and failover adds "Continue the previous request". Optional
-cron recovery never aborts a restart. Sessions with no matching card keep their existing
-renewal or failover note; first launches and manual resumes do not use this recovery.
-Cards with no saved crons also keep the existing note. Unreadable unrelated cards produce a
+Recovery after authentication failure or expiry omits the original task and the legacy
+cron catch-up note. Its matching saved-card recovery still restores definitions without
+replaying missed fires. Other renewals and failovers with no matching card keep their existing
+note; first launches and manual resumes do not use this recovery. Optional cron recovery
+never aborts a restart. Cards with no saved crons follow the same rules. Unreadable unrelated cards produce a
 discovery warning and do not stop ordinary renewal. Saved paths support absolute paths,
 paths relative to the card, `~/`, `$HOME/`, and `${HOME}/`; other variables and `~user`
 are refused with an explicit unsupported-path error.
-If the resumed conversation is missing, the existing `No conversation found` fallback
-starts a fresh session without this cron-restoration prompt. The failed resume reports
-unverified recovery; restore its jobs from the card in the fresh session. This limitation
-does not change the normal renewal-resume path.
+If an authentication recovery cannot resume its named conversation, it reports an error
+and stops. It never substitutes a new conversation. Other renewals and account failovers
+retain the existing `No conversation found` fallback to a fresh session without the
+cron-restoration prompt. That failed resume reports unverified recovery; restore its jobs
+from the card in the fresh session.
 
 This remains a best-effort workaround for Claude Code's resume behavior, with these limits:
 
@@ -334,18 +337,29 @@ This remains a best-effort workaround for Claude Code's resume behavior, with th
 - The defect belongs to Claude Code; an upstream report waits on the owner's decision. Remove
   the note once Claude Code fires restored jobs reliably.
 
-Automatic restart requires the quiet window and fresh workload evidence before provider selection,
-failover reservation and the final signal. Foreground turns, live background tasks,
-production markers, pending hooks and explicit holds prevent renewal and failover, even
-after token expiry. The task check reads live descendants' stdout/stderr: a Claude task
+Renewal while the held token is valid and account failover require the quiet window.
+After an `authentication_failed` hook or held-token expiry, recovery instead restarts
+automatically at the next verified idle point, on the same conversation and account.
+For a terminal session, fresh idle and terminal samples must stay unchanged for 16 seconds
+after workload blockers clear. This spans two Linux TTY timestamp periods. A new blocker
+or input restarts verification; prior valid-token quiet time is not reused.
+If the server still holds the exact
+rejected revision, the wrapper requests its replacement through the existing fenced refresh
+after fresh idle admission. Ordinary polling of a valid token remains an observing read.
+A later successful turn clears an old authentication-failure observation. A prompt, idle
+notification, other API failure or session change alone does not prove recovery.
+
+Fresh workload evidence is required before provider reads, failover reservation and the
+final signal. Foreground turns, live background tasks, production markers, pending hooks
+and explicit holds prevent every restart. The task check reads live descendants' stdout/stderr: a Claude task
 file under `<tmp>/claude-<uid>/.../tasks/*.output` holds admission. MCP/LSP servers and
 `caffeinate` without task-output descriptors do not add a workload blocker.
 
-After quiet completes, `restart_pending` retains expiry attention while a token read,
+After admission opens, `restart_pending` retains expiry attention while a token read,
 restart budget or account choice still prevents a restart. Gate eligibility does not clear
 that alert. During the window the status reason is `quiet_window`; damaged or missing evidence is
 `evidence_unknown`. No failover reservation or restart budget is consumed while blocked.
-Hooks publish pending intent before waiting for either admission lock, so a waiting hook
+Hooks publish pending intent before reading input or waiting for either admission lock, so a waiting hook
 blocks the final workload check. The signal path checks again before waiting on hook locks
 and before publishing `renewal=renewing`, then samples workload once more before SIGTERM.
 These locks and samples do not close all input sources. Any explicit child exit ends `server run` with
@@ -375,8 +389,9 @@ even when no goal file is configured. A usable tab ID takes precedence; a blank 
 digits, `:`, `_`, `-`, and internal `/` or `.` qualifiers; other internal punctuation or
 Unicode makes an ID unusable. Supplied IDs that cannot identify a lane report unknown
 evidence. A standalone session with neither ID and no goal file skips lane outboxes. An open marker defers admission even when Claude has no local task-output child. Missing or unreadable marker evidence is reported as
-`evidence_unknown` and keeps admission closed. Restoring clear workload evidence starts a new quiet window; it does not provide
-input-admission proof. Explicit holds remain the preferred production boundary.
+`evidence_unknown` and keeps admission closed. Restoring clear workload evidence starts a
+new admission check and, for valid-token renewal or failover, a new quiet window. It does
+not provide input-admission proof. Explicit holds remain the preferred production boundary.
 
 Marker history is tracked independently in each source. The ticket and full step label
 identify a step without case distinctions; use distinct labels for different operations and repeat the full label
@@ -432,8 +447,9 @@ Conversations that a `server run` before this model stored in
 directory.
 
 While Claude runs, the client reads usage every five minutes without changing the token
-inside the running process. Automatic renewal and failover wait for ten continuous minutes
-of observed quiet and fresh workload checks. Once eligible, the wrapper can observe the
+inside the running process. Valid-token renewal and failover wait for ten continuous minutes
+of observed quiet; authentication recovery uses the next verified idle point. Both require
+fresh workload checks. Once eligible, the wrapper can observe the
 available token, reserve a failover account if needed, and restart Claude with the new login.
 Busy or unknown sessions keep the held token, which can expire or be rotated by another
 client. If a session must be ended explicitly, finish its work and cleanup before relaunch.

@@ -44,6 +44,7 @@ pub(super) fn hook_admission(directory: &Path) -> Result<File> {
 #[serde(rename_all = "snake_case")]
 pub(super) enum Cause {
     Renewal,
+    AuthRecovery,
     Failover,
 }
 
@@ -58,6 +59,7 @@ enum Reason {
     StaleHold,
     EvidenceUnknown,
     QuietWindow,
+    TerminalInput,
     RestartPending,
 }
 
@@ -79,10 +81,13 @@ struct Deferred {
 struct ObservedQuiet {
     idle: super::renew::Idle,
     input_at: Option<std::time::SystemTime>,
+    cause: Cause,
     since: Instant,
 }
 
 const QUIET_WINDOW: Duration = Duration::from_secs(600);
+// Linux tty_update_time can hold atime unchanged for eight seconds. Observe two periods.
+const TERMINAL_OBSERVATION: Duration = Duration::from_secs(16);
 
 /// One gate per live Claude child. All automatic restart callers cross `check`.
 pub(super) struct Gate {
@@ -194,14 +199,16 @@ impl Gate {
             reason
         } else {
             let input_at = input_at.expect("terminal evidence was checked");
-            if self
-                .quiet
-                .as_ref()
-                .is_none_or(|previous| previous.idle != *idle || previous.input_at != input_at)
-            {
+            let changed = self.quiet.as_ref().is_none_or(|previous| {
+                previous.idle != *idle
+                    || previous.input_at != input_at
+                    || (cause == Cause::AuthRecovery && previous.cause != cause)
+            });
+            if changed {
                 self.quiet = Some(ObservedQuiet {
                     idle: idle.clone(),
                     input_at,
+                    cause,
                     since: observed_at,
                 });
             }
@@ -212,10 +219,19 @@ impl Gate {
                     .unwrap_or_default()
                     >= QUIET_WINDOW
             });
-            (observed_at.saturating_duration_since(quiet.since) < QUIET_WINDOW || !terminal_quiet)
-                .then_some(Reason::QuietWindow)
+            if cause == Cause::AuthRecovery {
+                // A dead token needs the next verified idle point, not ten minutes.
+                // A matching five-second sample cannot detect coarse tty timestamps.
+                (input_at.is_some()
+                    && observed_at.saturating_duration_since(quiet.since) < TERMINAL_OBSERVATION)
+                    .then_some(Reason::TerminalInput)
+            } else {
+                (observed_at.saturating_duration_since(quiet.since) < QUIET_WINDOW
+                    || !terminal_quiet)
+                    .then_some(Reason::QuietWindow)
+            }
         };
-        // Option B is only an observed-quiet heuristic. A hook can still be
+        // Workload observations do not close all inputs. A hook can still be
         // invisible or arrive between this sample and SIGTERM.
         let admitted = reason.is_none();
         // Quiet eligibility does not mean a token read, budget or account choice
@@ -1325,6 +1341,66 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status["reason"], "evidence_unknown");
+    }
+
+    #[test]
+    fn auth_recovery_cannot_inherit_old_terminal_observation_from_valid_renewal() {
+        let (_home, mut gate, idle) = setup();
+        let terminal = gate.directory.join("synthetic-terminal");
+        let file = File::create(&terminal).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_accessed(std::time::UNIX_EPOCH))
+            .unwrap();
+        gate = gate.with_terminal(Some(terminal));
+        let start = Instant::now();
+        assert!(!gate.check_at(&idle, Cause::Renewal, i64::MAX, start));
+        assert!(!gate.check_at(
+            &idle,
+            Cause::Renewal,
+            i64::MAX,
+            start + Duration::from_secs(20)
+        ));
+        let expired = now() - 1;
+        assert!(
+            !gate.check_at(
+                &idle,
+                Cause::AuthRecovery,
+                expired,
+                start + Duration::from_secs(20)
+            ),
+            "token expiry must begin a fresh terminal observation, even when tty atime has not changed yet"
+        );
+        assert!(!gate.check_at(
+            &idle,
+            Cause::AuthRecovery,
+            expired,
+            start + Duration::from_secs(35)
+        ));
+        assert!(gate.check_at(
+            &idle,
+            Cause::AuthRecovery,
+            expired,
+            start + Duration::from_secs(36)
+        ));
+        file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()))
+            .unwrap();
+        assert!(!gate.check_at(
+            &idle,
+            Cause::AuthRecovery,
+            expired,
+            start + Duration::from_secs(37)
+        ));
+        assert!(!gate.check_at(
+            &idle,
+            Cause::AuthRecovery,
+            expired,
+            start + Duration::from_secs(52)
+        ));
+        assert!(gate.check_at(
+            &idle,
+            Cause::AuthRecovery,
+            expired,
+            start + Duration::from_secs(53)
+        ));
     }
 
     #[test]

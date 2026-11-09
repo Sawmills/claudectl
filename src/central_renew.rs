@@ -70,6 +70,8 @@ pub(super) enum Event {
     Session(String),
     Prompt,
     Stop,
+    /// A failed turn ended without proving that authentication recovered.
+    Failed,
     IdlePrompt,
     /// A turn failed with `rate_limit` in this session; it also ended the turn.
     Limited(String),
@@ -101,12 +103,13 @@ pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
                 // account (SAW-12693); it ended all the same.
                 "StopFailure" if v["error"] == "rate_limit" => match v["session_id"].as_str() {
                     Some(session) => Event::Limited(session.to_string()),
-                    None => Event::Stop,
+                    None => Event::Failed,
                 },
                 "StopFailure" if v["error"] == "authentication_failed" => Event::AuthFailed,
                 // A turn that failed (another API error) ends with
                 // StopFailure: it ended all the same.
-                "Stop" | "StopFailure" => Event::Stop,
+                "StopFailure" => Event::Failed,
+                "Stop" => Event::Stop,
                 "Notification" if v["notification_type"] == "idle_prompt" => Event::IdlePrompt,
                 "SessionEnd" => Event::SessionEnd(v["session_id"].as_str().map(str::to_owned)),
                 _ => return None,
@@ -142,9 +145,8 @@ pub(super) struct Idle {
     pub limited: Option<(String, i64)>,
     /// When Claude ended its session with no new session since: Claude is exiting.
     pub ended: Option<i64>,
-    /// When a turn last failed with `authentication_failed`: the held token is dead, so
-    /// nothing the user types can succeed until a restart. A new session in the same process
-    /// (`/clear`, `/resume`) keeps the token, so only a relaunch (a new event log) clears it.
+    /// The latest unresolved `authentication_failed`. A successful Stop clears it; a prompt,
+    /// idle notification, other failure or new session alone does not prove recovery.
     pub auth_failed: Option<i64>,
     /// Count metadata events, including idle notifications, without storing prompt text.
     pub observed_events: u64,
@@ -188,7 +190,11 @@ pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
                 idle.limited = None;
             }
             // A turn just ended: the idle time starts now.
-            Event::Stop => idle.since = Some(*at),
+            Event::Stop => {
+                idle.since = Some(*at);
+                idle.auth_failed = None;
+            }
+            Event::Failed => idle.since = Some(*at),
             Event::IdlePrompt => {
                 idle.since.get_or_insert(*at);
             }
@@ -289,7 +295,8 @@ pub(super) fn decide(i: &Inputs) -> Decision {
     }
 }
 
-/// Whether Claude is idle enough to be restarted. Token expiry never bypasses this gate.
+/// Whether Claude is idle enough to be restarted. A dead token skips only the quiet delay;
+/// workload evidence and the final signal admission still apply.
 pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     if i.idle.session.is_none() {
         return Err("no session id from Claude yet");
@@ -298,15 +305,15 @@ pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     if i.idle.ended.is_some() {
         return Err("Claude is ending the session");
     }
-    // Expiry and authentication failure never bypass the observed quiet window.
+    let recovering = held_token_dead(i);
     match i.idle.since {
         None => return Err("a turn is running"),
-        Some(since) if i.now - since < i.idle_after_ms => {
+        Some(since) if !recovering && i.now - since < i.idle_after_ms => {
             return Err("the last turn ended less than 10 min ago");
         }
         Some(_) => {}
     }
-    if i.tty_idle_ms.is_some_and(|ms| ms < i.tty_gate_ms) {
+    if !recovering && i.tty_idle_ms.is_some_and(|ms| ms < i.tty_gate_ms) {
         return Err("terminal input in the last 10 min");
     }
     // restart_gate separately protects task-output descendants and explicit holds.
@@ -366,6 +373,16 @@ fn mark_hook_error(dir: &std::path::Path) {
     let _ = std::fs::File::create(dir.join("hook-error"));
 }
 
+fn publish_hook_intent(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let pending = dir.join(format!("hook-pending.{}", std::process::id()));
+    if let Err(error) = atomic(&pending, &serde_json::json!({"pid": std::process::id()})) {
+        mark_hook_error(dir);
+        let _ = std::fs::remove_file(&pending);
+        return Err(error);
+    }
+    Ok(pending)
+}
+
 /// The `server hook` entry point: read the hook input (at most `HOOK_INPUT_LIMIT`) and
 /// record it. Any read, size or parse failure leaves the error marker (fail closed).
 pub(super) fn hook_from(
@@ -376,12 +393,16 @@ pub(super) fn hook_from(
 ) -> anyhow::Result<()> {
     use std::io::Read;
     let dir = session_dir(sessions, dir)?;
+    // Reading stdin may wait while the native client submits its hook payload.
+    // Publish before that wait, as well as before either admission lock.
+    let pending = publish_hook_intent(&dir)?;
     let mut text = String::new();
     let read = input
         .take(HOOK_INPUT_LIMIT as u64 + 1)
         .read_to_string(&mut text);
     if read.is_err() || text.len() > HOOK_INPUT_LIMIT {
         mark_hook_error(&dir);
+        let _ = std::fs::remove_file(&pending);
         anyhow::bail!("hook input unreadable or too large");
     }
     record_hook(sessions, &dir, &text, now)
@@ -400,13 +421,7 @@ pub(super) fn record_hook(
 ) -> anyhow::Result<()> {
     use std::io::Write;
     let dir = session_dir(sessions, dir)?;
-    let pending = dir.join(format!("hook-pending.{}", std::process::id()));
-    // Publish intent before either lock so final admission can see a waiting hook.
-    if let Err(error) = atomic(&pending, &serde_json::json!({"pid": std::process::id()})) {
-        mark_hook_error(&dir);
-        let _ = std::fs::remove_file(&pending);
-        return Err(error);
-    }
+    let pending = publish_hook_intent(&dir)?;
     #[cfg(unix)]
     let _hook_admission = match super::restart_gate::hook_admission(&dir) {
         Ok(lock) => lock,
@@ -584,7 +599,7 @@ mod tests {
                 (1, Event::SessionStart("s-1".into())),
                 (2, Event::Prompt),
                 (3, Event::Limited("s-1".into())),
-                (4, Event::Stop),
+                (4, Event::Failed),
             ]
         );
         let events = parse_events(text);
@@ -785,7 +800,7 @@ mod tests {
         ]
         .join("\n");
         let events = parse_events(&text);
-        assert_eq!(events.last(), Some(&(3, Event::Stop)));
+        assert_eq!(events.last(), Some(&(3, Event::Failed)));
         assert_eq!(
             idle_state(&events),
             Idle {
@@ -856,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn option_b_expiry_and_auth_failure_do_not_bypass_recent_input() {
+    fn expiry_and_auth_failure_skip_the_quiet_delay_after_idle() {
         let idle = Idle {
             session: Some("s".into()),
             since: Some(9_999_000),
@@ -865,25 +880,19 @@ mod tests {
         let mut expired = inputs(&idle);
         expired.held_expires_at = expired.now - 1;
         expired.tty_idle_ms = Some(1_000);
-        assert!(
-            matches!(decide(&expired), Decision::Wait(_)),
-            "expiry cannot skip quiet"
-        );
+        assert_eq!(decide(&expired), Decision::Restart);
         let auth = Idle {
             auth_failed: Some(9_999_000),
             ..idle
         };
         let mut revoked = inputs(&auth);
         revoked.tty_idle_ms = Some(1_000);
-        assert!(
-            matches!(decide(&revoked), Decision::Wait(_)),
-            "401 cannot skip quiet"
-        );
+        assert_eq!(decide(&revoked), Decision::Restart);
     }
 
     #[test]
-    fn a_dead_held_token_waits_while_the_user_types() {
-        // Option B preserves drafts even when the held token has stopped working.
+    fn dead_token_recovery_still_requires_an_idle_turn_and_restart_budget() {
+        // Fresh terminal input is checked by restart_gate at final admission.
         let idle = Idle {
             session: Some("s".into()),
             since: Some(10_000_000 - 1_000),
@@ -895,7 +904,7 @@ mod tests {
         let mut expired = inputs(&idle);
         expired.held_expires_at = expired.now - 1;
         expired.tty_idle_ms = Some(5_000);
-        assert!(matches!(decide(&expired), Decision::Wait(_)));
+        assert_eq!(decide(&expired), Decision::Restart);
         // A running turn, an exiting session and the budget still hold.
         let busy = Idle {
             session: Some("s".into()),
@@ -914,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_authentication_marks_the_held_token_dead_for_the_process() {
+    fn a_failed_authentication_stays_unresolved_until_success_or_relaunch() {
         // A forced rotation revokes the held token before its expiry: the failed turn says so.
         let text = [
             r#"{"at":1,"event":"SessionStart","session_id":"s"}"#,
@@ -931,7 +940,7 @@ mod tests {
         typing.now = 6;
         typing.tty_idle_ms = Some(1_000);
         assert!(held_token_dead(&typing));
-        assert!(matches!(decide(&typing), Decision::Wait(_)));
+        assert_eq!(decide(&typing), Decision::Restart);
         // Same revision: the server has no newer token yet, so nothing to follow.
         typing.server_revision = "r1";
         assert_eq!(decide(&typing), Decision::Keep);
@@ -943,6 +952,20 @@ mod tests {
         let mut still = inputs(&cleared);
         still.now = 8;
         assert!(held_token_dead(&still));
+        // Neither another API failure nor an idle notification proves the token works.
+        let mut recovering = cleared.clone();
+        fold(&mut recovering, &parse_events(&[
+            r#"{"at":9,"event":"UserPromptSubmit","session_id":"s2"}"#,
+            r#"{"at":10,"event":"StopFailure","session_id":"s2","error":"overloaded"}"#,
+            r#"{"at":11,"event":"Notification","session_id":"s2","notification_type":"idle_prompt"}"#,
+        ].join("\n")));
+        assert_eq!(recovering.auth_failed, Some(5));
+        fold(
+            &mut recovering,
+            &parse_events(r#"{"at":12,"event":"Stop","session_id":"s2"}"#),
+        );
+        assert_eq!(recovering.auth_failed, None);
+        assert!(!held_token_dead(&inputs(&recovering)));
         // A relaunch on the new token starts a new event log: alive again.
         let fresh = idle_state(&parse_events(
             r#"{"at":9,"event":"SessionStart","session_id":"s"}"#,
@@ -1183,7 +1206,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_hook_reading_input_does_not_bypass_the_quiet_window() {
+    fn a_hook_reading_input_blocks_admission_before_the_quiet_window() {
         struct WaitingInput {
             started: std::sync::mpsc::Sender<()>,
             release: std::sync::mpsc::Receiver<()>,
@@ -1233,12 +1256,12 @@ mod tests {
         child.wait().unwrap();
         assert!(
             !admitted,
-            "a hook reading input must not bypass the quiet window"
+            "a hook reading input must block restart admission"
         );
         let status: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("restart-status.json")).unwrap())
                 .unwrap();
-        assert_eq!(status["reason"], "quiet_window");
+        assert_eq!(status["reason"], "queued_hook");
     }
 
     #[test]
