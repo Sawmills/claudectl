@@ -289,7 +289,8 @@ pub(super) fn decide(i: &Inputs) -> Decision {
     }
 }
 
-/// Whether Claude is idle enough to be restarted. Token expiry never bypasses this gate.
+/// Whether Claude is idle enough to be restarted. A dead token skips only the quiet delay;
+/// workload evidence and the final signal admission still apply.
 pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     if i.idle.session.is_none() {
         return Err("no session id from Claude yet");
@@ -298,15 +299,15 @@ pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     if i.idle.ended.is_some() {
         return Err("Claude is ending the session");
     }
-    // Expiry and authentication failure never bypass the observed quiet window.
+    let recovering = held_token_dead(i);
     match i.idle.since {
         None => return Err("a turn is running"),
-        Some(since) if i.now - since < i.idle_after_ms => {
+        Some(since) if !recovering && i.now - since < i.idle_after_ms => {
             return Err("the last turn ended less than 10 min ago");
         }
         Some(_) => {}
     }
-    if i.tty_idle_ms.is_some_and(|ms| ms < i.tty_gate_ms) {
+    if !recovering && i.tty_idle_ms.is_some_and(|ms| ms < i.tty_gate_ms) {
         return Err("terminal input in the last 10 min");
     }
     // restart_gate separately protects task-output descendants and explicit holds.
@@ -366,6 +367,16 @@ fn mark_hook_error(dir: &std::path::Path) {
     let _ = std::fs::File::create(dir.join("hook-error"));
 }
 
+fn publish_hook_intent(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let pending = dir.join(format!("hook-pending.{}", std::process::id()));
+    if let Err(error) = atomic(&pending, &serde_json::json!({"pid": std::process::id()})) {
+        mark_hook_error(dir);
+        let _ = std::fs::remove_file(&pending);
+        return Err(error);
+    }
+    Ok(pending)
+}
+
 /// The `server hook` entry point: read the hook input (at most `HOOK_INPUT_LIMIT`) and
 /// record it. Any read, size or parse failure leaves the error marker (fail closed).
 pub(super) fn hook_from(
@@ -376,12 +387,16 @@ pub(super) fn hook_from(
 ) -> anyhow::Result<()> {
     use std::io::Read;
     let dir = session_dir(sessions, dir)?;
+    // Reading stdin may wait while the native client submits its hook payload.
+    // Publish before that wait, as well as before either admission lock.
+    let pending = publish_hook_intent(&dir)?;
     let mut text = String::new();
     let read = input
         .take(HOOK_INPUT_LIMIT as u64 + 1)
         .read_to_string(&mut text);
     if read.is_err() || text.len() > HOOK_INPUT_LIMIT {
         mark_hook_error(&dir);
+        let _ = std::fs::remove_file(&pending);
         anyhow::bail!("hook input unreadable or too large");
     }
     record_hook(sessions, &dir, &text, now)
@@ -400,13 +415,7 @@ pub(super) fn record_hook(
 ) -> anyhow::Result<()> {
     use std::io::Write;
     let dir = session_dir(sessions, dir)?;
-    let pending = dir.join(format!("hook-pending.{}", std::process::id()));
-    // Publish intent before either lock so final admission can see a waiting hook.
-    if let Err(error) = atomic(&pending, &serde_json::json!({"pid": std::process::id()})) {
-        mark_hook_error(&dir);
-        let _ = std::fs::remove_file(&pending);
-        return Err(error);
-    }
+    let pending = publish_hook_intent(&dir)?;
     #[cfg(unix)]
     let _hook_admission = match super::restart_gate::hook_admission(&dir) {
         Ok(lock) => lock,
@@ -856,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn option_b_expiry_and_auth_failure_do_not_bypass_recent_input() {
+    fn expiry_and_auth_failure_skip_the_quiet_delay_after_idle() {
         let idle = Idle {
             session: Some("s".into()),
             since: Some(9_999_000),
@@ -865,25 +874,19 @@ mod tests {
         let mut expired = inputs(&idle);
         expired.held_expires_at = expired.now - 1;
         expired.tty_idle_ms = Some(1_000);
-        assert!(
-            matches!(decide(&expired), Decision::Wait(_)),
-            "expiry cannot skip quiet"
-        );
+        assert_eq!(decide(&expired), Decision::Restart);
         let auth = Idle {
             auth_failed: Some(9_999_000),
             ..idle
         };
         let mut revoked = inputs(&auth);
         revoked.tty_idle_ms = Some(1_000);
-        assert!(
-            matches!(decide(&revoked), Decision::Wait(_)),
-            "401 cannot skip quiet"
-        );
+        assert_eq!(decide(&revoked), Decision::Restart);
     }
 
     #[test]
-    fn a_dead_held_token_waits_while_the_user_types() {
-        // Option B preserves drafts even when the held token has stopped working.
+    fn dead_token_recovery_still_requires_an_idle_turn_and_restart_budget() {
+        // Fresh terminal input is checked by restart_gate at final admission.
         let idle = Idle {
             session: Some("s".into()),
             since: Some(10_000_000 - 1_000),
@@ -895,7 +898,7 @@ mod tests {
         let mut expired = inputs(&idle);
         expired.held_expires_at = expired.now - 1;
         expired.tty_idle_ms = Some(5_000);
-        assert!(matches!(decide(&expired), Decision::Wait(_)));
+        assert_eq!(decide(&expired), Decision::Restart);
         // A running turn, an exiting session and the budget still hold.
         let busy = Idle {
             session: Some("s".into()),
@@ -931,7 +934,7 @@ mod tests {
         typing.now = 6;
         typing.tty_idle_ms = Some(1_000);
         assert!(held_token_dead(&typing));
-        assert!(matches!(decide(&typing), Decision::Wait(_)));
+        assert_eq!(decide(&typing), Decision::Restart);
         // Same revision: the server has no newer token yet, so nothing to follow.
         typing.server_revision = "r1";
         assert_eq!(decide(&typing), Decision::Keep);
@@ -1183,7 +1186,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_hook_reading_input_does_not_bypass_the_quiet_window() {
+    fn a_hook_reading_input_blocks_admission_before_the_quiet_window() {
         struct WaitingInput {
             started: std::sync::mpsc::Sender<()>,
             release: std::sync::mpsc::Receiver<()>,
@@ -1233,12 +1236,12 @@ mod tests {
         child.wait().unwrap();
         assert!(
             !admitted,
-            "a hook reading input must not bypass the quiet window"
+            "a hook reading input must block restart admission"
         );
         let status: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("restart-status.json")).unwrap())
                 .unwrap();
-        assert_eq!(status["reason"], "quiet_window");
+        assert_eq!(status["reason"], "queued_hook");
     }
 
     #[test]

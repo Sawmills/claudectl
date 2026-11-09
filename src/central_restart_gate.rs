@@ -44,6 +44,7 @@ pub(super) fn hook_admission(directory: &Path) -> Result<File> {
 #[serde(rename_all = "snake_case")]
 pub(super) enum Cause {
     Renewal,
+    AuthRecovery,
     Failover,
 }
 
@@ -58,6 +59,7 @@ enum Reason {
     StaleHold,
     EvidenceUnknown,
     QuietWindow,
+    TerminalInput,
     RestartPending,
 }
 
@@ -194,11 +196,11 @@ impl Gate {
             reason
         } else {
             let input_at = input_at.expect("terminal evidence was checked");
-            if self
+            let changed = self
                 .quiet
                 .as_ref()
-                .is_none_or(|previous| previous.idle != *idle || previous.input_at != input_at)
-            {
+                .is_none_or(|previous| previous.idle != *idle || previous.input_at != input_at);
+            if changed {
                 self.quiet = Some(ObservedQuiet {
                     idle: idle.clone(),
                     input_at,
@@ -212,10 +214,17 @@ impl Gate {
                     .unwrap_or_default()
                     >= QUIET_WINDOW
             });
-            (observed_at.saturating_duration_since(quiet.since) < QUIET_WINDOW || !terminal_quiet)
-                .then_some(Reason::QuietWindow)
+            if cause == Cause::AuthRecovery {
+                // A dead token needs the next verified idle point, not ten minutes.
+                // Terminal evidence must still survive a fresh sample without input.
+                (input_at.is_some() && changed).then_some(Reason::TerminalInput)
+            } else {
+                (observed_at.saturating_duration_since(quiet.since) < QUIET_WINDOW
+                    || !terminal_quiet)
+                    .then_some(Reason::QuietWindow)
+            }
         };
-        // Option B is only an observed-quiet heuristic. A hook can still be
+        // Workload observations do not close all inputs. A hook can still be
         // invisible or arrive between this sample and SIGTERM.
         let admitted = reason.is_none();
         // Quiet eligibility does not mean a token read, budget or account choice

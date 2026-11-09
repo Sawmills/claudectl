@@ -114,11 +114,15 @@ while one runs). Read the summary table: rerun for `lost-reply` and `failed:fenc
 for `unrotated`. A row `migrated (log out the live login)` means the live login on that
 machine holds a retired grant: run `claude auth logout` there; claudectl never deletes it.
 
-7. **Verify renewal and failover:** use isolated fixtures for
-   the ten-minute quiet window. Confirm every turn, task-output child, hold, open production
-   marker and pending hook blocks admission and restarts the window. Expiry and a 401 must
-   not shorten it. Check warning journal/metric/status five minutes before expiry and blocked
-   status at expiry for every deferred workload. Damaged/missing evidence stays blocked.
+7. **Verify renewal and failover:** use isolated fixtures. A valid held token and account
+   failover retain the ten-minute quiet window. Authentication failure or expiry recovers
+   automatically at the next verified idle point, on the same session and account. Confirm
+   every running turn, task-output child, hold, open production marker and pending hook
+   blocks recovery. Check a hook waiting on input as well as one waiting for a lock. Verify
+   one restart per failed observation, terminal foreground, saved-card cron recovery and no
+   original-task or missed-fire replay. Check warning journal/metric/status five minutes
+   before expiry and blocked attention for each busy or unknown workload. Damaged/missing
+   evidence stays blocked.
    Do not start a test session on a shared account or force a shared account refresh.
    Quiet does not close all inputs: a late or invisible hook can still lose a prompt at
    SIGTERM. No prompt collection/replay or forced kill deadline is provided. Live acceptance

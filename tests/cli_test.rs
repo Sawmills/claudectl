@@ -387,7 +387,11 @@ fn run_help_discloses_quiet_window_and_residual_race() {
             .unwrap();
         assert!(output.status.success());
         let help = String::from_utf8(output.stdout).unwrap();
-        assert!(help.contains("Automatic restart requires ten minutes of observed quiet"));
+        assert!(help.contains("next verified idle point"));
+        assert!(help.contains("same session and account"));
+        assert!(help.contains(
+            "Renewal with a valid token and failover require ten minutes of observed quiet"
+        ));
         assert!(help.contains("Request failover after ten minutes of observed quiet"));
         assert!(!help.contains("currently deferred"));
         assert!(help.contains("held token may expire"));

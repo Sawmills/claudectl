@@ -234,6 +234,26 @@ pub(super) fn required_prompted_resume(
     recovery: &str,
     continue_request: bool,
 ) -> Result<(Vec<OsString>, String)> {
+    let (mut options, original) = resumed_options(args, session)?;
+    let prompt = match original.filter(|_| continue_request) {
+        Some(original) => format!(
+            "{recovery}\n\nOriginal user prompt (verbatim):\n{}",
+            original
+                .to_str()
+                .context("Claude prompt is not valid UTF-8")?
+        ),
+        None => recovery.to_owned(),
+    };
+    options.extend(["--".into(), prompt.clone().into()]);
+    Ok((options, prompt))
+}
+
+/// Resume the existing conversation without submitting the original task again.
+pub(super) fn unprompted_resume(args: &[OsString], session: &str) -> Result<Vec<OsString>> {
+    Ok(resumed_options(args, session)?.0)
+}
+
+fn resumed_options(args: &[OsString], session: &str) -> Result<(Vec<OsString>, Option<OsString>)> {
     // Claude Code 2.1.319 --help: these consume all following non-option values.
     const MANY: &[&str] = &[
         "--add-dir",
@@ -305,22 +325,8 @@ pub(super) fn required_prompted_resume(
             }
         }
     }
-    let prompt = match original.filter(|_| continue_request) {
-        Some(original) => format!(
-            "{recovery}\n\nOriginal user prompt (verbatim):\n{}",
-            original
-                .to_str()
-                .context("Claude prompt is not valid UTF-8")?
-        ),
-        None => recovery.to_owned(),
-    };
-    options.extend([
-        "--resume".into(),
-        session.into(),
-        "--".into(),
-        prompt.clone().into(),
-    ]);
-    Ok((options, prompt))
+    options.extend(["--resume".into(), session.into()]);
+    Ok((options, original.cloned()))
 }
 
 /// The time limit for confirming one limit. It starts when Claude is first idle enough to

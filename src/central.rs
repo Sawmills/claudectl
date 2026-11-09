@@ -18,9 +18,11 @@ Claude validates the settings schema. An invalid value such as model: 5 can make
 Claude ignore the WHOLE settings file, including claudectl's renewal/failover hooks.
 Test settings with your installed Claude version before rollout.
 
-Automatic restart requires ten minutes of observed quiet.
-Quiet does not prove all inputs are closed: a late prompt can be cut off at SIGTERM.
-Expiry does not bypass quiet; unknown evidence defers. The held token may expire.
+Renewal with a valid token and failover require ten minutes of observed quiet.
+After authentication failure or token expiry, Claude restarts at the next verified idle point
+on the same session and account. Workload blockers and unknown evidence defer recovery.
+The held token may expire while busy work stays alive.
+Idle and quiet do not close all inputs: a late prompt can be cut off at SIGTERM.
 No prompt collection or replay.";
 
 #[cfg(unix)]

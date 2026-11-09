@@ -430,6 +430,7 @@ enum RestartKind {
 struct Restart {
     kind: RestartKind,
     session_id: String,
+    cause: super::restart_gate::Cause,
 }
 /// Failover state that outlives one Claude process of the run.
 #[cfg(unix)]
@@ -450,8 +451,8 @@ struct Outcome {
     /// A failover notice for stderr once Claude no longer owns the terminal.
     notice: Option<String>,
 }
-/// Watches one Claude process and publishes workload/expiry status. Automatic renewal
-/// and failover require observed quiet and fresh workload evidence.
+/// Watches one Claude process and publishes workload/expiry status. Authentication recovery
+/// uses verified idle; other renewal and failover retain observed quiet.
 #[cfg(unix)]
 struct Monitor {
     client: Client,
@@ -657,10 +658,7 @@ impl Monitor {
             if let Some((_, restart)) = &sent {
                 // Await the child's own exit without a force-kill deadline, while
                 // retaining expiry attention if it ignores SIGTERM.
-                let cause = match &restart.kind {
-                    RestartKind::Renew(_) => super::restart_gate::Cause::Renewal,
-                    RestartKind::Failover { .. } => super::restart_gate::Cause::Failover,
-                };
+                let cause = restart.cause;
                 if self.read_events(&mut activity).is_err() {
                     gate.unknown(&activity.idle, cause, self.held_expires_at);
                 } else {
@@ -720,11 +718,15 @@ impl Monitor {
                 }
                 continue;
             }
-            let failover_pending = self.failover.is_some()
+            let recovering = renew::held_token_dead(&self.inputs(&mut activity, &timing, None));
+            let failover_pending = !recovering
+                && self.failover.is_some()
                 && activity.idle.limited.as_ref().is_some_and(|(session, at)| {
                     activity.idle.session.as_ref() == Some(session) && pending.handled != Some(*at)
                 });
-            let cause = if failover_pending {
+            let cause = if recovering {
+                super::restart_gate::Cause::AuthRecovery
+            } else if failover_pending {
                 super::restart_gate::Cause::Failover
             } else {
                 super::restart_gate::Cause::Renewal
@@ -735,9 +737,10 @@ impl Monitor {
             if !gate.check(&activity.idle, cause, self.held_expires_at) {
                 continue;
             }
-            // A usage limit first: while one is pending, renewal waits (one restart decision
-            // per tick, and a failover wins).
-            if self.failover.is_some()
+            // Authentication recovery keeps this account. Otherwise a pending usage limit
+            // takes precedence over renewal (one restart decision per tick).
+            if cause == super::restart_gate::Cause::Failover
+                && self.failover.is_some()
                 && let Some((session_id, failed_at)) = activity.idle.limited.clone()
                 && activity.idle.session.as_deref() == Some(session_id.as_str())
                 && pending.handled != Some(failed_at)
@@ -751,7 +754,14 @@ impl Monitor {
                     match self.stop_for_restart(&mut activity, &mut gate, &timing, cause) {
                         Ok(true) => {
                             let kind = RestartKind::Failover { account, access };
-                            sent = Some((now(), Restart { kind, session_id }));
+                            sent = Some((
+                                now(),
+                                Restart {
+                                    kind,
+                                    session_id,
+                                    cause,
+                                },
+                            ));
                         }
                         Ok(false) => break,
                         Err(()) => {}
@@ -780,7 +790,7 @@ impl Monitor {
             retry_now = false;
             // An observing read never refreshes an unexpired token, so it cannot revoke the
             // token another session's turn uses; a superseded revision shows at once.
-            let access = match self.client.observe(&self.account_id) {
+            let mut access = match self.client.observe(&self.account_id) {
                 Ok(access) => access,
                 Err(_) => {
                     // Retry soon: one failure near expiry must not use up the token's life.
@@ -797,6 +807,35 @@ impl Monitor {
                 gate.unknown(&activity.idle, cause, self.held_expires_at);
                 continue;
             }
+            if cause == super::restart_gate::Cause::AuthRecovery
+                && activity.idle.auth_failed.is_some()
+                && access.revision == self.held_revision
+            {
+                // The rejected grant is still current on the server. Replace that exact
+                // revision through the existing fenced refresh, after fresh idle admission.
+                if renew::idle_gate(&self.inputs(&mut activity, &timing, Some(&access))).is_err()
+                    || !gate.check(&activity.idle, cause, self.held_expires_at)
+                {
+                    retry_now = true;
+                    continue;
+                }
+                access = match self
+                    .client
+                    .acquire(&self.account_id, Some(&self.held_revision))
+                {
+                    Ok(access) => access,
+                    Err(_) => {
+                        last_check = now() - interval + timing.retry_ms;
+                        continue;
+                    }
+                };
+                if self.read_events(&mut activity).is_err() {
+                    outcome.note = Some("off: event log unreadable".into());
+                    renewing = false;
+                    gate.unknown(&activity.idle, cause, self.held_expires_at);
+                    continue;
+                }
+            }
             let inputs = self.inputs(&mut activity, &timing, Some(&access));
             if renew::idle_gate(&inputs).is_err() {
                 // Claude became busy: restart at its next idle point, without the poll wait.
@@ -807,15 +846,26 @@ impl Monitor {
                 && let Some(session_id) = activity.idle.session.clone()
             {
                 if !gate.check(&activity.idle, cause, self.held_expires_at) {
+                    retry_now = cause == super::restart_gate::Cause::AuthRecovery;
                     continue;
                 }
                 match self.stop_for_restart(&mut activity, &mut gate, &timing, cause) {
                     Ok(true) => {
                         let kind = RestartKind::Renew(access);
-                        sent = Some((now(), Restart { kind, session_id }));
+                        sent = Some((
+                            now(),
+                            Restart {
+                                kind,
+                                session_id,
+                                cause,
+                            },
+                        ));
                     }
                     Ok(false) => break,
-                    Err(()) => continue,
+                    Err(()) => {
+                        retry_now = cause == super::restart_gate::Cause::AuthRecovery;
+                        continue;
+                    }
                 }
             }
         }
@@ -847,7 +897,7 @@ impl Monitor {
         timing: &super::renew::Timing,
         cause: super::restart_gate::Cause,
     ) -> std::result::Result<bool, ()> {
-        // Deferral must not publish renewing or signal before the quiet window.
+        // Deferral must not publish renewing or signal before workload admission.
         // This guard and the locks do not close all input sources.
         if !gate.check(&activity.idle, cause, self.held_expires_at) {
             return Err(());
@@ -887,7 +937,7 @@ impl Monitor {
             return Err(());
         }
         // This last workload sample still leaves a sample-to-SIGTERM race.
-        // Option B accepts observed quiet only, with no prompt handover receipt.
+        // Workload observations do not acknowledge prompt handover.
         if !gate.check(&activity.idle, cause, self.held_expires_at) {
             let mut status = self.status.clone();
             status["renewal"] = "on".into();
@@ -1087,7 +1137,7 @@ pub fn run(
     let mut failovers: Vec<i64> = Vec::new();
     let mut tried: Vec<String> = Vec::new();
     // The session the running Claude was relaunched to resume, until its result is known.
-    let mut resumed: Option<String> = None;
+    let mut resumed: Option<(String, super::restart_gate::Cause)> = None;
     let mut first = true;
     let mut cron_recovery = None;
     loop {
@@ -1174,7 +1224,12 @@ pub fn run(
         }
         // Relaunch only after our own SIGTERM; any other exit ends `server run` with the
         // child's code.
-        let Some(Restart { kind, session_id }) = outcome.restart else {
+        let Some(Restart {
+            kind,
+            session_id,
+            cause,
+        }) = outcome.restart
+        else {
             if let Some(notice) = &outcome.notice {
                 eprintln!("claudectl: {notice}");
             }
@@ -1183,12 +1238,20 @@ pub fn run(
             // say so and start a new session on the same token, once (SAW-12882). A stop by
             // signal, or a code from 128 up (130 is Ctrl-C), is the user's stop: it ends the
             // run as before.
-            if let Some(id) = resumed.take()
+            if let Some((id, cause)) = resumed.take()
                 && status.code().is_some_and(|code| (1..128).contains(&code))
                 && !session_started(&session.directory().join("events"))
             {
                 if let Some(terminal) = &terminal {
                     terminal.restore();
+                }
+                if cause == super::restart_gate::Cause::AuthRecovery {
+                    eprintln!(
+                        "claudectl: ERROR: Claude could not resume original session {id} (exit code {}). \
+                         Automatic authentication recovery stopped; use /resume {id} on the same account.",
+                        exec::exit_code_of(&status)
+                    );
+                    return Ok(exec::exit_code_of(&status));
                 }
                 eprintln!(
                     "claudectl: ERROR: Claude could not resume session {id} (exit code {}). \
@@ -1203,7 +1266,7 @@ pub fn run(
             }
             return Ok(exec::exit_code_of(&status));
         };
-        resumed = Some(session_id.clone());
+        resumed = Some((session_id.clone(), cause));
         if let Some(terminal) = &terminal {
             terminal.restore();
         }
@@ -1215,9 +1278,12 @@ pub fn run(
         session.set_renewal("renewing")?;
         let continue_request = match kind {
             RestartKind::Renew(access) => {
-                launch_args =
+                launch_args = if cause == super::restart_gate::Cause::AuthRecovery {
+                    super::failover::unprompted_resume(args, &session_id)?
+                } else {
                     super::failover::prompted_resume(args, &session_id, super::renew::CRON_NOTE)
-                        .context("renewal of a one-shot run")?;
+                        .context("renewal of a one-shot run")?
+                };
                 session.renew(access)?;
                 restarts.push(now());
                 eprintln!("claudectl: server token renewed; resuming session {session_id}");

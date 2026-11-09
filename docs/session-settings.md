@@ -32,13 +32,16 @@ Verified, missing, duplicate, skipped, and unverified results stay in this log
 after the run exits. They never print over Claude's terminal or enter its input.
 The log contains no tokens or saved prompt contents.
 
-Automatic renewal and failover require ten continuous minutes of observed quiet.
-Running turns, live task-output children, open production steps, pending hooks and holds
-reset that window. Unknown or damaged evidence keeps restart blocked. Expiry or an
-authentication failure does not shorten the wait; the held token can expire while deferred.
-After quiet and fresh workload checks pass, claudectl can send SIGTERM and resume the
-session on the new token or account. Quiet does not close all input sources: a late or
-invisible prompt can still be cut off. Claudectl does not collect or replay prompts.
+Renewal while the held token is valid and account failover require ten continuous minutes
+of observed quiet. After authentication failure or expiry, Claude automatically resumes the
+same conversation on the same account at the next verified idle point. Running turns,
+live task-output children, open production steps, pending hooks and holds block admission;
+unknown or damaged evidence also stays blocked. Terminal input must remain unchanged across
+fresh samples. Recovery omits the original task and missed fires; saved-card cron recovery
+still restores its job definitions. A failed authentication resume reports an error and
+stops instead of opening a different conversation. These workload samples do not close all
+input sources: a late or invisible prompt can still be cut off. Claudectl does not collect
+or replay prompts.
 
 Renewal and failover also write deferred restart decisions to
 `~/.claudectl/server/restart-decisions.jsonl`. A running turn, live Claude task-output

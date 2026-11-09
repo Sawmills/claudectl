@@ -45,13 +45,14 @@ claudectl run -- --resume SESSION_ID
 
 Automatic `use` and `run` choose an eligible account with the earliest weekly reset.
 They exclude accounts with 5% or less weekly headroom and accounts that may bill
-extra usage. Automatic renewal and `--failover` require
-ten continuous minutes of observed quiet. Running turns, task-output descendants,
-production markers, pending hooks and explicit holds block restart and reset the window.
-Expiry and authentication failures do not shorten the wait. Unknown or damaged evidence
-keeps restart blocked; the held token may expire while the child stays alive.
+extra usage. Renewal while the held token is valid and `--failover` require ten continuous
+minutes of observed quiet. After authentication failure or token expiry, Claude automatically
+resumes the same session on the same account at the next verified idle point. Running turns,
+task-output descendants, production markers, pending hooks and explicit holds block every
+restart. Unknown or damaged evidence keeps recovery blocked. Busy work stays alive and
+reports attention while its held token cannot authenticate.
 
-**Residual risk:** quiet does not prove all inputs are closed. A hook or new input can
+**Residual risk:** idle and quiet observations do not prove all inputs are closed. A hook or new input can
 arrive after the final sample and before SIGTERM, so a submitted prompt can still be cut
 off. Claudectl does not collect or replay prompts.
 
