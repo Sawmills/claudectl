@@ -24,6 +24,7 @@ struct Fake {
     expires_at: i64,
     provider_requests: Vec<Value>,
     current_revoked: bool,
+    reject_once: bool,
     pause_observe: bool,
     observe_pending: bool,
 }
@@ -79,7 +80,8 @@ async fn provider(State(shared): State<Shared>, headers: HeaderMap) -> (StatusCo
     let current = format!("Bearer token-{}", fake.generation);
     let revoked = fake.current_revoked
         || headers.get("authorization").and_then(|h| h.to_str().ok()) != Some(current.as_str());
-    let status = if revoked || now >= fake.expires_at {
+    let transient = std::mem::take(&mut fake.reject_once);
+    let status = if revoked || transient || now >= fake.expires_at {
         StatusCode::UNAUTHORIZED
     } else {
         StatusCode::OK
@@ -116,6 +118,11 @@ signal.signal(signal.SIGTERM,term)
 command=settings['hooks']['Stop'][0]['hooks'][0]['command']
 def hook(event, **details):
     subprocess.run(['/bin/sh','-c',command],input=json.dumps({'hook_event_name':event,'session_id':'s',**details}).encode(),check=True)
+def provider_status():
+    request=urllib.request.Request(os.environ['FAKE_PROVIDER_URL'],headers={'Authorization':'Bearer '+os.environ['CLAUDE_CODE_OAUTH_TOKEN']})
+    try:
+        with urllib.request.urlopen(request,timeout=2) as response: return response.status
+    except urllib.error.HTTPError as error: return error.code
 if mode != 'no_hooks':
     hook('SessionStart'); hook('UserPromptSubmit')
     if mode != 'busy' or not first_launch: hook('Stop')
@@ -135,18 +142,22 @@ if mode=='extra': task=subprocess.Popen(['sleep','15'])
 deadline=time.monotonic()+15
 prompted=False
 probed=False
+retried=False
 became_idle=False
 while not (home/'release').exists() and time.monotonic()<deadline:
     if mode in ('auth_recovery','auth_prompt','auth_resume_fails','task','busy') and (home/'provider-probe').exists() and not probed:
-        request=urllib.request.Request(os.environ['FAKE_PROVIDER_URL'],headers={'Authorization':'Bearer '+os.environ['CLAUDE_CODE_OAUTH_TOKEN']})
-        try:
-            with urllib.request.urlopen(request,timeout=2) as response: status=response.status
-        except urllib.error.HTTPError as error: status=error.code
+        status=provider_status()
         if mode!='busy' or not first_launch:
             hook('StopFailure',error='authentication_failed') if status==401 else hook('Stop')
         probed=True
+    if (home/'provider-retry').exists() and not retried:
+        status=provider_status()
+        hook('StopFailure',error='authentication_failed') if status==401 else hook('Stop')
+        retried=True
     if (home/'become-idle').exists() and not became_idle:
-        hook('Stop'); became_idle=True
+        status=provider_status() if probed else 200
+        hook('StopFailure',error='authentication_failed') if status==401 else hook('Stop')
+        became_idle=True
     if mode=='busy' and first_launch and not became_idle:
         (home/'busy-progress').write_text(str(time.monotonic()))
     if (home/'submit').exists() and not prompted:
@@ -578,6 +589,40 @@ fn a_rejected_current_grant_is_replaced_once_at_idle_on_the_same_account() {
         "refresh only the exact rejected revision, once, after idle admission"
     );
     f.finish_recovered();
+}
+
+#[test]
+fn a_successful_retry_clears_stale_auth_failure_without_rotating_the_shared_grant() {
+    let mut f = Fixture::start("task", 600_000, false);
+    f.wait("background_task", "deferred");
+    let first = f.run();
+    f.state.lock().unwrap().reject_once = true;
+    std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+    f.wait("background_task", "blocked");
+    assert_eq!(f.state.lock().unwrap().provider_requests[0]["status"], 401);
+
+    std::fs::write(f.home.path().join("provider-retry"), "").unwrap();
+    let end = Instant::now() + Duration::from_secs(2);
+    while f.state.lock().unwrap().provider_requests.len() < 2 && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(f.state.lock().unwrap().provider_requests[1]["status"], 200);
+    let status = f.wait("background_task", "deferred");
+    assert_eq!(status["attention_required"], false);
+    std::fs::write(f.home.path().join("task-release"), "").unwrap();
+    f.wait("quiet_window", "deferred");
+    assert_eq!(f.runs(), vec![first]);
+    assert!(!f.home.path().join("terminated").exists());
+    assert_eq!(f.state.lock().unwrap().generation, 1);
+    assert!(
+        f.state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|r| r["previous_revision"].is_null())
+    );
+    f.finish();
 }
 impl Drop for Fixture {
     fn drop(&mut self) {

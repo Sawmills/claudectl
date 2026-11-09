@@ -343,6 +343,8 @@ automatically at the next verified idle point, on the same conversation and acco
 Fresh terminal samples must show unchanged input. If the server still holds the exact
 rejected revision, the wrapper requests its replacement through the existing fenced refresh
 after fresh idle admission. Ordinary polling of a valid token remains an observing read.
+A later successful turn clears an old authentication-failure observation. A prompt, idle
+notification, other API failure or session change alone does not prove recovery.
 
 Fresh workload evidence is required before provider reads, failover reservation and the
 final signal. Foreground turns, live background tasks, production markers, pending hooks

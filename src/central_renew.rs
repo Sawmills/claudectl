@@ -70,6 +70,8 @@ pub(super) enum Event {
     Session(String),
     Prompt,
     Stop,
+    /// A failed turn ended without proving that authentication recovered.
+    Failed,
     IdlePrompt,
     /// A turn failed with `rate_limit` in this session; it also ended the turn.
     Limited(String),
@@ -101,12 +103,13 @@ pub(super) fn parse_events(text: &str) -> Vec<(i64, Event)> {
                 // account (SAW-12693); it ended all the same.
                 "StopFailure" if v["error"] == "rate_limit" => match v["session_id"].as_str() {
                     Some(session) => Event::Limited(session.to_string()),
-                    None => Event::Stop,
+                    None => Event::Failed,
                 },
                 "StopFailure" if v["error"] == "authentication_failed" => Event::AuthFailed,
                 // A turn that failed (another API error) ends with
                 // StopFailure: it ended all the same.
-                "Stop" | "StopFailure" => Event::Stop,
+                "StopFailure" => Event::Failed,
+                "Stop" => Event::Stop,
                 "Notification" if v["notification_type"] == "idle_prompt" => Event::IdlePrompt,
                 "SessionEnd" => Event::SessionEnd(v["session_id"].as_str().map(str::to_owned)),
                 _ => return None,
@@ -142,9 +145,8 @@ pub(super) struct Idle {
     pub limited: Option<(String, i64)>,
     /// When Claude ended its session with no new session since: Claude is exiting.
     pub ended: Option<i64>,
-    /// When a turn last failed with `authentication_failed`: the held token is dead, so
-    /// nothing the user types can succeed until a restart. A new session in the same process
-    /// (`/clear`, `/resume`) keeps the token, so only a relaunch (a new event log) clears it.
+    /// The latest unresolved `authentication_failed`. A successful Stop clears it; a prompt,
+    /// idle notification, other failure or new session alone does not prove recovery.
     pub auth_failed: Option<i64>,
     /// Count metadata events, including idle notifications, without storing prompt text.
     pub observed_events: u64,
@@ -188,7 +190,11 @@ pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
                 idle.limited = None;
             }
             // A turn just ended: the idle time starts now.
-            Event::Stop => idle.since = Some(*at),
+            Event::Stop => {
+                idle.since = Some(*at);
+                idle.auth_failed = None;
+            }
+            Event::Failed => idle.since = Some(*at),
             Event::IdlePrompt => {
                 idle.since.get_or_insert(*at);
             }
@@ -593,7 +599,7 @@ mod tests {
                 (1, Event::SessionStart("s-1".into())),
                 (2, Event::Prompt),
                 (3, Event::Limited("s-1".into())),
-                (4, Event::Stop),
+                (4, Event::Failed),
             ]
         );
         let events = parse_events(text);
@@ -794,7 +800,7 @@ mod tests {
         ]
         .join("\n");
         let events = parse_events(&text);
-        assert_eq!(events.last(), Some(&(3, Event::Stop)));
+        assert_eq!(events.last(), Some(&(3, Event::Failed)));
         assert_eq!(
             idle_state(&events),
             Idle {
@@ -917,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_authentication_marks_the_held_token_dead_for_the_process() {
+    fn a_failed_authentication_stays_unresolved_until_success_or_relaunch() {
         // A forced rotation revokes the held token before its expiry: the failed turn says so.
         let text = [
             r#"{"at":1,"event":"SessionStart","session_id":"s"}"#,
@@ -946,6 +952,20 @@ mod tests {
         let mut still = inputs(&cleared);
         still.now = 8;
         assert!(held_token_dead(&still));
+        // Neither another API failure nor an idle notification proves the token works.
+        let mut recovering = cleared.clone();
+        fold(&mut recovering, &parse_events(&[
+            r#"{"at":9,"event":"UserPromptSubmit","session_id":"s2"}"#,
+            r#"{"at":10,"event":"StopFailure","session_id":"s2","error":"overloaded"}"#,
+            r#"{"at":11,"event":"Notification","session_id":"s2","notification_type":"idle_prompt"}"#,
+        ].join("\n")));
+        assert_eq!(recovering.auth_failed, Some(5));
+        fold(
+            &mut recovering,
+            &parse_events(r#"{"at":12,"event":"Stop","session_id":"s2"}"#),
+        );
+        assert_eq!(recovering.auth_failed, None);
+        assert!(!held_token_dead(&inputs(&recovering)));
         // A relaunch on the new token starts a new event log: alive again.
         let fresh = idle_state(&parse_events(
             r#"{"at":9,"event":"SessionStart","session_id":"s"}"#,
