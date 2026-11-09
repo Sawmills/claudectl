@@ -589,25 +589,24 @@ fn windows(usage: &crate::server::engine::Usage) -> Observed {
         .data
         .as_ref()
         .and_then(|d| serde_json::from_value::<crate::api::UsageResponse>(d.clone()).ok());
-    let window = |w: Option<&crate::api::UsageWindow>| Window {
-        used_percent: w
-            .and_then(|w| w.utilization)
-            .filter(|n| n.is_finite() && *n >= 0.0),
-        resets_at: w.and_then(crate::api::UsageWindow::reset_timestamp),
-    };
-    let five = window(parsed.as_ref().and_then(|u| u.five_hour.as_ref()));
-    let week = window(parsed.as_ref().and_then(|u| u.seven_day.as_ref()));
-    let fable = parsed
-        .as_ref()
-        .and_then(crate::api::UsageResponse::fable_weekly)
-        .map(|limit| Window {
-            used_percent: limit.percent.filter(|n| n.is_finite() && *n >= 0.0),
-            resets_at: None,
-        });
-    let models = parsed
+    let shared = parsed
         .as_ref()
         .map(crate::accounts::windows)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let window = |name| {
+        let value = shared.iter().find(|w| w.name == name);
+        Window {
+            used_percent: value.and_then(|w| w.used),
+            resets_at: value.and_then(|w| w.resets_at),
+        }
+    };
+    let five = window("5h");
+    let week = window("week");
+    let fable = shared
+        .iter()
+        .any(|w| w.name == "Fable")
+        .then(|| window("Fable"));
+    let models = shared
         .into_iter()
         .filter(|w| matches!(w.name, "Opus" | "Sonnet"))
         .collect();
@@ -854,7 +853,10 @@ mod tests {
         };
         // The shared rule decides, not a stale flag: a partial response is unknown
         // (never picked), and a confirmed full 5h window stays a visible limit.
-        let (stale, partial) = state(serde_json::json!({"seven_day": {"utilization": 1.0}}));
+        let (stale, partial) = state(serde_json::json!({
+            "five_hour": {"utilization": null},
+            "seven_day": {"utilization": 1.0}
+        }));
         assert!(!stale);
         assert_eq!(partial, crate::accounts::State::Unknown);
         let (stale, full) = state(serde_json::json!({"five_hour": {"utilization": 100.0}}));
