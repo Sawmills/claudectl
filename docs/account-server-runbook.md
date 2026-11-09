@@ -123,6 +123,8 @@ machine holds a retired grant: run `claude auth logout` there; claudectl never d
    original-task or missed-fire replay. Check warning journal/metric/status five minutes
    before expiry and blocked attention for each busy or unknown workload. Damaged/missing
    evidence stays blocked.
+   For a terminal, keep typing across its coarse timestamps and confirm recovery stays
+   blocked; after typing ends, unchanged idle/input samples must span 16 seconds.
    Do not start a test session on a shared account or force a shared account refresh.
    Quiet does not close all inputs: a late or invisible hook can still lose a prompt at
    SIGTERM. No prompt collection/replay or forced kill deadline is provided. Live acceptance

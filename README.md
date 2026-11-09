@@ -51,6 +51,7 @@ resumes the same session on the same account at the next verified idle point. Ru
 task-output descendants, production markers, pending hooks and explicit holds block every
 restart. Unknown or damaged evidence keeps recovery blocked. Busy work stays alive and
 reports attention while its held token cannot authenticate.
+Terminal recovery verifies unchanged idle/input evidence over 16 seconds.
 
 **Residual risk:** idle and quiet observations do not prove all inputs are closed. A hook or new input can
 arrive after the final sample and before SIGTERM, so a submitted prompt can still be cut

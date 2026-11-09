@@ -340,7 +340,10 @@ This remains a best-effort workaround for Claude Code's resume behavior, with th
 Renewal while the held token is valid and account failover require the quiet window.
 After an `authentication_failed` hook or held-token expiry, recovery instead restarts
 automatically at the next verified idle point, on the same conversation and account.
-Fresh terminal samples must show unchanged input. If the server still holds the exact
+For a terminal session, fresh idle and terminal samples must stay unchanged for 16 seconds
+after workload blockers clear. This spans two Linux TTY timestamp periods. A new blocker
+or input restarts verification; prior valid-token quiet time is not reused.
+If the server still holds the exact
 rejected revision, the wrapper requests its replacement through the existing fenced refresh
 after fresh idle admission. Ordinary polling of a valid token remains an observing read.
 A later successful turn clears an old authentication-failure observation. A prompt, idle

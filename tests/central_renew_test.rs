@@ -99,12 +99,13 @@ fn private_write(path: &Path, value: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 const FAKE_CLAUDE: &str = r#"#!/usr/bin/env python3
-import json, os, signal, subprocess, sys, time, urllib.error, urllib.request
+import json, os, select, signal, subprocess, sys, time, tty, urllib.error, urllib.request
 from pathlib import Path
 home=Path(os.environ['HOME'])
 log=home/'claude.log'
 first_launch=not log.exists()
 mode=os.environ['FAKE_MODE']
+if mode=='auth_typing': tty.setraw(0)
 args=sys.argv[1:]
 settings=json.load(open(args[args.index('--settings')+1]))
 run=Path(os.environ['CLAUDECTL_SERVER_RUN'])
@@ -139,13 +140,18 @@ if mode=='damaged':
     with (run/'events').open('a') as out: out.write('broken record\n')
 if mode=='extra': task=subprocess.Popen(['sleep','15'])
 (home/'ready').touch()
-deadline=time.monotonic()+15
+deadline=time.monotonic()+(60 if os.isatty(0) else 15)
 prompted=False
 probed=False
 retried=False
 became_idle=False
+typed=0
 while not (home/'release').exists() and time.monotonic()<deadline:
-    if mode in ('auth_recovery','auth_prompt','auth_resume_fails','task','busy') and (home/'provider-probe').exists() and not probed:
+    if mode=='auth_typing' and select.select([0],[],[],0)[0]:
+        typed+=len(os.read(0,4096))
+        (home/'typed-progress.next').write_text(str(typed))
+        os.replace(home/'typed-progress.next',home/'typed-progress')
+    if mode in ('auth_recovery','auth_prompt','auth_resume_fails','auth_typing','task','busy') and (home/'provider-probe').exists() and not probed:
         status=provider_status()
         if mode!='busy' or not first_launch:
             hook('StopFailure',error='authentication_failed') if status==401 else hook('Stop')
@@ -268,7 +274,11 @@ impl Fixture {
             .env("FAKE_MODE", mode)
             .env("FAKE_PROVIDER_URL", format!("{origin}/synthetic/provider"))
             .env("FAKE_WRAPPER_BIN", binary)
-            .stdin(Stdio::null())
+            .stdin(if mode == "auth_typing" {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = command.spawn().unwrap();
@@ -304,7 +314,8 @@ impl Fixture {
         fake.expires_at = chrono::Utc::now().timestamp_millis() + fake.life_ms;
     }
     fn wait_recovered(&self) -> Vec<Value> {
-        let end = Instant::now() + Duration::from_secs(4);
+        let wait = if self.run()["tty"] == true { 30 } else { 4 };
+        let end = Instant::now() + Duration::from_secs(wait);
         while Instant::now() < end {
             let runs = self.runs();
             if runs.len() >= 2 {
@@ -492,6 +503,62 @@ fn an_auth_recovery_preserves_terminal_foreground_for_the_same_session() {
         runs.iter()
             .all(|run| run["tty"] == true && run["foreground"] == true)
     );
+    f.finish_recovered();
+}
+
+#[test]
+fn terminal_input_keeps_auth_recovery_blocked_across_coarse_tty_timestamps() {
+    use std::io::Write;
+    let mut f = Fixture::start("auth_typing", 600_000, true);
+    f.wait("quiet_window", "deferred");
+    f.child
+        .as_mut()
+        .unwrap()
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"x")
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(2);
+    while !f.home.path().join("typed-progress").exists() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        f.home.path().join("typed-progress").exists(),
+        "fixture setup UNKNOWN: owned PTY did not deliver input"
+    );
+    f.revoke();
+    std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+    f.wait("terminal_input", "blocked");
+    // Real PTY reads keep happening across the kernel's eight-second timestamp buckets.
+    // Never write the bytes to disk: only the synthetic byte count is observed.
+    let end = Instant::now() + Duration::from_secs(9);
+    while Instant::now() < end {
+        f.child
+            .as_mut()
+            .unwrap()
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            f.runs().len(),
+            1,
+            "active terminal typing must block auth-recovery SIGTERM despite matching coarse timestamps"
+        );
+        assert!(!f.home.path().join("terminated").exists());
+    }
+    let typed: usize = std::fs::read_to_string(f.home.path().join("typed-progress"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        typed > 100,
+        "owned child must have read input throughout the observation"
+    );
+    f.wait_recovered();
     f.finish_recovered();
 }
 
