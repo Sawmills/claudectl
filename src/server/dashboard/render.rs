@@ -1,6 +1,7 @@
 //! The browser projection, ported from the codexctl #153 dashboard. It receives only the
 //! secret-free snapshot; rendering never mutates accounts.
 use super::enrollment::escape;
+use crate::accounts::Window;
 
 pub(super) struct Snapshot {
     pub email: String,
@@ -20,12 +21,7 @@ pub(super) struct Account {
     pub available: bool,
     /// `not_migrated`, `pending`, `unrotated`, or `rotated`.
     pub migration: String,
-    pub five_hour: Window,
-    pub seven_day: Window,
-    /// The weekly Fable limit, when the account has one.
-    pub fable: Option<Window>,
-    /// The weekly Opus and Sonnet windows, when the account has them.
-    pub model_windows: Vec<crate::accounts::Window>,
+    pub windows: Vec<Window>,
     pub limit_reset_offers: Option<crate::limit_resets::Offers>,
     pub reset_grant: Option<String>,
     /// Unix seconds of the server's last usage observation.
@@ -33,10 +29,6 @@ pub(super) struct Account {
     pub usage_stale: bool,
     /// Extra usage is not known to be off: never the account to use.
     pub billed: bool,
-}
-pub(super) struct Window {
-    pub used_percent: Option<f64>,
-    pub resets_at: Option<i64>,
 }
 pub(super) struct Machine {
     pub id: String,
@@ -46,24 +38,13 @@ pub(super) struct Machine {
 }
 
 impl Account {
-    /// The windows as the shared account model sees them (`crate::accounts`).
-    fn windows(&self) -> Vec<crate::accounts::Window> {
-        let w = |name, w: &Window| crate::accounts::Window {
-            name,
-            used: w.used_percent,
-            resets_at: w.resets_at,
-        };
-        let mut out = vec![w("5h", &self.five_hour), w("week", &self.seven_day)];
-        if let Some(fable) = &self.fable {
-            out.push(w("Fable", fable));
-        }
-        out.extend(self.model_windows.iter().cloned());
-        out
+    fn window(&self, name: &str) -> Option<&Window> {
+        self.windows.iter().find(|w| w.name == name)
     }
     fn candidate(&self) -> crate::accounts::Candidate {
         crate::accounts::Candidate {
             name: self.alias.clone(),
-            windows: self.windows(),
+            windows: self.windows.clone(),
             fresh: self.available && !self.usage_stale && self.migration != "pending",
             billed: self.billed,
         }
@@ -77,7 +58,7 @@ impl Account {
         if self.migration == "pending" {
             return ("pending", "Migration pending".into());
         }
-        let state = crate::accounts::state(&self.windows());
+        let state = crate::accounts::state(&self.windows);
         // A known full window stays visible, even on old data (the CLI's "(old data)").
         if let State::Limit { window, .. } = &state {
             let old = if self.usage_stale { " (old data)" } else { "" };
@@ -99,7 +80,7 @@ impl Account {
     fn has_room(&self) -> bool {
         self.candidate().fresh
             && matches!(
-                crate::accounts::state(&self.windows()),
+                crate::accounts::state(&self.windows),
                 crate::accounts::State::Ready | crate::accounts::State::Low { .. }
             )
     }
@@ -157,8 +138,10 @@ fn observed(a: &Account, now: i64) -> String {
         None => "No usage data yet".into(),
     }
 }
-fn window(w: &Window, label: &str, now: i64) -> String {
-    let left = w.used_percent.map(|n| (100.0 - n).clamp(0.0, 100.0));
+fn window(w: Option<&Window>, label: &str, now: i64) -> String {
+    let left = w
+        .and_then(|w| w.used)
+        .map(|n| (100.0 - n).clamp(0.0, 100.0));
     let value = left
         .map(|n| format!("{n:.0}<small>% left</small>"))
         .unwrap_or_else(|| "Unknown".into());
@@ -176,7 +159,7 @@ fn window(w: &Window, label: &str, now: i64) -> String {
     let unknown = if left.is_none() { "none" } else { "" };
     // A reset time without a usage figure is an old observation; leave it out.
     let time = if left.is_some() {
-        reset(w.resets_at, now)
+        reset(w.and_then(|w| w.resets_at), now)
     } else {
         String::new()
     };
@@ -235,20 +218,20 @@ fn answer(accounts: &[Account], names: &[String], now: i64) -> String {
     };
     let a = &accounts[best];
     let name = escape(&names[best]);
-    let left = |w: &Window| {
-        w.used_percent
+    let left = |w: Option<&Window>| {
+        w.and_then(|w| w.used)
             .map(|n| format!("{:.0}%", (100.0 - n).clamp(0.0, 100.0)))
             .unwrap_or_else(|| "unknown".into())
     };
-    let next = a
-        .five_hour
-        .resets_at
+    let five = a.window("5h");
+    let next = five
+        .and_then(|w| w.resets_at)
         .map(|at| format!(", 5h resets {}", crate::accounts::until(at, now)))
         .unwrap_or_default();
     format!(
         r#"<h1 id="answer-title">Use {name}</h1><p class="next-step">{} of the 5-hour window and {} of the week left{next}.</p>{}{count}"#,
-        left(&a.five_hour),
-        left(&a.seven_day),
+        left(five),
+        left(a.window("week")),
         command(
             "cmd-run",
             &format!("claudectl run {}", crate::shell::arg(&names[best]))
@@ -260,7 +243,7 @@ fn ledger(snapshot: &Snapshot, names: &[String], now: i64) -> String {
     if accounts.is_empty() {
         return String::new();
     }
-    let show_fable = accounts.iter().any(|a| a.fable.is_some());
+    let show_fable = accounts.iter().any(|a| a.window("Fable").is_some());
     let candidates: Vec<_> = accounts.iter().map(Account::candidate).collect();
     let best = crate::accounts::best(&candidates);
     let mut order: Vec<usize> = (0..accounts.len()).collect();
@@ -287,9 +270,8 @@ fn ledger(snapshot: &Snapshot, names: &[String], now: i64) -> String {
         let (class, state) = a.state();
         let fable = if show_fable {
             let cell = a
-                .fable
-                .as_ref()
-                .map(|w| window(w, "Fable", now))
+                .window("Fable")
+                .map(|w| window(Some(w), "Fable", now))
                 .unwrap_or_default();
             format!(r#"<td role="cell" class="cell-usage">{cell}</td>"#)
         } else {
@@ -340,8 +322,8 @@ fn ledger(snapshot: &Snapshot, names: &[String], now: i64) -> String {
             } else {
                 String::new()
             },
-            window(&a.five_hour, "5-hour", now),
-            window(&a.seven_day, "7-day", now),
+            window(a.window("5h"), "5-hour", now),
+            window(a.window("week"), "7-day", now),
             observed(a, now)
         );
     }
@@ -537,16 +519,18 @@ mod tests {
             alias: alias.into(),
             available: true,
             migration: "rotated".into(),
-            five_hour: Window {
-                used_percent: five,
-                resets_at: Some(NOW + 2 * 3600 + 5 * 60),
-            },
-            seven_day: Window {
-                used_percent: week,
-                resets_at: Some(NOW + 6 * 86400 + 22 * 3600),
-            },
-            fable: None,
-            model_windows: vec![],
+            windows: vec![
+                Window {
+                    name: "5h",
+                    used: five,
+                    resets_at: Some(NOW + 2 * 3600 + 5 * 60),
+                },
+                Window {
+                    name: "week",
+                    used: week,
+                    resets_at: Some(NOW + 6 * 86400 + 22 * 3600),
+                },
+            ],
             limit_reset_offers: None,
             reset_grant: None,
             observed_at: Some(NOW - 30),
@@ -653,7 +637,7 @@ mod tests {
     #[test]
     fn an_opus_or_sonnet_limit_is_a_limit_as_in_the_cli() {
         let mut opus = account("amir3", Some(0.0), Some(0.0));
-        opus.model_windows.push(crate::accounts::Window {
+        opus.windows.push(Window {
             name: "Opus",
             used: Some(100.0),
             resets_at: Some(NOW + 3600),
@@ -672,8 +656,9 @@ mod tests {
     #[test]
     fn a_fable_limit_is_a_limit_and_billed_accounts_are_never_the_hero() {
         let mut fable = account("amir4", Some(0.0), Some(98.0));
-        fable.fable = Some(Window {
-            used_percent: Some(100.0),
+        fable.windows.push(Window {
+            name: "Fable",
+            used: Some(100.0),
             resets_at: None,
         });
         let html = overview(&snapshot(vec![fable], vec![]));

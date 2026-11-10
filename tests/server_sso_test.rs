@@ -654,6 +654,137 @@ async fn a_dashboard_sign_in_never_offers_a_machine_approval() {
 }
 
 #[tokio::test]
+async fn dashboard_recommends_an_unopened_five_hour_window_with_known_weekly_usage() {
+    let f = Fixture::new().await;
+    let user = f.user_id("amir@sawmills.ai");
+    f.seed(&user, "work").await;
+    *f.issuer.usage.lock().unwrap() = Some(json!({
+        "five_hour": null,
+        "seven_day": {"utilization":24.0,"resets_at":"2099-11-16T12:00:00Z"},
+        "extra_usage": {"is_enabled":false}
+    }));
+    let account = f.server.engine().accounts(&user).await.unwrap().remove(0);
+    f.server
+        .engine()
+        .usage(&user, &account.account_id, false)
+        .await
+        .unwrap();
+    let session = f.session("amir@sawmills.ai").await;
+    let response = f.get("/accounts", Some(&session)).await;
+    assert_eq!(response.status().as_u16(), 200);
+    let body = response.text().await.unwrap();
+    let answer = body
+        .split("id=\"answer-title\">")
+        .nth(1)
+        .unwrap()
+        .split("</h1>")
+        .next()
+        .unwrap();
+    assert_eq!(
+        answer, "Use work",
+        "an unopened five-hour window with known weekly usage must be eligible"
+    );
+    assert!(body.contains("1 of 1 accounts have room"));
+    assert!(body.contains("100% of the 5-hour window and 76% of the week left"));
+    assert!(body.contains(r#"<span class="state ok">Available</span>"#));
+    assert!(!body.contains("No usage data"));
+}
+
+#[tokio::test]
+async fn dashboard_picks_the_earlier_reset_with_less_weekly_room_for_unopened_windows() {
+    let f = Fixture::new().await;
+    let user = f.user_id("amir@sawmills.ai");
+    for (alias, data) in [
+        (
+            "more-room",
+            json!({
+                "seven_day": {"utilization":16.0,"resets_at":"2099-11-18T12:00:00Z"},
+                "extra_usage": {"is_enabled":false}
+            }),
+        ),
+        (
+            "earlier-reset",
+            json!({
+                "five_hour": null,
+                "seven_day": {"utilization":63.0,"resets_at":"2099-11-17T12:00:00Z"},
+                "extra_usage": {"is_enabled":false}
+            }),
+        ),
+    ] {
+        f.seed(&user, alias).await;
+        *f.issuer.usage.lock().unwrap() = Some(data);
+        let account = f
+            .server
+            .engine()
+            .accounts(&user)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.alias == alias)
+            .unwrap();
+        f.server
+            .engine()
+            .usage(&user, &account.account_id, false)
+            .await
+            .unwrap();
+    }
+    let session = f.session("amir@sawmills.ai").await;
+    let response = f.get("/accounts", Some(&session)).await;
+    assert_eq!(response.status().as_u16(), 200);
+    let body = response.text().await.unwrap();
+    assert!(body.contains(r#"<h1 id="answer-title">Use earlier-reset</h1>"#));
+    assert!(body.contains("2 of 2 accounts have room"));
+    assert!(body.contains("100% of the 5-hour window and 37% of the week left"));
+    for (alias, week_left) in [
+        ("more-room", "84<small>% left</small>"),
+        ("earlier-reset", "37<small>% left</small>"),
+    ] {
+        let row = body
+            .split("</tr>")
+            .find(|row| row.contains(&format!(">{alias}</strong>")))
+            .unwrap();
+        assert!(row.contains("100<small>% left</small>"));
+        assert!(row.contains(week_left));
+        assert!(row.contains(r#"<span class="state ok">Available</span>"#));
+    }
+    assert!(!body.contains("No usage data"));
+}
+
+#[tokio::test]
+async fn dashboard_keeps_present_unknown_or_invalid_five_hour_usage_ineligible() {
+    for five in [
+        json!({}),
+        json!({"utilization":null}),
+        json!({"utilization":-1.0}),
+    ] {
+        let f = Fixture::new().await;
+        let user = f.user_id("amir@sawmills.ai");
+        f.seed(&user, "work").await;
+        *f.issuer.usage.lock().unwrap() = Some(json!({
+            "five_hour":five,
+            "seven_day":{"utilization":24.0},
+            "extra_usage":{"is_enabled":false}
+        }));
+        let account = f.server.engine().accounts(&user).await.unwrap().remove(0);
+        f.server
+            .engine()
+            .usage(&user, &account.account_id, false)
+            .await
+            .unwrap();
+        let session = f.session("amir@sawmills.ai").await;
+        let response = f.get("/accounts", Some(&session)).await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = response.text().await.unwrap();
+        assert!(
+            body.contains(r#"<h1 id="answer-title">No account can be picked automatically</h1>"#)
+        );
+        assert!(body.contains("0 of 1 accounts have room"));
+        assert!(body.contains(r#"<span class="state warn">No usage data</span>"#));
+        assert!(!body.contains(r#"<span class="state ok">Available</span>"#));
+    }
+}
+
+#[tokio::test]
 async fn dashboard_shows_cached_read_only_limit_reset_offers_without_polling() {
     let f = Fixture::new().await;
     let user = f.user_id("amir@sawmills.ai");
