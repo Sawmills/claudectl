@@ -8,6 +8,7 @@ use super::{
     app::{HttpError, Server},
     enrollment,
 };
+use crate::accounts::Window;
 use axum::{
     Form, Router,
     extract::{Query, State},
@@ -20,7 +21,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 mod render;
-use render::{Account, Machine, Snapshot, Window};
+use render::{Account, Machine, Snapshot};
 
 type Shared = State<Arc<Server>>;
 
@@ -136,10 +137,7 @@ async fn snapshot(
             alias: account.alias,
             available: account.available,
             migration: account.migration.into(),
-            five_hour: observed.five,
-            seven_day: observed.week,
-            fable: observed.fable,
-            model_windows: observed.models,
+            windows: observed.windows,
             limit_reset_offers: observed.limit_reset_offers,
             reset_grant,
             observed_at: usage.observed_at.map(|ms| ms / 1000),
@@ -546,12 +544,7 @@ async fn revoke(
 /// What the dashboard shows of a stored observation.
 struct Observed {
     limit_reset_offers: Option<crate::limit_resets::Offers>,
-    five: Window,
-    week: Window,
-    /// The weekly Fable limit, when the account has one.
-    fable: Option<Window>,
-    /// The weekly Opus and Sonnet windows, as the CLI reads them.
-    models: Vec<crate::accounts::Window>,
+    windows: Vec<Window>,
     /// No usage figure at all, or the server marked it stale.
     stale: bool,
     /// Extra usage is not known to be off (the CLI's rule for server accounts).
@@ -593,26 +586,11 @@ fn windows(usage: &crate::server::engine::Usage) -> Observed {
         .as_ref()
         .map(crate::accounts::windows)
         .unwrap_or_default();
-    let window = |name| {
-        let value = shared.iter().find(|w| w.name == name);
-        Window {
-            used_percent: value.and_then(|w| w.used),
-            resets_at: value.and_then(|w| w.resets_at),
-        }
-    };
-    let five = window("5h");
-    let week = window("week");
-    let fable = shared
-        .iter()
-        .any(|w| w.name == "Fable")
-        .then(|| window("Fable"));
-    let models = shared
-        .into_iter()
-        .filter(|w| matches!(w.name, "Opus" | "Sonnet"))
-        .collect();
     // Partial usage is not stale: `accounts::state` reads it (a known full window stays a
     // limit; otherwise it is unknown and never picked), as in the CLI.
-    let empty = five.used_percent.is_none() && week.used_percent.is_none();
+    let empty = !shared
+        .iter()
+        .any(|w| matches!(w.name, "5h" | "week") && w.used.is_some());
     let billed = parsed
         .as_ref()
         .and_then(|u| u.extra_usage.as_ref())
@@ -620,10 +598,7 @@ fn windows(usage: &crate::server::engine::Usage) -> Observed {
         != Some(false);
     Observed {
         limit_reset_offers: parsed.and_then(|usage| usage.cedar_ember),
-        five,
-        week,
-        fable,
-        models,
+        windows: shared,
         stale: usage.stale || empty,
         billed,
     }
@@ -836,20 +811,7 @@ mod tests {
         };
         let state = |data| {
             let o = windows(&usage(data));
-            let mut all = vec![
-                crate::accounts::Window {
-                    name: "5h",
-                    used: o.five.used_percent,
-                    resets_at: o.five.resets_at,
-                },
-                crate::accounts::Window {
-                    name: "week",
-                    used: o.week.used_percent,
-                    resets_at: o.week.resets_at,
-                },
-            ];
-            all.extend(o.models);
-            (o.stale, crate::accounts::state(&all))
+            (o.stale, crate::accounts::state(&o.windows))
         };
         // The shared rule decides, not a stale flag: a partial response is unknown
         // (never picked), and a confirmed full 5h window stays a visible limit.
@@ -915,7 +877,6 @@ mod tests {
             serde_json::json!({"five_hour": null, "seven_day": {"utilization": null}}),
         ] {
             let o = windows(&usage(data));
-            assert!(o.five.used_percent.is_none() && o.week.used_percent.is_none());
             assert!(o.stale, "no usage figure must not read as fresh");
         }
         let o = windows(&usage(serde_json::json!({
@@ -924,10 +885,16 @@ mod tests {
             "limits": [{"kind": "weekly_scoped", "percent": 100.0,
                 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}]
         })));
-        assert_eq!(o.five.used_percent, Some(12.0));
+        assert_eq!(o.windows[0].used, Some(12.0));
         // No week figure: not stale; `accounts::state` reads the partial usage.
         assert!(!o.stale);
-        assert_eq!(o.fable.as_ref().and_then(|w| w.used_percent), Some(100.0));
+        assert_eq!(
+            o.windows
+                .iter()
+                .find(|w| w.name == "Fable")
+                .and_then(|w| w.used),
+            Some(100.0)
+        );
         assert!(!o.billed, "extra usage known off");
         // Missing extra-usage data is not proof: billed.
         let missing = windows(&usage(
@@ -957,8 +924,9 @@ mod preview {
             .unwrap()
         };
         let now = chrono::Utc::now().timestamp();
-        let window = |used: f64, hours: i64| Window {
-            used_percent: Some(used),
+        let window = |name, used: f64, hours: i64| Window {
+            name,
+            used: Some(used),
             resets_at: Some(now + hours * 3600 + 300),
         };
         let account = |alias: &str, five, week, migration: &str| Account {
@@ -966,10 +934,7 @@ mod preview {
             alias: alias.into(),
             available: true,
             migration: migration.into(),
-            five_hour: window(five, 2),
-            seven_day: window(week, 142),
-            fable: None,
-            model_windows: vec![],
+            windows: vec![window("5h", five, 2), window("week", week, 142)],
             limit_reset_offers: None,
             reset_grant: None,
             observed_at: Some(now - 42),
@@ -977,13 +942,15 @@ mod preview {
             billed: false,
         };
         let mut pending = account("amir6@sawmills.ai", 0.0, 0.0, "pending");
-        pending.five_hour.used_percent = None;
-        pending.seven_day.used_percent = None;
+        for w in &mut pending.windows {
+            w.used = None;
+        }
         pending.observed_at = None;
         pending.usage_stale = true;
         let with_fable = |mut a: Account, used: f64| {
-            a.fable = Some(Window {
-                used_percent: Some(used),
+            a.windows.push(Window {
+                name: "Fable",
+                used: Some(used),
                 resets_at: None,
             });
             a
