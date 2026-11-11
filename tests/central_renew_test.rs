@@ -108,7 +108,7 @@ fn private_write(path: &Path, value: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 const FAKE_CLAUDE: &str = r#"#!/usr/bin/env python3
-import json, os, select, signal, subprocess, sys, time, tty, urllib.error, urllib.request
+import fcntl, json, os, select, signal, subprocess, sys, time, tty, urllib.error, urllib.request
 from pathlib import Path
 home=Path(os.environ['HOME'])
 log=home/'claude.log'
@@ -122,6 +122,17 @@ with log.open('a') as out:
     out.write(json.dumps({'token':os.environ['CLAUDE_CODE_OAUTH_TOKEN'],'args':args,'settings':settings,'run':str(run),'session':json.load(open(run/'session.json')),'pid':os.getpid(),'tty':os.isatty(0),'foreground':not os.isatty(0) or os.tcgetpgrp(0)==os.getpgrp()})+'\n')
 if mode=='auth_resume_fails' and not first_launch: sys.exit(7)
 def term(*_):
+    if mode=='exit_race' and first_launch:
+        admission=(run/'restart.lock').open('r+')
+        fcntl.flock(admission,fcntl.LOCK_EX)
+        ended=int((home/'exit-at').read_text())
+        with (run/'events').open('a') as out:
+            out.write(json.dumps({'at':ended,'event':'SessionEnd','session_id':'s'})+'\n'+'broken record\n')
+        if os.fork()==0:
+            signal.signal(signal.SIGTERM,signal.SIG_DFL)
+            time.sleep(.25)
+            os._exit(0)
+        sys.exit(23)
     if mode=='ignore_term' and first_launch:
         (home/'term-received').touch()
         return
@@ -566,6 +577,30 @@ fn a_child_ignoring_sigterm_is_killed_after_the_save_grace_and_resumed() {
 }
 
 #[test]
+fn an_explicit_exit_during_forced_shutdown_is_not_resumed() {
+    let mut f = Fixture::start("exit_race", 1_500, false);
+    f.wait("quiet_window", "warn");
+    f.state.lock().unwrap().life_ms = 600_000;
+    std::fs::write(
+        f.home.path().join("exit-at"),
+        chrono::Utc::now().timestamp_millis().to_string(),
+    )
+    .unwrap();
+    let end = Instant::now() + Duration::from_secs(4);
+    while f.child.as_mut().unwrap().try_wait().unwrap().is_none() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        f.child.as_mut().unwrap().try_wait().unwrap().is_some(),
+        "do not reopen an explicitly ended conversation"
+    );
+    let output = f.child.take().unwrap().wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(23));
+    assert_eq!(f.runs().len(), 1);
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("resuming session"));
+}
+
+#[test]
 fn failed_recovery_attempt_is_counted_once_then_recovers() {
     let mut f = Fixture::start("auth_recovery", 600_000, false);
     f.wait("quiet_window", "deferred");
@@ -604,7 +639,7 @@ fn unavailable_throttle_storage_does_not_drop_a_recovery_failure() {
     {
         let mut state = f.state.lock().unwrap();
         state.current_revoked = true;
-        state.token_failures = 1;
+        state.token_failures = 21;
     }
     std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
     f.wait_recovered();
@@ -613,10 +648,19 @@ fn unavailable_throttle_storage_does_not_drop_a_recovery_failure() {
         .into_iter()
         .filter(|event| event["metric"]["name"] == "claudectl_recovery_failed_total")
         .collect();
-    assert_eq!(failures.len(), 1);
-    assert_eq!(failures[0]["reason"], "acquire");
-    assert_eq!(failures[0]["route"], "voice_inbox");
-    assert_eq!(failures[0]["throttle_state_unavailable"], true);
+    assert_eq!(failures.len(), 21);
+    assert!(
+        failures.iter().all(
+            |event| event["reason"] == "acquire" && event["throttle_state_unavailable"] == true
+        )
+    );
+    assert_eq!(
+        failures
+            .iter()
+            .filter(|event| event["route"] == "voice_inbox")
+            .count(),
+        11
+    );
     f.finish_recovered();
 }
 

@@ -28,6 +28,7 @@ struct Fake {
     throttle: bool,
     /// An observing read after the first grant returns a newer token (a renewal follows).
     renew_work: bool,
+    observed_renewal: bool,
     /// Every usage read: (account id, cached).
     usage_reads: Vec<(String, String)>,
     token_requests: Vec<String>,
@@ -80,8 +81,10 @@ async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Va
         fake.token_request_bodies.push(body.clone());
     }
     let renewed = {
-        let fake = shared.lock().unwrap();
-        id == WORK && body["observe"] == true && fake.work_used && fake.renew_work
+        let mut fake = shared.lock().unwrap();
+        let renewed = id == WORK && body["observe"] == true && fake.work_used && fake.renew_work;
+        fake.observed_renewal |= renewed;
+        renewed
     };
     let (name, org) = if id == WORK {
         shared.lock().unwrap().work_used = true;
@@ -219,7 +222,7 @@ fn a_usage_limit_does_not_move_an_account_while_a_task_is_live() {
     assert_eq!(output.status.code(), Some(99));
     assert!(env.records().is_empty());
     assert_eq!(env.runs().len(), 1);
-    assert_eq!(env.fake.lock().unwrap().token_requests, [WORK]);
+    assert_observation_only(&env.fake.lock().unwrap());
 }
 
 impl Env {
@@ -313,6 +316,17 @@ impl Env {
     }
 }
 
+fn assert_observation_only(fake: &Fake) {
+    assert!(!fake.token_requests.is_empty());
+    assert!(fake.token_requests.iter().all(|account| account == WORK));
+    assert!(
+        fake.token_request_bodies.iter().all(|request| {
+            request["observe"] == true && request["previous_revision"].is_null()
+        }),
+        "deferral permits safe observation, never forced refresh or another account"
+    );
+}
+
 fn assert_deferred(env: &Env, output: &std::process::Output, cause: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(99), "{stderr}");
@@ -320,17 +334,7 @@ fn assert_deferred(env: &Env, output: &std::process::Output, cause: &str) {
     assert_eq!(runs.len(), 1, "{runs:?}");
     assert_eq!(runs[0]["token"], "token-work");
     assert!(env.records().is_empty());
-    {
-        let fake = env.fake.lock().unwrap();
-        assert!(!fake.token_requests.is_empty());
-        assert!(fake.token_requests.iter().all(|account| account == WORK));
-        assert!(
-            fake.token_request_bodies.iter().all(|request| {
-                request["observe"] == true && request["previous_revision"].is_null()
-            }),
-            "workload deferral permits safe observation, never forced refresh or another account"
-        );
-    }
+    assert_observation_only(&env.fake.lock().unwrap());
     assert!(!stderr.contains("resuming session"));
     let rows: Vec<Value> = std::fs::read_to_string(
         env.home
@@ -417,6 +421,43 @@ fn a_new_revision_does_not_bypass_unknown_failover_admission() {
         fake.renew_work = true;
     }
     let output = env.run(&["run", "work", "--failover"], "3");
-    assert_deferred(&env, &output, "failover");
+    assert_deferred(&env, &output, "renewal");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("server token renewed"));
+}
+
+#[test]
+fn a_pending_failover_still_observes_renewal_replacements() {
+    let env = Env::new();
+    let shared = env.fake.clone();
+    let log = env.log.clone();
+    let observer = std::thread::spawn(move || {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < end {
+            let pending = std::fs::read_to_string(&log)
+                .ok()
+                .and_then(|text| {
+                    text.lines()
+                        .next()
+                        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+                })
+                .and_then(|run| run["run"].as_str().map(std::path::PathBuf::from))
+                .and_then(|run| std::fs::read(run.join("restart-status.json")).ok())
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|status| status["cause"] == "failover");
+            if pending {
+                shared.lock().unwrap().renew_work = true;
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("fixture did not observe a pending failover");
+    });
+    let output = env.run(&["run", "work", "--failover"], "3");
+    observer.join().unwrap();
+    let observed = env.fake.lock().unwrap().observed_renewal;
+    assert!(
+        observed,
+        "a waiting failover must not suppress renewal observation and its deadline"
+    );
+    assert_deferred(&env, &output, "renewal");
 }

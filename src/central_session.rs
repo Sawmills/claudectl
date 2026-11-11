@@ -808,13 +808,19 @@ impl Monitor {
                                     cause,
                                 },
                             ));
+                            continue;
                         }
                         Ok(false) => break,
-                        Err(()) => {}
+                        Err(()) => continue,
                     }
                 }
-                continue;
             }
+            // Waiting for an account switch cannot suspend same-account renewal.
+            cause = if recovering {
+                super::restart_gate::Cause::AuthRecovery
+            } else {
+                super::restart_gate::Cause::Renewal
+            };
             // Observing an unexpired grant cannot rotate it. Read before workload
             // admission so a busy session can discover a pending renewal.
             let interval = if recovering {
@@ -944,8 +950,22 @@ impl Monitor {
         }
         // Claude may have ended its session just before our SIGTERM (a /exit while the
         // request ran): that exit is the user's, never a renewal (CX-0119).
-        let ended_first = self.read_events(&mut activity).is_ok()
-            && matches!((&sent, activity.idle.ended), (Some((at, _)), Some(end)) if end <= *at);
+        let drain_until = Instant::now() + Duration::from_secs(1);
+        loop {
+            let read = self.read_events(&mut activity);
+            if read.is_ok() || activity.idle.ended.is_some() {
+                break;
+            }
+            if Instant::now() >= drain_until {
+                // The child has exited. A complete SessionEnd may already be visible
+                // while a surviving hook still holds the admission lock.
+                let _ = read_new_events(&self.directory.join("events"), &mut activity);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ended_first =
+            matches!((&sent, activity.idle.ended), (Some((at, _)), Some(end)) if end <= *at);
         if let Err(error) = self.check_crons(true) {
             cron_log_error = Some(format!("could not record cron recovery: {error:#}"));
         }

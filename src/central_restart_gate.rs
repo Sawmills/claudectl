@@ -2,12 +2,13 @@
 //! deferral: a session holding a dead token cannot make progress.
 use super::*;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::os::unix::{
     ffi::OsStrExt,
     fs::{OpenOptionsExt, PermissionsExt},
 };
 use std::process::Command;
+use std::sync::Mutex;
 
 /// Serialize hold/hook publication with the final restart admission and signal.
 pub(super) fn admission(directory: &Path) -> Result<File> {
@@ -97,20 +98,76 @@ enum RecoveryEvent {
     Failed(RecoveryFailure),
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct FailureStreak {
     session_id: Option<String>,
     count: u64,
 }
 
+struct CachedStreak {
+    directory: PathBuf,
+    streak: FailureStreak,
+}
+
+enum StreakEvent {
+    Failed,
+    Succeeded,
+}
+
+// Retain flood control across monitor threads even when the run directory is unwritable.
+static FAILURE_STREAKS: Mutex<VecDeque<CachedStreak>> = Mutex::new(VecDeque::new());
+const MAX_CACHED_STREAKS: usize = 128;
+
+fn update_streak(
+    directory: &Path,
+    session: Option<&str>,
+    stored: Option<FailureStreak>,
+    event: StreakEvent,
+) -> FailureStreak {
+    let mut cache = FAILURE_STREAKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let cached = cache
+        .iter()
+        .position(|entry| entry.directory == directory)
+        .and_then(|index| cache.remove(index))
+        .map(|entry| entry.streak);
+    let mut streak = cached
+        .or(stored)
+        .filter(|streak| streak.session_id.as_deref() == session)
+        .unwrap_or_default();
+    streak.session_id = session.map(str::to_owned);
+    streak.count = match event {
+        StreakEvent::Failed => streak.count.saturating_add(1),
+        StreakEvent::Succeeded => 0,
+    };
+    if cache.len() >= MAX_CACHED_STREAKS {
+        cache.pop_front();
+    }
+    cache.push_back(CachedStreak {
+        directory: directory.to_path_buf(),
+        streak: streak.clone(),
+    });
+    streak
+}
+
+fn stored_streak(directory: &Path) -> Result<FailureStreak> {
+    match private_read(&directory.join("recovery-failures.json")) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(FailureStreak::default())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) fn recovery_succeeded(directory: &Path, session: Option<&str>) {
-    let _ = atomic(
-        &directory.join("recovery-failures.json"),
-        &FailureStreak {
-            session_id: session.map(str::to_owned),
-            count: 0,
-        },
-    );
+    let streak = update_streak(directory, session, None, StreakEvent::Succeeded);
+    let _ = atomic(&directory.join("recovery-failures.json"), &streak);
 }
 
 fn append_restart_record(home: &Path, record: &Value) -> Result<()> {
@@ -158,36 +215,14 @@ fn recovery_event(
     let mut route = Some("voice_inbox");
     let mut throttle_state_unavailable = false;
     if failed {
-        let count = (|| -> Result<u64> {
-            let path = directory.join("recovery-failures.json");
-            let mut streak: FailureStreak = match private_read(&path) {
-                Ok(bytes) => serde_json::from_slice(&bytes)?,
-                Err(error)
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-                {
-                    FailureStreak::default()
-                }
-                Err(error) => return Err(error),
-            };
-            if streak.session_id.as_deref() != session {
-                streak = FailureStreak {
-                    session_id: session.map(str::to_owned),
-                    count: 0,
-                };
-            }
-            streak.count = streak.count.saturating_add(1);
-            atomic(&path, &streak)?;
-            Ok(streak.count)
-        })();
-        match count {
-            Ok(count) if count > 10 && !count.is_multiple_of(10) => {
-                event = "recovery_metric";
-                route = None;
-            }
-            Ok(_) => {}
-            Err(_) => throttle_state_unavailable = true,
+        let stored = stored_streak(directory);
+        throttle_state_unavailable = stored.is_err();
+        let streak = update_streak(directory, session, stored.ok(), StreakEvent::Failed);
+        let write_failed = atomic(&directory.join("recovery-failures.json"), &streak).is_err();
+        throttle_state_unavailable |= write_failed;
+        if streak.count > 10 && !streak.count.is_multiple_of(10) {
+            event = "recovery_metric";
+            route = None;
         }
     }
     let stage = if failed {
