@@ -808,33 +808,27 @@ impl Monitor {
                 super::restart_gate::Cause::Renewal
             };
             let admitted = gate.check(&activity.idle, cause, self.held_expires_at);
-            if failover_pending {
-                if admitted
-                    && let Some((session_id, failed_at)) = activity.idle.limited.clone()
-                    && let Some((account, access)) = self.failover_target(
-                        &mut activity,
-                        &mut gate,
-                        &timing,
-                        &mut pending,
-                        failed_at,
-                    )
-                {
-                    match self.stop_for_restart(&mut activity, &mut gate, &timing, cause) {
-                        Ok(true) => {
-                            signalled_at = Some(Instant::now());
-                            sent = Some((
-                                now(),
-                                Restart {
-                                    kind: RestartKind::Failover { account, access },
-                                    session_id,
-                                    cause,
-                                },
-                            ));
-                            continue;
-                        }
-                        Ok(false) => break,
-                        Err(()) => continue,
+            if failover_pending
+                && admitted
+                && let Some((session_id, failed_at)) = activity.idle.limited.clone()
+                && let Some((account, access)) =
+                    self.failover_target(&mut activity, &mut gate, &timing, &mut pending, failed_at)
+            {
+                match self.stop_for_restart(&mut activity, &mut gate, &timing, cause) {
+                    Ok(true) => {
+                        signalled_at = Some(Instant::now());
+                        sent = Some((
+                            now(),
+                            Restart {
+                                kind: RestartKind::Failover { account, access },
+                                session_id,
+                                cause,
+                            },
+                        ));
+                        continue;
                     }
+                    Ok(false) => break,
+                    Err(()) => continue,
                 }
             }
             // Waiting for an account switch cannot suspend same-account renewal.
