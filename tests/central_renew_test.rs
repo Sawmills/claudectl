@@ -28,6 +28,8 @@ struct Fake {
     pause_observe: bool,
     observe_pending: bool,
     token_failures: usize,
+    usage_requests: usize,
+    pause_usage: bool,
 }
 type Shared = Arc<Mutex<Fake>>;
 fn identity() -> Value {
@@ -38,7 +40,11 @@ async fn accounts() -> Json<Value> {
         json!([{"provider":"anthropic","account_id":ACCOUNT,"alias":"work","identity":identity(),"available":true}]),
     )
 }
-async fn usage() -> Json<Value> {
+async fn usage(State(shared): State<Shared>) -> Json<Value> {
+    shared.lock().unwrap().usage_requests += 1;
+    while shared.lock().unwrap().pause_usage {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     Json(json!({"data":null,"observed_at":null,"next_retry_at":0,"stale":true,"error":null}))
 }
 async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
@@ -121,6 +127,11 @@ run=Path(os.environ['CLAUDECTL_SERVER_RUN'])
 with log.open('a') as out:
     out.write(json.dumps({'token':os.environ['CLAUDE_CODE_OAUTH_TOKEN'],'args':args,'settings':settings,'run':str(run),'session':json.load(open(run/'session.json')),'pid':os.getpid(),'tty':os.isatty(0),'foreground':not os.isatty(0) or os.tcgetpgrp(0)==os.getpgrp()})+'\n')
 if mode=='auth_resume_fails' and not first_launch: sys.exit(7)
+if mode=='one_shot':
+    (home/'ready').touch()
+    deadline=time.monotonic()+5
+    while not (home/'release').exists() and time.monotonic()<deadline: time.sleep(.02)
+    sys.exit(23)
 def term(*_):
     if mode=='exit_race' and first_launch:
         admission=(run/'restart.lock').open('r+')
@@ -217,6 +228,7 @@ impl Fixture {
         let state = Arc::new(Mutex::new(Fake {
             life_ms,
             generation: 1,
+            pause_usage: mode == "paused_usage",
             ..Default::default()
         }));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -287,6 +299,9 @@ impl Fixture {
         if mode == "auth_prompt" {
             command.args(["--", "synthetic original task that must not be replayed"]);
         }
+        if mode == "one_shot" {
+            command.args(["-p", "synthetic one-shot prompt"]);
+        }
         command
             .env_clear()
             .env("HOME", home.path())
@@ -295,7 +310,14 @@ impl Fixture {
             .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
             .env("CLAUDECTL_TEST_RENEW_FAST", "1")
             .env("TMPDIR", home.path().join("tmp"))
-            .env("FAKE_MODE", mode)
+            .env(
+                "FAKE_MODE",
+                if mode == "paused_usage" {
+                    "auth_recovery"
+                } else {
+                    mode
+                },
+            )
             .env("FAKE_PROVIDER_URL", format!("{origin}/synthetic/provider"))
             .env("FAKE_WRAPPER_BIN", binary)
             .stdin(if mode == "auth_typing" {
@@ -1005,7 +1027,11 @@ fn a_successful_retry_clears_stale_auth_failure_without_rotating_the_shared_gran
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        self.state.lock().unwrap().pause_observe = false;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.pause_observe = false;
+            state.pause_usage = false;
+        }
         if let Some(child) = self.child.take() {
             let _ = std::fs::write(self.home.path().join("release"), "");
             let _ = child.wait_with_output();
@@ -1245,4 +1271,36 @@ fn an_idle_terminal_session_keeps_foreground_until_its_owner_exits() {
     assert_eq!(f.run()["tty"], true);
     assert_eq!(f.run()["foreground"], true);
     f.finish();
+}
+
+#[test]
+fn a_one_shot_run_still_refreshes_the_usage_cache() {
+    let mut f = Fixture::start("one_shot", 600_000, false);
+    let end = Instant::now() + Duration::from_secs(3);
+    loop {
+        let reads = f.state.lock().unwrap().usage_requests;
+        if reads > 0 || Instant::now() >= end {
+            assert!(reads > 0);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    f.finish();
+}
+
+#[test]
+fn a_paused_usage_read_does_not_delay_revoked_token_recovery() {
+    let mut f = Fixture::start("paused_usage", 600_000, false);
+    f.wait("quiet_window", "deferred");
+    let end = Instant::now() + Duration::from_secs(3);
+    while f.state.lock().unwrap().usage_requests == 0 && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(f.state.lock().unwrap().usage_requests > 0);
+    f.revoke();
+    std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+    f.wait_recovered();
+    assert!(f.state.lock().unwrap().pause_usage);
+    f.state.lock().unwrap().pause_usage = false;
+    f.finish_recovered();
 }

@@ -1,8 +1,8 @@
 //! One server account per Claude process. The process keeps the host Claude config (its
 //! conversations, skills, hooks and trust) and receives only a server access token in
 //! CLAUDE_CODE_OAUTH_TOKEN. The token cannot change inside a running Claude (see
-//! experiments/settings-renewal/host-config.py). Renewal waits for safe restart admission;
-//! an expired token never authorizes killing active work. `session.json` records its expiry.
+//! experiments/settings-renewal/host-config.py). Authentication failure forces recovery;
+//! ordinary renewal waits at most ten minutes. `session.json` records its expiry.
 use super::*;
 use crate::exec;
 use std::{ffi::OsString, process::Command};
@@ -452,7 +452,7 @@ struct Outcome {
     notice: Option<String>,
 }
 /// Watches one Claude process and publishes workload/expiry status. Authentication recovery
-/// uses verified idle; other renewal and failover retain observed quiet.
+/// is immediate; ordinary renewal has a deadline and failover retains observed quiet.
 #[cfg(unix)]
 struct Monitor {
     client: Client,
@@ -665,6 +665,7 @@ impl Monitor {
         let started = now();
         let mut outcome = Outcome::default();
         let mut last_usage = 0;
+        let mut usage_worker: Option<std::thread::JoinHandle<()>> = None;
         let mut last_check = 0;
         let mut activity = Activity::default();
         let mut was_recovering = false;
@@ -689,6 +690,27 @@ impl Monitor {
             if let Err(error) = self.check_crons(false) {
                 // Stderr is Claude's terminal until it exits. Defer only the log failure.
                 cron_log_error = Some(format!("could not record cron recovery: {error:#}"));
+            }
+            if usage_worker
+                .as_ref()
+                .is_some_and(|worker| worker.is_finished())
+            {
+                let _ = usage_worker.take().map(|worker| worker.join());
+            }
+            if usage_worker.is_none() && now() - last_usage >= 300_000 {
+                let client = self.client.clone();
+                let account_id = self.account_id.clone();
+                let path = usage_path(&self.paths, &client.connection, &account_id);
+                // Optional usage I/O must never hold recovery or child shutdown.
+                usage_worker = std::thread::Builder::new()
+                    .name("session-usage".into())
+                    .spawn(move || {
+                        if let Ok(usage) = client.usage(&account_id, false) {
+                            let _ = atomic(&path, &usage);
+                        }
+                    })
+                    .ok();
+                last_usage = now();
             }
             if let Some((_, restart)) = &sent {
                 // The owned leader gets the same save grace as other Claude launchers.
@@ -909,15 +931,6 @@ impl Monitor {
                 }
             }
             let Some(access) = next_access.as_ref() else {
-                if !recovering && now() - last_usage >= 300_000 {
-                    if let Ok(usage) = self.client.usage(&self.account_id, false) {
-                        let _ = atomic(
-                            &usage_path(&self.paths, &self.client.connection, &self.account_id),
-                            &usage,
-                        );
-                    }
-                    last_usage = now();
-                }
                 continue;
             };
             let admitted = gate.check(&activity.idle, cause, self.held_expires_at);
@@ -994,30 +1007,8 @@ impl Monitor {
     ) -> std::result::Result<bool, ()> {
         // Deferral must not publish renewing or signal before workload admission.
         // This guard and the locks do not close all input sources.
-        if !gate.check(&activity.idle, cause, self.held_expires_at) {
-            return Err(());
-        }
+        let _admission = gate.admit(&activity.idle, cause, self.held_expires_at)?;
         let forced = gate.forced(cause).is_some();
-        let _hook_admission = match (!forced)
-            .then(|| super::restart_gate::try_hook_admission(&self.directory))
-            .transpose()
-        {
-            Ok(lock) => lock,
-            Err(error) => {
-                gate.admission_failed(&activity.idle, cause, self.held_expires_at, &error);
-                return Err(());
-            }
-        };
-        let _admission = match (!forced)
-            .then(|| super::restart_gate::try_admission(&self.directory))
-            .transpose()
-        {
-            Ok(lock) => lock,
-            Err(error) => {
-                gate.admission_failed(&activity.idle, cause, self.held_expires_at, &error);
-                return Err(());
-            }
-        };
         if self.directory.join("hook-error").exists()
             || read_new_events(&self.directory.join("events"), activity).is_err()
         {
@@ -1140,28 +1131,13 @@ impl Monitor {
                 let access = self.client.observe(&account.account_id).ok()?;
                 // All remote reads have completed. Do not reserve an account for work
                 // that became busy during them; the signal still has its final admission.
-                let _hook_admission = match super::restart_gate::hook_admission(&self.directory) {
-                    Ok(lock) => lock,
-                    Err(_) => {
-                        gate.unknown(
-                            &activity.idle,
-                            super::restart_gate::Cause::Failover,
-                            self.held_expires_at,
-                        );
-                        return None;
-                    }
-                };
-                let _admission = match super::restart_gate::admission(&self.directory) {
-                    Ok(lock) => lock,
-                    Err(_) => {
-                        gate.unknown(
-                            &activity.idle,
-                            super::restart_gate::Cause::Failover,
-                            self.held_expires_at,
-                        );
-                        return None;
-                    }
-                };
+                let _admission = gate
+                    .admit(
+                        &activity.idle,
+                        super::restart_gate::Cause::Failover,
+                        self.held_expires_at,
+                    )
+                    .ok()?;
                 if self.directory.join("hook-error").exists()
                     || read_new_events(&self.directory.join("events"), activity).is_err()
                 {

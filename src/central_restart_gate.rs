@@ -19,7 +19,7 @@ pub(super) fn try_admission(directory: &Path) -> Result<File> {
     admission_lock(directory, "restart.lock", false)
 }
 
-pub(super) fn try_hook_admission(directory: &Path) -> Result<File> {
+fn try_hook_admission(directory: &Path) -> Result<File> {
     admission_lock(directory, "hook.lock", false)
 }
 
@@ -309,7 +309,10 @@ enum RestartState {
     Waiting {
         requested_at: Instant,
     },
-    Ready(Forced),
+    Ready {
+        reason: Forced,
+        requested_at: Option<Instant>,
+    },
     Restarting,
 }
 
@@ -322,18 +325,48 @@ enum RestartEvent {
 }
 
 impl RestartState {
+    fn requested_at(self) -> Option<Instant> {
+        match self {
+            Self::Waiting { requested_at } => Some(requested_at),
+            Self::Ready { requested_at, .. } => requested_at,
+            _ => None,
+        }
+    }
+
     fn transition(self, event: RestartEvent) -> Self {
         use RestartEvent::*;
         use RestartState::*;
         match (self, event) {
             (Restarting, _) | (_, Signalled) => Restarting,
-            (_, AuthFailed) => Ready(Forced::AuthRecovery),
-            (Ready(Forced::AuthRecovery), Recovered) => Watching,
+            (state, AuthFailed) => Ready {
+                reason: Forced::AuthRecovery,
+                requested_at: state.requested_at(),
+            },
+            (
+                Ready {
+                    reason: Forced::AuthRecovery,
+                    requested_at,
+                },
+                Recovered,
+            ) => requested_at.map_or(Watching, |requested_at| Waiting { requested_at }),
+            (
+                Ready {
+                    reason: Forced::AuthRecovery,
+                    requested_at: None,
+                },
+                RenewalRequested(at),
+            ) => Ready {
+                reason: Forced::AuthRecovery,
+                requested_at: Some(at),
+            },
             (Watching, RenewalRequested(requested_at)) => Waiting { requested_at },
             (Waiting { requested_at }, Tick(at))
                 if at.saturating_duration_since(requested_at) >= QUIET_WINDOW =>
             {
-                Ready(Forced::RenewalDeadline)
+                Ready {
+                    reason: Forced::RenewalDeadline,
+                    requested_at: Some(requested_at),
+                }
             }
             (state, _) => state,
         }
@@ -376,6 +409,12 @@ struct ObservedQuiet {
 }
 
 const QUIET_WINDOW: Duration = Duration::from_secs(600);
+
+/// Holds ordinary restart admission until the final evidence check and signal.
+pub(super) struct Admission {
+    _restart: Option<File>,
+    _hook: Option<File>,
+}
 
 /// One gate per live Claude child. All automatic restart callers cross `check`.
 pub(super) struct Gate {
@@ -427,12 +466,13 @@ impl Gate {
     }
 
     pub(super) fn request_at(&mut self, cause: Cause, at: Instant) {
-        let event = match cause {
-            Cause::Renewal => RestartEvent::RenewalRequested(at),
-            Cause::AuthRecovery => RestartEvent::AuthFailed,
-            Cause::Failover => return,
-        };
-        self.state = self.state.transition(event);
+        if cause == Cause::Failover {
+            return;
+        }
+        self.state = self.state.transition(RestartEvent::RenewalRequested(at));
+        if cause == Cause::AuthRecovery {
+            self.state = self.state.transition(RestartEvent::AuthFailed);
+        }
     }
 
     pub(super) fn recovered(&mut self) {
@@ -442,9 +482,13 @@ impl Gate {
     pub(super) fn forced(&self, cause: Cause) -> Option<Forced> {
         match (cause, self.state) {
             (Cause::AuthRecovery, _) => Some(Forced::AuthRecovery),
-            (Cause::Renewal, RestartState::Ready(Forced::RenewalDeadline)) => {
-                Some(Forced::RenewalDeadline)
-            }
+            (
+                Cause::Renewal,
+                RestartState::Ready {
+                    reason: Forced::RenewalDeadline,
+                    ..
+                },
+            ) => Some(Forced::RenewalDeadline),
             _ => None,
         }
     }
@@ -463,6 +507,33 @@ impl Gate {
             );
         }
         self.state = self.state.transition(RestartEvent::Signalled);
+    }
+
+    pub(super) fn admit(
+        &mut self,
+        idle: &super::renew::Idle,
+        cause: Cause,
+        expires_at: i64,
+    ) -> std::result::Result<Admission, ()> {
+        if !self.check(idle, cause, expires_at) {
+            return Err(());
+        }
+        if self.forced(cause).is_some() {
+            return Ok(Admission {
+                _restart: None,
+                _hook: None,
+            });
+        }
+        let hook = try_hook_admission(&self.directory).map_err(|error| {
+            self.admission_failed(idle, cause, expires_at, &error);
+        })?;
+        let restart = try_admission(&self.directory).map_err(|error| {
+            self.admission_failed(idle, cause, expires_at, &error);
+        })?;
+        Ok(Admission {
+            _restart: Some(restart),
+            _hook: Some(hook),
+        })
     }
 
     /// Fresh workload evidence, with one diagnostic/counter per changed decision.
@@ -484,7 +555,7 @@ impl Gate {
         observed_at: std::time::Instant,
     ) -> bool {
         if cause == Cause::AuthRecovery {
-            self.request_at(cause, observed_at);
+            self.state = self.state.transition(RestartEvent::AuthFailed);
         }
         self.state = self.state.transition(RestartEvent::Tick(observed_at));
         if self.forced(cause).is_some() {
@@ -580,7 +651,7 @@ impl Gate {
         self.record(Some(Reason::EvidenceUnknown), idle, cause, expires_at);
     }
 
-    pub(super) fn admission_failed(
+    fn admission_failed(
         &mut self,
         idle: &super::renew::Idle,
         cause: Cause,
@@ -1752,10 +1823,19 @@ mod tests {
             waiting
         );
         let ready = waiting.transition(RestartEvent::Tick(start + Duration::from_secs(600)));
-        assert_eq!(ready, RestartState::Ready(Forced::RenewalDeadline));
+        assert_eq!(
+            ready,
+            RestartState::Ready {
+                reason: Forced::RenewalDeadline,
+                requested_at: Some(start)
+            }
+        );
         assert_eq!(
             ready.transition(RestartEvent::AuthFailed),
-            RestartState::Ready(Forced::AuthRecovery)
+            RestartState::Ready {
+                reason: Forced::AuthRecovery,
+                requested_at: Some(start)
+            }
         );
         assert_eq!(
             ready.transition(RestartEvent::Signalled),
@@ -1766,8 +1846,29 @@ mod tests {
             RestartState::Restarting
         );
         assert_eq!(
-            RestartState::Ready(Forced::AuthRecovery).transition(RestartEvent::Recovered),
+            RestartState::Ready {
+                reason: Forced::AuthRecovery,
+                requested_at: None
+            }
+            .transition(RestartEvent::Recovered),
             RestartState::Watching
+        );
+    }
+
+    #[test]
+    fn transient_auth_does_not_reset_a_pending_renewal_deadline() {
+        let start = Instant::now();
+        let waiting = RestartState::Watching.transition(RestartEvent::RenewalRequested(start));
+        let recovered = waiting
+            .transition(RestartEvent::AuthFailed)
+            .transition(RestartEvent::Recovered);
+        assert_eq!(recovered, waiting);
+        assert_eq!(
+            recovered.transition(RestartEvent::Tick(start + Duration::from_secs(600))),
+            RestartState::Ready {
+                reason: Forced::RenewalDeadline,
+                requested_at: Some(start)
+            }
         );
     }
 
@@ -2508,6 +2609,34 @@ mod tests {
             i64::MAX,
             start + Duration::from_secs(600)
         ));
+    }
+
+    #[test]
+    fn final_admission_after_quiet_never_waits_for_a_contended_lock() {
+        for hook in [true, false] {
+            let (_home, mut gate, idle) = setup();
+            let cause = Cause::Failover;
+            let before = Instant::now() - Duration::from_secs(600);
+            assert!(!gate.check_at(&idle, cause, i64::MAX, before));
+            assert!(gate.check(&idle, cause, i64::MAX));
+            let lock = if hook {
+                hook_admission(&gate.directory).unwrap()
+            } else {
+                admission(&gate.directory).unwrap()
+            };
+            let (sent, received) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                sent.send(gate.admit(&idle, cause, i64::MAX).is_err())
+                    .unwrap();
+            });
+            let result = received.recv_timeout(Duration::from_secs(1));
+            drop(lock);
+            worker.join().unwrap();
+            assert!(
+                matches!(result, Ok(true)),
+                "admission waited after its initial quiet check"
+            );
+        }
     }
 
     #[test]

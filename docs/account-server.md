@@ -449,8 +449,8 @@ Conversations that a `server run` before this model stored in
 `<project>/<session>.jsonl` into `~/.claude/projects/<project>/`; otherwise delete the
 directory.
 
-While Claude runs, the client refreshes usage about every five minutes when no recovery
-is pending. Safe observing reads continue during work at most thirty seconds apart until a usable
+While Claude runs, the client refreshes usage about every five minutes in a background
+worker, including one-shot runs and pending recovery. Safe observing reads continue during work at most thirty seconds apart until a usable
 replacement is cached; admission then proceeds without further token I/O. Authentication failure and expiry recover on the next five-second monitor
 tick plus replacement-token I/O. Ordinary renewal is forced after ten minutes from first
 observing a replacement; failover keeps its observed-quiet policy. On server outage, the
