@@ -255,9 +255,10 @@ workload changes and repeated requests never reset it. At that deadline the rest
 forced. Until a usable successor is obtained, the server is observed at most thirty seconds apart, including during work. A cached successor removes further token requests from restart admission.
 Account failover retains its ten-minute quiet requirement and has no forced deadline.
 Authentication failure or expiry overrides workload blockers immediately. An active explicit
-production hold can delay either forced restart by at most ten minutes from the moment
-the force condition is reached. After that, the restart proceeds and its event names the
-hold. Unknown hook, terminal, task, hold or production evidence cannot indefinitely keep
+production hold may delay auth recovery only until ten minutes after the auth failure is
+first observed. Renewal always retains its ten-minute deadline from the first observed
+replacement; a hold never extends it. The forced event names any overridden hold.
+Unknown hook, terminal, task, hold or production evidence cannot indefinitely keep
 a dead-token session waiting.
 
 Forced restarts can discard a running turn, background task or draft input. An explicit
@@ -355,7 +356,8 @@ clears a transient failure observed during a pending token read.
 Ordinary admission checks foreground turns, background tasks, production markers, pending
 hooks and explicit holds. Those checks govern failover and renewal before its deadline;
 authentication recovery and the renewal deadline override them, except that an active
-explicit hold receives the bounded ten-minute delay described above. The task check reads live descendants' stdout/stderr: a Claude task
+explicit auth-recovery hold receives only the remaining time within its original ten-minute
+limit. Renewal's original deadline is never extended. The task check reads live descendants' stdout/stderr: a Claude task
 file under `<tmp>/claude-<uid>/.../tasks/*.output` holds admission. MCP/LSP servers and
 `caffeinate` without task-output descriptors do not add a workload blocker.
 
@@ -384,11 +386,12 @@ claudectl hold end
 The command uses the inherited `CLAUDECTL_SERVER_RUN` identity. One hold belongs to one run;
 starting a different reason while a hold exists fails. Check the command's exit status before
 starting the production step. Lane skill/runbook adoption is a separate rollout.
-An active hold delays a forced auth recovery or deadline renewal for at most ten minutes
-from the first force condition, not from hold creation. Workload changes and repeated
-checks do not restart that clock. At the bound claudectl forces the restart and writes
+An active hold may delay auth recovery only until ten minutes from the first observed
+auth failure. A renewal restarts no later than ten minutes from its first observed
+replacement, even under a hold. Hold creation, workload changes and repeated checks
+never restart either clock or add another window. At the bound claudectl forces the restart and writes
 one `restart_forced` event whose `hold` field identifies the run and reason. Ending the
-hold earlier allows the pending forced restart immediately.
+hold earlier allows pending auth recovery immediately.
 
 When the lane exports `HERDR_TAB_ID` (or `HERDR_PANE_ID`), the monitor consumes that lane's
 `[starting]`/`STARTING NOW` and matching `[done]`/`DONE` markers from the optional goal file
@@ -427,13 +430,14 @@ After the wrapper exits, explicitly clear its recorded hold with
 `claudectl status` and the inherited status line show ordinary deferral reasons.
 `status --json` includes their run, stage and deferred counter. Workload deferral never
 prevents authentication recovery or deadline renewal indefinitely; the active explicit-hold
-exception lasts at most ten minutes from the force condition.
+exception ends ten minutes from the first observed auth failure, and renewal's original
+ten-minute deadline is never extended.
 
 `~/.claudectl/server/restart-decisions.jsonl` retains the existing `restart_deferred`
 events and adds `restart_forced` and `recovery_failed`. The counter names are
 `claudectl_restart_forced_total` and `claudectl_recovery_failed_total`; each actual event
 adds one. Labels contain only bounded cause, reason and stage values. Run and session IDs
-are log fields, as are the hold's run and reason when its bound is exceeded. Routed notices carry `route: voice_inbox`; claudectl sends no message itself.
+are log fields, as are the hold's run and reason when a deadline overrides it. Routed notices carry `route: voice_inbox`; claudectl sends no message itself.
 After ten consecutive failures, only every tenth failure is routed. Intervening
 `recovery_metric` rows keep their counter increment with a null route. A successful Stop
 resets the consecutive failure count. The fleet owns journal collection and Voice routing;

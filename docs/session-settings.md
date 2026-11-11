@@ -36,8 +36,9 @@ Authentication failure or expiry restarts the same conversation on the same acco
 immediately, once a replacement token is available. Turns, background tasks, typing,
 production markers and unknown evidence do not defer that recovery. Other renewals
 wait at most ten minutes after observing a replacement revision. An active explicit
-production hold can delay either forced restart for at most ten minutes from its force
-condition, then the restart proceeds with an event naming the hold. Account failover still
+production hold can delay auth recovery only until ten minutes from the first observed
+auth failure; it never extends renewal's original ten-minute deadline. The forced event
+names any overridden hold. Account failover still
 requires ten continuous minutes of observed quiet. A forced restart can discard a draft
 or background task. Recovery omits the original
 task and missed fires; saved-card cron recovery

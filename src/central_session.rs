@@ -2,8 +2,9 @@
 //! conversations, skills, hooks and trust) and receives only a server access token in
 //! CLAUDE_CODE_OAUTH_TOKEN. The token cannot change inside a running Claude (see
 //! experiments/settings-renewal/host-config.py). Authentication failure forces recovery;
-//! ordinary renewal waits at most ten minutes. Active explicit holds can delay either
-//! forced restart for at most ten more minutes. `session.json` records its expiry.
+//! ordinary renewal waits at most ten minutes. An active explicit hold may delay auth
+//! recovery only within ten minutes of the first auth failure and never extends renewal.
+//! `session.json` records its expiry.
 use super::*;
 use crate::exec;
 use std::{ffi::OsString, process::Command};

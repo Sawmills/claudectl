@@ -447,7 +447,7 @@ pub(super) struct Gate {
     terminal: Option<PathBuf>,
     production: ProductionEvidence,
     state: RestartState,
-    forced_since: Option<Instant>,
+    restart_origin: Option<Instant>,
     overridden_hold: Option<Hold>,
 }
 
@@ -473,7 +473,7 @@ impl Gate {
             terminal: None,
             production: ProductionEvidence::default(),
             state: RestartState::Watching,
-            forced_since: None,
+            restart_origin: None,
             overridden_hold: None,
         }
     }
@@ -579,16 +579,16 @@ impl Gate {
             self.state = self.state.transition(RestartEvent::AuthFailed);
         }
         self.state = self.state.transition(RestartEvent::Tick(observed_at));
-        let force_origin = match self.state {
+        let event_origin = match self.state {
             RestartState::Ready {
-                reason: Forced::RenewalDeadline,
                 requested_at: Some(at),
-            } => Some(at + QUIET_WINDOW),
+                ..
+            } => Some(at),
             RestartState::Ready { .. } => Some(observed_at),
             _ => None,
         };
-        self.forced_since =
-            force_origin.map(|at| self.forced_since.map_or(at, |since| since.min(at)));
+        self.restart_origin =
+            event_origin.map(|at| self.restart_origin.map_or(at, |since| since.min(at)));
         self.overridden_hold = None;
         if super::renew::session_end_intent(&self.directory, idle.session.as_deref()).is_some() {
             return false;
@@ -600,7 +600,7 @@ impl Gate {
             if let Ok(Some(hold)) = read_hold(&self.home, &self.directory)
                 && process_start(hold.owner_pid).is_ok_and(|start| start == hold.owner_started)
             {
-                let since = self.forced_since.get_or_insert(observed_at);
+                let since = self.restart_origin.get_or_insert(observed_at);
                 if observed_at.saturating_duration_since(*since) < forced_hold_limit() {
                     self.record(Some(Reason::ExplicitHold), idle, cause, held_expires_at);
                     return false;
@@ -810,10 +810,10 @@ impl Gate {
     }
 }
 
-/// A production step explicitly prevents renewal/failover of its server run.
+/// Hold ordinary restart admission while retaining the original forced deadlines.
 #[derive(clap::Subcommand)]
 pub enum HoldCommand {
-    /// Defer normal restarts; forced recovery waits at most ten more minutes, then records and overrides the hold
+    /// Hold auth recovery for at most ten minutes from its first failure; never extend renewal's deadline
     Start {
         /// Ticket and production step; kept locally, never a metric label
         #[arg(long)]
@@ -2137,7 +2137,11 @@ mod tests {
 
     #[test]
     fn an_active_hold_delays_a_forced_restart_for_at_most_ten_minutes() {
-        for cause in [Cause::AuthRecovery, Cause::Renewal] {
+        for (cause, pending_replacement, first_check_seconds) in [
+            (Cause::AuthRecovery, false, 0),
+            (Cause::Renewal, true, 0),
+            (Cause::AuthRecovery, true, 300),
+        ] {
             let (_home, mut gate, mut idle) = setup();
             let path = hold_path(&gate.home, &gate.directory).unwrap();
             atomic(
@@ -2154,19 +2158,24 @@ mod tests {
             .unwrap();
             let saved = std::fs::read(&path).unwrap();
             let start = Instant::now();
-            let force_at = if cause == Cause::Renewal {
-                gate.request_at(cause, start);
-                start + Duration::from_secs(600)
-            } else {
-                start
-            };
+            if pending_replacement {
+                gate.request_at(Cause::Renewal, start);
+            }
             assert!(
-                !gate.check_at(&idle, cause, i64::MAX, force_at),
+                !gate.check_at(
+                    &idle,
+                    cause,
+                    i64::MAX,
+                    start + Duration::from_secs(first_check_seconds)
+                ),
                 "an active hold must initially delay the forced signal"
             );
             idle.since = None;
-            assert!(!gate.check_at(&idle, cause, i64::MAX, force_at + Duration::from_secs(599)));
-            assert!(gate.check_at(&idle, cause, i64::MAX, force_at + Duration::from_secs(600)));
+            assert!(!gate.check_at(&idle, cause, i64::MAX, start + Duration::from_secs(599)));
+            assert!(
+                gate.check_at(&idle, cause, i64::MAX, start + Duration::from_secs(600)),
+                "{cause:?} must use the original event, not an added force-condition window"
+            );
             gate.signalled(cause, idle.session.as_deref());
             gate.signalled(cause, idle.session.as_deref());
             let records = std::fs::read_to_string(
