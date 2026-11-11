@@ -558,6 +558,9 @@ impl Gate {
             self.state = self.state.transition(RestartEvent::AuthFailed);
         }
         self.state = self.state.transition(RestartEvent::Tick(observed_at));
+        if super::renew::session_end_intent(&self.directory, idle.session.as_deref()).is_some() {
+            return false;
+        }
         if self.forced(cause).is_some() {
             if idle.session.is_none() || idle.ended.is_some() {
                 return false;

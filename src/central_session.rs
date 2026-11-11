@@ -23,11 +23,13 @@ fn write_hook_settings(dir: &Path, hook: &Path) -> Result<PathBuf> {
     let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
     let command = format!("{} server hook {}", quote(hook), quote(dir));
     let entry = json!([{"hooks": [{"type": "command", "command": command}]}]);
+    let end =
+        json!([{"hooks": [{"type": "command", "command": format!("{command} --session-end")}]}]);
     let settings = dir.join("hooks.json");
     atomic(
         &settings,
         &json!({"hooks": {"SessionStart": entry, "UserPromptSubmit": entry,
-            "Stop": entry, "StopFailure": entry, "Notification": entry, "SessionEnd": entry}}),
+            "Stop": entry, "StopFailure": entry, "Notification": entry, "SessionEnd": end}}),
     )?;
     Ok(settings)
 }
@@ -971,8 +973,16 @@ impl Monitor {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let ended_first =
-            matches!((&sent, activity.idle.ended), (Some((at, _)), Some(end)) if end <= *at);
+        let ended = activity
+            .idle
+            .ended
+            .into_iter()
+            .chain(super::renew::session_end_intent(
+                &self.directory,
+                activity.idle.session.as_deref(),
+            ))
+            .min();
+        let ended_first = matches!((&sent, ended), (Some((at, _)), Some(end)) if end <= *at);
         if let Err(error) = self.check_crons(true) {
             cron_log_error = Some(format!("could not record cron recovery: {error:#}"));
         }
@@ -1252,6 +1262,7 @@ pub fn run(
             exec::take_foreground(&mut command);
         }
         let _ = std::fs::remove_file(session.directory().join("events"));
+        super::renew::clear_session_end_intents(session.directory())?;
         if !first {
             // Before spawn: a failed write must not leave a Claude without its monitor.
             session.set_renewal("on")?;

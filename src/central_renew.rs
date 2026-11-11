@@ -390,6 +390,58 @@ fn publish_hook_intent(dir: &std::path::Path) -> anyhow::Result<std::path::PathB
     Ok(pending)
 }
 
+fn publish_session_end_intent(
+    dir: &std::path::Path,
+    at: i64,
+    session: Option<&str>,
+) -> anyhow::Result<()> {
+    atomic(
+        &dir.join(format!("session-end-intent.{}", std::process::id())),
+        &serde_json::json!({"at":at,"session_id":session}),
+    )
+    .inspect_err(|_| mark_hook_error(dir))
+}
+
+/// Typed lifecycle intent survives blocked hook input, admission and post-exit drain.
+pub(super) fn session_end_intent(dir: &std::path::Path, session: Option<&str>) -> Option<i64> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            if !entry
+                .file_name()
+                .to_str()?
+                .starts_with("session-end-intent.")
+            {
+                return None;
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(&super::private_read(&entry.path()).ok()?).ok()?;
+            if value["session_id"]
+                .as_str()
+                .is_some_and(|id| Some(id) != session)
+            {
+                return None;
+            }
+            value["at"].as_i64()
+        })
+        .min()
+}
+
+pub(super) fn clear_session_end_intents(dir: &std::path::Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("session-end-intent.")
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// The `server hook` entry point: read the hook input (at most `HOOK_INPUT_LIMIT`) and
 /// record it. Any read, size or parse failure leaves the error marker (fail closed).
 pub(super) fn hook_from(
@@ -397,9 +449,13 @@ pub(super) fn hook_from(
     dir: &std::path::Path,
     input: impl std::io::Read,
     now: i64,
+    session_end: bool,
 ) -> anyhow::Result<()> {
     use std::io::Read;
     let dir = session_dir(sessions, dir)?;
+    if session_end {
+        publish_session_end_intent(&dir, now, None)?;
+    }
     // Reading stdin may wait while the native client submits its hook payload.
     // Publish before that wait, as well as before either admission lock.
     let pending = publish_hook_intent(&dir)?;
@@ -429,6 +485,17 @@ pub(super) fn record_hook(
     use std::io::{Read, Seek, SeekFrom, Write};
     let dir = session_dir(sessions, dir)?;
     let pending = publish_hook_intent(&dir)?;
+    let v: serde_json::Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(error) => {
+            mark_hook_error(&dir);
+            let _ = std::fs::remove_file(&pending);
+            return Err(error.into());
+        }
+    };
+    if v["hook_event_name"] == "SessionEnd" {
+        publish_session_end_intent(&dir, now, v["session_id"].as_str())?;
+    }
     #[cfg(unix)]
     let _hook_admission = match super::restart_gate::hook_admission(&dir) {
         Ok(lock) => lock,
@@ -445,14 +512,6 @@ pub(super) fn record_hook(
             mark_hook_error(&dir);
             let _ = std::fs::remove_file(&pending);
             return Err(error);
-        }
-    };
-    let v: serde_json::Value = match serde_json::from_str(input) {
-        Ok(v) => v,
-        Err(error) => {
-            mark_hook_error(&dir);
-            let _ = std::fs::remove_file(&pending);
-            return Err(error.into());
         }
     };
     // The error type of a failed turn, only from Claude Code's known values; its details
@@ -520,6 +579,7 @@ pub(super) fn record_hook(
         return Err(error.into());
     }
     std::fs::remove_file(pending).ok();
+    std::fs::remove_file(dir.join(format!("session-end-intent.{}", std::process::id()))).ok();
     Ok(())
 }
 
@@ -1102,6 +1162,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_session_end_waiting_for_admission_vetoes_auth_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join(".claudectl/server/sessions");
+        let dir = sessions.join("run-exit-intent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = super::super::restart_gate::admission(&dir).unwrap();
+        let worker = std::thread::spawn({
+            let sessions = sessions.clone();
+            let dir = dir.clone();
+            move || {
+                record_hook(
+                    &sessions,
+                    &dir,
+                    r#"{"hook_event_name":"SessionEnd","session_id":"s"}"#,
+                    42,
+                )
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while session_end_intent(&dir, Some("s")).is_none() && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(session_end_intent(&dir, Some("s")), Some(42));
+        assert_eq!(session_end_intent(&dir, Some("another-session")), None);
+        let (mut child, mut gate, idle) = idle_hook_gate(root.path(), &dir);
+        assert!(!gate.check(
+            &idle,
+            super::super::restart_gate::Cause::AuthRecovery,
+            i64::MAX
+        ));
+        drop(lock);
+        worker.join().unwrap().unwrap();
+        assert_eq!(session_end_intent(&dir, Some("s")), None);
+        drop(child.stdin.take());
+        child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn option_b_quiet_defers_a_hook_waiting_for_admission() {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join(".claudectl/server/sessions");
@@ -1275,6 +1375,7 @@ mod tests {
                         ),
                     },
                     1,
+                    false,
                 )
             }
         });
@@ -1307,19 +1408,28 @@ mod tests {
         ] {
             let dir = sessions.join(name);
             std::fs::create_dir_all(&dir).unwrap();
-            assert!(hook_from(&sessions, &dir, std::io::Cursor::new(input), 1).is_err());
+            assert!(hook_from(&sessions, &dir, std::io::Cursor::new(input), 1, false).is_err());
             assert!(dir.join("hook-error").exists(), "{name}");
         }
         // A good event still records and leaves no marker.
         let dir = sessions.join("run-ok");
         std::fs::create_dir_all(&dir).unwrap();
         let good = br#"{"hook_event_name":"Stop","session_id":"s"}"#.to_vec();
-        hook_from(&sessions, &dir, std::io::Cursor::new(good), 1).unwrap();
+        hook_from(&sessions, &dir, std::io::Cursor::new(good), 1, false).unwrap();
         assert!(!dir.join("hook-error").exists());
         // Outside the sessions root nothing is written at all.
         let outside = root.path().join("run-out");
         std::fs::create_dir_all(&outside).unwrap();
-        assert!(hook_from(&sessions, &outside, std::io::Cursor::new(b"x".to_vec()), 1).is_err());
+        assert!(
+            hook_from(
+                &sessions,
+                &outside,
+                std::io::Cursor::new(b"x".to_vec()),
+                1,
+                false
+            )
+            .is_err()
+        );
         assert!(!outside.join("hook-error").exists());
     }
 

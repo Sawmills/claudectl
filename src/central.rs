@@ -1155,7 +1155,12 @@ pub enum Command {
     Statusline { account_id: String },
     /// Record a Claude hook event for a running server session (internal; never fails)
     #[command(hide = true)]
-    Hook { dir: PathBuf },
+    Hook {
+        dir: PathBuf,
+        /// Publish native SessionEnd intent before reading the hook payload
+        #[arg(long)]
+        session_end: bool,
+    },
     /// Transfer a profile, or every saved account with --all, after stopping every previous
     /// grant holder
     Migrate {
@@ -1266,7 +1271,7 @@ pub fn dispatch(command: Command) -> Result<()> {
             json,
         } => status(&paths, &alias, cached, json),
         Command::Statusline { account_id } => statusline(&paths, &account_id),
-        Command::Hook { dir } => {
+        Command::Hook { dir, session_end } => {
             // A hook never blocks or talks to Claude: no output, exit 0 whatever happens. A
             // failure leaves the session's error marker, so renewal stops (fail closed).
             let _ = renew::hook_from(
@@ -1274,6 +1279,7 @@ pub fn dispatch(command: Command) -> Result<()> {
                 &dir,
                 std::io::stdin(),
                 now(),
+                session_end,
             );
             Ok(())
         }

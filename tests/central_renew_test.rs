@@ -1048,13 +1048,19 @@ impl Drop for Fixture {
 struct HookInput(Option<Child>);
 impl HookInput {
     fn reading(f: &Fixture) -> Self {
+        Self::reading_event(f, "UserPromptSubmit")
+    }
+    fn reading_event(f: &Fixture, event: &str) -> Self {
         use std::io::Write;
-        let mut child = Command::new(assert_cmd::cargo::cargo_bin("claudectl"))
+        let command = f.run()["settings"]["hooks"][event][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut child = Command::new("/bin/sh")
             .env_clear()
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .env("HOME", f.home.path())
-            .args(["server", "hook"])
-            .arg(f.directory())
+            .args(["-c", &format!("exec {command}")])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -1064,7 +1070,7 @@ impl HookInput {
             .stdin
             .as_mut()
             .unwrap()
-            .write_all(b"{\"hook_event_name\":\"UserPromptSubmit\",")
+            .write_all(format!("{{\"hook_event_name\":\"{event}\",").as_bytes())
             .unwrap();
         let hook = Self(Some(child));
         let end = Instant::now() + Duration::from_secs(3);
@@ -1095,6 +1101,31 @@ impl HookInput {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn a_session_end_hook_blocked_on_input_prevents_forced_recovery() {
+    let mut f = Fixture::start("auth_recovery", 600_000, false);
+    f.wait("quiet_window", "deferred");
+    f.state.lock().unwrap().pause_observe = true;
+    f.revoke();
+    std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+    let end = Instant::now() + Duration::from_secs(3);
+    while !f.state.lock().unwrap().observe_pending && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(f.state.lock().unwrap().observe_pending);
+    let hook = HookInput::reading_event(&f, "SessionEnd");
+    f.state.lock().unwrap().pause_observe = false;
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        f.runs().len(),
+        1,
+        "explicit exit intent must prevent resume"
+    );
+    assert!(!f.home.path().join("terminated").exists());
+    f.finish();
+    drop(hook);
 }
 impl Drop for HookInput {
     fn drop(&mut self) {
