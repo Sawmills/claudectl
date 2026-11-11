@@ -286,7 +286,7 @@ pub(super) fn decide(i: &Inputs) -> Decision {
     if i.server_revision == i.held_revision {
         return Decision::Keep;
     }
-    if i.server_expires_at <= i.held_expires_at {
+    if !replacement_ready(i) || (!held_token_dead(i) && i.server_expires_at <= i.held_expires_at) {
         return Decision::Wait("the new token does not outlive the held one");
     }
     match idle_gate(i) {
@@ -295,8 +295,12 @@ pub(super) fn decide(i: &Inputs) -> Decision {
     }
 }
 
-/// Whether Claude is idle enough to be restarted. A dead token skips only the quiet delay;
-/// workload evidence and the final signal admission still apply.
+pub(super) fn replacement_ready(i: &Inputs) -> bool {
+    i.server_revision != i.held_revision && i.server_expires_at > i.now
+}
+
+/// Normal renewals require idle admission. A dead token overrides workload delays and
+/// the hourly budget, while preserving explicit session exit and session identity.
 pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     if i.idle.session.is_none() {
         return Err("no session id from Claude yet");
@@ -306,6 +310,9 @@ pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
         return Err("Claude is ending the session");
     }
     let recovering = held_token_dead(i);
+    if recovering {
+        return Ok(());
+    }
     match i.idle.since {
         None => return Err("a turn is running"),
         Some(since) if !recovering && i.now - since < i.idle_after_ms => {
@@ -451,10 +458,28 @@ pub(super) fn record_hook(
     // The error type of a failed turn, only from Claude Code's known values; its details
     // and the last message are never kept.
     let error = (v["hook_event_name"] == "StopFailure").then(|| {
-        let known = v["error"]
-            .as_str()
-            .filter(|e| TURN_ERRORS.contains(e))
-            .unwrap_or("unknown");
+        let authentication_failed = v["error"] == "authentication_failed"
+            || v["status_code"].as_u64() == Some(401)
+            || ["error", "error_details"].iter().any(|field| {
+                v[field].as_str().is_some_and(|text| {
+                    let text = text.to_ascii_lowercase();
+                    [
+                        "oauth token revoked",
+                        "oauth access token has expired",
+                        "please run /login",
+                    ]
+                    .iter()
+                    .any(|message| text.contains(message))
+                })
+            });
+        let known = if authentication_failed {
+            "authentication_failed"
+        } else {
+            v["error"]
+                .as_str()
+                .filter(|e| TURN_ERRORS.contains(e))
+                .unwrap_or("unknown")
+        };
         serde_json::Value::from(known)
     });
     let line = serde_json::json!({
@@ -891,8 +916,8 @@ mod tests {
     }
 
     #[test]
-    fn dead_token_recovery_still_requires_an_idle_turn_and_restart_budget() {
-        // Fresh terminal input is checked by restart_gate at final admission.
+    fn dead_token_recovery_overrides_running_turn_and_restart_budget() {
+        // A dead token cannot make progress, even with terminal input or a running turn.
         let idle = Idle {
             session: Some("s".into()),
             since: Some(10_000_000 - 1_000),
@@ -905,7 +930,7 @@ mod tests {
         expired.held_expires_at = expired.now - 1;
         expired.tty_idle_ms = Some(5_000);
         assert_eq!(decide(&expired), Decision::Restart);
-        // A running turn, an exiting session and the budget still hold.
+        // A running turn and the hourly budget no longer defer recovery.
         let busy = Idle {
             session: Some("s".into()),
             since: None,
@@ -916,10 +941,10 @@ mod tests {
         };
         let mut running = inputs(&busy);
         running.held_expires_at = running.now - 1;
-        assert!(matches!(decide(&running), Decision::Wait(_)));
+        assert_eq!(decide(&running), Decision::Restart);
         let mut budget = expired;
         budget.restarts_last_hour = RESTARTS_PER_HOUR;
-        assert!(matches!(decide(&budget), Decision::Wait(_)));
+        assert_eq!(decide(&budget), Decision::Restart);
     }
 
     #[test]

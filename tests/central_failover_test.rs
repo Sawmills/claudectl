@@ -31,6 +31,7 @@ struct Fake {
     /// Every usage read: (account id, cached).
     usage_reads: Vec<(String, String)>,
     token_requests: Vec<String>,
+    token_request_bodies: Vec<Value>,
 }
 type Shared = Arc<Mutex<Fake>>;
 
@@ -73,7 +74,11 @@ async fn usage(
 
 async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Value> {
     let id = body["account_id"].as_str().unwrap_or_default().to_string();
-    shared.lock().unwrap().token_requests.push(id.clone());
+    {
+        let mut fake = shared.lock().unwrap();
+        fake.token_requests.push(id.clone());
+        fake.token_request_bodies.push(body.clone());
+    }
     let renewed = {
         let fake = shared.lock().unwrap();
         id == WORK && body["observe"] == true && fake.work_used && fake.renew_work
@@ -315,7 +320,17 @@ fn assert_deferred(env: &Env, output: &std::process::Output, cause: &str) {
     assert_eq!(runs.len(), 1, "{runs:?}");
     assert_eq!(runs[0]["token"], "token-work");
     assert!(env.records().is_empty());
-    assert_eq!(env.fake.lock().unwrap().token_requests, [WORK]);
+    {
+        let fake = env.fake.lock().unwrap();
+        assert!(!fake.token_requests.is_empty());
+        assert!(fake.token_requests.iter().all(|account| account == WORK));
+        assert!(
+            fake.token_request_bodies.iter().all(|request| {
+                request["observe"] == true && request["previous_revision"].is_null()
+            }),
+            "workload deferral permits safe observation, never forced refresh or another account"
+        );
+    }
     assert!(!stderr.contains("resuming session"));
     let rows: Vec<Value> = std::fs::read_to_string(
         env.home

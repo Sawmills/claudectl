@@ -1,5 +1,5 @@
-//! Admission for automatic renewal/failover. Workload evidence never authorizes a signal
-//! on an I/O failure, and an expired token never overrides active work.
+//! Admission for automatic renewal/failover. Authentication recovery overrides workload
+//! deferral: a session holding a dead token cannot make progress.
 use super::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -11,6 +11,18 @@ use std::process::Command;
 
 /// Serialize hold/hook publication with the final restart admission and signal.
 pub(super) fn admission(directory: &Path) -> Result<File> {
+    admission_lock(directory, "restart.lock", true)
+}
+
+pub(super) fn try_admission(directory: &Path) -> Result<File> {
+    admission_lock(directory, "restart.lock", false)
+}
+
+pub(super) fn try_hook_admission(directory: &Path) -> Result<File> {
+    admission_lock(directory, "hook.lock", false)
+}
+
+fn admission_lock(directory: &Path, name: &str, wait: bool) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -18,8 +30,12 @@ pub(super) fn admission(directory: &Path) -> Result<File> {
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(directory.join("restart.lock"))?;
-    file.lock()?;
+        .open(directory.join(name))?;
+    if wait {
+        file.lock()?;
+    } else {
+        file.try_lock()?;
+    }
     Ok(file)
 }
 
@@ -50,6 +66,226 @@ pub(super) enum Cause {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub(super) enum Forced {
+    AuthRecovery,
+    RenewalDeadline,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RecoveryFailure {
+    NoSession,
+    Observe,
+    Acquire,
+    ReplacementRejected,
+    UnusableReplacement,
+    StatusPublish,
+    Signal,
+    Spawn,
+    Teardown,
+    Persist,
+    Resume,
+}
+
+enum RecoveryEvent {
+    Forced(Forced),
+    Failed(RecoveryFailure),
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct FailureStreak {
+    session_id: Option<String>,
+    count: u64,
+}
+
+pub(super) fn recovery_succeeded(directory: &Path, session: Option<&str>) {
+    let _ = atomic(
+        &directory.join("recovery-failures.json"),
+        &FailureStreak {
+            session_id: session.map(str::to_owned),
+            count: 0,
+        },
+    );
+}
+
+fn recovery_event(
+    home: &Path,
+    directory: &Path,
+    session: Option<&str>,
+    cause: Cause,
+    event: RecoveryEvent,
+) -> Result<()> {
+    let failed = matches!(event, RecoveryEvent::Failed(_));
+    let (mut event, metric, reason) = match event {
+        RecoveryEvent::Forced(reason) => (
+            "restart_forced",
+            "claudectl_restart_forced_total",
+            json!(reason),
+        ),
+        RecoveryEvent::Failed(reason) => (
+            "recovery_failed",
+            "claudectl_recovery_failed_total",
+            json!(reason),
+        ),
+    };
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(home.join(".claudectl/server/restart-decisions.jsonl"))?;
+    if !file.metadata()?.is_file() {
+        bail!("restart journal is not a regular file");
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let mut route = Some("voice_inbox");
+    if failed {
+        let path = directory.join("recovery-failures.json");
+        let mut streak: FailureStreak = match private_read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                FailureStreak::default()
+            }
+            Err(error) => return Err(error),
+        };
+        if streak.session_id.as_deref() != session {
+            streak = FailureStreak {
+                session_id: session.map(str::to_owned),
+                count: 0,
+            };
+        }
+        streak.count = streak.count.saturating_add(1);
+        atomic(&path, &streak)?;
+        if streak.count > 10 && !streak.count.is_multiple_of(10) {
+            event = "recovery_metric";
+            route = None;
+        }
+    }
+    let stage = if failed {
+        reason.clone()
+    } else {
+        json!("signal")
+    };
+    let mut line = serde_json::to_vec(&json!({
+        "at":now(),"event":event,"run":run_id(directory)?,"session_id":session,
+        "cause":cause,"reason":reason,"stage":stage,"route":route,
+        "metric":{"name":metric,"value":1,"labels":{"cause":cause,"reason":reason,"stage":stage}},
+    }))?;
+    line.push(b'\n');
+    // O_APPEND and one write keep concurrent records together without waiting for
+    // another session's advisory lock. Never retry an uncertain partial append.
+    if file.write(&line)? != line.len() {
+        bail!("incomplete restart event append");
+    }
+    file.sync_data()?;
+    Ok(())
+}
+
+pub(super) fn recovery_failed(
+    home: &Path,
+    directory: &Path,
+    session: Option<&str>,
+    cause: Cause,
+    stage: RecoveryFailure,
+) {
+    // Telemetry failure must not disable token recovery or enter Claude's terminal.
+    let _ = recovery_event(
+        home,
+        directory,
+        session,
+        cause,
+        RecoveryEvent::Failed(stage),
+    );
+}
+
+/// One relaunch preparation attempt. Any propagated error is counted at its current
+/// stage; handing the child to its monitor completes preparation.
+pub(super) struct RecoveryAttempt {
+    home: PathBuf,
+    directory: PathBuf,
+    session: String,
+    cause: Cause,
+    stage: Option<RecoveryFailure>,
+}
+
+impl RecoveryAttempt {
+    pub(super) fn new(home: &Path, directory: &Path, session: &str, cause: Cause) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            directory: directory.to_path_buf(),
+            session: session.to_owned(),
+            cause,
+            stage: Some(RecoveryFailure::Teardown),
+        }
+    }
+
+    pub(super) fn at(&mut self, stage: RecoveryFailure) {
+        self.stage = Some(stage);
+    }
+
+    pub(super) fn started(mut self) {
+        self.stage = None;
+    }
+}
+
+impl Drop for RecoveryAttempt {
+    fn drop(&mut self) {
+        if let Some(stage) = self.stage {
+            recovery_failed(
+                &self.home,
+                &self.directory,
+                Some(&self.session),
+                self.cause,
+                stage,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RestartState {
+    #[default]
+    Watching,
+    Waiting {
+        requested_at: Instant,
+    },
+    Ready(Forced),
+    Restarting,
+}
+
+enum RestartEvent {
+    RenewalRequested(Instant),
+    AuthFailed,
+    Tick(Instant),
+    Recovered,
+    Signalled,
+}
+
+impl RestartState {
+    fn transition(self, event: RestartEvent) -> Self {
+        use RestartEvent::*;
+        use RestartState::*;
+        match (self, event) {
+            (Restarting, _) | (_, Signalled) => Restarting,
+            (_, AuthFailed) => Ready(Forced::AuthRecovery),
+            (Ready(Forced::AuthRecovery), Recovered) => Watching,
+            (Watching, RenewalRequested(requested_at)) => Waiting { requested_at },
+            (Waiting { requested_at }, Tick(at))
+                if at.saturating_duration_since(requested_at) >= QUIET_WINDOW =>
+            {
+                Ready(Forced::RenewalDeadline)
+            }
+            (state, _) => state,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum Reason {
     RunningTurn,
     BackgroundTask,
@@ -59,7 +295,6 @@ enum Reason {
     StaleHold,
     EvidenceUnknown,
     QuietWindow,
-    TerminalInput,
     RestartPending,
 }
 
@@ -81,13 +316,10 @@ struct Deferred {
 struct ObservedQuiet {
     idle: super::renew::Idle,
     input_at: Option<std::time::SystemTime>,
-    cause: Cause,
     since: Instant,
 }
 
 const QUIET_WINDOW: Duration = Duration::from_secs(600);
-// Linux tty_update_time can hold atime unchanged for eight seconds. Observe two periods.
-const TERMINAL_OBSERVATION: Duration = Duration::from_secs(16);
 
 /// One gate per live Claude child. All automatic restart callers cross `check`.
 pub(super) struct Gate {
@@ -105,6 +337,7 @@ pub(super) struct Gate {
     quiet: Option<ObservedQuiet>,
     terminal: Option<PathBuf>,
     production: ProductionEvidence,
+    state: RestartState,
 }
 
 impl Gate {
@@ -128,12 +361,52 @@ impl Gate {
             quiet: None,
             terminal: None,
             production: ProductionEvidence::default(),
+            state: RestartState::Watching,
         }
     }
 
     pub(super) fn with_terminal(mut self, terminal: Option<PathBuf>) -> Self {
         self.terminal = terminal;
         self
+    }
+
+    pub(super) fn request_at(&mut self, cause: Cause, at: Instant) {
+        let event = match cause {
+            Cause::Renewal => RestartEvent::RenewalRequested(at),
+            Cause::AuthRecovery => RestartEvent::AuthFailed,
+            Cause::Failover => return,
+        };
+        self.state = self.state.transition(event);
+    }
+
+    pub(super) fn recovered(&mut self) {
+        self.state = self.state.transition(RestartEvent::Recovered);
+    }
+
+    pub(super) fn forced(&self, cause: Cause) -> Option<Forced> {
+        match (cause, self.state) {
+            (Cause::AuthRecovery, _) => Some(Forced::AuthRecovery),
+            (Cause::Renewal, RestartState::Ready(Forced::RenewalDeadline)) => {
+                Some(Forced::RenewalDeadline)
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn signalled(&mut self, cause: Cause, session: Option<&str>) {
+        if self.state == RestartState::Restarting {
+            return;
+        }
+        if let Some(reason) = self.forced(cause) {
+            let _ = recovery_event(
+                &self.home,
+                &self.directory,
+                session,
+                cause,
+                RecoveryEvent::Forced(reason),
+            );
+        }
+        self.state = self.state.transition(RestartEvent::Signalled);
     }
 
     /// Fresh workload evidence, with one diagnostic/counter per changed decision.
@@ -154,6 +427,19 @@ impl Gate {
         held_expires_at: i64,
         observed_at: std::time::Instant,
     ) -> bool {
+        if cause == Cause::AuthRecovery {
+            self.request_at(cause, observed_at);
+        }
+        self.state = self.state.transition(RestartEvent::Tick(observed_at));
+        if self.forced(cause).is_some() {
+            if idle.session.is_none() || idle.ended.is_some() {
+                return false;
+            }
+            // Diagnostics are best effort here; unavailable evidence must not strand a
+            // dead session. Session lifecycle still belongs to the user.
+            self.record(None, idle, cause, held_expires_at);
+            return true;
+        }
         if self.log_error {
             self.retry_error_status(idle, held_expires_at);
             return false;
@@ -199,16 +485,14 @@ impl Gate {
             reason
         } else {
             let input_at = input_at.expect("terminal evidence was checked");
-            let changed = self.quiet.as_ref().is_none_or(|previous| {
-                previous.idle != *idle
-                    || previous.input_at != input_at
-                    || (cause == Cause::AuthRecovery && previous.cause != cause)
-            });
+            let changed = self
+                .quiet
+                .as_ref()
+                .is_none_or(|previous| previous.idle != *idle || previous.input_at != input_at);
             if changed {
                 self.quiet = Some(ObservedQuiet {
                     idle: idle.clone(),
                     input_at,
-                    cause,
                     since: observed_at,
                 });
             }
@@ -219,17 +503,8 @@ impl Gate {
                     .unwrap_or_default()
                     >= QUIET_WINDOW
             });
-            if cause == Cause::AuthRecovery {
-                // A dead token needs the next verified idle point, not ten minutes.
-                // A matching five-second sample cannot detect coarse tty timestamps.
-                (input_at.is_some()
-                    && observed_at.saturating_duration_since(quiet.since) < TERMINAL_OBSERVATION)
-                    .then_some(Reason::TerminalInput)
-            } else {
-                (observed_at.saturating_duration_since(quiet.since) < QUIET_WINDOW
-                    || !terminal_quiet)
-                    .then_some(Reason::QuietWindow)
-            }
+            (observed_at.saturating_duration_since(quiet.since) < QUIET_WINDOW || !terminal_quiet)
+                .then_some(Reason::QuietWindow)
         };
         // Workload observations do not close all inputs. A hook can still be
         // invisible or arrive between this sample and SIGTERM.
@@ -325,7 +600,7 @@ impl Gate {
                     .mode(0o600)
                     .custom_flags(libc::O_NOFOLLOW)
                     .open(self.home.join(".claudectl/server/restart-decisions.jsonl"))?;
-                file.lock()?;
+                file.try_lock()?;
                 file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
                 let record = json!({"at":at,"event":"restart_deferred","session_id":session,
                 "run":run,"cause":d.cause,"reason":d.reason,"stage":d.stage,
@@ -360,7 +635,7 @@ impl Gate {
 /// A production step explicitly prevents renewal/failover of its server run.
 #[derive(clap::Subcommand)]
 pub enum HoldCommand {
-    /// Hold this run until `hold end`, even when the token expires
+    /// Defer normal restarts; auth recovery and the ten-minute renewal deadline override this hold
     Start {
         /// Ticket and production step; kept locally, never a metric label
         #[arg(long)]
@@ -731,6 +1006,12 @@ pub fn hold(paths: &Paths, command: HoldCommand) -> Result<()> {
                 bail!(
                     "this server wrapper does not support holds; do not start the production step"
                 );
+            }
+            if status["expires_at"]
+                .as_i64()
+                .is_some_and(|expiry| expiry <= now())
+            {
+                bail!("the held token has expired; recovery overrides holds");
             }
             if status["renewal"] == "renewing" {
                 bail!("server run is already restarting; hold was not started");
@@ -1187,6 +1468,35 @@ mod tests {
     }
 
     #[test]
+    fn renewal_deadline_survives_changing_workload_and_repeated_requests() {
+        let (_home, mut gate, mut idle) = setup();
+        let start = Instant::now();
+        idle.since = None;
+        gate.request_at(Cause::Renewal, start);
+        assert!(!gate.check_at(&idle, Cause::Renewal, i64::MAX, start));
+        gate.request_at(Cause::Renewal, start + Duration::from_secs(599));
+        assert!(!gate.check_at(
+            &idle,
+            Cause::Renewal,
+            i64::MAX,
+            start + Duration::from_secs(599)
+        ));
+        File::create(gate.directory.join("hook-error")).unwrap();
+        assert!(gate.check_at(
+            &idle,
+            Cause::Renewal,
+            i64::MAX,
+            start + Duration::from_secs(600)
+        ));
+        assert!(!gate.check_at(
+            &idle,
+            Cause::Failover,
+            i64::MAX,
+            start + Duration::from_secs(601)
+        ));
+    }
+
+    #[test]
     fn option_b_observed_activity_restarts_the_entire_window() {
         let (_home, mut gate, mut idle) = setup();
         let start = Instant::now();
@@ -1344,63 +1654,59 @@ mod tests {
     }
 
     #[test]
-    fn auth_recovery_cannot_inherit_old_terminal_observation_from_valid_renewal() {
+    fn auth_recovery_does_not_wait_for_terminal_observation() {
         let (_home, mut gate, idle) = setup();
         let terminal = gate.directory.join("synthetic-terminal");
         let file = File::create(&terminal).unwrap();
-        file.set_times(std::fs::FileTimes::new().set_accessed(std::time::UNIX_EPOCH))
-            .unwrap();
-        gate = gate.with_terminal(Some(terminal));
+        gate = gate.with_terminal(Some(terminal.clone()));
         let start = Instant::now();
         assert!(!gate.check_at(&idle, Cause::Renewal, i64::MAX, start));
-        assert!(!gate.check_at(
-            &idle,
-            Cause::Renewal,
-            i64::MAX,
-            start + Duration::from_secs(20)
-        ));
-        let expired = now() - 1;
-        assert!(
-            !gate.check_at(
-                &idle,
-                Cause::AuthRecovery,
-                expired,
-                start + Duration::from_secs(20)
-            ),
-            "token expiry must begin a fresh terminal observation, even when tty atime has not changed yet"
-        );
-        assert!(!gate.check_at(
-            &idle,
-            Cause::AuthRecovery,
-            expired,
-            start + Duration::from_secs(35)
-        ));
-        assert!(gate.check_at(
-            &idle,
-            Cause::AuthRecovery,
-            expired,
-            start + Duration::from_secs(36)
-        ));
+        assert!(gate.check_at(&idle, Cause::AuthRecovery, now() - 1, start));
         file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()))
             .unwrap();
-        assert!(!gate.check_at(
-            &idle,
-            Cause::AuthRecovery,
-            expired,
-            start + Duration::from_secs(37)
-        ));
-        assert!(!gate.check_at(
-            &idle,
-            Cause::AuthRecovery,
-            expired,
-            start + Duration::from_secs(52)
-        ));
-        assert!(gate.check_at(
-            &idle,
-            Cause::AuthRecovery,
-            expired,
-            start + Duration::from_secs(53)
-        ));
+        assert!(gate.check_at(&idle, Cause::AuthRecovery, now() - 1, start));
+        std::fs::remove_file(terminal).unwrap();
+        assert!(gate.check_at(&idle, Cause::AuthRecovery, now() - 1, start));
+    }
+
+    #[test]
+    fn restart_policy_named_state_transitions_preserve_the_deadline() {
+        let start = Instant::now();
+        let waiting = RestartState::Watching.transition(RestartEvent::RenewalRequested(start));
+        assert_eq!(
+            waiting,
+            RestartState::Waiting {
+                requested_at: start
+            }
+        );
+        assert_eq!(
+            waiting.transition(RestartEvent::RenewalRequested(
+                start + Duration::from_secs(599)
+            )),
+            waiting
+        );
+        assert_eq!(
+            waiting.transition(RestartEvent::Tick(start + Duration::from_secs(599))),
+            waiting
+        );
+        let ready = waiting.transition(RestartEvent::Tick(start + Duration::from_secs(600)));
+        assert_eq!(ready, RestartState::Ready(Forced::RenewalDeadline));
+        assert_eq!(
+            ready.transition(RestartEvent::AuthFailed),
+            RestartState::Ready(Forced::AuthRecovery)
+        );
+        assert_eq!(
+            ready.transition(RestartEvent::Signalled),
+            RestartState::Restarting
+        );
+        assert_eq!(
+            RestartState::Restarting.transition(RestartEvent::AuthFailed),
+            RestartState::Restarting
+        );
+        assert_eq!(
+            RestartState::Ready(Forced::AuthRecovery).transition(RestartEvent::Recovered),
+            RestartState::Watching
+        );
     }
 
     #[test]

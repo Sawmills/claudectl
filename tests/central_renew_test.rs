@@ -27,6 +27,7 @@ struct Fake {
     reject_once: bool,
     pause_observe: bool,
     observe_pending: bool,
+    token_failures: usize,
 }
 type Shared = Arc<Mutex<Fake>>;
 fn identity() -> Value {
@@ -40,10 +41,18 @@ async fn accounts() -> Json<Value> {
 async fn usage() -> Json<Value> {
     Json(json!({"data":null,"observed_at":null,"next_retry_at":0,"stale":true,"error":null}))
 }
-async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Value> {
+async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
     let response = {
         let mut fake = shared.lock().unwrap();
         fake.requests.push(body);
+        if fake.token_failures > 0 && fake.requests.last().unwrap()["previous_revision"].is_string()
+        {
+            fake.token_failures -= 1;
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"synthetic failure"})),
+            );
+        }
         if fake.pause_observe && fake.requests.len() > 1 {
             fake.observe_pending = true;
         }
@@ -72,7 +81,7 @@ async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Va
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    Json(response)
+    (StatusCode::OK, Json(response))
 }
 async fn provider(State(shared): State<Shared>, headers: HeaderMap) -> (StatusCode, Json<Value>) {
     let mut fake = shared.lock().unwrap();
@@ -113,6 +122,9 @@ with log.open('a') as out:
     out.write(json.dumps({'token':os.environ['CLAUDE_CODE_OAUTH_TOKEN'],'args':args,'settings':settings,'run':str(run),'session':json.load(open(run/'session.json')),'pid':os.getpid(),'tty':os.isatty(0),'foreground':not os.isatty(0) or os.tcgetpgrp(0)==os.getpgrp()})+'\n')
 if mode=='auth_resume_fails' and not first_launch: sys.exit(7)
 def term(*_):
+    if mode=='ignore_term' and first_launch:
+        (home/'term-received').touch()
+        return
     (home/'terminated').touch()
     sys.exit(143)
 signal.signal(signal.SIGTERM,term)
@@ -140,7 +152,7 @@ if mode=='damaged':
     with (run/'events').open('a') as out: out.write('broken record\n')
 if mode=='extra': task=subprocess.Popen(['sleep','15'])
 (home/'ready').touch()
-deadline=time.monotonic()+(60 if os.isatty(0) else 15)
+deadline=time.monotonic()+(60 if os.isatty(0) or mode=='ignore_term' else 15)
 prompted=False
 probed=False
 retried=False
@@ -151,10 +163,11 @@ while not (home/'release').exists() and time.monotonic()<deadline:
         typed+=len(os.read(0,4096))
         (home/'typed-progress.next').write_text(str(typed))
         os.replace(home/'typed-progress.next',home/'typed-progress')
-    if mode in ('auth_recovery','auth_prompt','auth_resume_fails','auth_typing','task','busy') and (home/'provider-probe').exists() and not probed:
+    if mode in ('auth_recovery','auth_prompt','auth_resume_fails','auth_typing','auth_revoked','auth_expired','auth_login','task','busy') and (home/'provider-probe').exists() and not probed:
         status=provider_status()
         if mode!='busy' or not first_launch:
-            hook('StopFailure',error='authentication_failed') if status==401 else hook('Stop')
+            details={'auth_revoked':'OAuth token revoked','auth_expired':'401 OAuth access token has expired','auth_login':'Please run /login'}.get(mode)
+            hook('StopFailure',error='unknown' if details else 'authentication_failed',error_details=details) if status==401 else hook('Stop')
         probed=True
     if (home/'provider-retry').exists() and not retried:
         status=provider_status()
@@ -323,7 +336,11 @@ impl Fixture {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        panic!("the child did not automatically resume at the next verified idle point");
+        panic!(
+            "the child did not automatically resume; last restart status: {}",
+            std::fs::read_to_string(self.directory().join("restart-status.json"))
+                .unwrap_or_default()
+        );
     }
     fn finish_recovered(&mut self) {
         std::fs::write(self.home.path().join("release"), "").unwrap();
@@ -405,10 +422,10 @@ impl Fixture {
             1
         );
         assert_eq!(self.run()["token"], "token-1");
-        assert_eq!(
-            self.state.lock().unwrap().requests.len(),
-            1,
-            "only the initial token grant is allowed"
+        assert!(
+            self.state.lock().unwrap().requests.iter().skip(1)
+                .all(|request| request["observe"] == true && request["previous_revision"].is_null()),
+            "busy sessions may observe the server but must not force-refresh a live token"
         );
         assert!(
             !self
@@ -460,35 +477,238 @@ fn a_revoked_idle_child_automatically_resumes_the_same_session_and_account() {
 }
 
 #[test]
-fn a_revoked_busy_child_alerts_and_resumes_only_after_its_task_finishes() {
+fn revoked_token_restarts_despite_background_task() {
     let mut f = Fixture::start("task", 600_000, false);
     f.wait("background_task", "deferred");
-    let first = f.run();
+    assert!(f.home.path().join("task-progress").exists());
+    assert!(!f.home.path().join("task-done").exists());
     f.revoke();
     std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
-    let blocked = f.wait("background_task", "blocked");
-    assert_eq!(blocked["attention_required"], true);
-    assert_eq!(f.runs(), vec![first]);
-    assert!(!f.home.path().join("terminated").exists());
-    let progress = std::fs::read(f.home.path().join("task-progress")).unwrap();
-    std::thread::sleep(Duration::from_millis(150));
-    assert_ne!(
-        std::fs::read(f.home.path().join("task-progress")).unwrap(),
-        progress
-    );
-    let count = f
-        .journal()
-        .iter()
-        .filter(|row| row["stage"] == "blocked")
-        .count();
-    assert_eq!(
-        count, 1,
-        "one actionable blocked alert for this observation"
-    );
-    std::fs::write(f.home.path().join("task-release"), "").unwrap();
     f.wait_recovered();
-    assert!(f.home.path().join("task-done").exists());
+    assert!(
+        f.state
+            .lock()
+            .unwrap()
+            .provider_requests
+            .iter()
+            .any(|request| { request["status"] == 401 && request["revoked"] == true })
+    );
+    assert!(f.home.path().join("terminated").exists());
+    assert!(
+        !f.home.path().join("task-done").exists(),
+        "tK case: recovery must stop the revoked child and its task before natural task completion"
+    );
+    let forced: Vec<_> = f
+        .journal()
+        .into_iter()
+        .filter(|event| event["event"] == "restart_forced")
+        .collect();
+    assert_eq!(forced.len(), 1, "count each actual forced restart once");
+    assert_eq!(
+        forced[0]["metric"]["name"],
+        "claudectl_restart_forced_total"
+    );
+    assert_eq!(forced[0]["metric"]["value"], 1);
+    assert_eq!(forced[0]["route"], "voice_inbox");
     std::thread::sleep(Duration::from_millis(450));
+    f.finish_recovered();
+}
+
+#[test]
+fn expiry_restarts_even_after_hook_failure() {
+    let mut f = Fixture::start("hook_error", 1_500, false);
+    f.wait("evidence_unknown", "warn");
+    f.state.lock().unwrap().life_ms = 600_000;
+    f.wait_recovered();
+    f.finish_recovered();
+}
+
+#[test]
+fn a_child_ignoring_sigterm_is_killed_after_the_save_grace_and_resumed() {
+    let mut f = Fixture::start("ignore_term", 1_500, false);
+    f.wait("quiet_window", "warn");
+    f.state.lock().unwrap().life_ms = 600_000;
+    let start = Instant::now();
+    let end = start + Duration::from_secs(25);
+    while f.runs().len() < 2 && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(f.home.path().join("term-received").exists());
+    assert!(
+        start.elapsed() >= Duration::from_secs(20),
+        "allow Claude to save before SIGKILL"
+    );
+    assert_eq!(
+        f.runs().len(),
+        2,
+        "a leader ignoring SIGTERM must not strand recovery"
+    );
+    f.finish_recovered();
+}
+
+#[test]
+fn failed_recovery_attempt_is_counted_once_then_recovers() {
+    let mut f = Fixture::start("auth_recovery", 600_000, false);
+    f.wait("quiet_window", "deferred");
+    {
+        let mut state = f.state.lock().unwrap();
+        state.current_revoked = true;
+        state.token_failures = 1;
+    }
+    std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+    f.wait_recovered();
+    let failures: Vec<_> = f
+        .journal()
+        .into_iter()
+        .filter(|event| event["event"] == "recovery_failed")
+        .collect();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["reason"], "acquire");
+    assert_eq!(
+        failures[0]["metric"]["name"],
+        "claudectl_recovery_failed_total"
+    );
+    assert_eq!(failures[0]["metric"]["value"], 1);
+    assert_eq!(failures[0]["route"], "voice_inbox");
+    f.finish_recovered();
+}
+
+#[test]
+fn auth_failure_messages_trigger_recovery_without_logging_raw_details() {
+    for mode in ["auth_revoked", "auth_expired", "auth_login"] {
+        let mut f = Fixture::start(mode, 600_000, false);
+        f.wait("quiet_window", "deferred");
+        f.state.lock().unwrap().pause_observe = true;
+        f.revoke();
+        std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+        let end = Instant::now() + Duration::from_secs(3);
+        let events = loop {
+            let events = std::fs::read_to_string(f.directory().join("events")).unwrap_or_default();
+            if events.contains("authentication_failed") || Instant::now() >= end {
+                assert!(events.contains("authentication_failed"));
+                break events;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(!events.contains("error_details"));
+        f.state.lock().unwrap().pause_observe = false;
+        f.wait_recovered();
+        assert!(
+            !f.journal()
+                .iter()
+                .any(|event| event.to_string().contains("token-"))
+        );
+        f.finish_recovered();
+    }
+}
+
+#[test]
+fn a_held_restart_lock_cannot_block_expired_token_recovery() {
+    let mut f = Fixture::start("busy", 1_500, false);
+    f.wait("running_turn", "warn");
+    f.state.lock().unwrap().life_ms = 600_000;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.directory().join("restart.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    f.wait_recovered();
+    drop(lock);
+    f.finish_recovered();
+}
+
+#[test]
+fn a_busy_journal_does_not_drop_a_forced_restart_metric() {
+    let mut f = Fixture::start("auth_recovery", 600_000, false);
+    f.wait("quiet_window", "deferred");
+    let journal = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(
+            f.home
+                .path()
+                .join(".claudectl/server/restart-decisions.jsonl"),
+        )
+        .unwrap();
+    journal.lock().unwrap();
+    f.revoke();
+    std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+    f.wait_recovered();
+    assert_eq!(
+        f.journal()
+            .iter()
+            .filter(|event| event["event"] == "restart_forced")
+            .count(),
+        1
+    );
+    drop(journal);
+    f.finish_recovered();
+}
+
+#[test]
+fn a_failed_recovery_spawn_is_counted_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = Fixture::start("auth_recovery", 600_000, false);
+    f.wait("quiet_window", "deferred");
+    std::fs::set_permissions(
+        f.directory().join("claude"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    f.revoke();
+    std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+    let end = Instant::now() + Duration::from_secs(4);
+    while f.child.as_mut().unwrap().try_wait().unwrap().is_none() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(f.child.as_mut().unwrap().try_wait().unwrap().is_some());
+    let output = f.child.take().unwrap().wait_with_output().unwrap();
+    assert!(!output.status.success());
+    let failures: Vec<_> = f
+        .journal()
+        .into_iter()
+        .filter(|event| event["event"] == "recovery_failed")
+        .collect();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["reason"], "spawn");
+}
+
+#[test]
+fn repeated_failures_keep_all_metrics_and_throttle_voice_notices() {
+    let mut f = Fixture::start("auth_recovery", 600_000, false);
+    f.wait("quiet_window", "deferred");
+    {
+        let mut state = f.state.lock().unwrap();
+        state.current_revoked = true;
+        state.token_failures = 21;
+    }
+    std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+    f.wait_recovered();
+    let events = f.journal();
+    let failures: Vec<_> = events
+        .iter()
+        .filter(|event| event["metric"]["name"] == "claudectl_recovery_failed_total")
+        .collect();
+    assert_eq!(
+        failures.len(),
+        21,
+        "retain a counter increment for every failed attempt"
+    );
+    assert_eq!(
+        failures
+            .iter()
+            .filter(|event| event["route"] == "voice_inbox")
+            .count(),
+        11
+    );
+    assert_eq!(
+        failures
+            .iter()
+            .filter(|event| event["event"] == "recovery_failed")
+            .count(),
+        11
+    );
     f.finish_recovered();
 }
 
@@ -507,7 +727,7 @@ fn an_auth_recovery_preserves_terminal_foreground_for_the_same_session() {
 }
 
 #[test]
-fn terminal_input_keeps_auth_recovery_blocked_across_coarse_tty_timestamps() {
+fn terminal_input_does_not_defer_auth_recovery() {
     use std::io::Write;
     let mut f = Fixture::start("auth_typing", 600_000, true);
     f.wait("quiet_window", "deferred");
@@ -525,70 +745,31 @@ fn terminal_input_keeps_auth_recovery_blocked_across_coarse_tty_timestamps() {
     }
     assert!(
         f.home.path().join("typed-progress").exists(),
-        "fixture setup UNKNOWN: owned PTY did not deliver input"
+        "owned PTY must deliver input"
     );
+    let start = Instant::now();
     f.revoke();
     std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
-    f.wait("terminal_input", "blocked");
-    // Real PTY reads keep happening across the kernel's eight-second timestamp buckets.
-    // Never write the bytes to disk: only the synthetic byte count is observed.
-    let end = Instant::now() + Duration::from_secs(9);
-    while Instant::now() < end {
-        f.child
-            .as_mut()
-            .unwrap()
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(b"x")
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(
-            f.runs().len(),
-            1,
-            "active terminal typing must block auth-recovery SIGTERM despite matching coarse timestamps"
-        );
-        assert!(!f.home.path().join("terminated").exists());
-    }
-    let typed: usize = std::fs::read_to_string(f.home.path().join("typed-progress"))
-        .unwrap()
-        .parse()
-        .unwrap();
+    let runs = f.wait_recovered();
     assert!(
-        typed > 100,
-        "owned child must have read input throughout the observation"
+        start.elapsed() < Duration::from_secs(4),
+        "typing cannot add a terminal observation delay"
     );
-    f.wait_recovered();
+    assert!(
+        runs.iter()
+            .all(|run| run["tty"] == true && run["foreground"] == true)
+    );
     f.finish_recovered();
 }
 
 #[test]
-fn a_naturally_expired_busy_child_alerts_then_resumes_once_after_its_turn() {
-    let mut f = Fixture::start("busy", 2_500, false);
+fn a_naturally_expired_busy_child_resumes_before_its_turn_finishes() {
+    let mut f = Fixture::start("busy", 1_500, false);
     f.wait("running_turn", "warn");
-    let blocked = f.wait("running_turn", "blocked");
-    assert_eq!(blocked["attention_required"], true);
-    assert_eq!(f.runs().len(), 1);
-    assert!(!f.home.path().join("terminated").exists());
-    std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
-    let end = Instant::now() + Duration::from_secs(2);
-    while f.state.lock().unwrap().provider_requests.is_empty() && Instant::now() < end {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let requests = f.state.lock().unwrap().provider_requests.clone();
-    assert_eq!(requests[0]["status"], 401);
-    assert_eq!(requests[0]["revoked"], false);
-    assert!(requests[0]["at"].as_i64().unwrap() >= requests[0]["expires_at"].as_i64().unwrap());
-    let progress = std::fs::read(f.home.path().join("busy-progress")).unwrap();
-    std::thread::sleep(Duration::from_millis(150));
-    assert_ne!(
-        std::fs::read(f.home.path().join("busy-progress")).unwrap(),
-        progress
-    );
+    assert!(f.home.path().join("busy-progress").exists());
     f.state.lock().unwrap().life_ms = 600_000;
-    std::fs::write(f.home.path().join("become-idle"), "").unwrap();
     f.wait_recovered();
-    std::thread::sleep(Duration::from_millis(450));
+    assert!(!f.home.path().join("become-idle").exists());
     f.finish_recovered();
 }
 
@@ -631,6 +812,13 @@ fn a_failed_auth_resume_does_not_start_a_different_conversation() {
         "auth recovery must stop when the original conversation cannot resume, not start a fresh one"
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("authentication recovery stopped"));
+    let failures: Vec<_> = f
+        .journal()
+        .into_iter()
+        .filter(|event| event["event"] == "recovery_failed")
+        .collect();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["reason"], "resume");
 }
 
 #[test]
@@ -663,21 +851,35 @@ fn a_successful_retry_clears_stale_auth_failure_without_rotating_the_shared_gran
     let mut f = Fixture::start("task", 600_000, false);
     f.wait("background_task", "deferred");
     let first = f.run();
-    f.state.lock().unwrap().reject_once = true;
+    {
+        let mut state = f.state.lock().unwrap();
+        state.reject_once = true;
+        state.pause_observe = true;
+    }
     std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
-    f.wait("background_task", "blocked");
-    assert_eq!(f.state.lock().unwrap().provider_requests[0]["status"], 401);
-
-    std::fs::write(f.home.path().join("provider-retry"), "").unwrap();
-    let end = Instant::now() + Duration::from_secs(2);
-    while f.state.lock().unwrap().provider_requests.len() < 2 && Instant::now() < end {
+    let end = Instant::now() + Duration::from_secs(3);
+    while f.state.lock().unwrap().provider_requests.is_empty() && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(10));
     }
+    assert_eq!(f.state.lock().unwrap().provider_requests[0]["status"], 401);
+    std::fs::write(f.home.path().join("provider-retry"), "").unwrap();
+    let end = Instant::now() + Duration::from_secs(3);
+    loop {
+        let events = std::fs::read_to_string(f.directory().join("events")).unwrap_or_default();
+        let stops = events
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["event"] == "Stop")
+            .count();
+        if stops >= 2 || Instant::now() >= end {
+            assert!(stops >= 2);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    f.state.lock().unwrap().pause_observe = false;
     assert_eq!(f.state.lock().unwrap().provider_requests[1]["status"], 200);
-    let status = f.wait("background_task", "deferred");
-    assert_eq!(status["attention_required"], false);
-    std::fs::write(f.home.path().join("task-release"), "").unwrap();
-    f.wait("quiet_window", "deferred");
+    f.wait("background_task", "deferred");
     assert_eq!(f.runs(), vec![first]);
     assert!(!f.home.path().join("terminated").exists());
     assert_eq!(f.state.lock().unwrap().generation, 1);
@@ -691,6 +893,7 @@ fn a_successful_retry_clears_stale_auth_failure_without_rotating_the_shared_gran
     );
     f.finish();
 }
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.state.lock().unwrap().pause_observe = false;
@@ -768,12 +971,12 @@ impl Drop for HookInput {
 }
 
 #[test]
-fn a_prompt_hook_reading_input_blocks_the_auth_recovery_signal() {
+fn a_prompt_hook_reading_input_cannot_block_the_auth_recovery_signal() {
     hook_input_blocks_recovery(false);
 }
 
 #[test]
-fn a_prompt_hook_blocks_refreshing_the_rejected_current_grant_until_idle() {
+fn a_prompt_hook_cannot_block_refreshing_the_rejected_current_grant() {
     hook_input_blocks_recovery(true);
 }
 
@@ -797,37 +1000,19 @@ fn hook_input_blocks_recovery(reject_current: bool) {
     );
     let hook = HookInput::reading(&f);
     f.state.lock().unwrap().pause_observe = false;
-    let end = Instant::now() + Duration::from_secs(4);
-    let mut queued = false;
-    while Instant::now() < end && f.runs().len() == 1 {
-        if let Ok(bytes) = std::fs::read(f.directory().join("restart-status.json"))
-            && let Ok(status) = serde_json::from_slice::<Value>(&bytes)
-            && status["reason"] == "queued_hook"
-            && status["stage"] == "blocked"
-        {
-            queued = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        queued,
-        "a prompt hook already reading input must block auth-recovery SIGTERM"
-    );
-    assert!(!f.home.path().join("terminated").exists());
-    hook.submit();
-    f.wait("running_turn", "blocked");
-    assert_eq!(f.runs().len(), 1);
-    assert!(
+    f.wait_recovered();
+    assert!(f.home.path().join("terminated").exists());
+    assert_eq!(
         f.state
             .lock()
             .unwrap()
             .requests
             .iter()
-            .all(|r| r["previous_revision"].is_null())
+            .filter(|r| r["previous_revision"] == "revision-1")
+            .count(),
+        usize::from(reject_current),
     );
-    std::fs::write(f.home.path().join("become-idle"), "").unwrap();
-    f.wait_recovered();
+    hook.submit();
     f.finish_recovered();
 }
 
@@ -860,60 +1045,75 @@ fn quiet_window_preserves_child_token_settings_and_accounting() {
 }
 
 #[test]
-fn every_deferred_session_warns_and_blocks_without_monitor_teardown() {
-    for (mode, reason) in [
-        ("busy", "running_turn"),
-        ("task", "background_task"),
-        ("hold", "explicit_hold"),
-        ("no_hooks", "evidence_unknown"),
-        ("hook_error", "evidence_unknown"),
-        ("damaged", "evidence_unknown"),
-    ] {
-        // Cross the missing-hook timeout before expiry, rather than only its startup path.
-        let life_ms = if mode == "no_hooks" { 6_500 } else { 2_500 };
-        let mut f = Fixture::start(mode, life_ms, false);
-        let warn = f.wait(reason, "warn");
-        assert_eq!(warn["attention_required"], true);
+fn a_pending_replacement_does_not_wait_on_further_server_reads() {
+    let mut f = Fixture::start("busy", 3_600_000, false);
+    f.wait("running_turn", "deferred");
+    let before = f.state.lock().unwrap().requests.len();
+    f.revoke();
+    let end = Instant::now() + Duration::from_secs(3);
+    while f.state.lock().unwrap().requests.len() <= before && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(f.state.lock().unwrap().requests.len() > before);
+    // Let the observing response reach the wrapper, then verify admission keeps
+    // progressing from its snapshot instead of depending on another HTTP request.
+    std::thread::sleep(Duration::from_millis(150));
+    let observed = f.state.lock().unwrap().requests.len();
+    std::thread::sleep(Duration::from_millis(350));
+    let after = f.state.lock().unwrap().requests.len();
+    assert_eq!(after, observed);
+    f.finish();
+}
+
+#[test]
+fn expired_sessions_recover_despite_each_workload_blocker() {
+    for mode in ["busy", "task", "hold", "hook_error", "damaged"] {
+        let mut f = Fixture::start(mode, 1_500, false);
+        let end = Instant::now() + Duration::from_secs(3);
+        while !f.home.path().join("ready").exists() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(f.home.path().join("ready").exists());
         let hold = f.home.path().join(".claudectl/server/holds").join(format!(
             "{}.json",
             f.directory().file_name().unwrap().to_str().unwrap()
         ));
         let held = std::fs::read(&hold).ok();
-        let blocked = f.wait(reason, "blocked");
-        assert_eq!(blocked["attention_required"], true);
-        assert!(f.child.as_mut().unwrap().try_wait().unwrap().is_none());
-        for stage in ["warn", "blocked"] {
-            let rows = f.journal();
-            let matching: Vec<_> = rows.iter().filter(|r| r["stage"] == stage).collect();
-            assert!(!matching.is_empty(), "each session needs its {stage} event");
-            assert_eq!(matching[0]["metric"]["labels"]["stage"], stage);
-        }
-        let mut command = Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
-        command
-            .env_clear()
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .env("HOME", f.home.path())
-            .env("CLAUDECTL_SERVER_RUN", f.directory())
-            .arg("statusline");
-        let output = command.output().unwrap();
-        assert!(
-            String::from_utf8_lossy(&output.stdout)
-                .contains(&format!("restart deferred: {reason} (blocked)"))
-        );
-        if mode == "task" {
-            assert!(f.home.path().join("task-progress").exists());
-        }
-        let output = f.finish();
-        if mode == "no_hooks" {
-            assert!(String::from_utf8_lossy(&output.stderr).contains("sent no hook events"));
-        }
-        if mode == "task" {
-            assert!(f.home.path().join("task-done").exists());
-        }
+        f.state.lock().unwrap().life_ms = 600_000;
+        f.wait_recovered();
         if let Some(held) = held {
             assert_eq!(std::fs::read(hold).unwrap(), held);
         }
+        f.finish_recovered();
     }
+}
+
+#[test]
+fn an_expired_child_without_a_session_id_reports_one_failed_recovery() {
+    let mut f = Fixture::start("no_hooks", 1_500, false);
+    f.wait("evidence_unknown", "warn");
+    let end = Instant::now() + Duration::from_secs(4);
+    loop {
+        let count = f
+            .journal()
+            .iter()
+            .filter(|event| event["event"] == "recovery_failed" && event["reason"] == "no_session")
+            .count();
+        if count > 0 || Instant::now() >= end {
+            assert_eq!(count, 1);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        f.journal()
+            .iter()
+            .filter(|event| event["event"] == "recovery_failed")
+            .count(),
+        1
+    );
+    f.finish();
 }
 
 #[test]
