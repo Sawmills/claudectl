@@ -399,42 +399,88 @@ fn publish_session_end_intent(
         &dir.join(format!("session-end-intent.{}", std::process::id())),
         &serde_json::json!({"at":at,"session_id":session}),
     )
-    .inspect_err(|_| mark_hook_error(dir))
+    .inspect_err(|_| {
+        let _ = atomic(
+            &dir.join("session-end-error"),
+            &serde_json::json!({"at":at,"session_id":session}),
+        );
+        mark_hook_error(dir);
+    })
 }
 
 /// Typed lifecycle intent survives blocked hook input, admission and post-exit drain.
-pub(super) fn session_end_intent(dir: &std::path::Path, session: Option<&str>) -> Option<i64> {
-    std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .filter_map(|entry| {
-            if !entry
-                .file_name()
-                .to_str()?
-                .starts_with("session-end-intent.")
-            {
-                return None;
-            }
-            let value: serde_json::Value =
-                serde_json::from_slice(&super::private_read(&entry.path()).ok()?).ok()?;
-            if value["session_id"]
+pub(super) fn session_end_intent(
+    dir: &std::path::Path,
+    session: Option<&str>,
+) -> anyhow::Result<Option<i64>> {
+    match super::private_read(&dir.join("session-end-error")) {
+        Ok(bytes) => {
+            let failure: serde_json::Value = serde_json::from_slice(&bytes)?;
+            if !failure["session_id"]
                 .as_str()
                 .is_some_and(|id| Some(id) != session)
             {
-                return None;
+                anyhow::bail!("SessionEnd intent publication failed");
             }
-            value["at"].as_i64()
-        })
-        .min()
+        }
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+        Err(error) => return Err(error),
+    }
+    let mut ended = None;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("session-end-intent.")
+        {
+            continue;
+        }
+        let bytes = match super::private_read(&entry.path()) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let at = value["at"]
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("SessionEnd intent time unavailable"))?;
+        if value["session_id"]
+            .as_str()
+            .is_some_and(|id| Some(id) != session)
+        {
+            continue;
+        }
+        ended = Some(ended.map_or(at, |before: i64| before.min(at)));
+    }
+    if ended.is_none() {
+        // A readable directory can still refuse native exit-intent publication.
+        use std::io::Write;
+        let mut probe = tempfile::Builder::new()
+            .prefix("exit-intent-probe.")
+            .tempfile_in(dir)?;
+        probe.write_all(b"{}\n")?;
+    }
+    Ok(ended)
 }
 
 pub(super) fn clear_session_end_intents(dir: &std::path::Path) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("session-end-intent.")
+        if entry.file_name() == "session-end-error"
+            || entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("session-end-intent.")
         {
             std::fs::remove_file(entry.path())?;
         }
@@ -1181,12 +1227,16 @@ mod tests {
             }
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while session_end_intent(&dir, Some("s")).is_none() && std::time::Instant::now() < deadline
+        while session_end_intent(&dir, Some("s")).unwrap().is_none()
+            && std::time::Instant::now() < deadline
         {
             std::thread::yield_now();
         }
-        assert_eq!(session_end_intent(&dir, Some("s")), Some(42));
-        assert_eq!(session_end_intent(&dir, Some("another-session")), None);
+        assert_eq!(session_end_intent(&dir, Some("s")).unwrap(), Some(42));
+        assert_eq!(
+            session_end_intent(&dir, Some("another-session")).unwrap(),
+            None
+        );
         let (mut child, mut gate, idle) = idle_hook_gate(root.path(), &dir);
         assert!(!gate.check(
             &idle,
@@ -1195,7 +1245,7 @@ mod tests {
         ));
         drop(lock);
         worker.join().unwrap().unwrap();
-        assert_eq!(session_end_intent(&dir, Some("s")), None);
+        assert_eq!(session_end_intent(&dir, Some("s")).unwrap(), None);
         drop(child.stdin.take());
         child.wait().unwrap();
     }

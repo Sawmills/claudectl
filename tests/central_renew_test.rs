@@ -167,7 +167,7 @@ if mode=='task' and first_launch:
     folder.mkdir(parents=True)
     with (folder/'task.output').open('w') as out:
         task=subprocess.Popen([sys.executable,'-c',"import os,time; from pathlib import Path; h=Path(os.environ['HOME']); end=time.monotonic()+15\nwhile not (h/'release').exists() and not (h/'task-release').exists() and time.monotonic()<end:\n (h/'task-progress').write_text(str(time.monotonic())); time.sleep(.02)\n(h/'task-done').touch()"],stdout=out,stderr=out)
-if mode=='hold':
+if mode=='hold' and first_launch:
     subprocess.run([os.environ['FAKE_WRAPPER_BIN'],'hold','start','--reason','FLT-553 synthetic step'],check=True)
 if mode=='hook_error': (run/'hook-error').touch()
 if mode=='damaged':
@@ -180,7 +180,11 @@ probed=False
 retried=False
 became_idle=False
 typed=0
+hold_ended=False
 while not (home/'release').exists() and time.monotonic()<deadline:
+    if mode=='hold' and first_launch and not hold_ended and (home/'end-hold').exists():
+        subprocess.run([os.environ['FAKE_WRAPPER_BIN'],'hold','end'],check=True)
+        hold_ended=True
     if mode=='auth_typing' and select.select([0],[],[],0)[0]:
         typed+=len(os.read(0,4096))
         (home/'typed-progress.next').write_text(str(typed))
@@ -1127,6 +1131,78 @@ fn a_session_end_hook_blocked_on_input_prevents_forced_recovery() {
     f.finish();
     drop(hook);
 }
+
+#[test]
+fn unreadable_session_end_intent_prevents_forced_recovery() {
+    let mut f = Fixture::start("auth_recovery", 600_000, false);
+    f.wait("quiet_window", "deferred");
+    std::fs::create_dir(
+        f.directory()
+            .join(format!("session-end-intent.{}", std::process::id())),
+    )
+    .unwrap();
+    f.revoke();
+    std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        f.runs().len(),
+        1,
+        "unreadable exit intent must not authorize resume"
+    );
+    assert!(!f.home.path().join("terminated").exists());
+    let failures = f
+        .journal()
+        .into_iter()
+        .filter(|event| event["event"] == "recovery_failed")
+        .collect::<Vec<_>>();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["stage"], "session_end_intent");
+    assert_eq!(
+        failures[0]["metric"]["name"],
+        "claudectl_recovery_failed_total"
+    );
+    f.finish();
+}
+
+#[test]
+fn failed_session_end_publication_is_not_an_unrelated_hook_failure() {
+    let mut f = Fixture::start("auth_recovery", 600_000, false);
+    f.wait("quiet_window", "deferred");
+    let command = f.run()["settings"]["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let script = format!("mkdir \"$TEST_SESSION_DIR/session-end-intent.$$\"\nexec {command}");
+    let child = Command::new("/bin/sh")
+        .args(["-c", &script])
+        .env_clear()
+        .env("HOME", f.home.path())
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("TEST_SESSION_DIR", f.directory())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let blocked = f
+        .directory()
+        .join(format!("session-end-intent.{}", child.id()));
+    assert!(child.wait_with_output().unwrap().status.success());
+    std::fs::remove_dir(blocked).unwrap();
+    f.revoke();
+    std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(f.runs().len(), 1);
+    assert!(!f.home.path().join("terminated").exists());
+    let failures = f
+        .journal()
+        .into_iter()
+        .filter(|event| event["event"] == "recovery_failed")
+        .collect::<Vec<_>>();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["stage"], "session_end_intent");
+    f.finish();
+}
 impl Drop for HookInput {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
@@ -1248,19 +1324,32 @@ fn expired_sessions_recover_despite_each_workload_blocker() {
         f.state.lock().unwrap().life_ms = 600_000;
         if mode == "hold" {
             f.wait("explicit_hold", "blocked");
+            std::thread::sleep(Duration::from_millis(500));
             assert_eq!(f.runs().len(), 1);
             assert!(!f.home.path().join("terminated").exists());
+            assert_eq!(
+                std::fs::read(&hold).unwrap(),
+                held.as_ref().unwrap().as_slice()
+            );
+            let blocked = f
+                .journal()
+                .into_iter()
+                .filter(|event| event["event"] == "restart_blocked_by_hold")
+                .collect::<Vec<_>>();
+            assert_eq!(blocked.len(), 1);
+            assert_eq!(blocked[0]["hold"]["reason"], "FLT-553 synthetic step");
+            std::fs::write(f.home.path().join("end-hold"), "").unwrap();
         }
         f.wait_recovered();
-        if let Some(held) = held {
-            assert_eq!(std::fs::read(hold).unwrap(), held);
+        if held.is_some() {
+            assert!(!hold.exists());
             let forced = f
                 .journal()
                 .into_iter()
                 .filter(|event| event["event"] == "restart_forced")
                 .collect::<Vec<_>>();
             assert_eq!(forced.len(), 1);
-            assert_eq!(forced[0]["hold"]["reason"], "FLT-553 synthetic step");
+            assert!(forced[0]["hold"].is_null());
         }
         f.finish_recovered();
     }

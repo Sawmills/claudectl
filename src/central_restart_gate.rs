@@ -1,5 +1,5 @@
 //! Admission for automatic renewal/failover. Authentication recovery overrides workload
-//! deferral, with a bounded ten-minute exception for active explicit production holds.
+//! deferral; explicit holds and unknown exit intent remain lifecycle vetoes.
 use super::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -87,17 +87,15 @@ pub(super) enum RecoveryFailure {
     UnusableReplacement,
     StatusPublish,
     Signal,
+    SessionEndIntent,
     Spawn,
     Teardown,
     Persist,
     Resume,
 }
 
-enum RecoveryEvent<'a> {
-    Forced {
-        reason: Forced,
-        hold: Option<&'a Hold>,
-    },
+enum RecoveryEvent {
+    Forced(Forced),
     Failed(RecoveryFailure),
 }
 
@@ -200,21 +198,19 @@ fn recovery_event(
     directory: &Path,
     session: Option<&str>,
     cause: Cause,
-    event: RecoveryEvent<'_>,
+    event: RecoveryEvent,
 ) -> Result<()> {
     let failed = matches!(event, RecoveryEvent::Failed(_));
-    let (mut event, metric, reason, hold) = match event {
-        RecoveryEvent::Forced { reason, hold } => (
+    let (mut event, metric, reason) = match event {
+        RecoveryEvent::Forced(reason) => (
             "restart_forced",
             "claudectl_restart_forced_total",
             json!(reason),
-            hold,
         ),
         RecoveryEvent::Failed(reason) => (
             "recovery_failed",
             "claudectl_recovery_failed_total",
             json!(reason),
-            None,
         ),
     };
     let mut route = Some("voice_inbox");
@@ -241,7 +237,6 @@ fn recovery_event(
             "at":now(),"event":event,"run":run_id(directory)?,"session_id":session,
             "cause":cause,"reason":reason,"stage":stage,"route":route,
             "throttle_state_unavailable":throttle_state_unavailable,
-            "hold":hold.map(|hold| json!({"run":hold.run,"reason":hold.reason,"at":hold.at})),
             "metric":{"name":metric,"value":1,"labels":{"cause":cause,"reason":reason,"stage":stage}},
         }),
     )
@@ -389,6 +384,7 @@ enum Reason {
     ExplicitHold,
     StaleHold,
     EvidenceUnknown,
+    ExitIntentUnknown,
     QuietWindow,
     RestartPending,
 }
@@ -416,14 +412,6 @@ struct ObservedQuiet {
 
 const QUIET_WINDOW: Duration = Duration::from_secs(600);
 
-fn forced_hold_limit() -> Duration {
-    if cfg!(debug_assertions) && std::env::var("CLAUDECTL_TEST_RENEW_FAST").as_deref() == Ok("1") {
-        Duration::from_millis(300)
-    } else {
-        QUIET_WINDOW
-    }
-}
-
 /// Holds ordinary restart admission until the final evidence check and signal.
 pub(super) struct Admission {
     _restart: Option<File>,
@@ -447,8 +435,8 @@ pub(super) struct Gate {
     terminal: Option<PathBuf>,
     production: ProductionEvidence,
     state: RestartState,
-    restart_origin: Option<Instant>,
-    overridden_hold: Option<Hold>,
+    last_hold_notice: Option<(i64, String, Instant)>,
+    exit_intent_failed: bool,
 }
 
 impl Gate {
@@ -473,8 +461,8 @@ impl Gate {
             terminal: None,
             production: ProductionEvidence::default(),
             state: RestartState::Watching,
-            restart_origin: None,
-            overridden_hold: None,
+            last_hold_notice: None,
+            exit_intent_failed: false,
         }
     }
 
@@ -511,6 +499,54 @@ impl Gate {
         }
     }
 
+    fn blocked_by_hold(
+        &mut self,
+        hold: &Hold,
+        idle: &super::renew::Idle,
+        cause: Cause,
+        at: Instant,
+    ) {
+        if self
+            .last_hold_notice
+            .as_ref()
+            .is_some_and(|(created, reason, last)| {
+                *created == hold.at
+                    && *reason == hold.reason
+                    && at.saturating_duration_since(*last) < QUIET_WINDOW
+            })
+        {
+            return;
+        }
+        self.last_hold_notice = Some((hold.at, hold.reason.clone(), at));
+        let _ = append_restart_record(
+            &self.home,
+            &json!({
+                "at":now(),"event":"restart_blocked_by_hold","run":hold.run,
+                "session_id":idle.session,"cause":cause,"reason":"explicit_hold","stage":"blocked",
+                "route":"voice_inbox","hold":{"run":hold.run,"reason":hold.reason,"at":hold.at}
+            }),
+        );
+    }
+
+    pub(super) fn exit_intent_unknown(
+        &mut self,
+        idle: &super::renew::Idle,
+        cause: Cause,
+        expires_at: i64,
+    ) {
+        if !self.exit_intent_failed {
+            recovery_failed(
+                &self.home,
+                &self.directory,
+                idle.session.as_deref(),
+                cause,
+                RecoveryFailure::SessionEndIntent,
+            );
+            self.exit_intent_failed = true;
+        }
+        self.record(Some(Reason::ExitIntentUnknown), idle, cause, expires_at);
+    }
+
     pub(super) fn signalled(&mut self, cause: Cause, session: Option<&str>) {
         if self.state == RestartState::Restarting {
             return;
@@ -521,10 +557,7 @@ impl Gate {
                 &self.directory,
                 session,
                 cause,
-                RecoveryEvent::Forced {
-                    reason,
-                    hold: self.overridden_hold.as_ref(),
-                },
+                RecoveryEvent::Forced(reason),
             );
         }
         self.state = self.state.transition(RestartEvent::Signalled);
@@ -579,33 +612,32 @@ impl Gate {
             self.state = self.state.transition(RestartEvent::AuthFailed);
         }
         self.state = self.state.transition(RestartEvent::Tick(observed_at));
-        let event_origin = match self.state {
-            RestartState::Ready {
-                requested_at: Some(at),
-                ..
-            } => Some(at),
-            RestartState::Ready { .. } => Some(observed_at),
-            _ => None,
-        };
-        self.restart_origin =
-            event_origin.map(|at| self.restart_origin.map_or(at, |since| since.min(at)));
-        self.overridden_hold = None;
-        if super::renew::session_end_intent(&self.directory, idle.session.as_deref()).is_some() {
-            return false;
+        match super::renew::session_end_intent(&self.directory, idle.session.as_deref()) {
+            Ok(Some(_)) => {
+                self.exit_intent_failed = false;
+                return false;
+            }
+            Ok(None) => self.exit_intent_failed = false,
+            Err(_) => {
+                self.exit_intent_unknown(idle, cause, held_expires_at);
+                return false;
+            }
         }
         if self.forced(cause).is_some() {
             if idle.session.is_none() || idle.ended.is_some() {
                 return false;
             }
-            if let Ok(Some(hold)) = read_hold(&self.home, &self.directory)
-                && process_start(hold.owner_pid).is_ok_and(|start| start == hold.owner_started)
-            {
-                let since = self.restart_origin.get_or_insert(observed_at);
-                if observed_at.saturating_duration_since(*since) < forced_hold_limit() {
+            match read_hold(&self.home, &self.directory) {
+                Ok(Some(hold)) => {
                     self.record(Some(Reason::ExplicitHold), idle, cause, held_expires_at);
+                    self.blocked_by_hold(&hold, idle, cause, observed_at);
                     return false;
                 }
-                self.overridden_hold = Some(hold);
+                Ok(None) => self.last_hold_notice = None,
+                Err(_) => {
+                    self.record(Some(Reason::EvidenceUnknown), idle, cause, held_expires_at);
+                    return false;
+                }
             }
             // Diagnostics are best effort here; unavailable evidence must not strand a
             // dead session. Session lifecycle still belongs to the user.
@@ -810,10 +842,10 @@ impl Gate {
     }
 }
 
-/// Hold ordinary restart admission while retaining the original forced deadlines.
+/// An explicit production hold prevents every restart until it is ended.
 #[derive(clap::Subcommand)]
 pub enum HoldCommand {
-    /// Hold auth recovery for at most ten minutes from its first failure; never extend renewal's deadline
+    /// Hold this run until hold end, including auth recovery and token expiry
     Start {
         /// Ticket and production step; kept locally, never a metric label
         #[arg(long)]
@@ -1184,12 +1216,6 @@ pub fn hold(paths: &Paths, command: HoldCommand) -> Result<()> {
                 bail!(
                     "this server wrapper does not support holds; do not start the production step"
                 );
-            }
-            if status["expires_at"]
-                .as_i64()
-                .is_some_and(|expiry| expiry <= now())
-            {
-                bail!("the held token has expired; recovery overrides holds");
             }
             if status["renewal"] == "renewing" {
                 bail!("server run is already restarting; hold was not started");
@@ -2136,11 +2162,11 @@ mod tests {
     }
 
     #[test]
-    fn an_active_hold_delays_a_forced_restart_for_at_most_ten_minutes() {
-        for (cause, pending_replacement, first_check_seconds) in [
-            (Cause::AuthRecovery, false, 0),
-            (Cause::Renewal, true, 0),
-            (Cause::AuthRecovery, true, 300),
+    fn an_explicit_hold_blocks_restarts_and_throttles_named_notices() {
+        for (cause, pending_replacement, first_check_seconds, notices) in [
+            (Cause::AuthRecovery, false, 0, 3),
+            (Cause::Renewal, true, 0, 2),
+            (Cause::AuthRecovery, true, 300, 2),
         ] {
             let (_home, mut gate, mut idle) = setup();
             let path = hold_path(&gate.home, &gate.directory).unwrap();
@@ -2161,41 +2187,48 @@ mod tests {
             if pending_replacement {
                 gate.request_at(Cause::Renewal, start);
             }
-            assert!(
-                !gate.check_at(
-                    &idle,
-                    cause,
-                    i64::MAX,
-                    start + Duration::from_secs(first_check_seconds)
-                ),
-                "an active hold must initially delay the forced signal"
-            );
+            assert!(!gate.check_at(
+                &idle,
+                cause,
+                i64::MAX,
+                start + Duration::from_secs(first_check_seconds)
+            ));
             idle.since = None;
-            assert!(!gate.check_at(&idle, cause, i64::MAX, start + Duration::from_secs(599)));
-            assert!(
-                gate.check_at(&idle, cause, i64::MAX, start + Duration::from_secs(600)),
-                "{cause:?} must use the original event, not an added force-condition window"
-            );
-            gate.signalled(cause, idle.session.as_deref());
-            gate.signalled(cause, idle.session.as_deref());
+            for seconds in [599, 600, 600, 1200] {
+                assert!(
+                    !gate.check_at(&idle, cause, i64::MAX, start + Duration::from_secs(seconds)),
+                    "an explicit hold must remain a veto at {seconds}s"
+                );
+            }
             let records = std::fs::read_to_string(
                 gate.home.join(".claudectl/server/restart-decisions.jsonl"),
             )
             .unwrap();
-            let forced = records
+            let events = records
                 .lines()
                 .map(|line| serde_json::from_str::<Value>(line).unwrap())
-                .filter(|event| event["event"] == "restart_forced")
                 .collect::<Vec<_>>();
-            assert_eq!(forced.len(), 1);
-            assert_eq!(forced[0]["hold"]["reason"], "FLT-726 production step");
-            assert_eq!(forced[0]["hold"]["run"], "run-gate");
-            assert_eq!(
-                forced[0]["metric"]["name"],
-                "claudectl_restart_forced_total"
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["event"] != "restart_forced")
             );
-            assert_eq!(forced[0]["metric"]["value"], 1);
-            assert_eq!(std::fs::read(path).unwrap(), saved);
+            let blocked = events
+                .iter()
+                .filter(|event| event["event"] == "restart_blocked_by_hold")
+                .collect::<Vec<_>>();
+            assert_eq!(blocked.len(), notices);
+            assert!(
+                blocked
+                    .iter()
+                    .all(|event| event["hold"]["reason"] == "FLT-726 production step"
+                        && event["hold"]["run"] == "run-gate"
+                        && event["route"] == "voice_inbox")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            std::fs::remove_file(path).unwrap();
+            assert!(gate.check_at(&idle, cause, i64::MAX, start + Duration::from_secs(1200)));
+            gate.signalled(cause, idle.session.as_deref());
         }
     }
 

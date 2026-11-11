@@ -2,8 +2,8 @@
 //! conversations, skills, hooks and trust) and receives only a server access token in
 //! CLAUDE_CODE_OAUTH_TOKEN. The token cannot change inside a running Claude (see
 //! experiments/settings-renewal/host-config.py). Authentication failure forces recovery;
-//! ordinary renewal waits at most ten minutes. An active explicit hold may delay auth
-//! recovery only within ten minutes of the first auth failure and never extends renewal.
+//! unheld renewal waits at most ten minutes. Explicit holds and unknown SessionEnd intent
+//! veto every automatic restart.
 //! `session.json` records its expiry.
 use super::*;
 use crate::exec;
@@ -456,7 +456,7 @@ struct Outcome {
     notice: Option<String>,
 }
 /// Watches one Claude process and publishes workload/expiry status. Authentication recovery
-/// is immediate except for bounded explicit holds; renewal has a deadline and failover retains observed quiet.
+/// is immediate except for explicit holds/unknown exit intent; renewal has a deadline and failover retains observed quiet.
 #[cfg(unix)]
 struct Monitor {
     client: Client,
@@ -975,21 +975,25 @@ impl Monitor {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        let exit_intent =
+            super::renew::session_end_intent(&self.directory, activity.idle.session.as_deref());
+        if exit_intent.is_err()
+            && let Some((_, restart)) = &sent
+        {
+            gate.exit_intent_unknown(&activity.idle, restart.cause, self.held_expires_at);
+        }
         let ended = activity
             .idle
             .ended
             .into_iter()
-            .chain(super::renew::session_end_intent(
-                &self.directory,
-                activity.idle.session.as_deref(),
-            ))
+            .chain(exit_intent.as_ref().ok().copied().flatten())
             .min();
         let ended_first = matches!((&sent, ended), (Some((at, _)), Some(end)) if end <= *at);
         if let Err(error) = self.check_crons(true) {
             cron_log_error = Some(format!("could not record cron recovery: {error:#}"));
         }
         outcome.restart = sent
-            .filter(|_| !ended_first && exec::signals::pending().is_none())
+            .filter(|_| !ended_first && exit_intent.is_ok() && exec::signals::pending().is_none())
             .map(|(_, restart)| restart);
         outcome.notice = match (pending.notice.take(), cron_log_error) {
             (Some(notice), Some(error)) => Some(format!("{notice}\n{error}")),

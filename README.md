@@ -48,10 +48,11 @@ They exclude accounts with 5% or less weekly headroom and accounts that may bill
 extra usage. Authentication failure or token expiry immediately restarts the same
 session on the same account once a replacement token is available. Workload blockers,
 typing and unrelated hooks do not defer this recovery. Other token renewals wait at most
-ten minutes after a replacement revision is observed; then claudectl forces the restart.
-An active explicit production hold can delay auth recovery only until ten minutes from
-the first observed auth failure. A hold never extends renewal's ten-minute deadline from
-the first replacement observation. The forced event names any overridden hold.
+ten minutes after a replacement revision is observed when no explicit hold is active.
+Explicit production holds block every restart until `claudectl hold end`, including auth
+recovery and expiry. When a hold blocks dead-token recovery or an overdue renewal, a named
+`restart_blocked_by_hold` notice is written at most once per ten minutes. Unknown SessionEnd
+intent also prevents restart and records one recovery failure.
 Account failover still requires ten continuous minutes of observed quiet. Forced restarts
 can discard background tasks and draft input. Claude gets twenty seconds after SIGTERM
 to save its session before SIGKILL. A failed recovery is counted and retried; it does not
