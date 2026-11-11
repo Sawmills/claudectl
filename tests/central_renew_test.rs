@@ -524,6 +524,25 @@ fn expiry_restarts_even_after_hook_failure() {
 }
 
 #[test]
+fn a_corrupt_log_cannot_hide_a_later_revoked_token_failure() {
+    use std::io::Write;
+    for damaged in [b"broken record\n".as_slice(), b"partial record".as_slice()] {
+        let mut f = Fixture::start("auth_recovery", 600_000, false);
+        f.wait("quiet_window", "deferred");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(f.directory().join("events"))
+            .unwrap()
+            .write_all(damaged)
+            .unwrap();
+        f.revoke();
+        std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+        f.wait_recovered();
+        f.finish_recovered();
+    }
+}
+
+#[test]
 fn a_child_ignoring_sigterm_is_killed_after_the_save_grace_and_resumed() {
     let mut f = Fixture::start("ignore_term", 1_500, false);
     f.wait("quiet_window", "warn");
@@ -574,6 +593,34 @@ fn failed_recovery_attempt_is_counted_once_then_recovers() {
 }
 
 #[test]
+fn unavailable_throttle_storage_does_not_drop_a_recovery_failure() {
+    let mut f = Fixture::start("auth_recovery", 600_000, false);
+    f.wait("quiet_window", "deferred");
+    let streak = f.directory().join("recovery-failures.json");
+    if streak.exists() {
+        std::fs::remove_file(&streak).unwrap();
+    }
+    std::fs::create_dir(&streak).unwrap();
+    {
+        let mut state = f.state.lock().unwrap();
+        state.current_revoked = true;
+        state.token_failures = 1;
+    }
+    std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+    f.wait_recovered();
+    let failures: Vec<_> = f
+        .journal()
+        .into_iter()
+        .filter(|event| event["metric"]["name"] == "claudectl_recovery_failed_total")
+        .collect();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["reason"], "acquire");
+    assert_eq!(failures[0]["route"], "voice_inbox");
+    assert_eq!(failures[0]["throttle_state_unavailable"], true);
+    f.finish_recovered();
+}
+
+#[test]
 fn auth_failure_messages_trigger_recovery_without_logging_raw_details() {
     for mode in ["auth_revoked", "auth_expired", "auth_login"] {
         let mut f = Fixture::start(mode, 600_000, false);
@@ -616,6 +663,24 @@ fn a_held_restart_lock_cannot_block_expired_token_recovery() {
     f.wait_recovered();
     drop(lock);
     f.finish_recovered();
+}
+
+#[test]
+fn ordinary_restart_lock_contention_does_not_poison_admission() {
+    let mut f = Fixture::start("idle", 3_600_000, false);
+    f.wait("quiet_window", "deferred");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.directory().join("restart.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    std::thread::sleep(Duration::from_millis(350));
+    drop(lock);
+    f.wait("quiet_window", "deferred");
+    std::fs::write(f.home.path().join("submit"), "").unwrap();
+    f.wait("running_turn", "deferred");
+    f.finish();
 }
 
 #[test]

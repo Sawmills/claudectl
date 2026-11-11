@@ -485,8 +485,8 @@ struct Pending {
     notice: Option<String>,
 }
 /// Fold the events appended to `path` since the last read into the activity. A missing log
-/// before the first event is no error. Retain a validated prefix on failure so token
-/// expiry can still recover its known session; unknown evidence blocks ordinary admission.
+/// before the first event is no error. Salvage valid metadata after damaged records so
+/// auth failure and session exit remain visible; corruption blocks ordinary admission.
 #[cfg(unix)]
 fn read_new_events(path: &Path, activity: &mut Activity) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
@@ -497,39 +497,48 @@ fn read_new_events(path: &Path, activity: &mut Activity) -> std::io::Result<()> 
         }
         Err(error) => return Err(error),
     };
-    let mut chunk = String::new();
+    let mut failure = None;
     if file.metadata()?.len() < activity.offset {
-        return Err(std::io::Error::new(
+        activity.offset = 0;
+        failure = Some(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "hook log truncated",
         ));
     }
     file.seek(SeekFrom::Start(activity.offset))?;
-    file.read_to_string(&mut chunk)?;
-    let mut valid = 0;
-    let mut failure = None;
-    for line in chunk.split_inclusive('\n') {
-        let record = serde_json::from_str::<Value>(line);
-        let complete = line.ends_with('\n');
-        let valid_record = record.as_ref().is_ok_and(|record| {
+    let mut chunk = Vec::new();
+    file.read_to_end(&mut chunk)?;
+    let mut consumed = 0;
+    let mut valid_records = String::new();
+    for line in chunk.split_inclusive(|byte| *byte == b'\n') {
+        if !line.ends_with(b"\n") {
+            failure = Some(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "incomplete hook record",
+            ));
+            break;
+        }
+        consumed += line.len();
+        let record = serde_json::from_slice::<Value>(line);
+        let valid = record.as_ref().is_ok_and(|record| {
             record["at"].as_i64().is_some()
                 && record["event"].as_str().is_some()
                 && record["session_id"]
                     .as_str()
                     .is_some_and(|id| !id.is_empty())
         });
-        if !complete || !valid_record {
+        if !valid {
             failure = Some(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "incomplete or invalid hook record",
+                "invalid hook record",
             ));
-            break;
+            continue;
         }
-        valid += line.len();
+        valid_records.push_str(std::str::from_utf8(line).map_err(std::io::Error::other)?);
     }
-    if valid > 0 {
-        activity.offset += valid as u64;
-        let events = super::renew::parse_events(&chunk[..valid]);
+    activity.offset += consumed as u64;
+    if !valid_records.is_empty() {
+        let events = super::renew::parse_events(&valid_records);
         activity.seen_start |= events
             .iter()
             .any(|(_, e)| matches!(e, super::renew::Event::SessionStart(_)));
@@ -589,8 +598,11 @@ impl Monitor {
     /// Fold the hook events appended since the last read into the activity.
     fn read_events(&self, activity: &mut Activity) -> std::io::Result<()> {
         // A healthy writer's in-progress append must not look like damaged evidence.
-        let _admission =
-            super::restart_gate::try_admission(&self.directory).map_err(std::io::Error::other)?;
+        let _admission = super::restart_gate::try_admission(&self.directory).map_err(|error| {
+            error
+                .downcast::<std::io::Error>()
+                .unwrap_or_else(std::io::Error::other)
+        })?;
         read_new_events(&self.directory.join("events"), activity)
     }
     /// The decision inputs from the current activity, terminal and process group. Without a
@@ -678,7 +690,7 @@ impl Monitor {
                 // Stderr is Claude's terminal until it exits. Defer only the log failure.
                 cron_log_error = Some(format!("could not record cron recovery: {error:#}"));
             }
-            if sent.is_some() {
+            if let Some((_, restart)) = &sent {
                 // The owned leader gets the same save grace as other Claude launchers.
                 // Never read hooks or wait for admission while this deadline runs.
                 if signalled_at.is_some_and(|at| at.elapsed() >= exec::STOP_GRACE)
@@ -687,7 +699,7 @@ impl Monitor {
                     if unsafe { libc::kill(self.pid as i32, libc::SIGKILL) } != 0 {
                         self.failed(
                             &activity,
-                            super::restart_gate::Cause::AuthRecovery,
+                            restart.cause,
                             super::restart_gate::RecoveryFailure::Signal,
                         );
                     }
@@ -698,8 +710,10 @@ impl Monitor {
             if !self.renewable {
                 continue;
             }
-            let events_ok = self.read_events(&mut activity).is_ok();
-            if !events_ok || self.directory.join("hook-error").exists() {
+            let events_failed = self
+                .read_events(&mut activity)
+                .is_err_and(|error| error.kind() != std::io::ErrorKind::WouldBlock);
+            if events_failed || self.directory.join("hook-error").exists() {
                 outcome.note = Some("off: hook evidence unavailable".into());
                 gate.unknown(
                     &activity.idle,
@@ -832,7 +846,10 @@ impl Monitor {
                         continue;
                     }
                 };
-                if self.read_events(&mut activity).is_err() {
+                if self
+                    .read_events(&mut activity)
+                    .is_err_and(|error| error.kind() != std::io::ErrorKind::WouldBlock)
+                {
                     gate.unknown(&activity.idle, cause, self.held_expires_at);
                 }
                 if activity.idle.ended.is_some() || exec::signals::pending().is_some() {
@@ -864,7 +881,10 @@ impl Monitor {
                             continue;
                         }
                     };
-                    if self.read_events(&mut activity).is_err() {
+                    if self
+                        .read_events(&mut activity)
+                        .is_err_and(|error| error.kind() != std::io::ErrorKind::WouldBlock)
+                    {
                         gate.unknown(&activity.idle, cause, self.held_expires_at);
                     }
                 }
@@ -963,8 +983,8 @@ impl Monitor {
             .transpose()
         {
             Ok(lock) => lock,
-            Err(_) => {
-                gate.unknown(&activity.idle, cause, self.held_expires_at);
+            Err(error) => {
+                gate.admission_failed(&activity.idle, cause, self.held_expires_at, &error);
                 return Err(());
             }
         };
@@ -973,8 +993,8 @@ impl Monitor {
             .transpose()
         {
             Ok(lock) => lock,
-            Err(_) => {
-                gate.unknown(&activity.idle, cause, self.held_expires_at);
+            Err(error) => {
+                gate.admission_failed(&activity.idle, cause, self.held_expires_at, &error);
                 return Err(());
             }
         };

@@ -426,7 +426,7 @@ pub(super) fn record_hook(
     input: &str,
     now: i64,
 ) -> anyhow::Result<()> {
-    use std::io::Write;
+    use std::io::{Read, Seek, SeekFrom, Write};
     let dir = session_dir(sessions, dir)?;
     let pending = publish_hook_intent(&dir)?;
     #[cfg(unix)]
@@ -497,15 +497,23 @@ pub(super) fn record_hook(
     }
     let path = dir.join("events");
     let mut options = std::fs::OpenOptions::new();
-    options.append(true).create(true);
+    options.read(true).append(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let written = options
-        .open(&path)
-        .and_then(|mut file| writeln!(file, "{line}"));
+    let written = options.open(&path).and_then(|mut file| {
+        if file.metadata()?.len() > 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut last = [0];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")?;
+            }
+        }
+        writeln!(file, "{line}")
+    });
     if let Err(error) = written {
         mark_hook_error(&dir);
         let _ = std::fs::remove_file(&pending);

@@ -252,7 +252,7 @@ expiry retain their existing reason labels.
 An ordinary renewal uses ten continuous minutes of observed quiet when possible. A
 replacement token revision starts a separate ten-minute deadline on its first observation;
 workload changes and repeated requests never reset it. At that deadline the restart is
-forced. Observing the server happens at least every thirty seconds, including during work.
+forced. Until a usable successor is obtained, the server is observed at most thirty seconds apart, including during work. A cached successor removes further token requests from restart admission.
 Account failover retains its ten-minute quiet requirement and has no forced deadline.
 Authentication failure or expiry overrides all workload blockers immediately. Unknown hook,
 terminal, task, hold or production evidence cannot keep a dead-token session waiting.
@@ -450,8 +450,8 @@ Conversations that a `server run` before this model stored in
 directory.
 
 While Claude runs, the client refreshes usage about every five minutes when no recovery
-is pending. Safe observing reads of the account token continue during work, at most thirty
-seconds apart. Authentication failure and expiry recover on the next five-second monitor
+is pending. Safe observing reads continue during work at most thirty seconds apart until a usable
+replacement is cached; admission then proceeds without further token I/O. Authentication failure and expiry recover on the next five-second monitor
 tick plus replacement-token I/O. Ordinary renewal is forced after ten minutes from first
 observing a replacement; failover keeps its observed-quiet policy. On server outage, the
 running token works until provider expiry or rejection, and recovery errors are counted.

@@ -34,7 +34,12 @@ fn admission_lock(directory: &Path, name: &str, wait: bool) -> Result<File> {
     if wait {
         file.lock()?;
     } else {
-        file.try_lock()?;
+        file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => {
+                std::io::Error::from(std::io::ErrorKind::WouldBlock)
+            }
+            error => std::io::Error::other(error),
+        })?;
     }
     Ok(file)
 }
@@ -108,6 +113,28 @@ pub(super) fn recovery_succeeded(directory: &Path, session: Option<&str>) {
     );
 }
 
+fn append_restart_record(home: &Path, record: &Value) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(home.join(".claudectl/server/restart-decisions.jsonl"))?;
+    if !file.metadata()?.is_file() {
+        bail!("restart journal is not a regular file");
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let mut line = serde_json::to_vec(record)?;
+    line.push(b'\n');
+    // A single O_APPEND write keeps concurrent records together without waiting
+    // behind another session's advisory lock. Do not retry a partial append.
+    if file.write(&line)? != line.len() {
+        bail!("incomplete restart event append");
+    }
+    file.sync_data()?;
+    Ok(())
+}
+
 fn recovery_event(
     home: &Path,
     directory: &Path,
@@ -128,41 +155,39 @@ fn recovery_event(
             json!(reason),
         ),
     };
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(home.join(".claudectl/server/restart-decisions.jsonl"))?;
-    if !file.metadata()?.is_file() {
-        bail!("restart journal is not a regular file");
-    }
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let mut route = Some("voice_inbox");
+    let mut throttle_state_unavailable = false;
     if failed {
-        let path = directory.join("recovery-failures.json");
-        let mut streak: FailureStreak = match private_read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                FailureStreak::default()
-            }
-            Err(error) => return Err(error),
-        };
-        if streak.session_id.as_deref() != session {
-            streak = FailureStreak {
-                session_id: session.map(str::to_owned),
-                count: 0,
+        let count = (|| -> Result<u64> {
+            let path = directory.join("recovery-failures.json");
+            let mut streak: FailureStreak = match private_read(&path) {
+                Ok(bytes) => serde_json::from_slice(&bytes)?,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    FailureStreak::default()
+                }
+                Err(error) => return Err(error),
             };
-        }
-        streak.count = streak.count.saturating_add(1);
-        atomic(&path, &streak)?;
-        if streak.count > 10 && !streak.count.is_multiple_of(10) {
-            event = "recovery_metric";
-            route = None;
+            if streak.session_id.as_deref() != session {
+                streak = FailureStreak {
+                    session_id: session.map(str::to_owned),
+                    count: 0,
+                };
+            }
+            streak.count = streak.count.saturating_add(1);
+            atomic(&path, &streak)?;
+            Ok(streak.count)
+        })();
+        match count {
+            Ok(count) if count > 10 && !count.is_multiple_of(10) => {
+                event = "recovery_metric";
+                route = None;
+            }
+            Ok(_) => {}
+            Err(_) => throttle_state_unavailable = true,
         }
     }
     let stage = if failed {
@@ -170,19 +195,15 @@ fn recovery_event(
     } else {
         json!("signal")
     };
-    let mut line = serde_json::to_vec(&json!({
-        "at":now(),"event":event,"run":run_id(directory)?,"session_id":session,
-        "cause":cause,"reason":reason,"stage":stage,"route":route,
-        "metric":{"name":metric,"value":1,"labels":{"cause":cause,"reason":reason,"stage":stage}},
-    }))?;
-    line.push(b'\n');
-    // O_APPEND and one write keep concurrent records together without waiting for
-    // another session's advisory lock. Never retry an uncertain partial append.
-    if file.write(&line)? != line.len() {
-        bail!("incomplete restart event append");
-    }
-    file.sync_data()?;
-    Ok(())
+    append_restart_record(
+        home,
+        &json!({
+            "at":now(),"event":event,"run":run_id(directory)?,"session_id":session,
+            "cause":cause,"reason":reason,"stage":stage,"route":route,
+            "throttle_state_unavailable":throttle_state_unavailable,
+            "metric":{"name":metric,"value":1,"labels":{"cause":cause,"reason":reason,"stage":stage}},
+        }),
+    )
 }
 
 pub(super) fn recovery_failed(
@@ -524,6 +545,24 @@ impl Gate {
         self.record(Some(Reason::EvidenceUnknown), idle, cause, expires_at);
     }
 
+    pub(super) fn admission_failed(
+        &mut self,
+        idle: &super::renew::Idle,
+        cause: Cause,
+        expires_at: i64,
+        error: &anyhow::Error,
+    ) {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+        {
+            self.quiet = None;
+            self.record(Some(Reason::QueuedHook), idle, cause, expires_at);
+        } else {
+            self.unknown(idle, cause, expires_at);
+        }
+    }
+
     fn record(
         &mut self,
         reason: Option<Reason>,
@@ -593,24 +632,12 @@ impl Gate {
             "restart_deferred_total":self.total});
         if let Some(d) = decision {
             if self.recorded_stage != Some(d.stage) || self.recorded_session.as_deref() != session {
-                let mut file = OpenOptions::new()
-                    .read(true)
-                    .create(true)
-                    .append(true)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(self.home.join(".claudectl/server/restart-decisions.jsonl"))?;
-                file.try_lock()?;
-                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
                 let record = json!({"at":at,"event":"restart_deferred","session_id":session,
                 "run":run,"cause":d.cause,"reason":d.reason,"stage":d.stage,
                 "expires_at":expires_at,
                 "metric":{"name":"claudectl_restart_deferred_total","value":1,
                     "labels":{"cause":d.cause,"reason":d.reason,"stage":d.stage}}});
-                let mut line = serde_json::to_vec(&record)?;
-                line.push(b'\n');
-                file.write_all(&line)?;
-                file.sync_data()?;
+                append_restart_record(&self.home, &record)?;
                 self.total += 1;
                 self.recorded_stage = Some(d.stage);
                 self.recorded_session = session.map(str::to_owned);
@@ -2425,6 +2452,27 @@ mod tests {
         idle.since = Some(0);
         assert!(!gate.check(&idle, Cause::Renewal, now() + 600_000));
         assert_eq!(gate.total, 0);
+    }
+
+    #[test]
+    fn shared_journal_contention_does_not_poison_ordinary_admission() {
+        let (_home, mut gate, idle) = setup();
+        let journal = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(gate.home.join(".claudectl/server/restart-decisions.jsonl"))
+            .unwrap();
+        journal.lock().unwrap();
+        let start = Instant::now();
+        assert!(!gate.check_at(&idle, Cause::Renewal, i64::MAX, start));
+        drop(journal);
+        assert!(gate.check_at(
+            &idle,
+            Cause::Renewal,
+            i64::MAX,
+            start + Duration::from_secs(600)
+        ));
     }
 
     #[test]
