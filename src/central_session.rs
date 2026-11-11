@@ -1,8 +1,10 @@
 //! One server account per Claude process. The process keeps the host Claude config (its
 //! conversations, skills, hooks and trust) and receives only a server access token in
 //! CLAUDE_CODE_OAUTH_TOKEN. The token cannot change inside a running Claude (see
-//! experiments/settings-renewal/host-config.py). Renewal waits for safe restart admission;
-//! an expired token never authorizes killing active work. `session.json` records its expiry.
+//! experiments/settings-renewal/host-config.py). Authentication failure forces recovery;
+//! unheld renewal waits at most ten minutes. Explicit holds and unknown SessionEnd intent
+//! veto every automatic restart.
+//! `session.json` records its expiry.
 use super::*;
 use crate::exec;
 use std::{ffi::OsString, process::Command};
@@ -23,11 +25,13 @@ fn write_hook_settings(dir: &Path, hook: &Path) -> Result<PathBuf> {
     let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
     let command = format!("{} server hook {}", quote(hook), quote(dir));
     let entry = json!([{"hooks": [{"type": "command", "command": command}]}]);
+    let end =
+        json!([{"hooks": [{"type": "command", "command": format!("{command} --session-end")}]}]);
     let settings = dir.join("hooks.json");
     atomic(
         &settings,
         &json!({"hooks": {"SessionStart": entry, "UserPromptSubmit": entry,
-            "Stop": entry, "StopFailure": entry, "Notification": entry, "SessionEnd": entry}}),
+            "Stop": entry, "StopFailure": entry, "Notification": entry, "SessionEnd": end}}),
     )?;
     Ok(settings)
 }
@@ -452,7 +456,7 @@ struct Outcome {
     notice: Option<String>,
 }
 /// Watches one Claude process and publishes workload/expiry status. Authentication recovery
-/// uses verified idle; other renewal and failover retain observed quiet.
+/// is immediate except for explicit holds/unknown exit intent; renewal has a deadline and failover retains observed quiet.
 #[cfg(unix)]
 struct Monitor {
     client: Client,
@@ -463,6 +467,7 @@ struct Monitor {
     held_expires_at: i64,
     pid: u32,
     renewable: bool,
+    recovery_resume: bool,
     restarts: usize,
     tty: Option<PathBuf>,
     /// The session.json content, to mark the session renewing before SIGTERM.
@@ -484,9 +489,8 @@ struct Pending {
     notice: Option<String>,
 }
 /// Fold the events appended to `path` since the last read into the activity. A missing log
-/// before the first event is no error; any other failure is returned and leaves the activity
-/// unchanged, and the caller then stops renewing (stale idle evidence must not authorize a
-/// restart).
+/// before the first event is no error. Salvage valid metadata after damaged records so
+/// auth failure and session exit remain visible; corruption blocks ordinary admission.
 #[cfg(unix)]
 fn read_new_events(path: &Path, activity: &mut Activity) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
@@ -497,40 +501,61 @@ fn read_new_events(path: &Path, activity: &mut Activity) -> std::io::Result<()> 
         }
         Err(error) => return Err(error),
     };
-    let mut chunk = String::new();
+    let mut failure = None;
     if file.metadata()?.len() < activity.offset {
-        return Err(std::io::Error::new(
+        activity.offset = 0;
+        failure = Some(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "hook log truncated",
         ));
     }
     file.seek(SeekFrom::Start(activity.offset))?;
-    file.read_to_string(&mut chunk)?;
-    if !chunk.is_empty() && !chunk.ends_with('\n') {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "incomplete hook record",
-        ));
-    }
-    for line in chunk.lines() {
-        let record: Value = serde_json::from_str(line)?;
-        if record["at"].as_i64().is_none()
-            || record["event"].as_str().is_none()
-            || record["session_id"].as_str().is_none_or(str::is_empty)
-        {
-            return Err(std::io::Error::new(
+    let mut chunk = Vec::new();
+    file.read_to_end(&mut chunk)?;
+    let mut consumed = 0;
+    let mut valid_records = String::new();
+    for line in chunk.split_inclusive(|byte| *byte == b'\n') {
+        if !line.ends_with(b"\n") {
+            failure = Some(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "incomplete hook record",
+            ));
+            break;
+        }
+        consumed += line.len();
+        let record = serde_json::from_slice::<Value>(line);
+        let valid = record.as_ref().is_ok_and(|record| {
+            record["at"].as_i64().is_some()
+                && record["event"].as_str().is_some()
+                && record["session_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty())
+        });
+        if !valid {
+            failure = Some(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "invalid hook record",
             ));
+            continue;
         }
+        valid_records.push_str(std::str::from_utf8(line).map_err(std::io::Error::other)?);
     }
-    if let Some(end) = chunk.rfind('\n') {
-        activity.offset += end as u64 + 1;
-        let events = super::renew::parse_events(&chunk[..end]);
+    activity.offset += consumed as u64;
+    if !valid_records.is_empty() {
+        let events = super::renew::parse_events(&valid_records);
         activity.seen_start |= events
             .iter()
             .any(|(_, e)| matches!(e, super::renew::Event::SessionStart(_)));
+        activity.successful_stops = activity.successful_stops.saturating_add(
+            events
+                .iter()
+                .filter(|(_, e)| matches!(e, super::renew::Event::Stop))
+                .count() as u64,
+        );
         super::renew::fold(&mut activity.idle, &events);
+    }
+    if let Some(error) = failure {
+        return Err(error);
     }
     Ok(())
 }
@@ -555,14 +580,33 @@ struct Activity {
     offset: u64,
     idle: super::renew::Idle,
     seen_start: bool,
+    successful_stops: u64,
 }
 #[cfg(unix)]
 impl Monitor {
+    fn failed(
+        &self,
+        activity: &Activity,
+        cause: super::restart_gate::Cause,
+        stage: super::restart_gate::RecoveryFailure,
+    ) {
+        super::restart_gate::recovery_failed(
+            &self.paths.home,
+            &self.directory,
+            activity.idle.session.as_deref(),
+            cause,
+            stage,
+        );
+    }
+
     /// Fold the hook events appended since the last read into the activity.
     fn read_events(&self, activity: &mut Activity) -> std::io::Result<()> {
         // A healthy writer's in-progress append must not look like damaged evidence.
-        let _admission =
-            super::restart_gate::admission(&self.directory).map_err(std::io::Error::other)?;
+        let _admission = super::restart_gate::try_admission(&self.directory).map_err(|error| {
+            error
+                .downcast::<std::io::Error>()
+                .unwrap_or_else(std::io::Error::other)
+        })?;
         read_new_events(&self.directory.join("events"), activity)
     }
     /// The decision inputs from the current activity, terminal and process group. Without a
@@ -625,10 +669,15 @@ impl Monitor {
         let started = now();
         let mut outcome = Outcome::default();
         let mut last_usage = 0;
+        let mut usage_worker: Option<std::thread::JoinHandle<()>> = None;
         let mut last_check = 0;
-        let mut renewing = self.renewable;
         let mut activity = Activity::default();
-        let mut retry_now = false;
+        let mut was_recovering = false;
+        let mut next_access: Option<Access> = None;
+        let mut signalled_at: Option<Instant> = None;
+        let mut no_session_reported = false;
+        let mut replacement_backoff: Option<Instant> = None;
+        let mut last_successful_stops = 0;
         let mut sent: Option<(i64, Restart)> = None;
         let mut pending = Pending::default();
         let mut cron_log_error = None;
@@ -646,237 +695,306 @@ impl Monitor {
                 // Stderr is Claude's terminal until it exits. Defer only the log failure.
                 cron_log_error = Some(format!("could not record cron recovery: {error:#}"));
             }
-            if now() - last_usage >= 300_000 {
-                if let Ok(usage) = self.client.usage(&self.account_id, false) {
-                    let _ = atomic(
-                        &usage_path(&self.paths, &self.client.connection, &self.account_id),
-                        &usage,
-                    );
-                }
+            if usage_worker
+                .as_ref()
+                .is_some_and(|worker| worker.is_finished())
+            {
+                let _ = usage_worker.take().map(|worker| worker.join());
+            }
+            if usage_worker.is_none() && now() - last_usage >= 300_000 {
+                let client = self.client.clone();
+                let account_id = self.account_id.clone();
+                let path = usage_path(&self.paths, &client.connection, &account_id);
+                // Optional usage I/O must never hold recovery or child shutdown.
+                usage_worker = std::thread::Builder::new()
+                    .name("session-usage".into())
+                    .spawn(move || {
+                        if let Ok(usage) = client.usage(&account_id, false) {
+                            let _ = atomic(&path, &usage);
+                        }
+                    })
+                    .ok();
                 last_usage = now();
             }
             if let Some((_, restart)) = &sent {
-                // Await the child's own exit without a force-kill deadline, while
-                // retaining expiry attention if it ignores SIGTERM.
-                let cause = restart.cause;
-                if self.read_events(&mut activity).is_err() {
-                    gate.unknown(&activity.idle, cause, self.held_expires_at);
-                } else {
-                    gate.check(&activity.idle, cause, self.held_expires_at);
+                // The owned leader gets the same save grace as other Claude launchers.
+                // Never read hooks or wait for admission while this deadline runs.
+                if signalled_at.is_some_and(|at| at.elapsed() >= exec::STOP_GRACE)
+                    && !exec::has_exited(self.pid)
+                {
+                    if unsafe { libc::kill(self.pid as i32, libc::SIGKILL) } != 0 {
+                        self.failed(
+                            &activity,
+                            restart.cause,
+                            super::restart_gate::RecoveryFailure::Signal,
+                        );
+                    }
+                    signalled_at = None;
                 }
                 continue;
             }
-            if !renewing {
-                if self.renewable {
-                    gate.unknown(
-                        &activity.idle,
-                        super::restart_gate::Cause::Renewal,
-                        self.held_expires_at,
+            if !self.renewable {
+                continue;
+            }
+            let events_failed = self
+                .read_events(&mut activity)
+                .is_err_and(|error| error.kind() != std::io::ErrorKind::WouldBlock);
+            if events_failed || self.directory.join("hook-error").exists() {
+                outcome.note = Some("off: hook evidence unavailable".into());
+                gate.unknown(
+                    &activity.idle,
+                    super::restart_gate::Cause::Renewal,
+                    self.held_expires_at,
+                );
+            }
+            let recovering = renew::held_token_dead(&self.inputs(&mut activity, &timing, None));
+            if activity.idle.session.is_none() {
+                if recovering && !no_session_reported {
+                    self.failed(
+                        &activity,
+                        super::restart_gate::Cause::AuthRecovery,
+                        super::restart_gate::RecoveryFailure::NoSession,
                     );
+                    no_session_reported = true;
                 }
-                continue;
-            }
-            // A hook that could not record an event leaves this marker: the event log may
-            // miss a prompt, so it can no longer prove Claude idle.
-            if self.directory.join("hook-error").exists() {
-                eprintln!(
-                    "claudectl: a Claude hook event was not recorded; server token renewal is off for this session"
-                );
-                outcome.note = Some("off: hook write failed".into());
-                renewing = false;
-                gate.unknown(
-                    &activity.idle,
-                    super::restart_gate::Cause::Renewal,
-                    self.held_expires_at,
-                );
-                continue;
-            }
-            if self.read_events(&mut activity).is_err() {
-                outcome.note = Some("off: event log unreadable".into());
-                renewing = false;
-                gate.unknown(
-                    &activity.idle,
-                    super::restart_gate::Cause::Renewal,
-                    self.held_expires_at,
-                );
-                continue;
-            }
-            if !activity.seen_start {
-                // Missing startup events are unknown now, not a permanent hook failure.
-                // Continue sampling so later events can still identify the workload.
                 gate.check(
                     &activity.idle,
-                    super::restart_gate::Cause::Renewal,
+                    if recovering {
+                        super::restart_gate::Cause::AuthRecovery
+                    } else {
+                        super::restart_gate::Cause::Renewal
+                    },
                     self.held_expires_at,
                 );
                 if now() - started > timing.hooks_wait_ms {
-                    eprintln!(
-                        "claudectl: Claude sent no hook events; server token renewal is off for this session"
-                    );
                     outcome.note = Some("off: no hook events".into());
-                    renewing = false;
                 }
                 continue;
             }
-            let recovering = renew::held_token_dead(&self.inputs(&mut activity, &timing, None));
+            no_session_reported = false;
+            if activity.idle.ended.is_some() || exec::signals::pending().is_some() {
+                continue;
+            }
+            if activity.successful_stops != last_successful_stops {
+                super::restart_gate::recovery_succeeded(
+                    &self.directory,
+                    activity.idle.session.as_deref(),
+                );
+                last_successful_stops = activity.successful_stops;
+                self.recovery_resume = false;
+            }
+            if self.recovery_resume && activity.idle.auth_failed.is_some() {
+                self.failed(
+                    &activity,
+                    super::restart_gate::Cause::AuthRecovery,
+                    super::restart_gate::RecoveryFailure::ReplacementRejected,
+                );
+                replacement_backoff =
+                    Some(Instant::now() + Duration::from_millis(timing.retry_ms as u64));
+                self.recovery_resume = false;
+            }
+            if replacement_backoff.is_some_and(|until| Instant::now() < until) {
+                continue;
+            }
+            if !recovering {
+                gate.recovered();
+            }
             let failover_pending = !recovering
                 && self.failover.is_some()
                 && activity.idle.limited.as_ref().is_some_and(|(session, at)| {
                     activity.idle.session.as_ref() == Some(session) && pending.handled != Some(*at)
                 });
-            let cause = if recovering {
+            let mut cause = if recovering {
                 super::restart_gate::Cause::AuthRecovery
             } else if failover_pending {
                 super::restart_gate::Cause::Failover
             } else {
                 super::restart_gate::Cause::Renewal
             };
-            // Sample every tick, including while a turn is busy or no revision has
-            // changed, so each deferred session still gets its expiry warning.
-            // Observed quiet remains a heuristic, not closed input admission.
-            if !gate.check(&activity.idle, cause, self.held_expires_at) {
-                continue;
-            }
-            // Authentication recovery keeps this account. Otherwise a pending usage limit
-            // takes precedence over renewal (one restart decision per tick).
-            if cause == super::restart_gate::Cause::Failover
-                && self.failover.is_some()
+            let admitted = gate.check(&activity.idle, cause, self.held_expires_at);
+            if failover_pending
+                && admitted
                 && let Some((session_id, failed_at)) = activity.idle.limited.clone()
-                && activity.idle.session.as_deref() == Some(session_id.as_str())
-                && pending.handled != Some(failed_at)
-            {
-                if !gate.check(&activity.idle, cause, self.held_expires_at) {
-                    continue;
-                }
-                if let Some((account, access)) =
+                && let Some((account, access)) =
                     self.failover_target(&mut activity, &mut gate, &timing, &mut pending, failed_at)
-                {
-                    match self.stop_for_restart(&mut activity, &mut gate, &timing, cause) {
-                        Ok(true) => {
-                            let kind = RestartKind::Failover { account, access };
-                            sent = Some((
-                                now(),
-                                Restart {
-                                    kind,
-                                    session_id,
-                                    cause,
-                                },
-                            ));
-                        }
-                        Ok(false) => break,
-                        Err(()) => {}
-                    }
-                }
-                continue;
-            }
-            // Ask the server only while idle: after expiry the request refreshes the grant,
-            // and a turn that starts meanwhile would get the old, dead token.
-            let before = self.inputs(&mut activity, &timing, None);
-            if renew::idle_gate(&before).is_err() {
-                continue;
-            }
-            // A dead held token: the tab is useless until the new token shows, so ask often.
-            let interval = if renew::held_token_dead(&before) {
-                timing.retry_ms
-            } else if self.held_expires_at - now() < 3_600_000 {
-                timing.poll_near_ms
-            } else {
-                timing.poll_far_ms
-            };
-            if !retry_now && now() - last_check < interval {
-                continue;
-            }
-            last_check = now();
-            retry_now = false;
-            // An observing read never refreshes an unexpired token, so it cannot revoke the
-            // token another session's turn uses; a superseded revision shows at once.
-            let mut access = match self.client.observe(&self.account_id) {
-                Ok(access) => access,
-                Err(_) => {
-                    // Retry soon: one failure near expiry must not use up the token's life.
-                    // Nothing is printed: stderr is Claude's terminal.
-                    last_check = now() - interval + timing.retry_ms;
-                    continue;
-                }
-            };
-            // Activity may have changed while the request ran (a prompt, typing): sample it
-            // again and decide on the fresh state only.
-            if self.read_events(&mut activity).is_err() {
-                outcome.note = Some("off: event log unreadable".into());
-                renewing = false;
-                gate.unknown(&activity.idle, cause, self.held_expires_at);
-                continue;
-            }
-            if cause == super::restart_gate::Cause::AuthRecovery
-                && activity.idle.auth_failed.is_some()
-                && access.revision == self.held_revision
             {
-                // The rejected grant is still current on the server. Replace that exact
-                // revision through the existing fenced refresh, after fresh idle admission.
-                if renew::idle_gate(&self.inputs(&mut activity, &timing, Some(&access))).is_err()
-                    || !gate.check(&activity.idle, cause, self.held_expires_at)
-                {
-                    retry_now = true;
-                    continue;
+                match self.stop_for_restart(&mut activity, &mut gate, &timing, cause) {
+                    Ok(true) => {
+                        signalled_at = Some(Instant::now());
+                        sent = Some((
+                            now(),
+                            Restart {
+                                kind: RestartKind::Failover { account, access },
+                                session_id,
+                                cause,
+                            },
+                        ));
+                        continue;
+                    }
+                    Ok(false) => break,
+                    Err(()) => continue,
                 }
-                access = match self
-                    .client
-                    .acquire(&self.account_id, Some(&self.held_revision))
-                {
+            }
+            // Waiting for an account switch cannot suspend same-account renewal.
+            cause = if recovering {
+                super::restart_gate::Cause::AuthRecovery
+            } else {
+                super::restart_gate::Cause::Renewal
+            };
+            // Observing an unexpired grant cannot rotate it. Read before workload
+            // admission so a busy session can discover a pending renewal.
+            let interval = if recovering {
+                timing.retry_ms
+            } else {
+                timing.poll_near_ms.min(timing.poll_far_ms).min(30_000)
+            };
+            // Once a usable successor is known, admission must not wait behind another
+            // HTTP request. Expired snapshots are replaced without resetting the deadline.
+            let needs_token = next_access
+                .as_ref()
+                .is_none_or(|access| access.expires_at <= now());
+            let due =
+                needs_token && ((recovering && !was_recovering) || now() - last_check >= interval);
+            was_recovering = recovering;
+            if due {
+                last_check = now();
+                let mut access = match self.client.observe(&self.account_id) {
                     Ok(access) => access,
                     Err(_) => {
+                        if recovering || next_access.is_some() {
+                            self.failed(
+                                &activity,
+                                cause,
+                                super::restart_gate::RecoveryFailure::Observe,
+                            );
+                        }
                         last_check = now() - interval + timing.retry_ms;
                         continue;
                     }
                 };
-                if self.read_events(&mut activity).is_err() {
-                    outcome.note = Some("off: event log unreadable".into());
-                    renewing = false;
+                if self
+                    .read_events(&mut activity)
+                    .is_err_and(|error| error.kind() != std::io::ErrorKind::WouldBlock)
+                {
                     gate.unknown(&activity.idle, cause, self.held_expires_at);
+                }
+                if activity.idle.ended.is_some() || exec::signals::pending().is_some() {
                     continue;
                 }
+                // A successful Stop during the request can clear a transient failure.
+                let recovering = renew::held_token_dead(&self.inputs(&mut activity, &timing, None));
+                cause = if recovering {
+                    super::restart_gate::Cause::AuthRecovery
+                } else {
+                    super::restart_gate::Cause::Renewal
+                };
+                if !recovering {
+                    gate.recovered();
+                }
+                if activity.idle.auth_failed.is_some() && access.revision == self.held_revision {
+                    access = match self
+                        .client
+                        .acquire(&self.account_id, Some(&self.held_revision))
+                    {
+                        Ok(access) => access,
+                        Err(_) => {
+                            self.failed(
+                                &activity,
+                                cause,
+                                super::restart_gate::RecoveryFailure::Acquire,
+                            );
+                            last_check = now() - interval + timing.retry_ms;
+                            continue;
+                        }
+                    };
+                    if self
+                        .read_events(&mut activity)
+                        .is_err_and(|error| error.kind() != std::io::ErrorKind::WouldBlock)
+                    {
+                        gate.unknown(&activity.idle, cause, self.held_expires_at);
+                    }
+                }
+                if access.revision != self.held_revision && access.expires_at > now() {
+                    gate.request_at(cause, Instant::now());
+                    next_access = Some(access);
+                } else {
+                    if recovering {
+                        self.failed(
+                            &activity,
+                            cause,
+                            super::restart_gate::RecoveryFailure::UnusableReplacement,
+                        );
+                    }
+                    next_access = None;
+                }
             }
-            let inputs = self.inputs(&mut activity, &timing, Some(&access));
-            if renew::idle_gate(&inputs).is_err() {
-                // Claude became busy: restart at its next idle point, without the poll wait.
-                retry_now = true;
-            }
-            let decision = renew::decide(&inputs);
-            if decision == renew::Decision::Restart
+            let Some(access) = next_access.as_ref() else {
+                continue;
+            };
+            let admitted = gate.check(&activity.idle, cause, self.held_expires_at);
+            let inputs = self.inputs(&mut activity, &timing, Some(access));
+            let restart = renew::replacement_ready(&inputs)
+                && (gate.forced(cause).is_some()
+                    || renew::decide(&inputs) == renew::Decision::Restart);
+            if admitted
+                && restart
                 && let Some(session_id) = activity.idle.session.clone()
             {
-                if !gate.check(&activity.idle, cause, self.held_expires_at) {
-                    retry_now = cause == super::restart_gate::Cause::AuthRecovery;
-                    continue;
-                }
                 match self.stop_for_restart(&mut activity, &mut gate, &timing, cause) {
                     Ok(true) => {
-                        let kind = RestartKind::Renew(access);
+                        signalled_at = Some(Instant::now());
                         sent = Some((
                             now(),
                             Restart {
-                                kind,
+                                kind: RestartKind::Renew(
+                                    next_access.take().expect("replacement checked"),
+                                ),
                                 session_id,
                                 cause,
                             },
                         ));
                     }
                     Ok(false) => break,
-                    Err(()) => {
-                        retry_now = cause == super::restart_gate::Cause::AuthRecovery;
-                        continue;
-                    }
+                    Err(()) => {}
                 }
             }
         }
         // Claude may have ended its session just before our SIGTERM (a /exit while the
         // request ran): that exit is the user's, never a renewal (CX-0119).
-        let ended_first = self.read_events(&mut activity).is_ok()
-            && matches!((&sent, activity.idle.ended), (Some((at, _)), Some(end)) if end <= *at);
+        let drain_until = Instant::now() + Duration::from_secs(1);
+        loop {
+            let read = self.read_events(&mut activity);
+            if read.is_ok() || activity.idle.ended.is_some() {
+                break;
+            }
+            if Instant::now() >= drain_until {
+                // The child has exited. A complete SessionEnd may already be visible
+                // while a surviving hook still holds the admission lock.
+                let _ = read_new_events(&self.directory.join("events"), &mut activity);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let exit_intent =
+            super::renew::session_end_intent(&self.directory, activity.idle.session.as_deref());
+        if exit_intent.is_err()
+            && let Some((_, restart)) = &sent
+        {
+            gate.exit_intent_unknown(&activity.idle, restart.cause, self.held_expires_at);
+        }
+        let ended = activity
+            .idle
+            .ended
+            .into_iter()
+            .chain(exit_intent.as_ref().ok().copied().flatten())
+            .min();
+        let ended_first = matches!((&sent, ended), (Some((at, _)), Some(end)) if end <= *at);
         if let Err(error) = self.check_crons(true) {
             cron_log_error = Some(format!("could not record cron recovery: {error:#}"));
         }
-        outcome.restart = sent.filter(|_| !ended_first).map(|(_, restart)| restart);
+        outcome.restart = sent
+            .filter(|_| !ended_first && exit_intent.is_ok() && exec::signals::pending().is_none())
+            .map(|(_, restart)| restart);
         outcome.notice = match (pending.notice.take(), cron_log_error) {
             (Some(notice), Some(error)) => Some(format!("{notice}\n{error}")),
             (notice, error) => notice.or(error),
@@ -899,34 +1017,23 @@ impl Monitor {
     ) -> std::result::Result<bool, ()> {
         // Deferral must not publish renewing or signal before workload admission.
         // This guard and the locks do not close all input sources.
-        if !gate.check(&activity.idle, cause, self.held_expires_at) {
-            return Err(());
-        }
-        let _hook_admission = match super::restart_gate::hook_admission(&self.directory) {
-            Ok(lock) => lock,
-            Err(_) => {
-                gate.unknown(&activity.idle, cause, self.held_expires_at);
-                return Err(());
-            }
-        };
-        let _admission = match super::restart_gate::admission(&self.directory) {
-            Ok(lock) => lock,
-            Err(_) => {
-                gate.unknown(&activity.idle, cause, self.held_expires_at);
-                return Err(());
-            }
-        };
+        let _admission = gate.admit(&activity.idle, cause, self.held_expires_at)?;
+        let forced = gate.forced(cause).is_some();
         if self.directory.join("hook-error").exists()
             || read_new_events(&self.directory.join("events"), activity).is_err()
         {
             gate.unknown(&activity.idle, cause, self.held_expires_at);
-            return Err(());
+            if !forced {
+                return Err(());
+            }
         }
         let mut inputs = self.inputs(activity, timing, None);
         if cause == super::restart_gate::Cause::Failover {
             inputs.restarts_last_hour = self.failover.as_ref().map_or(0, |f| f.last_hour);
         }
-        if super::renew::idle_gate(&inputs).is_err()
+        if (!forced && super::renew::idle_gate(&inputs).is_err())
+            || inputs.idle.session.is_none()
+            || inputs.idle.ended.is_some()
             || !gate.check(&activity.idle, cause, self.held_expires_at)
         {
             return Err(());
@@ -934,7 +1041,14 @@ impl Monitor {
         let mut status = self.status.clone();
         status["renewal"] = "renewing".into();
         if atomic(&self.directory.join("session.json"), &status).is_err() {
-            return Err(());
+            self.failed(
+                activity,
+                cause,
+                super::restart_gate::RecoveryFailure::StatusPublish,
+            );
+            if !forced {
+                return Err(());
+            }
         }
         // This last workload sample still leaves a sample-to-SIGTERM race.
         // Workload observations do not acknowledge prompt handover.
@@ -946,13 +1060,21 @@ impl Monitor {
         }
         // SIGTERM the leader; teardown of the rest of the group follows its exit. A leader
         // that already exited (not yet reaped, so kill would still succeed) left on its own.
-        if exec::has_exited(self.pid) || unsafe { libc::kill(self.pid as i32, libc::SIGTERM) } != 0
-        {
+        if exec::has_exited(self.pid) || exec::signals::pending().is_some() {
             let mut status = self.status.clone();
             status["renewal"] = "on".into();
             let _ = atomic(&self.directory.join("session.json"), &status);
             return Ok(false);
         }
+        if unsafe { libc::kill(self.pid as i32, libc::SIGTERM) } != 0 {
+            self.failed(
+                activity,
+                cause,
+                super::restart_gate::RecoveryFailure::Signal,
+            );
+            return Err(());
+        }
+        gate.signalled(cause, activity.idle.session.as_deref());
         Ok(true)
     }
     /// The account and token to move to for the limit a turn hit at `failed_at`, once a
@@ -1019,28 +1141,13 @@ impl Monitor {
                 let access = self.client.observe(&account.account_id).ok()?;
                 // All remote reads have completed. Do not reserve an account for work
                 // that became busy during them; the signal still has its final admission.
-                let _hook_admission = match super::restart_gate::hook_admission(&self.directory) {
-                    Ok(lock) => lock,
-                    Err(_) => {
-                        gate.unknown(
-                            &activity.idle,
-                            super::restart_gate::Cause::Failover,
-                            self.held_expires_at,
-                        );
-                        return None;
-                    }
-                };
-                let _admission = match super::restart_gate::admission(&self.directory) {
-                    Ok(lock) => lock,
-                    Err(_) => {
-                        gate.unknown(
-                            &activity.idle,
-                            super::restart_gate::Cause::Failover,
-                            self.held_expires_at,
-                        );
-                        return None;
-                    }
-                };
+                let _admission = gate
+                    .admit(
+                        &activity.idle,
+                        super::restart_gate::Cause::Failover,
+                        self.held_expires_at,
+                    )
+                    .ok()?;
                 if self.directory.join("hook-error").exists()
                     || read_new_events(&self.directory.join("events"), activity).is_err()
                 {
@@ -1140,7 +1247,11 @@ pub fn run(
     let mut resumed: Option<(String, super::restart_gate::Cause)> = None;
     let mut first = true;
     let mut cron_recovery = None;
+    let mut relaunch: Option<super::restart_gate::RecoveryAttempt> = None;
     loop {
+        if let Some(attempt) = relaunch.as_mut() {
+            attempt.at(super::restart_gate::RecoveryFailure::Spawn);
+        }
         let mut command = session.command(&snapshot, &[])?;
         if let Some(settings) = &settings {
             command.arg("--settings").arg(settings);
@@ -1157,11 +1268,15 @@ pub fn run(
             exec::take_foreground(&mut command);
         }
         let _ = std::fs::remove_file(session.directory().join("events"));
+        super::renew::clear_session_end_intents(session.directory())?;
         if !first {
             // Before spawn: a failed write must not leave a Claude without its monitor.
             session.set_renewal("on")?;
         }
         let mut child = command.spawn().context("could not start Claude")?;
+        if let Some(attempt) = relaunch.take() {
+            attempt.started();
+        }
         let pid = child.id();
         exec::signals::watch(pid);
         // A relaunch got the foreground before exec; give it back to claudectl's own group.
@@ -1180,6 +1295,9 @@ pub fn run(
             held_expires_at: session.expires_at(),
             pid,
             renewable: hooks.is_some(),
+            recovery_resume: resumed
+                .as_ref()
+                .is_some_and(|(_, cause)| *cause == super::restart_gate::Cause::AuthRecovery),
             restarts: restarts
                 .iter()
                 .filter(|&&at| now() - at < 3_600_000)
@@ -1202,6 +1320,14 @@ pub fn run(
         let outcome = watcher
             .join()
             .map_err(|_| anyhow::anyhow!("session monitor stopped unexpectedly"))?;
+        if let Some(restart) = &outcome.restart {
+            relaunch = Some(super::restart_gate::RecoveryAttempt::new(
+                &paths.home,
+                session.directory(),
+                &restart.session_id,
+                restart.cause,
+            ));
+        }
         let descendants = if waited.is_ok() {
             Some(exec::teardown_group(pid))
         } else {
@@ -1218,6 +1344,9 @@ pub fn run(
             )
         ) {
             bail!("Claude descendants could not be confirmed stopped");
+        }
+        if let Some(attempt) = relaunch.as_mut() {
+            attempt.at(super::restart_gate::RecoveryFailure::Persist);
         }
         if let Some(note) = &outcome.note {
             session.set_renewal(note)?;
@@ -1242,6 +1371,13 @@ pub fn run(
                 && status.code().is_some_and(|code| (1..128).contains(&code))
                 && !session_started(&session.directory().join("events"))
             {
+                super::restart_gate::recovery_failed(
+                    &paths.home,
+                    session.directory(),
+                    Some(&id),
+                    cause,
+                    super::restart_gate::RecoveryFailure::Resume,
+                );
                 if let Some(terminal) = &terminal {
                     terminal.restore();
                 }
@@ -1487,6 +1623,7 @@ mod tests {
             held_revision: "old".into(),
             held_expires_at: now() + 600_000,
             renewable: true,
+            recovery_resume: false,
             restarts: 1,
             tty: None,
             status,
@@ -1532,6 +1669,45 @@ mod tests {
                 .unwrap();
         assert_eq!(status["renewal"], "renewing");
         assert!(!child.0.wait().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renewal_deadline_signals_a_busy_child_without_waiting_for_locks() {
+        let (_home, mut child, monitor, mut activity) = admission_fixture();
+        let lock = super::super::restart_gate::admission(&monitor.directory).unwrap();
+        let hook_lock = super::super::restart_gate::hook_admission(&monitor.directory).unwrap();
+        activity.idle.since = None;
+        let mut gate = super::super::restart_gate::Gate::new(
+            &monitor.paths.home,
+            &monitor.directory,
+            monitor.pid,
+            &monitor.alias,
+        );
+        let cause = super::super::restart_gate::Cause::Renewal;
+        gate.request_at(cause, Instant::now() - Duration::from_secs(600));
+        assert_eq!(
+            monitor.stop_for_restart(
+                &mut activity,
+                &mut gate,
+                &super::super::renew::timing(),
+                cause,
+            ),
+            Ok(true)
+        );
+        drop(hook_lock);
+        drop(lock);
+        assert!(!child.0.wait().unwrap().success());
+        let journal = std::fs::read_to_string(
+            monitor
+                .paths
+                .home
+                .join(".claudectl/server/restart-decisions.jsonl"),
+        )
+        .unwrap();
+        let forced: Value = serde_json::from_str(journal.lines().last().unwrap()).unwrap();
+        assert_eq!(forced["reason"], "renewal_deadline");
+        assert_eq!(forced["metric"]["value"], 1);
     }
 
     #[cfg(unix)]

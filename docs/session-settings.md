@@ -32,12 +32,14 @@ Verified, missing, duplicate, skipped, and unverified results stay in this log
 after the run exits. They never print over Claude's terminal or enter its input.
 The log contains no tokens or saved prompt contents.
 
-Renewal while the held token is valid and account failover require ten continuous minutes
-of observed quiet. After authentication failure or expiry, Claude automatically resumes the
-same conversation on the same account at the next verified idle point. Running turns,
-live task-output children, open production steps, pending hooks and holds block admission;
-unknown or damaged evidence also stays blocked. Terminal input must remain unchanged across
-fresh samples for 16 seconds, spanning coarse TTY timestamps. Recovery omits the original
+Authentication failure or expiry restarts the same conversation on the same account
+immediately, once a replacement token is available. Turns, background tasks, typing,
+production markers and unrelated hook errors do not defer that recovery. Other unheld renewals
+wait at most ten minutes after observing a replacement revision. Explicit production
+holds block every restart until hold end, including auth recovery. Unknown SessionEnd
+intent also prevents restart, with one failure record while that uncertainty persists. Account failover still
+requires ten continuous minutes of observed quiet. A forced restart can discard a draft
+or background task. Recovery omits the original
 task and missed fires; saved-card cron recovery
 still restores its job definitions. A failed authentication resume reports an error and
 stops instead of opening a different conversation. These workload samples do not close all
@@ -46,9 +48,9 @@ or replay prompts.
 
 Renewal and failover also write deferred restart decisions to
 `~/.claudectl/server/restart-decisions.jsonl`. A running turn, live Claude task-output
-child or explicit run hold prevents a restart. `claudectl status`, `status --json` and
+child or explicit run hold prevents ordinary restart admission. `claudectl status`, `status --json` and
 the session's status line show the reason. Five minutes before token expiry the wrapper
-warns; expiry or authentication failure reports blocked status without killing the work.
+warns; expiry or authentication failure starts recovery, except when an explicit hold or unknown SessionEnd intent vetoes restart.
 See [production holds and deferred restarts](account-server.md#production-holds-and-deferred-restarts).
 
 Most failures name the next command on a last line that starts with `Try:`. Setup

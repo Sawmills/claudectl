@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+/// Time an owned Claude child gets to save its session after SIGTERM before SIGKILL.
+pub const STOP_GRACE: Duration = Duration::from_secs(20);
+
 use sha2::{Digest, Sha256};
 
 use crate::api;

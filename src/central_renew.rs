@@ -286,7 +286,7 @@ pub(super) fn decide(i: &Inputs) -> Decision {
     if i.server_revision == i.held_revision {
         return Decision::Keep;
     }
-    if i.server_expires_at <= i.held_expires_at {
+    if !replacement_ready(i) || (!held_token_dead(i) && i.server_expires_at <= i.held_expires_at) {
         return Decision::Wait("the new token does not outlive the held one");
     }
     match idle_gate(i) {
@@ -295,8 +295,12 @@ pub(super) fn decide(i: &Inputs) -> Decision {
     }
 }
 
-/// Whether Claude is idle enough to be restarted. A dead token skips only the quiet delay;
-/// workload evidence and the final signal admission still apply.
+pub(super) fn replacement_ready(i: &Inputs) -> bool {
+    i.server_revision != i.held_revision && i.server_expires_at > i.now
+}
+
+/// Normal renewals require idle admission. A dead token overrides workload delays and
+/// the hourly budget, while preserving explicit session exit and session identity.
 pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
     if i.idle.session.is_none() {
         return Err("no session id from Claude yet");
@@ -306,6 +310,9 @@ pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
         return Err("Claude is ending the session");
     }
     let recovering = held_token_dead(i);
+    if recovering {
+        return Ok(());
+    }
     match i.idle.since {
         None => return Err("a turn is running"),
         Some(since) if !recovering && i.now - since < i.idle_after_ms => {
@@ -383,6 +390,104 @@ fn publish_hook_intent(dir: &std::path::Path) -> anyhow::Result<std::path::PathB
     Ok(pending)
 }
 
+fn publish_session_end_intent(
+    dir: &std::path::Path,
+    at: i64,
+    session: Option<&str>,
+) -> anyhow::Result<()> {
+    atomic(
+        &dir.join(format!("session-end-intent.{}", std::process::id())),
+        &serde_json::json!({"at":at,"session_id":session}),
+    )
+    .inspect_err(|_| {
+        let _ = atomic(
+            &dir.join("session-end-error"),
+            &serde_json::json!({"at":at,"session_id":session}),
+        );
+        mark_hook_error(dir);
+    })
+}
+
+/// Typed lifecycle intent survives blocked hook input, admission and post-exit drain.
+pub(super) fn session_end_intent(
+    dir: &std::path::Path,
+    session: Option<&str>,
+) -> anyhow::Result<Option<i64>> {
+    match super::private_read(&dir.join("session-end-error")) {
+        Ok(bytes) => {
+            let failure: serde_json::Value = serde_json::from_slice(&bytes)?;
+            if !failure["session_id"]
+                .as_str()
+                .is_some_and(|id| Some(id) != session)
+            {
+                anyhow::bail!("SessionEnd intent publication failed");
+            }
+        }
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+        Err(error) => return Err(error),
+    }
+    let mut ended = None;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("session-end-intent.")
+        {
+            continue;
+        }
+        let bytes = match super::private_read(&entry.path()) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let at = value["at"]
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("SessionEnd intent time unavailable"))?;
+        if value["session_id"]
+            .as_str()
+            .is_some_and(|id| Some(id) != session)
+        {
+            continue;
+        }
+        ended = Some(ended.map_or(at, |before: i64| before.min(at)));
+    }
+    if ended.is_none() {
+        // A readable directory can still refuse native exit-intent publication.
+        use std::io::Write;
+        let mut probe = tempfile::Builder::new()
+            .prefix("exit-intent-probe.")
+            .tempfile_in(dir)?;
+        probe.write_all(b"{}\n")?;
+    }
+    Ok(ended)
+}
+
+pub(super) fn clear_session_end_intents(dir: &std::path::Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name() == "session-end-error"
+            || entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("session-end-intent.")
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// The `server hook` entry point: read the hook input (at most `HOOK_INPUT_LIMIT`) and
 /// record it. Any read, size or parse failure leaves the error marker (fail closed).
 pub(super) fn hook_from(
@@ -390,9 +495,13 @@ pub(super) fn hook_from(
     dir: &std::path::Path,
     input: impl std::io::Read,
     now: i64,
+    session_end: bool,
 ) -> anyhow::Result<()> {
     use std::io::Read;
     let dir = session_dir(sessions, dir)?;
+    if session_end {
+        publish_session_end_intent(&dir, now, None)?;
+    }
     // Reading stdin may wait while the native client submits its hook payload.
     // Publish before that wait, as well as before either admission lock.
     let pending = publish_hook_intent(&dir)?;
@@ -419,9 +528,20 @@ pub(super) fn record_hook(
     input: &str,
     now: i64,
 ) -> anyhow::Result<()> {
-    use std::io::Write;
+    use std::io::{Read, Seek, SeekFrom, Write};
     let dir = session_dir(sessions, dir)?;
     let pending = publish_hook_intent(&dir)?;
+    let v: serde_json::Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(error) => {
+            mark_hook_error(&dir);
+            let _ = std::fs::remove_file(&pending);
+            return Err(error.into());
+        }
+    };
+    if v["hook_event_name"] == "SessionEnd" {
+        publish_session_end_intent(&dir, now, v["session_id"].as_str())?;
+    }
     #[cfg(unix)]
     let _hook_admission = match super::restart_gate::hook_admission(&dir) {
         Ok(lock) => lock,
@@ -440,21 +560,31 @@ pub(super) fn record_hook(
             return Err(error);
         }
     };
-    let v: serde_json::Value = match serde_json::from_str(input) {
-        Ok(v) => v,
-        Err(error) => {
-            mark_hook_error(&dir);
-            let _ = std::fs::remove_file(&pending);
-            return Err(error.into());
-        }
-    };
     // The error type of a failed turn, only from Claude Code's known values; its details
     // and the last message are never kept.
     let error = (v["hook_event_name"] == "StopFailure").then(|| {
-        let known = v["error"]
-            .as_str()
-            .filter(|e| TURN_ERRORS.contains(e))
-            .unwrap_or("unknown");
+        let authentication_failed = v["error"] == "authentication_failed"
+            || v["status_code"].as_u64() == Some(401)
+            || ["error", "error_details"].iter().any(|field| {
+                v[field].as_str().is_some_and(|text| {
+                    let text = text.to_ascii_lowercase();
+                    [
+                        "oauth token revoked",
+                        "oauth access token has expired",
+                        "please run /login",
+                    ]
+                    .iter()
+                    .any(|message| text.contains(message))
+                })
+            });
+        let known = if authentication_failed {
+            "authentication_failed"
+        } else {
+            v["error"]
+                .as_str()
+                .filter(|e| TURN_ERRORS.contains(e))
+                .unwrap_or("unknown")
+        };
         serde_json::Value::from(known)
     });
     let line = serde_json::json!({
@@ -472,21 +602,30 @@ pub(super) fn record_hook(
     }
     let path = dir.join("events");
     let mut options = std::fs::OpenOptions::new();
-    options.append(true).create(true);
+    options.read(true).append(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let written = options
-        .open(&path)
-        .and_then(|mut file| writeln!(file, "{line}"));
+    let written = options.open(&path).and_then(|mut file| {
+        if file.metadata()?.len() > 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut last = [0];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")?;
+            }
+        }
+        writeln!(file, "{line}")
+    });
     if let Err(error) = written {
         mark_hook_error(&dir);
         let _ = std::fs::remove_file(&pending);
         return Err(error.into());
     }
     std::fs::remove_file(pending).ok();
+    std::fs::remove_file(dir.join(format!("session-end-intent.{}", std::process::id()))).ok();
     Ok(())
 }
 
@@ -891,8 +1030,8 @@ mod tests {
     }
 
     #[test]
-    fn dead_token_recovery_still_requires_an_idle_turn_and_restart_budget() {
-        // Fresh terminal input is checked by restart_gate at final admission.
+    fn dead_token_recovery_overrides_running_turn_and_restart_budget() {
+        // A dead token cannot make progress, even with terminal input or a running turn.
         let idle = Idle {
             session: Some("s".into()),
             since: Some(10_000_000 - 1_000),
@@ -905,7 +1044,7 @@ mod tests {
         expired.held_expires_at = expired.now - 1;
         expired.tty_idle_ms = Some(5_000);
         assert_eq!(decide(&expired), Decision::Restart);
-        // A running turn, an exiting session and the budget still hold.
+        // A running turn and the hourly budget no longer defer recovery.
         let busy = Idle {
             session: Some("s".into()),
             since: None,
@@ -916,10 +1055,10 @@ mod tests {
         };
         let mut running = inputs(&busy);
         running.held_expires_at = running.now - 1;
-        assert!(matches!(decide(&running), Decision::Wait(_)));
+        assert_eq!(decide(&running), Decision::Restart);
         let mut budget = expired;
         budget.restarts_last_hour = RESTARTS_PER_HOUR;
-        assert!(matches!(decide(&budget), Decision::Wait(_)));
+        assert_eq!(decide(&budget), Decision::Restart);
     }
 
     #[test]
@@ -1065,6 +1204,50 @@ mod tests {
                     .exists()
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_end_waiting_for_admission_vetoes_auth_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join(".claudectl/server/sessions");
+        let dir = sessions.join("run-exit-intent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = super::super::restart_gate::admission(&dir).unwrap();
+        let worker = std::thread::spawn({
+            let sessions = sessions.clone();
+            let dir = dir.clone();
+            move || {
+                record_hook(
+                    &sessions,
+                    &dir,
+                    r#"{"hook_event_name":"SessionEnd","session_id":"s"}"#,
+                    42,
+                )
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while session_end_intent(&dir, Some("s")).unwrap().is_none()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(session_end_intent(&dir, Some("s")).unwrap(), Some(42));
+        assert_eq!(
+            session_end_intent(&dir, Some("another-session")).unwrap(),
+            None
+        );
+        let (mut child, mut gate, idle) = idle_hook_gate(root.path(), &dir);
+        assert!(!gate.check(
+            &idle,
+            super::super::restart_gate::Cause::AuthRecovery,
+            i64::MAX
+        ));
+        drop(lock);
+        worker.join().unwrap().unwrap();
+        assert_eq!(session_end_intent(&dir, Some("s")).unwrap(), None);
+        drop(child.stdin.take());
+        child.wait().unwrap();
     }
 
     #[cfg(unix)]
@@ -1242,6 +1425,7 @@ mod tests {
                         ),
                     },
                     1,
+                    false,
                 )
             }
         });
@@ -1274,19 +1458,28 @@ mod tests {
         ] {
             let dir = sessions.join(name);
             std::fs::create_dir_all(&dir).unwrap();
-            assert!(hook_from(&sessions, &dir, std::io::Cursor::new(input), 1).is_err());
+            assert!(hook_from(&sessions, &dir, std::io::Cursor::new(input), 1, false).is_err());
             assert!(dir.join("hook-error").exists(), "{name}");
         }
         // A good event still records and leaves no marker.
         let dir = sessions.join("run-ok");
         std::fs::create_dir_all(&dir).unwrap();
         let good = br#"{"hook_event_name":"Stop","session_id":"s"}"#.to_vec();
-        hook_from(&sessions, &dir, std::io::Cursor::new(good), 1).unwrap();
+        hook_from(&sessions, &dir, std::io::Cursor::new(good), 1, false).unwrap();
         assert!(!dir.join("hook-error").exists());
         // Outside the sessions root nothing is written at all.
         let outside = root.path().join("run-out");
         std::fs::create_dir_all(&outside).unwrap();
-        assert!(hook_from(&sessions, &outside, std::io::Cursor::new(b"x".to_vec()), 1).is_err());
+        assert!(
+            hook_from(
+                &sessions,
+                &outside,
+                std::io::Cursor::new(b"x".to_vec()),
+                1,
+                false
+            )
+            .is_err()
+        );
         assert!(!outside.join("hook-error").exists());
     }
 

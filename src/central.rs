@@ -18,11 +18,16 @@ Claude validates the settings schema. An invalid value such as model: 5 can make
 Claude ignore the WHOLE settings file, including claudectl's renewal/failover hooks.
 Test settings with your installed Claude version before rollout.
 
-Renewal with a valid token and failover require ten minutes of observed quiet.
-After authentication failure or token expiry, Claude restarts at the next verified idle point
-on the same session and account. Workload blockers and unknown evidence defer recovery.
-Terminal recovery verifies 16 seconds of unchanged idle/input evidence.
-The held token may expire while busy work stays alive.
+After authentication failure or token expiry, Claude restarts immediately on the
+same session and account. Workload blockers and typing do not defer recovery.
+Other renewals wait at most ten minutes after a replacement revision is observed,
+then restart even if work remains active, except for explicit holds. An explicit
+production hold blocks every restart until hold end, including auth recovery.
+Unknown SessionEnd intent also vetoes restart and records one recovery failure.
+Hold-blocked notices name the hold at most once per ten minutes.
+Failover requires ten minutes of observed quiet.
+Forced restarts can discard background work and draft input.
+Claude gets twenty seconds to save after SIGTERM before SIGKILL.
 Idle and quiet do not close all inputs: a late prompt can be cut off at SIGTERM.
 No prompt collection or replay.";
 
@@ -1154,7 +1159,12 @@ pub enum Command {
     Statusline { account_id: String },
     /// Record a Claude hook event for a running server session (internal; never fails)
     #[command(hide = true)]
-    Hook { dir: PathBuf },
+    Hook {
+        dir: PathBuf,
+        /// Publish native SessionEnd intent before reading the hook payload
+        #[arg(long)]
+        session_end: bool,
+    },
     /// Transfer a profile, or every saved account with --all, after stopping every previous
     /// grant holder
     Migrate {
@@ -1265,7 +1275,7 @@ pub fn dispatch(command: Command) -> Result<()> {
             json,
         } => status(&paths, &alias, cached, json),
         Command::Statusline { account_id } => statusline(&paths, &account_id),
-        Command::Hook { dir } => {
+        Command::Hook { dir, session_end } => {
             // A hook never blocks or talks to Claude: no output, exit 0 whatever happens. A
             // failure leaves the session's error marker, so renewal stops (fail closed).
             let _ = renew::hook_from(
@@ -1273,6 +1283,7 @@ pub fn dispatch(command: Command) -> Result<()> {
                 &dir,
                 std::io::stdin(),
                 now(),
+                session_end,
             );
             Ok(())
         }

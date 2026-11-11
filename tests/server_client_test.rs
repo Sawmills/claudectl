@@ -153,7 +153,8 @@ def sample(stage):
     try:
         with urllib.request.urlopen(request,timeout=3) as response: status=response.status; body=json.load(response)
     except urllib.error.HTTPError as error: status=error.code; body=json.load(error)
-    result={'pid':os.getpid(),'status':status,'token_sha256':hashlib.sha256(os.environ['CLAUDE_CODE_OAUTH_TOKEN'].encode()).hexdigest(),'provider_at':body['at'],'provider_expires_at':body['expires_at'],'provider_reason':body.get('error',{}).get('reason')}
+    account=json.load(open(Path(os.environ['CLAUDECTL_SERVER_RUN'])/'session.json'))['account_id']
+    result={'pid':os.getpid(),'args':args,'account_id':account,'status':status,'token_sha256':hashlib.sha256(os.environ['CLAUDE_CODE_OAUTH_TOKEN'].encode()).hexdigest(),'provider_at':body['at'],'provider_expires_at':body['expires_at'],'provider_reason':body.get('error',{}).get('reason')}
     (control/(name+'-'+stage+'.json')).write_text(json.dumps(result))
 def terminated(*_):
     (control/(name+'-terminated')).touch()
@@ -340,6 +341,15 @@ fn live_child_token_case(lifetime: i64, peer: Peer) {
         if remaining > 0 {
             std::thread::sleep(std::time::Duration::from_millis(remaining as u64 + 100));
         }
+        let rejected = http
+            .get(format!("{}/synthetic/inference", server.api))
+            .bearer_auth(held["access_token"].as_str().unwrap())
+            .send()
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        let rejected: serde_json::Value = rejected.json().unwrap();
+        assert_eq!(rejected["error"]["reason"], "synthetic_expired");
+        assert!(rejected["at"].as_i64().unwrap() >= server.seed_expires_at);
     }
     let request_at = chrono::Utc::now().timestamp_millis();
     let latest = match peer {
@@ -388,7 +398,18 @@ fn live_child_token_case(lifetime: i64, peer: Peer) {
     let exchanges_after_next = server.refreshes.load(Ordering::SeqCst);
     let current = observe();
     std::fs::write(control.join("sample-after"), "").unwrap();
-    let after = wait_for_token_sample(&control.join("live-after.json"));
+    let recovered_by = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let after = loop {
+        let sample = wait_for_token_sample(&control.join("live-after.json"));
+        if !expired_control || sample["pid"] != before["pid"] {
+            break sample;
+        }
+        assert!(
+            std::time::Instant::now() < recovered_by,
+            "the expired busy child did not resume"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
     let status = claudectl(live_home.path(), &["server", "status", "work", "--json"]);
     let status: serde_json::Value = serde_json::from_str(&ok(&status)).unwrap();
     assert_eq!(status.get("error"), Some(&serde_json::Value::Null));
@@ -400,9 +421,19 @@ fn live_child_token_case(lifetime: i64, peer: Peer) {
         "status or observing a successor refreshed the grant"
     );
     assert!(live.process.as_mut().unwrap().try_wait().unwrap().is_none());
-    assert_eq!(before["pid"], after["pid"]);
-    assert_eq!(before["token_sha256"], after["token_sha256"]);
-    assert!(!control.join("live-terminated").exists());
+    if expired_control {
+        assert_ne!(before["pid"], after["pid"]);
+        assert_ne!(before["token_sha256"], after["token_sha256"]);
+        assert!(control.join("live-terminated").exists());
+        assert_eq!(after["account_id"], receipt.account_id);
+        let args = after["args"].as_array().unwrap();
+        let resume = args.iter().position(|arg| arg == "--resume").unwrap();
+        assert_eq!(args[resume + 1], "synthetic-live");
+    } else {
+        assert_eq!(before["pid"], after["pid"]);
+        assert_eq!(before["token_sha256"], after["token_sha256"]);
+        assert!(!control.join("live-terminated").exists());
+    }
     assert_eq!(latest["status"], 200);
     let revision_changed = held["revision"] != current["revision"];
     let metrics = http
@@ -434,14 +465,9 @@ fn live_child_token_case(lifetime: i64, peer: Peer) {
         json!({"case":"D3-FAIL-0143","version":env!("CARGO_PKG_VERSION"),"peer":format!("{peer:?}"),"request_at":request_at,"held_expires_at":held["expires_at"],"before":before,"after":after,"successor_status":latest["status"],"held_revision":held["revision"],"current_revision":current["revision"],"revision_changed":revision_changed,"server_error":status["error"],"server_stale":status["stale"],"exchanges_before":exchanges_after_start,"exchanges_after":exchanges_after_next,"rotations":rotations})
     );
     drop(live); // Release the synthetic child normally before the RED assertion.
-    if expired_control {
-        assert_eq!(after["provider_reason"], "synthetic_expired");
-        assert!(after["provider_at"].as_i64().unwrap() >= server.seed_expires_at);
-    }
     assert_eq!(
-        after["status"],
-        if expired_control { 401 } else { 200 },
-        "a same-account caller invalidated a still-live child's grant while server status remained OK: peer={peer:?}, lifetime={lifetime}, revision_changed={revision_changed}, exchanges={exchanges_after_start}->{exchanges_after_next}, rotations={rotations:?}"
+        after["status"], 200,
+        "the managed child has no usable grant: peer={peer:?}, lifetime={lifetime}, revision_changed={revision_changed}, exchanges={exchanges_after_start}->{exchanges_after_next}, rotations={rotations:?}"
     );
 }
 

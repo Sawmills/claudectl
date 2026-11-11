@@ -241,20 +241,30 @@ An expired grant or pending migration still follows the existing leased refresh 
 verification path. Supplying the exact current `previous_revision` still forces rotation;
 a stale revision returns the available unexpired successor.
 
-A new child can therefore start near token expiry. Expiry alerts and workload blockers
-still apply; recovery after expiry uses the next verified idle point described below.
-This does not guarantee continuous authentication for a busy child.
+A new child can start near token expiry. Authentication failure or expiry immediately
+starts recovery on the same session and account, once a replacement token is available.
+This does not guarantee continuous authentication while the provider or server is unavailable.
 `claudectl server refresh-access` deliberately rotates the shared grant, so existing child
 snapshots can be rejected until restart is permitted. The historical `margin` rotation
 metric label remains exported at zero for compatibility; explicit force, migration and
 expiry retain their existing reason labels.
 
-Renewal while the held token is valid and account failover
-require ten continuous minutes of observed quiet. The clock starts with the first clear
-workload sample and resets on an observed blocker, hook event, session change or terminal
-input. Startup never inherits old quiet time. Authentication failure or expiry instead
-recovers at the next verified idle point, on the same session and account. Unknown or
-damaged evidence still blocks restart.
+An ordinary renewal uses ten continuous minutes of observed quiet when possible. A
+replacement token revision starts a separate ten-minute deadline on its first observation;
+workload changes and repeated requests never reset it. At that deadline the restart is
+forced unless an explicit production hold or unknown SessionEnd intent vetoes it. Until a usable successor is obtained, the server is observed at most thirty seconds apart, including during work. A cached successor removes further token requests from restart admission.
+Account failover retains its ten-minute quiet requirement and has no forced deadline.
+Authentication failure or expiry overrides ordinary workload blockers immediately. Explicit
+production holds prevent every restart until hold end, including authentication recovery
+and expiry. A missing normal exit-intent marker means no exit is pending; a known intent
+publication, read or parse failure is unknown lifecycle evidence and prevents both forced
+signaling and relaunch. It records one recovery failure while the uncertainty persists.
+Unrelated hook, terminal, task and production-marker errors do not defer auth recovery.
+
+Forced restarts can discard a running turn, background task or draft input. An explicit
+session exit and user interruption still end the run; claudectl does not invent a session
+ID when none was recorded. Failed recovery attempts are counted and retried at the existing
+thirty-second interval. There is no hourly cap on authentication recovery or deadline renewals.
 
 **Residual race:** command hooks cannot acknowledge that all input sources are closed and
 every submitted prompt is safe to hand over. Hooks publish pending intent before reading
@@ -266,17 +276,16 @@ Quiet is a heuristic, not all-input closure. No prompts are collected, stored or
 `StopFailure`, `SessionEnd` and the `idle_prompt` notification. They record only the event,
 session ID and time in `<session dir>/events`. Workload evidence still distinguishes running
 turns, background tasks and holds, but a clear workload sample is not input-admission proof.
-Every deferred session is checked each monitor tick, even before hooks arrive, during a
-running turn, or when no server revision has changed. Five minutes before token expiry its
-status and structured alert change to `warn`; expiry or an authentication failure changes
-them to `blocked`. While restart is deferred, the child and its work stay alive without
-a forced timeout; the held token can stop working. Once the applicable idle/quiet and fresh workload checks
-permit admission, the wrapper can send SIGTERM and resume with the available new token.
+The monitor checks each session every five seconds. Ordinary deferrals warn five minutes
+before expiry. Expiry or an authentication failure starts recovery instead of waiting for
+workload admission. A failed hook or unreadable event log keeps ordinary admission closed;
+monitoring continues so the known session can still recover at expiry. A missing session
+ID emits one failed-recovery notice until evidence changes.
 
-After admission and fresh workload checks pass, the retained restart and cron
-recovery path below can run. No timeout forces a restart while blocked, and no forced
-kill deadline follows SIGTERM. A child that does not exit keeps its current token and
-work. Installing a new CLI does not upgrade a running wrapper.
+The wrapper sends SIGTERM to its owned Claude child and gives it twenty seconds to save.
+If it has not exited, the wrapper sends SIGKILL, confirms descendant cleanup, then resumes
+the conversation with the replacement token. Blocking hook/admission locks cannot stop a
+forced restart. Installing a new CLI does not upgrade a running wrapper.
 
 For a Fleet Operator, `HERDR_TAB_ID` selects the matching `operator_tab` in
 `~/Code/.fleet/*/operator.md`. Its `cron_prompts` entries (a prompt file and five schedule
@@ -337,21 +346,17 @@ This remains a best-effort workaround for Claude Code's resume behavior, with th
 - The defect belongs to Claude Code; an upstream report waits on the owner's decision. Remove
   the note once Claude Code fires restored jobs reliably.
 
-Renewal while the held token is valid and account failover require the quiet window.
-After an `authentication_failed` hook or held-token expiry, recovery instead restarts
-automatically at the next verified idle point, on the same conversation and account.
-For a terminal session, fresh idle and terminal samples must stay unchanged for 16 seconds
-after workload blockers clear. This spans two Linux TTY timestamp periods. A new blocker
-or input restarts verification; prior valid-token quiet time is not reused.
-If the server still holds the exact
-rejected revision, the wrapper requests its replacement through the existing fenced refresh
-after fresh idle admission. Ordinary polling of a valid token remains an observing read.
-A later successful turn clears an old authentication-failure observation. A prompt, idle
-notification, other API failure or session change alone does not prove recovery.
+Authentication recovery preserves the same conversation and account. When the server
+still holds the rejected revision, claudectl replaces that exact revision through the
+existing fenced refresh. A usable successor can have a shorter lifetime than the rejected
+token's recorded expiry. Authentication error details are normalized to the known
+`authentication_failed` event; raw error text is never retained. A later successful Stop
+clears a transient failure observed during a pending token read.
 
-Fresh workload evidence is required before provider reads, failover reservation and the
-final signal. Foreground turns, live background tasks, production markers, pending hooks
-and explicit holds prevent every restart. The task check reads live descendants' stdout/stderr: a Claude task
+Ordinary admission checks foreground turns, background tasks, production markers, pending
+hooks and explicit holds. Those checks govern failover and renewal before its deadline;
+authentication recovery and deadline renewal override ordinary workload checks, while
+explicit production holds remain a veto until hold end. The task check reads live descendants' stdout/stderr: a Claude task
 file under `<tmp>/claude-<uid>/.../tasks/*.output` holds admission. MCP/LSP servers and
 `caffeinate` without task-output descriptors do not add a workload blocker.
 
@@ -380,6 +385,10 @@ claudectl hold end
 The command uses the inherited `CLAUDECTL_SERVER_RUN` identity. One hold belongs to one run;
 starting a different reason while a hold exists fails. Check the command's exit status before
 starting the production step. Lane skill/runbook adoption is a separate rollout.
+An explicit hold blocks every restart until it is ended, even after token expiry or an
+authentication failure. When a hold blocks dead-token recovery or an overdue renewal,
+claudectl writes at most one `restart_blocked_by_hold` event per ten minutes naming the
+run and hold reason. Ending the hold allows either restart immediately.
 
 When the lane exports `HERDR_TAB_ID` (or `HERDR_PANE_ID`), the monitor consumes that lane's
 `[starting]`/`STARTING NOW` and matching `[done]`/`DONE` markers from the optional goal file
@@ -410,24 +419,29 @@ gate capability and refuses the start if it is absent; installing a new CLI alon
 upgrade a wrapper that is already running.
 
 Holds stay in `~/.claudectl/server/holds/<run-id>.json`, outside temporary session cleanup.
-A hold whose owner exits remains blocked and reports attention. It never clears by age or
-token expiry. After the wrapper exits, explicitly clear its recorded hold with
+A hold whose owner exits remains recorded and reports attention. Hold files never clear
+by age or token expiry, and forced recovery never overrides them.
+After the wrapper exits, explicitly clear its recorded hold with
 `claudectl hold end --run <run-id>` after the production step and its cleanup are complete.
 
-`claudectl status` and the inherited session's status line show
-`restart deferred: <reason>`. `status --json` adds a `sessions` list with the run, reason,
-stage and deferred counter. At five minutes before token expiry the wrapper warns; expiry
-or an authentication failure changes the stage to blocked. It keeps the child and its
-background work alive until admission is safe, with no forced timeout. API use can fail
-while the held token is expired or revoked; another session can revoke it before its
-recorded expiry.
+`claudectl status` and the inherited status line show ordinary deferral reasons.
+`status --json` includes their run, stage and deferred counter. Ordinary workload deferrals
+never delay auth recovery. Explicit holds remain until hold end; unknown SessionEnd intent
+remains a lifecycle veto until it is known.
 
-`~/.claudectl/server/restart-decisions.jsonl` records one `restart_deferred` event per
-session and severity stage. Its `claudectl_restart_deferred_total` metric has only cause,
-reason and stage labels. Routine workload or cause changes update current status without
-adding journal rows or counts; entering warning or blocked status emits a new event. The current run's `restart-status.json` holds its status
-and counter. Records contain no tokens or prompt contents. A diagnostic write failure
-closes automatic admission for that child and reports attention instead of restarting it.
+`~/.claudectl/server/restart-decisions.jsonl` retains the existing `restart_deferred`
+events and adds `restart_forced`, `recovery_failed` and `restart_blocked_by_hold`. The counter names are
+`claudectl_restart_forced_total` and `claudectl_recovery_failed_total`; each actual event
+adds one. Labels contain only bounded cause, reason and stage values. Run and session IDs
+are log fields, as are the blocked hold's run and reason. Routed notices carry `route: voice_inbox`; claudectl sends no message itself.
+After ten consecutive failures, only every tenth failure is routed. Intervening
+`recovery_metric` rows keep their counter increment with a null route. A successful Stop
+resets the consecutive failure count. The fleet owns journal collection and Voice routing;
+these host metrics are separate from the remote account server's `/metrics` endpoint.
+
+Records contain no tokens, raw provider errors or prompt contents. The journal is private
+and refuses symlinks. Diagnostic write failures do not prevent a forced recovery. Ordinary
+admission still closes on unavailable diagnostic evidence.
 
 This is not an OS sandbox. Tools inherit the access token environment and can
 access files available to the same OS user. The Mac experiment's fake `security`
@@ -446,16 +460,13 @@ Conversations that a `server run` before this model stored in
 `<project>/<session>.jsonl` into `~/.claude/projects/<project>/`; otherwise delete the
 directory.
 
-While Claude runs, the client reads usage every five minutes without changing the token
-inside the running process. Valid-token renewal and failover wait for ten continuous minutes
-of observed quiet; authentication recovery uses the next verified idle point. Both require
-fresh workload checks. Once eligible, the wrapper can observe the
-available token, reserve a failover account if needed, and restart Claude with the new login.
-Busy or unknown sessions keep the held token, which can expire or be rotated by another
-client. If a session must be ended explicitly, finish its work and cleanup before relaunch.
-The client never replays tools. On server outage, the token of a running session stays
-valid until provider expiry or rejection. Revocation
-stops new acquisitions; it cannot revoke an access token already delivered.
+While Claude runs, the client refreshes usage about every five minutes in a background
+worker, including one-shot runs and pending recovery. Safe observing reads continue during work at most thirty seconds apart until a usable
+replacement is cached; admission then proceeds without further token I/O. Authentication failure and expiry recover on the next five-second monitor
+tick plus replacement-token I/O. Ordinary renewal is forced after ten minutes from first
+observing a replacement; failover keeps its observed-quiet policy. On server outage, the
+running token works until provider expiry or rejection, and recovery errors are counted.
+Revocation stops new acquisitions; it cannot revoke an access token already delivered.
 
 `status --cached` and `statusline ACCOUNT_ID` read local files only. Native Claude
 status-line fields remain available, but the wrapper does not overwrite a user's

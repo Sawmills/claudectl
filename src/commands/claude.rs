@@ -27,8 +27,6 @@ const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 const CONFIRM_RETRY: Duration = Duration::from_secs(30);
 /// Longest the watcher works on after the run ends: one confirmation retry.
 const AFTER_EXIT: Duration = Duration::from_secs(40);
-/// Time Claude gets to save its session after SIGTERM before SIGKILL.
-const STOP_GRACE: Duration = Duration::from_secs(20);
 
 pub struct LaunchArgs {
     pub lane: String,
@@ -284,7 +282,7 @@ fn watch(
 fn end_run(stop: &AtomicBool) {
     exec::signals::forward(libc::SIGTERM);
     let started = Instant::now();
-    while started.elapsed() < STOP_GRACE {
+    while started.elapsed() < exec::STOP_GRACE {
         if stop.load(Ordering::SeqCst) {
             return;
         }

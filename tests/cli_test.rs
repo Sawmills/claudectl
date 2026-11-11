@@ -387,14 +387,12 @@ fn run_help_discloses_quiet_window_and_residual_race() {
             .unwrap();
         assert!(output.status.success());
         let help = String::from_utf8(output.stdout).unwrap();
-        assert!(help.contains("next verified idle point"));
+        assert!(help.contains("restarts immediately"));
         assert!(help.contains("same session and account"));
-        assert!(help.contains(
-            "Renewal with a valid token and failover require ten minutes of observed quiet"
-        ));
+        assert!(help.contains("Other renewals wait at most ten minutes"));
         assert!(help.contains("Request failover after ten minutes of observed quiet"));
         assert!(!help.contains("currently deferred"));
-        assert!(help.contains("held token may expire"));
+        assert!(help.contains("Forced restarts can discard background work and draft input"));
         assert!(help.contains("a late prompt can be cut off at SIGTERM"));
         assert!(help.contains("No prompt collection or replay"));
     }
