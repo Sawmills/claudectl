@@ -19,9 +19,11 @@ Claude ignore the WHOLE settings file, including claudectl's renewal/failover ho
 Test settings with your installed Claude version before rollout.
 
 After authentication failure or token expiry, Claude restarts immediately on the
-same session and account. Workload blockers, typing and holds do not defer recovery.
+same session and account. Workload blockers and typing do not defer recovery.
 Other renewals wait at most ten minutes after a replacement revision is observed,
-then restart even if work remains active. Failover requires ten minutes of observed quiet.
+then restart even if work remains active. An active explicit production hold can
+delay either forced restart for at most ten more minutes from its force condition;
+then the restart event names the hold. Failover requires ten minutes of observed quiet.
 Forced restarts can discard background work and draft input.
 Claude gets twenty seconds to save after SIGTERM before SIGKILL.
 Idle and quiet do not close all inputs: a late prompt can be cut off at SIGTERM.

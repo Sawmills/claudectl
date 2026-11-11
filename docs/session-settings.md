@@ -34,8 +34,10 @@ The log contains no tokens or saved prompt contents.
 
 Authentication failure or expiry restarts the same conversation on the same account
 immediately, once a replacement token is available. Turns, background tasks, typing,
-production markers, holds and unknown evidence do not defer that recovery. Other renewals
-wait at most ten minutes after observing a replacement revision. Account failover still
+production markers and unknown evidence do not defer that recovery. Other renewals
+wait at most ten minutes after observing a replacement revision. An active explicit
+production hold can delay either forced restart for at most ten minutes from its force
+condition, then the restart proceeds with an event naming the hold. Account failover still
 requires ten continuous minutes of observed quiet. A forced restart can discard a draft
 or background task. Recovery omits the original
 task and missed fires; saved-card cron recovery
@@ -46,9 +48,9 @@ or replay prompts.
 
 Renewal and failover also write deferred restart decisions to
 `~/.claudectl/server/restart-decisions.jsonl`. A running turn, live Claude task-output
-child or explicit run hold prevents a restart. `claudectl status`, `status --json` and
+child or explicit run hold prevents ordinary restart admission. `claudectl status`, `status --json` and
 the session's status line show the reason. Five minutes before token expiry the wrapper
-warns; expiry or authentication failure reports blocked status without killing the work.
+warns; expiry or authentication failure starts recovery, with the bounded explicit-hold exception above.
 See [production holds and deferred restarts](account-server.md#production-holds-and-deferred-restarts).
 
 Most failures name the next command on a last line that starts with `Try:`. Setup

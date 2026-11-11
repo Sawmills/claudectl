@@ -47,8 +47,10 @@ Automatic `use` and `run` choose an eligible account with the earliest weekly re
 They exclude accounts with 5% or less weekly headroom and accounts that may bill
 extra usage. Authentication failure or token expiry immediately restarts the same
 session on the same account once a replacement token is available. Workload blockers,
-typing, hooks and holds do not defer this recovery. Other token renewals wait at most
+typing and unrelated hooks do not defer this recovery. Other token renewals wait at most
 ten minutes after a replacement revision is observed; then claudectl forces the restart.
+An active explicit production hold can delay either forced restart by at most ten more
+minutes from the force condition; then the restart proceeds and its event names the hold.
 Account failover still requires ten continuous minutes of observed quiet. Forced restarts
 can discard background tasks and draft input. Claude gets twenty seconds after SIGTERM
 to save its session before SIGKILL. A failed recovery is counted and retried; it does not

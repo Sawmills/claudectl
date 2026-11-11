@@ -1246,9 +1246,21 @@ fn expired_sessions_recover_despite_each_workload_blocker() {
         ));
         let held = std::fs::read(&hold).ok();
         f.state.lock().unwrap().life_ms = 600_000;
+        if mode == "hold" {
+            f.wait("explicit_hold", "blocked");
+            assert_eq!(f.runs().len(), 1);
+            assert!(!f.home.path().join("terminated").exists());
+        }
         f.wait_recovered();
         if let Some(held) = held {
             assert_eq!(std::fs::read(hold).unwrap(), held);
+            let forced = f
+                .journal()
+                .into_iter()
+                .filter(|event| event["event"] == "restart_forced")
+                .collect::<Vec<_>>();
+            assert_eq!(forced.len(), 1);
+            assert_eq!(forced[0]["hold"]["reason"], "FLT-553 synthetic step");
         }
         f.finish_recovered();
     }
