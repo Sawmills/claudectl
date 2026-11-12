@@ -286,7 +286,7 @@ def case(core, binary, mode, output):
                 assert any(request["account"] == SPARE for request in server.requests)
             assert not jobs["asks_missed_fire_replay"]
             journal = home / ".claudectl/server/cron-recovery.jsonl"
-            assert "cron recovery verified: 2/2 saved jobs" in journal.read_text()
+            assert "crons intact: 2 jobs" in journal.read_text()
         result["pass"] = True
     except Exception as error:
         result.update(error=repr(error), elapsed=time.monotonic() - started, **{"pass": False})
