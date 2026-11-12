@@ -245,8 +245,9 @@ A new child can start near token expiry. Authentication failure or expiry immedi
 starts recovery on the same session and account, once a replacement token is available.
 Same-account renewal and authentication recovery resume the last admitted live conversation,
 including a later in-app `/resume`. The original `--resume <UUID>` or `--session-id <UUID>`
-does not override that current conversation. An explicit launch UUID still makes a failed
-renewal resume stop instead of creating a different session; authentication recovery also
+does not override that current conversation. Recovery also follows a newer conversation
+observed in the final hook drain while the child stops. An explicit launch UUID still makes
+a failed renewal resume stop instead of creating a different session; authentication recovery also
 stops on a failed resume. Resume search terms and fork sources are not bound launch IDs.
 Supervisors that bind conversation IDs must verify and adopt the replacement child's live
 ID; a launch UUID is not a permanent conversation binding.

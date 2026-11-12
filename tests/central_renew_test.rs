@@ -147,6 +147,11 @@ if mode=='one_shot':
     while not (home/'release').exists() and time.monotonic()<deadline: time.sleep(.02)
     sys.exit(23)
 def term(*_):
+    global session_id
+    if mode=='resume_on_term' and first_launch:
+        session_id=(home/'late-session').read_text().strip()
+        hook('SessionStart'); hook('Stop')
+        (home/'late-session-observed').write_text(session_id)
     if mode=='exit_race' and first_launch:
         admission=(run/'restart.lock').open('r+')
         fcntl.flock(admission,fcntl.LOCK_EX)
@@ -209,7 +214,7 @@ while not (home/'release').exists() and time.monotonic()<deadline:
         typed+=len(os.read(0,4096))
         (home/'typed-progress.next').write_text(str(typed))
         os.replace(home/'typed-progress.next',home/'typed-progress')
-    if mode in ('auth_recovery','auth_prompt','auth_resume_fails','auth_typing','auth_revoked','auth_expired','auth_login','task','busy') and (home/'provider-probe').exists() and not probed:
+    if mode in ('auth_recovery','auth_prompt','auth_resume_fails','auth_typing','auth_revoked','auth_expired','auth_login','resume_on_term','task','busy') and (home/'provider-probe').exists() and not probed:
         status=provider_status()
         if mode!='busy' or not first_launch:
             details={'auth_revoked':'OAuth token revoked','auth_expired':'401 OAuth access token has expired','auth_login':'Please run /login'}.get(mode)
@@ -558,6 +563,31 @@ fn auth_recovery_after_in_app_resume_keeps_the_live_conversation() {
         args[resume + 1]
     );
     assert_eq!(args[resume + 1], LIVE);
+}
+
+#[test]
+fn auth_recovery_follows_a_session_switch_seen_during_shutdown() {
+    const WRAPPER: &str = "ebeca78f-687a-4ad7-8f05-b988a6690cb5";
+    const LIVE: &str = "31555be4-b5c0-4323-ab8b-5afe6b2ca78e";
+    // A synthetic third conversation, reported by the real child after SIGTERM.
+    const LATE: &str = "92f1f6f1-0000-4000-8000-000000000001";
+    let mut f = Fixture::with_args("resume_on_term", 600_000, false, &["--resume", WRAPPER]);
+    std::fs::write(f.home.path().join("late-session"), LATE).unwrap();
+    let runs = f.recover_after_switch(LIVE);
+    assert_eq!(
+        std::fs::read_to_string(f.home.path().join("late-session-observed")).unwrap(),
+        LATE
+    );
+    assert_ne!(runs[0]["pid"], runs[1]["pid"]);
+    assert_eq!(runs[1]["run"], runs[0]["run"]);
+    assert_eq!(runs[1]["session"]["account_id"], ACCOUNT);
+    let args = runs[1]["args"].as_array().unwrap();
+    let resume = args.iter().position(|arg| arg == "--resume").unwrap();
+    eprintln!(
+        "LIVEID before-signal={LIVE} during-shutdown={LATE} relaunched={}",
+        args[resume + 1]
+    );
+    assert_eq!(args[resume + 1], LATE);
 }
 
 #[test]

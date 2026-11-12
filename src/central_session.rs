@@ -991,7 +991,14 @@ impl Monitor {
         }
         outcome.restart = sent
             .filter(|_| !ended_first && exit_intent.is_ok() && exec::signals::pending().is_none())
-            .map(|(_, restart)| restart);
+            .and_then(|(_, mut restart)| {
+                // An in-flight /resume hook can finish while the child stops. The exit
+                // intent above was checked for this final observed conversation.
+                if matches!(&restart.kind, RestartKind::Renew(_)) {
+                    restart.session_id = activity.idle.session.clone()?;
+                }
+                Some(restart)
+            });
         outcome.notice = match (pending.notice.take(), cron_log_error) {
             (Some(notice), Some(error)) => Some(format!("{notice}\n{error}")),
             (notice, error) => notice.or(error),
@@ -1236,7 +1243,6 @@ pub fn run(
     exec::signals::install();
     let _signals = Signals;
     let mut launch_args = args.to_vec();
-    let launch_session = super::renew::launch_session(args);
     let mut restarts: Vec<i64> = Vec::new();
     // Failovers have their own budget; they never use up renewals (and the reverse).
     let mut failovers: Vec<i64> = Vec::new();
@@ -1379,9 +1385,7 @@ pub fn run(
                 if let Some(terminal) = &terminal {
                     terminal.restore();
                 }
-                if cause == super::restart_gate::Cause::AuthRecovery
-                    || (cause == super::restart_gate::Cause::Renewal && launch_session.is_some())
-                {
+                if super::renew::failed_resume_stops(args, cause) {
                     let recovery = if cause == super::restart_gate::Cause::AuthRecovery {
                         "authentication recovery"
                     } else {
