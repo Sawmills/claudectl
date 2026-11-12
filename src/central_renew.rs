@@ -210,7 +210,7 @@ pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
     }
 }
 
-/// The fixed UUID a supervisor binds. Resume names/searches and fork sources are not IDs.
+/// A bound launch UUID makes a failed renewal resume terminal. Names and fork sources do not.
 pub(super) fn launch_session(args: &[OsString]) -> Option<&str> {
     let mut resume = None;
     let mut session = None;
@@ -250,6 +250,13 @@ pub(super) fn launch_session(args: &[OsString]) -> Option<&str> {
         }
     }
     session.or(resume.filter(|_| !fork))
+}
+
+/// Preserve conversation identity when a failed resume cannot safely start fresh.
+#[cfg(unix)]
+pub(super) fn failed_resume_stops(args: &[OsString], cause: super::restart_gate::Cause) -> bool {
+    use super::restart_gate::Cause;
+    cause == Cause::AuthRecovery || (cause == Cause::Renewal && launch_session(args).is_some())
 }
 
 fn is_session_uuid(value: &str) -> bool {
@@ -708,6 +715,47 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_resume_preserves_the_cause_and_bound_launch_safety_policy() {
+        use super::super::restart_gate::Cause;
+        const WRAPPER: &str = "ebeca78f-687a-4ad7-8f05-b988a6690cb5";
+        const FORK: &str = "92f1f6f1-0000-4000-8000-000000000001";
+        let assigned = format!("--resume={WRAPPER}");
+        let session = format!("--session-id={WRAPPER}");
+        // Expected order: authentication recovery, ordinary renewal, account failover.
+        for (args, expected) in [
+            (os(&["--resume", WRAPPER]), [true, true, false]),
+            (os(&[&assigned]), [true, true, false]),
+            (os(&["-r", WRAPPER]), [true, true, false]),
+            (os(&["--session-id", WRAPPER]), [true, true, false]),
+            (os(&[&session]), [true, true, false]),
+            (
+                os(&["--session-id", FORK, "--resume", WRAPPER, "--fork-session"]),
+                [true, true, false],
+            ),
+            (os(&[]), [true, false, false]),
+            (os(&["--resume", "search"]), [true, false, false]),
+            (os(&["--continue"]), [true, false, false]),
+            (
+                os(&["--resume", WRAPPER, "--fork-session"]),
+                [true, false, false],
+            ),
+            (os(&["--", "--resume", WRAPPER]), [true, false, false]),
+        ] {
+            for (cause, stop) in [Cause::AuthRecovery, Cause::Renewal, Cause::Failover]
+                .into_iter()
+                .zip(expected)
+            {
+                assert_eq!(
+                    failed_resume_stops(&args, cause),
+                    stop,
+                    "{cause:?}: {args:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn launch_identity_does_not_interpret_option_values_as_options() {

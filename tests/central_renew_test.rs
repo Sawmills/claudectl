@@ -147,6 +147,11 @@ if mode=='one_shot':
     while not (home/'release').exists() and time.monotonic()<deadline: time.sleep(.02)
     sys.exit(23)
 def term(*_):
+    global session_id
+    if mode=='resume_on_term' and first_launch:
+        session_id=(home/'late-session').read_text().strip()
+        hook('SessionStart'); hook('Stop')
+        (home/'late-session-observed').write_text(session_id)
     if mode=='exit_race' and first_launch:
         admission=(run/'restart.lock').open('r+')
         fcntl.flock(admission,fcntl.LOCK_EX)
@@ -209,7 +214,7 @@ while not (home/'release').exists() and time.monotonic()<deadline:
         typed+=len(os.read(0,4096))
         (home/'typed-progress.next').write_text(str(typed))
         os.replace(home/'typed-progress.next',home/'typed-progress')
-    if mode in ('auth_recovery','auth_prompt','auth_resume_fails','auth_typing','auth_revoked','auth_expired','auth_login','task','busy') and (home/'provider-probe').exists() and not probed:
+    if mode in ('auth_recovery','auth_prompt','auth_resume_fails','auth_typing','auth_revoked','auth_expired','auth_login','resume_on_term','task','busy') and (home/'provider-probe').exists() and not probed:
         status=provider_status()
         if mode!='busy' or not first_launch:
             details={'auth_revoked':'OAuth token revoked','auth_expired':'401 OAuth access token has expired','auth_login':'Please run /login'}.get(mode)
@@ -532,7 +537,7 @@ impl Fixture {
 }
 
 #[test]
-fn auth_recovery_after_in_app_resume_keeps_the_wrapper_launch_resume_id() {
+fn auth_recovery_after_in_app_resume_keeps_the_live_conversation() {
     const WRAPPER: &str = "ebeca78f-687a-4ad7-8f05-b988a6690cb5";
     const LIVE: &str = "31555be4-b5c0-4323-ab8b-5afe6b2ca78e";
     let mut f = Fixture::with_args(
@@ -554,59 +559,81 @@ fn auth_recovery_after_in_app_resume_keeps_the_wrapper_launch_resume_id() {
     let args = runs[1]["args"].as_array().unwrap();
     let resume = args.iter().position(|arg| arg == "--resume").unwrap();
     eprintln!(
-        "RESUMEID wrapper={WRAPPER} live={LIVE} relaunched={}",
+        "LIVEID wrapper={WRAPPER} live={LIVE} relaunched={}",
         args[resume + 1]
     );
-    assert_eq!(args[resume + 1], WRAPPER);
+    assert_eq!(args[resume + 1], LIVE);
 }
 
 #[test]
-fn recovery_honors_launch_identity_forms_and_keeps_unbound_sessions_live() {
+fn auth_recovery_follows_a_session_switch_seen_during_shutdown() {
+    const WRAPPER: &str = "ebeca78f-687a-4ad7-8f05-b988a6690cb5";
+    const LIVE: &str = "31555be4-b5c0-4323-ab8b-5afe6b2ca78e";
+    // A synthetic third conversation, reported by the real child after SIGTERM.
+    const LATE: &str = "92f1f6f1-0000-4000-8000-000000000001";
+    let mut f = Fixture::with_args("resume_on_term", 600_000, false, &["--resume", WRAPPER]);
+    std::fs::write(f.home.path().join("late-session"), LATE).unwrap();
+    let runs = f.recover_after_switch(LIVE);
+    assert_eq!(
+        std::fs::read_to_string(f.home.path().join("late-session-observed")).unwrap(),
+        LATE
+    );
+    assert_ne!(runs[0]["pid"], runs[1]["pid"]);
+    assert_eq!(runs[1]["run"], runs[0]["run"]);
+    assert_eq!(runs[1]["session"]["account_id"], ACCOUNT);
+    let args = runs[1]["args"].as_array().unwrap();
+    let resume = args.iter().position(|arg| arg == "--resume").unwrap();
+    eprintln!(
+        "LIVEID before-signal={LIVE} during-shutdown={LATE} relaunched={}",
+        args[resume + 1]
+    );
+    assert_eq!(args[resume + 1], LATE);
+}
+
+#[test]
+fn in_app_resume_retargets_launch_identity_forms_and_unbound_sessions() {
     const WRAPPER: &str = "ebeca78f-687a-4ad7-8f05-b988a6690cb5";
     const LIVE: &str = "31555be4-b5c0-4323-ab8b-5afe6b2ca78e";
     let resume = format!("--resume={WRAPPER}");
     let session = format!("--session-id={WRAPPER}");
     let prompt = format!("--resume={LIVE}");
-    for (args, expected) in [
-        (vec![resume.as_str()], WRAPPER),
-        (vec!["-r", WRAPPER], WRAPPER),
-        (vec!["--session-id", WRAPPER], WRAPPER),
-        (vec![session.as_str()], WRAPPER),
-        (vec![], LIVE),
-        (vec!["--resume", "--verbose"], LIVE),
-        (vec!["--continue"], LIVE),
-        (vec!["--resume", WRAPPER, "--", prompt.as_str()], WRAPPER),
+    for args in [
+        vec![resume.as_str()],
+        vec!["-r", WRAPPER],
+        vec!["--session-id", WRAPPER],
+        vec![session.as_str()],
+        vec![],
+        vec!["--resume", "--verbose"],
+        vec!["--continue"],
+        vec!["--resume", WRAPPER, "--", prompt.as_str()],
     ] {
-        eprintln!("RESUMEID launch arguments: {args:?}, expected={expected}");
+        eprintln!("LIVEID launch arguments: {args:?}, expected={LIVE}");
         let mut f = Fixture::with_args("auth_recovery", 600_000, false, &args);
         let runs = f.recover_after_switch(LIVE);
         let relaunched = runs[1]["args"].as_array().unwrap();
         let resume = relaunched.iter().position(|arg| arg == "--resume").unwrap();
-        assert_eq!(relaunched[resume + 1], expected, "{args:?}");
+        assert_eq!(relaunched[resume + 1], LIVE, "{args:?}");
         assert!(!relaunched.iter().any(|arg| arg == prompt.as_str()));
     }
 }
 
 #[test]
-fn launch_identity_ignores_search_terms_and_fork_sources() {
+fn in_app_resume_retargets_search_terms_and_fork_launches() {
     const WRAPPER: &str = "ebeca78f-687a-4ad7-8f05-b988a6690cb5";
     const LIVE: &str = "31555be4-b5c0-4323-ab8b-5afe6b2ca78e";
     const FORK: &str = "92f1f6f1-0000-4000-8000-000000000001";
-    for (args, expected) in [
-        (vec!["--resume", WRAPPER, "--fork-session"], LIVE),
-        (vec!["--resume", "auth"], LIVE),
-        (vec!["--resume", "synthetic-session"], LIVE),
-        (
-            vec!["--session-id", FORK, "--resume", WRAPPER, "--fork-session"],
-            FORK,
-        ),
+    for args in [
+        vec!["--resume", WRAPPER, "--fork-session"],
+        vec!["--resume", "auth"],
+        vec!["--resume", "synthetic-session"],
+        vec!["--session-id", FORK, "--resume", WRAPPER, "--fork-session"],
     ] {
-        eprintln!("RESUMEID launch arguments: {args:?}, expected={expected}");
+        eprintln!("LIVEID launch arguments: {args:?}, expected={LIVE}");
         let mut f = Fixture::with_args("auth_recovery", 600_000, false, &args);
         let runs = f.recover_after_switch(LIVE);
         let relaunched = runs[1]["args"].as_array().unwrap();
         let resume = relaunched.iter().position(|arg| arg == "--resume").unwrap();
-        assert_eq!(relaunched[resume + 1], expected, "{args:?}");
+        assert_eq!(relaunched[resume + 1], LIVE, "{args:?}");
     }
 }
 
@@ -633,9 +660,9 @@ fn a_failed_bound_resume_stops_without_creating_an_unbound_child() {
     );
     let args = runs[1]["args"].as_array().unwrap();
     let resume = args.iter().position(|arg| arg == "--resume").unwrap();
-    assert_eq!(args[resume + 1], WRAPPER);
+    assert_eq!(args[resume + 1], LIVE);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(WRAPPER) && stderr.contains("authentication recovery stopped"));
+    assert!(stderr.contains(LIVE) && stderr.contains("authentication recovery stopped"));
 }
 
 #[test]

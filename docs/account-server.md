@@ -243,13 +243,14 @@ a stale revision returns the available unexpired successor.
 
 A new child can start near token expiry. Authentication failure or expiry immediately
 starts recovery on the same session and account, once a replacement token is available.
-Same-account renewal and authentication recovery keep the explicit `--resume <UUID>` or
-`--session-id <UUID>` identity from the original launch. An in-app `/resume` does not retarget
-automatic recovery: it returns to the conversation named at launch, preserving the
-supervisor's session binding. Resume search terms and fork sources are not fixed identities;
-a fork can supply its new identity with `--session-id`. Without a fixed launch identity,
-recovery follows the current conversation. If the fixed conversation cannot be resumed,
-recovery stops instead of creating a different session.
+Same-account renewal and authentication recovery resume the last admitted live conversation,
+including a later in-app `/resume`. The original `--resume <UUID>` or `--session-id <UUID>`
+does not override that current conversation. Recovery also follows a newer conversation
+observed in the final hook drain while the child stops. An explicit launch UUID still makes
+a failed renewal resume stop instead of creating a different session; authentication recovery also
+stops on a failed resume. Resume search terms and fork sources are not bound launch IDs.
+Supervisors that bind conversation IDs must verify and adopt the replacement child's live
+ID; a launch UUID is not a permanent conversation binding.
 This does not guarantee continuous authentication while the provider or server is unavailable.
 `claudectl server refresh-access` deliberately rotates the shared grant, so existing child
 snapshots can be rejected until restart is permitted. The historical `margin` rotation

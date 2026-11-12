@@ -436,6 +436,15 @@ struct Restart {
     session_id: String,
     cause: super::restart_gate::Cause,
 }
+#[cfg(unix)]
+impl Restart {
+    fn with_current_session(mut self, current: Option<&str>) -> Option<Self> {
+        if matches!(&self.kind, RestartKind::Renew(_)) {
+            self.session_id = current?.to_owned();
+        }
+        Some(self)
+    }
+}
 /// Failover state that outlives one Claude process of the run.
 #[cfg(unix)]
 #[derive(Clone, Default)]
@@ -819,7 +828,7 @@ impl Monitor {
                     self.failover_target(&mut activity, &mut gate, &timing, &mut pending, failed_at)
             {
                 match self.stop_for_restart(&mut activity, &mut gate, &timing, cause) {
-                    Ok(true) => {
+                    Ok(Some(_)) => {
                         signalled_at = Some(Instant::now());
                         sent = Some((
                             now(),
@@ -831,7 +840,7 @@ impl Monitor {
                         ));
                         continue;
                     }
-                    Ok(false) => break,
+                    Ok(None) => break,
                     Err(()) => continue,
                 }
             }
@@ -936,12 +945,9 @@ impl Monitor {
             let restart = renew::replacement_ready(&inputs)
                 && (gate.forced(cause).is_some()
                     || renew::decide(&inputs) == renew::Decision::Restart);
-            if admitted
-                && restart
-                && let Some(session_id) = activity.idle.session.clone()
-            {
+            if admitted && restart {
                 match self.stop_for_restart(&mut activity, &mut gate, &timing, cause) {
-                    Ok(true) => {
+                    Ok(Some(session_id)) => {
                         signalled_at = Some(Instant::now());
                         sent = Some((
                             now(),
@@ -954,7 +960,7 @@ impl Monitor {
                             },
                         ));
                     }
-                    Ok(false) => break,
+                    Ok(None) => break,
                     Err(()) => {}
                 }
             }
@@ -994,7 +1000,11 @@ impl Monitor {
         }
         outcome.restart = sent
             .filter(|_| !ended_first && exit_intent.is_ok() && exec::signals::pending().is_none())
-            .map(|(_, restart)| restart);
+            .and_then(|(_, restart)| {
+                // An in-flight /resume hook can finish while the child stops. The exit
+                // intent above was checked for this final observed conversation.
+                restart.with_current_session(activity.idle.session.as_deref())
+            });
         outcome.notice = match (pending.notice.take(), cron_log_error) {
             (Some(notice), Some(error)) => Some(format!("{notice}\n{error}")),
             (notice, error) => notice.or(error),
@@ -1005,16 +1015,15 @@ impl Monitor {
 
 #[cfg(unix)]
 impl Monitor {
-    /// Mark the session renewing, then SIGTERM Claude. Ok(true): the signal was delivered,
-    /// so the coming exit is a restart. Ok(false): Claude already exited. Err: the marker
-    /// could not be written (without it a supervisor could relaunch this session too).
+    /// Mark renewing, then SIGTERM Claude, returning the final admitted conversation ID.
+    /// None means Claude already exited; Err means admission or signalling failed.
     fn stop_for_restart(
         &self,
         activity: &mut Activity,
         gate: &mut super::restart_gate::Gate,
         timing: &super::renew::Timing,
         cause: super::restart_gate::Cause,
-    ) -> std::result::Result<bool, ()> {
+    ) -> std::result::Result<Option<String>, ()> {
         // Deferral must not publish renewing or signal before workload admission.
         // This guard and the locks do not close all input sources.
         let _admission = gate.admit(&activity.idle, cause, self.held_expires_at)?;
@@ -1038,6 +1047,7 @@ impl Monitor {
         {
             return Err(());
         }
+        let session_id = activity.idle.session.clone().ok_or(())?;
         let mut status = self.status.clone();
         status["renewal"] = "renewing".into();
         if atomic(&self.directory.join("session.json"), &status).is_err() {
@@ -1064,7 +1074,7 @@ impl Monitor {
             let mut status = self.status.clone();
             status["renewal"] = "on".into();
             let _ = atomic(&self.directory.join("session.json"), &status);
-            return Ok(false);
+            return Ok(None);
         }
         if unsafe { libc::kill(self.pid as i32, libc::SIGTERM) } != 0 {
             self.failed(
@@ -1074,8 +1084,8 @@ impl Monitor {
             );
             return Err(());
         }
-        gate.signalled(cause, activity.idle.session.as_deref());
-        Ok(true)
+        gate.signalled(cause, Some(&session_id));
+        Ok(Some(session_id))
     }
     /// The account and token to move to for the limit a turn hit at `failed_at`, once a
     /// fresh usage read confirms it and Claude is idle. None: not yet, or `pending` records
@@ -1239,7 +1249,6 @@ pub fn run(
     exec::signals::install();
     let _signals = Signals;
     let mut launch_args = args.to_vec();
-    let launch_session = super::renew::launch_session(args);
     let mut restarts: Vec<i64> = Vec::new();
     // Failovers have their own budget; they never use up renewals (and the reverse).
     let mut failovers: Vec<i64> = Vec::new();
@@ -1318,15 +1327,9 @@ pub fn run(
         let watcher = std::thread::spawn(move || monitor.watch(stopped));
         let waited = exec::wait_exit_no_reap(pid, terminal.is_some());
         let _ = stop.send(());
-        let mut outcome = watcher
+        let outcome = watcher
             .join()
             .map_err(|_| anyhow::anyhow!("session monitor stopped unexpectedly"))?;
-        if let Some(restart) = outcome.restart.as_mut()
-            && matches!(&restart.kind, RestartKind::Renew(_))
-            && let Some(id) = launch_session
-        {
-            restart.session_id = id.to_owned();
-        }
         if let Some(restart) = &outcome.restart {
             relaunch = Some(super::restart_gate::RecoveryAttempt::new(
                 &paths.home,
@@ -1388,9 +1391,7 @@ pub fn run(
                 if let Some(terminal) = &terminal {
                     terminal.restore();
                 }
-                if cause == super::restart_gate::Cause::AuthRecovery
-                    || (cause == super::restart_gate::Cause::Renewal && launch_session.is_some())
-                {
+                if super::renew::failed_resume_stops(args, cause) {
                     let recovery = if cause == super::restart_gate::Cause::AuthRecovery {
                         "authentication recovery"
                     } else {
@@ -1579,6 +1580,59 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    #[test]
+    fn a_shutdown_session_switch_retargets_only_same_account_recovery() {
+        use super::super::restart_gate::Cause;
+        let account = Account {
+            provider: "anthropic".into(),
+            account_id: "b".repeat(64),
+            alias: "spare".into(),
+            identity: Identity {
+                account_uuid: "synthetic-account".into(),
+                organization_uuid: "synthetic-org".into(),
+            },
+            available: true,
+        };
+        let access = Access {
+            provider: account.provider.clone(),
+            account_id: account.account_id.clone(),
+            user_id: "synthetic-user".into(),
+            identity: account.identity.clone(),
+            access_token: "synthetic-token".into(),
+            expires_at: i64::MAX,
+            scopes: vec![],
+            revision: "synthetic-revision".into(),
+            generation: 1,
+        };
+        for (kind, cause, expected) in [
+            (
+                RestartKind::Renew(access.clone()),
+                Cause::Renewal,
+                "new-live",
+            ),
+            (
+                RestartKind::Renew(access.clone()),
+                Cause::AuthRecovery,
+                "new-live",
+            ),
+            (
+                RestartKind::Failover { account, access },
+                Cause::Failover,
+                "limited",
+            ),
+        ] {
+            let restart = Restart {
+                kind,
+                session_id: "limited".into(),
+                cause,
+            }
+            .with_current_session(Some("new-live"))
+            .unwrap();
+            assert_eq!(restart.session_id, expected, "{cause:?}");
+        }
+    }
+
+    #[cfg(unix)]
     struct WaitingChild(std::process::Child);
     #[cfg(unix)]
     impl Drop for WaitingChild {
@@ -1676,7 +1730,7 @@ mod tests {
                 &super::super::renew::timing(),
                 cause
             ),
-            Ok(true)
+            Ok(Some("s".into()))
         );
         let status: Value =
             serde_json::from_slice(&private_read(&monitor.directory.join("session.json")).unwrap())
@@ -1687,7 +1741,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn renewal_deadline_signals_a_busy_child_without_waiting_for_locks() {
+    fn renewal_deadline_uses_the_final_live_id_without_waiting_for_locks() {
         let (_home, mut child, monitor, mut activity) = admission_fixture();
         let lock = super::super::restart_gate::admission(&monitor.directory).unwrap();
         let hook_lock = super::super::restart_gate::hook_admission(&monitor.directory).unwrap();
@@ -1700,6 +1754,17 @@ mod tests {
         );
         let cause = super::super::restart_gate::Cause::Renewal;
         gate.request_at(cause, Instant::now() - Duration::from_secs(600));
+        use std::io::Write;
+        let live = "31555be4-b5c0-4323-ab8b-5afe6b2ca78e";
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(monitor.directory.join("events"))
+                .unwrap(),
+            "{}",
+            json!({"at":now(),"event":"UserPromptSubmit","session_id":live})
+        )
+        .unwrap();
         assert_eq!(
             monitor.stop_for_restart(
                 &mut activity,
@@ -1707,7 +1772,7 @@ mod tests {
                 &super::super::renew::timing(),
                 cause,
             ),
-            Ok(true)
+            Ok(Some(live.into()))
         );
         drop(hook_lock);
         drop(lock);
@@ -1721,6 +1786,7 @@ mod tests {
         .unwrap();
         let forced: Value = serde_json::from_str(journal.lines().last().unwrap()).unwrap();
         assert_eq!(forced["reason"], "renewal_deadline");
+        assert_eq!(forced["session_id"], live);
         assert_eq!(forced["metric"]["value"], 1);
     }
 
