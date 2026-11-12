@@ -210,6 +210,59 @@ pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
     }
 }
 
+/// The fixed UUID a supervisor binds. Resume names/searches and fork sources are not IDs.
+pub(super) fn launch_session(args: &[OsString]) -> Option<&str> {
+    let mut resume = None;
+    let mut session = None;
+    let mut fork = false;
+    let mut rest = args.iter().peekable();
+    while let Some(arg) = rest.next() {
+        let Some(arg) = arg.to_str() else {
+            continue;
+        };
+        if arg == "--" {
+            break;
+        }
+        if super::failover::VALUE_FLAGS.contains(&arg) {
+            rest.next();
+            continue;
+        }
+        if arg == "--fork-session" {
+            fork = true;
+            continue;
+        }
+        let (flag, assigned) = arg
+            .split_once('=')
+            .map_or((arg, None), |(flag, value)| (flag, Some(value)));
+        if !matches!(flag, "--resume" | "-r" | "--session-id") {
+            continue;
+        }
+        let value = assigned
+            .or_else(|| {
+                rest.next_if(|value| !starts_with_dash(value))
+                    .and_then(|value| value.to_str())
+            })
+            .filter(|value| is_session_uuid(value));
+        if flag == "--session-id" {
+            session = value;
+        } else {
+            resume = value;
+        }
+    }
+    session.or(resume.filter(|_| !fork))
+}
+
+fn is_session_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
 /// The relaunch arguments: the user's arguments without resume, continue, session-id and
 /// fork forms, plus `--resume <session>`. None for a one-shot `-p`/`--print` run.
 pub(super) fn relaunch_args(args: &[OsString], session: &str) -> Option<Vec<OsString>> {
@@ -655,6 +708,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn launch_identity_does_not_interpret_option_values_as_options() {
+        const WRAPPER: &str = "ebeca78f-687a-4ad7-8f05-b988a6690cb5";
+        const LIVE: &str = "31555be4-b5c0-4323-ab8b-5afe6b2ca78e";
+        let prompt = format!("--resume={LIVE}");
+        for args in [
+            os(&["--system-prompt", "--", "--resume", WRAPPER]),
+            os(&["--resume", WRAPPER, "--append-system-prompt", &prompt]),
+            os(&["--system-prompt", "--fork-session", "--resume", WRAPPER]),
+        ] {
+            assert_eq!(launch_session(&args), Some(WRAPPER), "{args:?}");
+        }
+    }
 
     #[test]
     fn the_current_session_follows_a_fork_without_its_own_session_start() {
