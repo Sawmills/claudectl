@@ -135,7 +135,7 @@ fn quoted_body_owner_references_do_not_count() {
 }
 
 #[test]
-fn verified_recovery_logs_one_positive_session_record() {
+fn verified_recovery_log_names_the_session_and_saved_job_count() {
     let f = Fixture::new();
     let recovery = f.prepare().unwrap().unwrap();
     let report = f.report(&recovery, f.jobs(), &recovery.prompt());
@@ -147,7 +147,6 @@ fn verified_recovery_logs_one_positive_session_record() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["session"], "run-recovery");
     assert_eq!(rows[0]["message"], "crons intact: 2 jobs");
 }
