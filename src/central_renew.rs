@@ -210,7 +210,7 @@ pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
     }
 }
 
-/// The fixed UUID a supervisor binds. Resume names/searches and fork sources are not IDs.
+/// A bound launch UUID makes a failed renewal resume terminal. Names and fork sources do not.
 pub(super) fn launch_session(args: &[OsString]) -> Option<&str> {
     let mut resume = None;
     let mut session = None;

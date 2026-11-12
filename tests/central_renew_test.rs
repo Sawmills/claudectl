@@ -532,7 +532,7 @@ impl Fixture {
 }
 
 #[test]
-fn auth_recovery_after_in_app_resume_keeps_the_wrapper_launch_resume_id() {
+fn auth_recovery_after_in_app_resume_keeps_the_live_conversation() {
     const WRAPPER: &str = "ebeca78f-687a-4ad7-8f05-b988a6690cb5";
     const LIVE: &str = "31555be4-b5c0-4323-ab8b-5afe6b2ca78e";
     let mut f = Fixture::with_args(
@@ -554,59 +554,56 @@ fn auth_recovery_after_in_app_resume_keeps_the_wrapper_launch_resume_id() {
     let args = runs[1]["args"].as_array().unwrap();
     let resume = args.iter().position(|arg| arg == "--resume").unwrap();
     eprintln!(
-        "RESUMEID wrapper={WRAPPER} live={LIVE} relaunched={}",
+        "LIVEID wrapper={WRAPPER} live={LIVE} relaunched={}",
         args[resume + 1]
     );
-    assert_eq!(args[resume + 1], WRAPPER);
+    assert_eq!(args[resume + 1], LIVE);
 }
 
 #[test]
-fn recovery_honors_launch_identity_forms_and_keeps_unbound_sessions_live() {
+fn in_app_resume_retargets_launch_identity_forms_and_unbound_sessions() {
     const WRAPPER: &str = "ebeca78f-687a-4ad7-8f05-b988a6690cb5";
     const LIVE: &str = "31555be4-b5c0-4323-ab8b-5afe6b2ca78e";
     let resume = format!("--resume={WRAPPER}");
     let session = format!("--session-id={WRAPPER}");
     let prompt = format!("--resume={LIVE}");
-    for (args, expected) in [
-        (vec![resume.as_str()], WRAPPER),
-        (vec!["-r", WRAPPER], WRAPPER),
-        (vec!["--session-id", WRAPPER], WRAPPER),
-        (vec![session.as_str()], WRAPPER),
-        (vec![], LIVE),
-        (vec!["--resume", "--verbose"], LIVE),
-        (vec!["--continue"], LIVE),
-        (vec!["--resume", WRAPPER, "--", prompt.as_str()], WRAPPER),
+    for args in [
+        vec![resume.as_str()],
+        vec!["-r", WRAPPER],
+        vec!["--session-id", WRAPPER],
+        vec![session.as_str()],
+        vec![],
+        vec!["--resume", "--verbose"],
+        vec!["--continue"],
+        vec!["--resume", WRAPPER, "--", prompt.as_str()],
     ] {
-        eprintln!("RESUMEID launch arguments: {args:?}, expected={expected}");
+        eprintln!("LIVEID launch arguments: {args:?}, expected={LIVE}");
         let mut f = Fixture::with_args("auth_recovery", 600_000, false, &args);
         let runs = f.recover_after_switch(LIVE);
         let relaunched = runs[1]["args"].as_array().unwrap();
         let resume = relaunched.iter().position(|arg| arg == "--resume").unwrap();
-        assert_eq!(relaunched[resume + 1], expected, "{args:?}");
+        assert_eq!(relaunched[resume + 1], LIVE, "{args:?}");
         assert!(!relaunched.iter().any(|arg| arg == prompt.as_str()));
     }
 }
 
 #[test]
-fn launch_identity_ignores_search_terms_and_fork_sources() {
+fn in_app_resume_retargets_search_terms_and_fork_launches() {
     const WRAPPER: &str = "ebeca78f-687a-4ad7-8f05-b988a6690cb5";
     const LIVE: &str = "31555be4-b5c0-4323-ab8b-5afe6b2ca78e";
     const FORK: &str = "92f1f6f1-0000-4000-8000-000000000001";
-    for (args, expected) in [
-        (vec!["--resume", WRAPPER, "--fork-session"], LIVE),
-        (vec!["--resume", "auth"], LIVE),
-        (vec!["--resume", "synthetic-session"], LIVE),
-        (
-            vec!["--session-id", FORK, "--resume", WRAPPER, "--fork-session"],
-            FORK,
-        ),
+    for args in [
+        vec!["--resume", WRAPPER, "--fork-session"],
+        vec!["--resume", "auth"],
+        vec!["--resume", "synthetic-session"],
+        vec!["--session-id", FORK, "--resume", WRAPPER, "--fork-session"],
     ] {
-        eprintln!("RESUMEID launch arguments: {args:?}, expected={expected}");
+        eprintln!("LIVEID launch arguments: {args:?}, expected={LIVE}");
         let mut f = Fixture::with_args("auth_recovery", 600_000, false, &args);
         let runs = f.recover_after_switch(LIVE);
         let relaunched = runs[1]["args"].as_array().unwrap();
         let resume = relaunched.iter().position(|arg| arg == "--resume").unwrap();
-        assert_eq!(relaunched[resume + 1], expected, "{args:?}");
+        assert_eq!(relaunched[resume + 1], LIVE, "{args:?}");
     }
 }
 
@@ -633,9 +630,9 @@ fn a_failed_bound_resume_stops_without_creating_an_unbound_child() {
     );
     let args = runs[1]["args"].as_array().unwrap();
     let resume = args.iter().position(|arg| arg == "--resume").unwrap();
-    assert_eq!(args[resume + 1], WRAPPER);
+    assert_eq!(args[resume + 1], LIVE);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(WRAPPER) && stderr.contains("authentication recovery stopped"));
+    assert!(stderr.contains(LIVE) && stderr.contains("authentication recovery stopped"));
 }
 
 #[test]
