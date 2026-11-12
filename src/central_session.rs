@@ -436,6 +436,15 @@ struct Restart {
     session_id: String,
     cause: super::restart_gate::Cause,
 }
+#[cfg(unix)]
+impl Restart {
+    fn with_current_session(mut self, current: Option<&str>) -> Option<Self> {
+        if matches!(&self.kind, RestartKind::Renew(_)) {
+            self.session_id = current?.to_owned();
+        }
+        Some(self)
+    }
+}
 /// Failover state that outlives one Claude process of the run.
 #[cfg(unix)]
 #[derive(Clone, Default)]
@@ -991,13 +1000,10 @@ impl Monitor {
         }
         outcome.restart = sent
             .filter(|_| !ended_first && exit_intent.is_ok() && exec::signals::pending().is_none())
-            .and_then(|(_, mut restart)| {
+            .and_then(|(_, restart)| {
                 // An in-flight /resume hook can finish while the child stops. The exit
                 // intent above was checked for this final observed conversation.
-                if matches!(&restart.kind, RestartKind::Renew(_)) {
-                    restart.session_id = activity.idle.session.clone()?;
-                }
-                Some(restart)
+                restart.with_current_session(activity.idle.session.as_deref())
             });
         outcome.notice = match (pending.notice.take(), cron_log_error) {
             (Some(notice), Some(error)) => Some(format!("{notice}\n{error}")),
@@ -1572,6 +1578,59 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shutdown_session_switch_retargets_only_same_account_recovery() {
+        use super::super::restart_gate::Cause;
+        let account = Account {
+            provider: "anthropic".into(),
+            account_id: "b".repeat(64),
+            alias: "spare".into(),
+            identity: Identity {
+                account_uuid: "synthetic-account".into(),
+                organization_uuid: "synthetic-org".into(),
+            },
+            available: true,
+        };
+        let access = Access {
+            provider: account.provider.clone(),
+            account_id: account.account_id.clone(),
+            user_id: "synthetic-user".into(),
+            identity: account.identity.clone(),
+            access_token: "synthetic-token".into(),
+            expires_at: i64::MAX,
+            scopes: vec![],
+            revision: "synthetic-revision".into(),
+            generation: 1,
+        };
+        for (kind, cause, expected) in [
+            (
+                RestartKind::Renew(access.clone()),
+                Cause::Renewal,
+                "new-live",
+            ),
+            (
+                RestartKind::Renew(access.clone()),
+                Cause::AuthRecovery,
+                "new-live",
+            ),
+            (
+                RestartKind::Failover { account, access },
+                Cause::Failover,
+                "limited",
+            ),
+        ] {
+            let restart = Restart {
+                kind,
+                session_id: "limited".into(),
+                cause,
+            }
+            .with_current_session(Some("new-live"))
+            .unwrap();
+            assert_eq!(restart.session_id, expected, "{cause:?}");
+        }
+    }
 
     #[cfg(unix)]
     struct WaitingChild(std::process::Child);
