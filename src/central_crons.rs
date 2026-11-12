@@ -124,17 +124,13 @@ impl Recovery {
                     continue;
                 }
             };
-            let mut owners = Vec::new();
-            for line in text.lines() {
-                let mut words = line.split_whitespace();
-                while let Some(word) = words.next() {
-                    if word == "operator_tab:"
-                        && let Some(owner) = words.next()
-                    {
-                        owners.push(owner);
-                    }
-                }
-            }
+            let mut owners: Vec<_> = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("operator_tab:"))
+                .filter_map(|value| value.split_whitespace().next())
+                .collect();
+            owners.sort_unstable();
+            owners.dedup();
             if !owners
                 .iter()
                 .any(|owner| std::ffi::OsStr::new(owner) == tab)
@@ -300,10 +296,7 @@ impl Recovery {
             }
         }
         Ok(Some(if missing.is_empty() {
-            format!(
-                "cron recovery verified: {0}/{0} saved jobs",
-                self.jobs.len()
-            )
+            format!("crons intact: {} jobs", self.jobs.len())
         } else {
             missing.join("; ")
         }))

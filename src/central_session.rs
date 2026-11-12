@@ -1707,6 +1707,81 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn completed_cron_recovery_logs_once_per_session() {
+        const CHILD: &str = "CLAUDECTL_TEST_CRON_REPORT_ONCE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "central::session::tests::completed_cron_recovery_logs_once_per_session",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HERDR_TAB_ID", "w9C:tF")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let (_home, _child, mut monitor, _activity) = admission_fixture();
+        let fleet = monitor.paths.home.join("Code/.fleet/example");
+        private_dir(&fleet).unwrap();
+        std::fs::write(fleet.join("check.txt"), "Check the owned lanes.\n").unwrap();
+        std::fs::write(
+            fleet.join("operator.md"),
+            "operator_tab: w9C:tF\ncron_prompts: check.txt */5 * * * *\n",
+        )
+        .unwrap();
+        let recovery =
+            super::super::crons::Recovery::prepare(&monitor.paths.home, &monitor.directory, "s")
+                .unwrap()
+                .unwrap();
+        let transcript = monitor.paths.home.join("recovery.jsonl");
+        let rows = [
+            json!({"type":"user","sessionId":"s","message":{"content":recovery.prompt()}}),
+            json!({"type":"assistant","sessionId":"s","uuid":"a","message":{"content":[{"type":"tool_use","name":"CronList","id":"list","input":{}}]}}),
+            json!({"type":"user","sessionId":"s","sourceToolAssistantUUID":"a","message":{"content":[{"type":"tool_result","tool_use_id":"list","content":"inventory"}]},"toolUseResult":{"jobs":[{"id":"kept","cron":"*/5 * * * *","prompt":"Check the owned lanes.\n","recurring":true,"durable":false}]}}),
+        ];
+        std::fs::write(
+            &transcript,
+            rows.iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        monitor.crons = Some(recovery);
+        let log = monitor
+            .paths
+            .home
+            .join(".claudectl/server/cron-recovery.jsonl");
+        monitor.check_crons(false).unwrap();
+        assert!(!log.exists(), "no report before the recovery turn stops");
+        super::super::crons::record_transcript(
+            &monitor.directory,
+            &json!({"hook_event_name":"Stop","session_id":"s","transcript_path":transcript}),
+        )
+        .unwrap();
+
+        monitor.check_crons(false).unwrap();
+        monitor.check_crons(true).unwrap();
+        let text = std::fs::read_to_string(log).unwrap();
+        let rows: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["session"], "run-admission");
+        assert_eq!(rows[0]["message"], "crons intact: 1 jobs");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn option_b_final_signal_requires_a_completed_quiet_window() {
         let (_home, mut child, monitor, mut activity) = admission_fixture();
         activity.idle.since = Some(now() - 600_001);
