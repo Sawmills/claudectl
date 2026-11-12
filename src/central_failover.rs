@@ -163,7 +163,7 @@ pub(super) const RECOVERY_PROMPT: &str = "Continue the previous request.";
 /// Claude Code flags (2.1.295 `--help` and the CLI reference) that take exactly one value.
 /// Flags with many values or an optional value are left out on purpose: after them, an
 /// argument may be a prompt.
-const VALUE_FLAGS: &[&str] = &[
+pub(super) const VALUE_FLAGS: &[&str] = &[
     "--agent",
     "--agents",
     "--append-system-prompt",

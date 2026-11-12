@@ -1239,6 +1239,7 @@ pub fn run(
     exec::signals::install();
     let _signals = Signals;
     let mut launch_args = args.to_vec();
+    let launch_session = super::renew::launch_session(args);
     let mut restarts: Vec<i64> = Vec::new();
     // Failovers have their own budget; they never use up renewals (and the reverse).
     let mut failovers: Vec<i64> = Vec::new();
@@ -1317,9 +1318,15 @@ pub fn run(
         let watcher = std::thread::spawn(move || monitor.watch(stopped));
         let waited = exec::wait_exit_no_reap(pid, terminal.is_some());
         let _ = stop.send(());
-        let outcome = watcher
+        let mut outcome = watcher
             .join()
             .map_err(|_| anyhow::anyhow!("session monitor stopped unexpectedly"))?;
+        if let Some(restart) = outcome.restart.as_mut()
+            && matches!(&restart.kind, RestartKind::Renew(_))
+            && let Some(id) = launch_session
+        {
+            restart.session_id = id.to_owned();
+        }
         if let Some(restart) = &outcome.restart {
             relaunch = Some(super::restart_gate::RecoveryAttempt::new(
                 &paths.home,
@@ -1381,10 +1388,17 @@ pub fn run(
                 if let Some(terminal) = &terminal {
                     terminal.restore();
                 }
-                if cause == super::restart_gate::Cause::AuthRecovery {
+                if cause == super::restart_gate::Cause::AuthRecovery
+                    || (cause == super::restart_gate::Cause::Renewal && launch_session.is_some())
+                {
+                    let recovery = if cause == super::restart_gate::Cause::AuthRecovery {
+                        "authentication recovery"
+                    } else {
+                        "token renewal"
+                    };
                     eprintln!(
                         "claudectl: ERROR: Claude could not resume original session {id} (exit code {}). \
-                         Automatic authentication recovery stopped; use /resume {id} on the same account.",
+                         Automatic {recovery} stopped; use /resume {id} on the same account.",
                         exec::exit_code_of(&status)
                     );
                     return Ok(exec::exit_code_of(&status));

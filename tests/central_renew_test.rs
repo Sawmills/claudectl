@@ -122,6 +122,20 @@ first_launch=not log.exists()
 mode=os.environ['FAKE_MODE']
 if mode=='auth_typing': tty.setraw(0)
 args=sys.argv[1:]
+session_id='s'
+skip_value=False
+for index,arg in enumerate(args):
+    if skip_value:
+        skip_value=False
+        continue
+    if arg in ('--model','--settings','--system-prompt','--append-system-prompt'):
+        skip_value=True
+        continue
+    if arg=='--': break
+    if arg in ('--resume','-r','--session-id') and index+1<len(args) and not args[index+1].startswith('-'):
+        session_id=args[index+1]
+    elif arg.startswith(('--resume=','--session-id=')):
+        session_id=arg.split('=',1)[1]
 settings=json.load(open(args[args.index('--settings')+1]))
 run=Path(os.environ['CLAUDECTL_SERVER_RUN'])
 with log.open('a') as out:
@@ -152,7 +166,7 @@ def term(*_):
 signal.signal(signal.SIGTERM,term)
 command=settings['hooks']['Stop'][0]['hooks'][0]['command']
 def hook(event, **details):
-    subprocess.run(['/bin/sh','-c',command],input=json.dumps({'hook_event_name':event,'session_id':'s',**details}).encode(),check=True)
+    subprocess.run(['/bin/sh','-c',command],input=json.dumps({'hook_event_name':event,'session_id':session_id,**details}).encode(),check=True)
 def provider_status():
     request=urllib.request.Request(os.environ['FAKE_PROVIDER_URL'],headers={'Authorization':'Bearer '+os.environ['CLAUDE_CODE_OAUTH_TOKEN']})
     try:
@@ -181,7 +195,13 @@ retried=False
 became_idle=False
 typed=0
 hold_ended=False
+session_switched=False
 while not (home/'release').exists() and time.monotonic()<deadline:
+    if first_launch and not session_switched and (home/'switch-session').exists():
+        session_id=(home/'switch-session').read_text().strip()
+        hook('SessionStart'); hook('Stop')
+        session_switched=True
+        (home/'session-switched').touch()
     if mode=='hold' and first_launch and not hold_ended and (home/'end-hold').exists():
         subprocess.run([os.environ['FAKE_WRAPPER_BIN'],'hold','end'],check=True)
         hold_ended=True
@@ -227,6 +247,18 @@ struct Fixture {
 }
 impl Fixture {
     fn start(mode: &str, life_ms: i64, tty: bool) -> Self {
+        Self::with_args(
+            mode,
+            life_ms,
+            tty,
+            if tty {
+                &["--model", "opus"]
+            } else {
+                &["--model", "opus", "--resume", "s"]
+            },
+        )
+    }
+    fn with_args(mode: &str, life_ms: i64, tty: bool, args: &[&str]) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
         let state = Arc::new(Mutex::new(Fake {
@@ -273,14 +305,20 @@ impl Fixture {
         let settings = r#"{"crossSessionInbound":"accept","isolatePeerMachines":true}"#;
         let mut command = if tty {
             let quote = |s: &Path| format!("'{}'", s.display().to_string().replace('\'', "'\\''"));
+            let args = args
+                .iter()
+                .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+                .collect::<Vec<_>>()
+                .join(" ");
             let mut c = Command::new("/usr/bin/script");
             c.args([
                 "-qec",
                 &format!(
-                    "{} server run work --claude {} -- --model opus --settings '{}'",
+                    "{} server run work --claude {} -- --settings '{}' {}",
                     quote(&binary),
                     quote(&claude),
-                    settings
+                    settings,
+                    args
                 ),
                 "/dev/null",
             ]);
@@ -289,15 +327,9 @@ impl Fixture {
             let mut c = Command::new(&binary);
             c.args(["server", "run", "work", "--claude"])
                 .arg(&claude)
-                .args([
-                    "--",
-                    "--model",
-                    "opus",
-                    "--resume",
-                    "old",
-                    "--settings",
-                    settings,
-                ]);
+                .arg("--")
+                .args(["--settings", settings])
+                .args(args);
             c
         };
         if mode == "auth_prompt" {
@@ -362,6 +394,29 @@ impl Fixture {
         let mut fake = self.state.lock().unwrap();
         fake.generation += 1;
         fake.expires_at = chrono::Utc::now().timestamp_millis() + fake.life_ms;
+    }
+    fn switch_session(&self, session: &str) {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !self.home.path().join("ready").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(self.home.path().join("ready").exists());
+        std::fs::write(self.home.path().join("switch-session"), session).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !self.home.path().join("session-switched").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(self.home.path().join("session-switched").exists());
+    }
+    fn recover_after_switch(&mut self, session: &str) -> Vec<Value> {
+        self.switch_session(session);
+        self.revoke();
+        std::fs::write(self.home.path().join("provider-probe"), "").unwrap();
+        let runs = self.wait_recovered();
+        std::fs::write(self.home.path().join("release"), "").unwrap();
+        let output = self.child.take().unwrap().wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(23));
+        runs
     }
     fn wait_recovered(&self) -> Vec<Value> {
         let wait = if self.run()["tty"] == true { 30 } else { 4 };
@@ -474,6 +529,113 @@ impl Fixture {
         assert!(!String::from_utf8_lossy(&output.stderr).contains("resuming session"));
         output
     }
+}
+
+#[test]
+fn auth_recovery_after_in_app_resume_keeps_the_wrapper_launch_resume_id() {
+    const WRAPPER: &str = "ebeca78f-687a-4ad7-8f05-b988a6690cb5";
+    const LIVE: &str = "31555be4-b5c0-4323-ab8b-5afe6b2ca78e";
+    let mut f = Fixture::with_args(
+        "auth_recovery",
+        600_000,
+        false,
+        &["--model", "opus", "--resume", WRAPPER],
+    );
+    let runs = f.recover_after_switch(LIVE);
+    assert_ne!(runs[0]["pid"], runs[1]["pid"]);
+    assert_eq!(runs[1]["token"], "token-2");
+    assert_eq!(runs[1]["run"], runs[0]["run"]);
+    assert_eq!(runs[1]["session"]["account_id"], ACCOUNT);
+    assert!(
+        f.journal()
+            .iter()
+            .any(|event| event["event"] == "restart_forced" && event["cause"] == "auth_recovery")
+    );
+    let args = runs[1]["args"].as_array().unwrap();
+    let resume = args.iter().position(|arg| arg == "--resume").unwrap();
+    eprintln!(
+        "RESUMEID wrapper={WRAPPER} live={LIVE} relaunched={}",
+        args[resume + 1]
+    );
+    assert_eq!(args[resume + 1], WRAPPER);
+}
+
+#[test]
+fn recovery_honors_launch_identity_forms_and_keeps_unbound_sessions_live() {
+    const WRAPPER: &str = "ebeca78f-687a-4ad7-8f05-b988a6690cb5";
+    const LIVE: &str = "31555be4-b5c0-4323-ab8b-5afe6b2ca78e";
+    let resume = format!("--resume={WRAPPER}");
+    let session = format!("--session-id={WRAPPER}");
+    let prompt = format!("--resume={LIVE}");
+    for (args, expected) in [
+        (vec![resume.as_str()], WRAPPER),
+        (vec!["-r", WRAPPER], WRAPPER),
+        (vec!["--session-id", WRAPPER], WRAPPER),
+        (vec![session.as_str()], WRAPPER),
+        (vec![], LIVE),
+        (vec!["--resume", "--verbose"], LIVE),
+        (vec!["--continue"], LIVE),
+        (vec!["--resume", WRAPPER, "--", prompt.as_str()], WRAPPER),
+    ] {
+        eprintln!("RESUMEID launch arguments: {args:?}, expected={expected}");
+        let mut f = Fixture::with_args("auth_recovery", 600_000, false, &args);
+        let runs = f.recover_after_switch(LIVE);
+        let relaunched = runs[1]["args"].as_array().unwrap();
+        let resume = relaunched.iter().position(|arg| arg == "--resume").unwrap();
+        assert_eq!(relaunched[resume + 1], expected, "{args:?}");
+        assert!(!relaunched.iter().any(|arg| arg == prompt.as_str()));
+    }
+}
+
+#[test]
+fn launch_identity_ignores_search_terms_and_fork_sources() {
+    const WRAPPER: &str = "ebeca78f-687a-4ad7-8f05-b988a6690cb5";
+    const LIVE: &str = "31555be4-b5c0-4323-ab8b-5afe6b2ca78e";
+    const FORK: &str = "92f1f6f1-0000-4000-8000-000000000001";
+    for (args, expected) in [
+        (vec!["--resume", WRAPPER, "--fork-session"], LIVE),
+        (vec!["--resume", "auth"], LIVE),
+        (vec!["--resume", "synthetic-session"], LIVE),
+        (
+            vec!["--session-id", FORK, "--resume", WRAPPER, "--fork-session"],
+            FORK,
+        ),
+    ] {
+        eprintln!("RESUMEID launch arguments: {args:?}, expected={expected}");
+        let mut f = Fixture::with_args("auth_recovery", 600_000, false, &args);
+        let runs = f.recover_after_switch(LIVE);
+        let relaunched = runs[1]["args"].as_array().unwrap();
+        let resume = relaunched.iter().position(|arg| arg == "--resume").unwrap();
+        assert_eq!(relaunched[resume + 1], expected, "{args:?}");
+    }
+}
+
+#[test]
+fn a_failed_bound_resume_stops_without_creating_an_unbound_child() {
+    const WRAPPER: &str = "ebeca78f-687a-4ad7-8f05-b988a6690cb5";
+    const LIVE: &str = "31555be4-b5c0-4323-ab8b-5afe6b2ca78e";
+    let mut f = Fixture::with_args("auth_resume_fails", 600_000, false, &["--resume", WRAPPER]);
+    f.switch_session(LIVE);
+    f.revoke();
+    std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while f.child.as_mut().unwrap().try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(f.child.as_mut().unwrap().try_wait().unwrap().is_some());
+    let output = f.child.take().unwrap().wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    let runs = f.runs();
+    assert_eq!(
+        runs.len(),
+        2,
+        "a bound launch must never become a fresh child"
+    );
+    let args = runs[1]["args"].as_array().unwrap();
+    let resume = args.iter().position(|arg| arg == "--resume").unwrap();
+    assert_eq!(args[resume + 1], WRAPPER);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(WRAPPER) && stderr.contains("authentication recovery stopped"));
 }
 
 #[test]
