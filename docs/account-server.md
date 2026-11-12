@@ -296,9 +296,12 @@ the conversation with the replacement token. Blocking hook/admission locks canno
 forced restart. Installing a new CLI does not upgrade a running wrapper.
 
 For a Fleet Operator, `HERDR_TAB_ID` selects the matching `operator_tab` in
-`~/Code/.fleet/*/operator.md`. Its `cron_prompts` entries (a prompt file and five schedule
-fields, separated by semicolons) are the source of truth, even when the resumed session's
-CronList is empty. Cards without saved jobs do not participate in discovery. When one tab
+`~/Code/.fleet/*/operator.md`. Only lines that start with `operator_tab:` name an owner.
+Repeated values count as one owner; two different values make a populated card ambiguous.
+Inline fields and quoted body references do not count. Each card's `cron_prompts` entries
+(a prompt file and five schedule fields, separated by semicolons) are the source of truth,
+even when the resumed session's CronList is empty. Cards without saved jobs do not
+participate in discovery. When one tab
 owns several populated cards, their jobs are merged: the same resolved prompt file and
 schedule is restored once, with its ID recorded on every owning card. Different schedules
 for the same file across cards skip recovery with a conflict reason; a single card can
@@ -309,9 +312,12 @@ jobs, create only missing jobs once, run CronList again, and update
 each card's `cron_ids` and `claude_session_file`. claudectl reads that final inventory from the
 resumed session transcript, matched to its tool call and recovery prompt. Recovery does not
 replay missed fires or run saved prompts. After recovery, a renewal stops; a failover
-continues the previous request. claudectl prints
-`cron recovery verified: N/N saved jobs`, `missing cron: <file> (<schedule>)`, or an explicit
-unverified notice if evidence is absent or unreadable. Prompt contents are not printed.
+continues the previous request. Each completed recovery writes one result per session to
+`~/.claudectl/server/cron-recovery.jsonl`. A complete final inventory logs
+`crons intact: N jobs`, where N counts saved jobs, including any restored jobs.
+Missing jobs log `missing cron: <file> (<schedule>)`.
+Absent or unreadable evidence logs an explicit unverified notice.
+Results stay outside the live terminal. The log contains no saved prompt contents.
 Recovery preserves option values, including multi-value `--add-dir` and `--allowedTools`.
 Failover includes the original task verbatim in its single delivered recovery prompt.
 Renewal omits the original task and stops after restoring crons.

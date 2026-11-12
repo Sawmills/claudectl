@@ -80,6 +80,79 @@ impl Fixture {
 }
 
 #[test]
+fn repeated_owner_headers_are_one_owner() {
+    let f = Fixture::new();
+    let text = std::fs::read_to_string(&f.card).unwrap();
+    std::fs::write(
+        &f.card,
+        format!(
+            "hq: agent-platform hq_pane: NONE operator_tab: w9C:tF\n\
+             operator_tab: w9C:tF (pane w9C:pF)\n{text}"
+        ),
+    )
+    .unwrap();
+
+    let recovery = f.prepare().unwrap().unwrap();
+    for file in [&f.first, &f.second] {
+        assert!(
+            recovery
+                .prompt()
+                .contains(&format!("file: {}\n", file.display()))
+        );
+    }
+}
+
+#[test]
+fn distinct_owner_headers_are_ambiguous() {
+    for other in ["w9C:tOther", "w9C:tF-extra"] {
+        let f = Fixture::new();
+        let text = std::fs::read_to_string(&f.card).unwrap();
+        std::fs::write(&f.card, format!("{text}operator_tab: {other}\n")).unwrap();
+
+        assert_eq!(
+            f.prepare().err().unwrap().to_string(),
+            "cron recovery: ambiguous Operator card ownership"
+        );
+        assert!(!f.directory.join(ARMED).exists());
+    }
+}
+
+#[test]
+fn quoted_body_owner_references_do_not_count() {
+    let f = Fixture::new();
+    let text = std::fs::read_to_string(&f.card).unwrap();
+    std::fs::write(
+        &f.card,
+        format!(
+            "hq: guide hq_pane: NONE operator_tab: w9C:tF\n{text}\n\
+             The guide quotes operator_tab: w9C:tC in its body.\n\
+             > operator_tab: w9C:tC\n"
+        ),
+    )
+    .unwrap();
+
+    assert!(f.prepare().unwrap().is_some());
+}
+
+#[test]
+fn verified_recovery_logs_one_positive_session_record() {
+    let f = Fixture::new();
+    let recovery = f.prepare().unwrap().unwrap();
+    let report = f.report(&recovery, f.jobs(), &recovery.prompt());
+    log_notice(f.home.path(), &f.directory, &report).unwrap();
+
+    let text = std::fs::read_to_string(f.home.path().join(".claudectl/server/cron-recovery.jsonl"))
+        .unwrap();
+    let rows: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["session"], "run-recovery");
+    assert_eq!(rows[0]["message"], "crons intact: 2 jobs");
+}
+
+#[test]
 fn recovery_names_saved_jobs_and_preserves_unrelated_inventory() {
     let f = Fixture::new();
     let recovery = f.prepare().unwrap().unwrap();
@@ -99,10 +172,7 @@ fn recovery_names_saved_jobs_and_preserves_unrelated_inventory() {
     }
     let mut jobs = f.jobs();
     jobs.as_array_mut().unwrap().push(json!({"id":"manual","cron":"0 9 * * *","prompt":"Manual reminder.","recurring":true,"durable":false}));
-    assert_eq!(
-        f.report(&recovery, jobs, &prompt),
-        "cron recovery verified: 2/2 saved jobs"
-    );
+    assert_eq!(f.report(&recovery, jobs, &prompt), "crons intact: 2 jobs");
 }
 
 #[test]
@@ -124,7 +194,7 @@ fn renewal_recovery_verifies_the_complete_launch_prompt() {
     assert!(prompt.ends_with("Then stop: do no other work."));
     assert_eq!(
         f.report(&recovery, f.jobs(), &prompt),
-        "cron recovery verified: 2/2 saved jobs"
+        "crons intact: 2 jobs"
     );
 }
 
@@ -138,7 +208,7 @@ fn failover_recovery_verifies_its_continuation_prompt() {
     assert!(!prompt.contains("Then stop: do no other work."));
     assert_eq!(
         f.report(&recovery, f.jobs(), &prompt),
-        "cron recovery verified: 2/2 saved jobs"
+        "crons intact: 2 jobs"
     );
 }
 
@@ -201,7 +271,7 @@ fn assert_recovery_resume(continue_request: bool) {
         }
         assert_eq!(
             f.report(&recovery, f.jobs(), delivered),
-            "cron recovery verified: 2/2 saved jobs"
+            "crons intact: 2 jobs"
         );
     }
 }
@@ -239,7 +309,7 @@ fn recovery_accepts_kept_jobs_with_their_existing_ids() {
     jobs[1]["id"] = "old-two".into();
     assert_eq!(
         f.report(&recovery, jobs, &recovery.prompt()),
-        "cron recovery verified: 2/2 saved jobs"
+        "crons intact: 2 jobs"
     );
 }
 
@@ -274,10 +344,7 @@ fn recovery_merges_cards_deduplicates_jobs_and_keeps_distinct_local_schedules() 
         assert!(prompt.contains("same ID on every owning card"));
         let mut jobs = f.jobs();
         jobs.as_array_mut().unwrap().push(json!({"id":"new-three","cron":"0 12 * * *","prompt":if second_schedule {"Check the owned lanes.\n"} else {"Check the other project.\n"},"recurring":true,"durable":false}));
-        assert_eq!(
-            f.report(&recovery, jobs, &prompt),
-            "cron recovery verified: 3/3 saved jobs"
-        );
+        assert_eq!(f.report(&recovery, jobs, &prompt), "crons intact: 3 jobs");
     }
 }
 
@@ -343,24 +410,19 @@ fn empty_unrelated_or_unreadable_cards_do_not_hide_owned_saved_jobs() {
 }
 
 #[test]
-fn canonical_inline_operator_headers_are_supported() {
-    let f = Fixture::new();
-    let text = std::fs::read_to_string(&f.card).unwrap();
-    std::fs::write(
-        &f.card,
-        text.replace(
-            "operator_tab: w9C:tF",
-            "hq: example hq_pane: w5C:t41 operator_tab: w9C:tF",
-        ),
-    )
-    .unwrap();
-    assert!(
-        f.prepare()
-            .unwrap()
-            .unwrap()
-            .prompt()
-            .contains(f.first.to_str().unwrap())
-    );
+fn inline_and_body_owner_references_do_not_select_a_card() {
+    for owner in [
+        "hq: example hq_pane: w5C:t41 operator_tab: w9C:tF",
+        "The guide quotes operator_tab: w9C:tF in its body.",
+        "> operator_tab: w9C:tF",
+        "  operator_tab: w9C:tF",
+    ] {
+        let f = Fixture::new();
+        let text = std::fs::read_to_string(&f.card).unwrap();
+        std::fs::write(&f.card, text.replace("operator_tab: w9C:tF", owner)).unwrap();
+        assert!(f.prepare().unwrap().is_none(), "selected {owner}");
+        assert!(!f.directory.join(ARMED).exists());
+    }
 }
 
 #[test]
@@ -382,7 +444,7 @@ fn missing_and_duplicate_jobs_never_claim_verified_recovery() {
         } else {
             "missing cron:"
         }));
-        assert!(!report.contains("cron recovery verified"));
+        assert!(!report.contains("crons intact:"));
         assert!(!report.contains("Check the owned lanes."));
     }
 }
@@ -413,12 +475,7 @@ fn recovery_logging_is_private_and_optional_without_prompt_contents() {
     let path = f.home.path().join(".claudectl/server/cron-recovery.jsonl");
     std::fs::write(&path, "").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    log_notice(
-        f.home.path(),
-        &f.directory,
-        "cron recovery verified: 2/2 saved jobs",
-    )
-    .unwrap();
+    log_notice(f.home.path(), &f.directory, "crons intact: 2 jobs").unwrap();
     assert_eq!(
         std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
@@ -438,7 +495,7 @@ fn recovery_logging_is_private_and_optional_without_prompt_contents() {
     let recovery = f.prepare().unwrap().unwrap();
     let report = f.report(&recovery, f.jobs(), &recovery.prompt());
     assert!(log_notice(f.home.path(), &f.directory, &report).is_err());
-    assert_eq!(report, "cron recovery verified: 2/2 saved jobs");
+    assert_eq!(report, "crons intact: 2 jobs");
 }
 
 #[cfg(target_os = "linux")]
@@ -450,7 +507,7 @@ fn recovery_log_never_enters_the_child_terminal_or_input() {
         log_notice(
             &home,
             &home.join(".claudectl/server/sessions/run-recovery"),
-            "cron recovery verified: 2/2 saved jobs",
+            "crons intact: 2 jobs",
         )
         .unwrap();
         // This is the isolated test child's PTY, with no user terminal attached.
@@ -491,7 +548,7 @@ fn recovery_log_never_enters_the_child_terminal_or_input() {
         String::from_utf8_lossy(&output.stderr)
     );
     for bytes in [&output.stdout, &output.stderr] {
-        assert!(!String::from_utf8_lossy(bytes).contains("cron recovery verified:"));
+        assert!(!String::from_utf8_lossy(bytes).contains("crons intact:"));
     }
     let text = std::fs::read_to_string(f.home.path().join(".claudectl/server/cron-recovery.jsonl"))
         .unwrap();
