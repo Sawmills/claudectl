@@ -518,14 +518,21 @@ impl Gate {
         );
     }
 
-    pub(super) fn request_at(&mut self, cause: Cause, at: Instant) {
+    pub(super) fn request_at(&mut self, cause: Cause, at: Instant, held_expires_at: i64) {
         if cause == Cause::Failover {
             return;
         }
-        self.state = self.state.transition(RestartEvent::RenewalRequested(at));
         if cause == Cause::AuthRecovery {
             self.state = self.state.transition(RestartEvent::AuthFailed);
+            return;
         }
+        // A cached successor is not a pending restart. Start the admission clock
+        // only when the held grant enters its real expiry margin.
+        if held_expires_at.saturating_sub(now()) > 300_000 {
+            self.state = RestartState::Watching;
+            return;
+        }
+        self.state = self.state.transition(RestartEvent::RenewalRequested(at));
     }
 
     pub(super) fn recovered(&mut self) {
@@ -1722,9 +1729,13 @@ mod tests {
         let (_home, mut gate, mut idle) = setup();
         let start = Instant::now();
         idle.since = None;
-        gate.request_at(Cause::Renewal, start);
+        gate.request_at(Cause::Renewal, start, now() + 240_000);
         assert!(!gate.check_at(&idle, Cause::Renewal, i64::MAX, start));
-        gate.request_at(Cause::Renewal, start + Duration::from_secs(599));
+        gate.request_at(
+            Cause::Renewal,
+            start + Duration::from_secs(599),
+            now() + 240_000,
+        );
         assert!(!gate.check_at(
             &idle,
             Cause::Renewal,
@@ -2231,7 +2242,7 @@ mod tests {
             let saved = std::fs::read(&path).unwrap();
             let start = Instant::now();
             if pending_replacement {
-                gate.request_at(Cause::Renewal, start);
+                gate.request_at(Cause::Renewal, start, now() + 240_000);
             }
             assert!(!gate.check_at(
                 &idle,
