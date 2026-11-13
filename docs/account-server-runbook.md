@@ -114,11 +114,14 @@ while one runs). Read the summary table: rerun for `lost-reply` and `failed:fenc
 for `unrotated`. A row `migrated (log out the live login)` means the live login on that
 machine holds a retired grant: run `claude auth logout` there; claudectl never deletes it.
 
-7. **Verify renewal and failover:** use isolated fixtures. A valid held token and account
-   failover retain the ten-minute quiet window. Authentication failure or expiry recovers
-   automatically at the next verified idle point, on the same session and account. Confirm
-   every running turn, task-output child, hold, open production marker and pending hook
-   blocks recovery. Check a hook waiting on input as well as one waiting for a lock. Verify
+7. **Verify renewal and failover:** use isolated fixtures. A new revision must not start
+   a restart deadline while the held token has more than five minutes left.
+   Eligible near-expiry renewal retains quiet admission. Account failover still requires
+   ten continuous minutes of observed quiet.
+   Fresh authentication failure or expiry recovers immediately on the same session and
+   account, after observing the current replacement. Ordinary workload checks still block
+   ordinary renewal; explicit holds and unknown SessionEnd intent veto every restart.
+   Exercise hooks that wait for input or a lock. Verify
    one restart per failed observation, terminal foreground, saved-card cron recovery and no
    original-task or missed-fire replay. Check warning journal/metric/status five minutes
    before expiry and blocked attention for each busy or unknown workload. Damaged/missing

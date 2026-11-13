@@ -996,6 +996,8 @@ fn a_failed_recovery_spawn_is_counted_once() {
         .collect();
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0]["reason"], "spawn");
+    assert_eq!(failures[0]["held_revision"], "revision-1");
+    assert_eq!(failures[0]["current_revision"], "revision-2");
 }
 
 #[test]
@@ -1143,6 +1145,8 @@ fn a_failed_auth_resume_does_not_start_a_different_conversation() {
         .collect();
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0]["reason"], "resume");
+    assert_eq!(failures[0]["held_revision"], "revision-1");
+    assert_eq!(failures[0]["current_revision"], "revision-2");
 }
 
 #[test]

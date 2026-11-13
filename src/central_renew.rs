@@ -1,6 +1,5 @@
-//! SAW-12610: `server run` follows the account's token revision. A provider refresh revokes
-//! the token every session of the account holds, so a session restarts Claude with
-//! `--resume <session>` on the new token, only at an idle point.
+//! `server run` follows a replacement when the held grant is rejected or near expiry.
+//! A different token revision alone does not restart a healthy Claude session.
 use std::ffi::{OsStr, OsString};
 
 use super::atomic;
@@ -9,6 +8,8 @@ use super::atomic;
 pub(super) const IDLE_AFTER_STOP_MS: i64 = 600_000;
 /// No terminal input for this long before a restart (ms): protects a draft being typed.
 pub(super) const TTY_IDLE_MS: i64 = 600_000;
+/// Ordinary renewal becomes eligible this long before the held grant expires.
+pub(super) const EXPIRY_MARGIN_MS: i64 = 300_000;
 /// The first prompt of a renewal resume only (never a first launch, a manual resume or a
 /// failover). Claude Code can keep session cron jobs listed after a resume but stop firing
 /// them (SAW-12610, 10-09): the session creates them again, catches up each missed job once,
@@ -343,7 +344,7 @@ pub(super) enum Decision {
 }
 
 pub(super) fn decide(i: &Inputs) -> Decision {
-    if i.server_revision == i.held_revision {
+    if i.server_revision == i.held_revision || !restart_needed(i) {
         return Decision::Keep;
     }
     if !replacement_ready(i) || (!held_token_dead(i) && i.server_expires_at <= i.held_expires_at) {
@@ -395,6 +396,12 @@ pub(super) fn idle_gate(i: &Inputs) -> Result<(), &'static str> {
 /// `authentication_failed` (a forced rotation revokes it before expiry).
 pub(super) fn held_token_dead(i: &Inputs) -> bool {
     i.now >= i.held_expires_at || i.idle.auth_failed.is_some()
+}
+
+/// A newer revision alone does not make the held grant unusable. Renew only for
+/// an observed rejection or within five minutes of the held grant's expiry.
+pub(super) fn restart_needed(i: &Inputs) -> bool {
+    held_token_dead(i) || i.held_expires_at.saturating_sub(i.now) <= EXPIRY_MARGIN_MS
 }
 
 /// The error types of a failed turn in Claude Code's StopFailure hook (2.1.295).
@@ -1032,7 +1039,7 @@ mod tests {
         Inputs {
             now: 10_000_000,
             held_revision: "r1",
-            held_expires_at: 20_000_000,
+            held_expires_at: 10_240_000,
             server_revision: "r2",
             server_expires_at: 40_000_000,
             idle,
@@ -1069,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn a_revoked_token_restarts_only_an_idle_claude() {
+    fn a_near_expiry_token_restarts_only_an_idle_claude() {
         let idle = Idle {
             session: Some("s".into()),
             since: Some(10_000_000 - IDLE_AFTER_STOP_MS),
@@ -1083,8 +1090,11 @@ mod tests {
         let mut same = inputs(&idle);
         same.server_revision = "r1";
         assert_eq!(decide(&same), Decision::Keep);
+        let mut healthy = inputs(&idle);
+        healthy.held_expires_at = 20_000_000;
+        assert_eq!(decide(&healthy), Decision::Keep);
         // Busy, too recent, typing, no session, or the budget used up. Extra processes in
-        // Claude's group are no gate: the held token is superseded here (SAW-12610).
+        // Claude's group are no gate: this valid held token is within its expiry margin.
         let busy = Idle {
             session: Some("s".into()),
             since: None,

@@ -435,6 +435,7 @@ struct Restart {
     kind: RestartKind,
     session_id: String,
     cause: super::restart_gate::Cause,
+    revisions: super::restart_gate::Revisions,
 }
 #[cfg(unix)]
 impl Restart {
@@ -593,21 +594,6 @@ struct Activity {
 }
 #[cfg(unix)]
 impl Monitor {
-    fn failed(
-        &self,
-        activity: &Activity,
-        cause: super::restart_gate::Cause,
-        stage: super::restart_gate::RecoveryFailure,
-    ) {
-        super::restart_gate::recovery_failed(
-            &self.paths.home,
-            &self.directory,
-            activity.idle.session.as_deref(),
-            cause,
-            stage,
-        );
-    }
-
     /// Fold the hook events appended since the last read into the activity.
     fn read_events(&self, activity: &mut Activity) -> std::io::Result<()> {
         // A healthy writer's in-progress append must not look like damaged evidence.
@@ -683,6 +669,10 @@ impl Monitor {
         let mut activity = Activity::default();
         let mut was_recovering = false;
         let mut next_access: Option<Access> = None;
+        let mut checked_auth = None;
+        let mut checked_at = 0;
+        let mut cached_revision: Option<String> = None;
+        let mut current_revision: Option<String> = None;
         let mut signalled_at: Option<Instant> = None;
         let mut no_session_reported = false;
         let mut replacement_backoff: Option<Instant> = None;
@@ -732,8 +722,8 @@ impl Monitor {
                     && !exec::has_exited(self.pid)
                 {
                     if unsafe { libc::kill(self.pid as i32, libc::SIGKILL) } != 0 {
-                        self.failed(
-                            &activity,
+                        gate.failed(
+                            &activity.idle,
                             restart.cause,
                             super::restart_gate::RecoveryFailure::Signal,
                         );
@@ -748,6 +738,13 @@ impl Monitor {
             let events_failed = self
                 .read_events(&mut activity)
                 .is_err_and(|error| error.kind() != std::io::ErrorKind::WouldBlock);
+            gate.revisions(
+                &self.held_revision,
+                cached_revision.as_deref(),
+                current_revision.as_deref(),
+                self.held_expires_at,
+                activity.idle.auth_failed,
+            );
             if events_failed || self.directory.join("hook-error").exists() {
                 outcome.note = Some("off: hook evidence unavailable".into());
                 gate.unknown(
@@ -759,8 +756,8 @@ impl Monitor {
             let recovering = renew::held_token_dead(&self.inputs(&mut activity, &timing, None));
             if activity.idle.session.is_none() {
                 if recovering && !no_session_reported {
-                    self.failed(
-                        &activity,
+                    gate.failed(
+                        &activity.idle,
                         super::restart_gate::Cause::AuthRecovery,
                         super::restart_gate::RecoveryFailure::NoSession,
                     );
@@ -793,8 +790,8 @@ impl Monitor {
                 self.recovery_resume = false;
             }
             if self.recovery_resume && activity.idle.auth_failed.is_some() {
-                self.failed(
-                    &activity,
+                gate.failed(
+                    &activity.idle,
                     super::restart_gate::Cause::AuthRecovery,
                     super::restart_gate::RecoveryFailure::ReplacementRejected,
                 );
@@ -820,6 +817,7 @@ impl Monitor {
             } else {
                 super::restart_gate::Cause::Renewal
             };
+            gate.request_at(cause, Instant::now(), self.held_expires_at);
             let admitted = gate.check(&activity.idle, cause, self.held_expires_at);
             if failover_pending
                 && admitted
@@ -836,6 +834,7 @@ impl Monitor {
                                 kind: RestartKind::Failover { account, access },
                                 session_id,
                                 cause,
+                                revisions: gate.recovery_context(),
                             },
                         ));
                         continue;
@@ -857,26 +856,39 @@ impl Monitor {
             } else {
                 timing.poll_near_ms.min(timing.poll_far_ms).min(30_000)
             };
-            // Once a usable successor is known, admission must not wait behind another
-            // HTTP request. Expired snapshots are replaced without resetting the deadline.
+            // A timestamp-valid candidate can have been revoked by another holder.
+            // A new rejection needs an observation made after that rejection.
             let needs_token = next_access
                 .as_ref()
                 .is_none_or(|access| access.expires_at <= now());
-            let due =
-                needs_token && ((recovering && !was_recovering) || now() - last_check >= interval);
+            let unchecked_auth =
+                activity.idle.auth_failed.is_some() && activity.idle.auth_failed != checked_auth;
+            let entering_recovery = recovering && !was_recovering;
+            let due = (needs_token || unchecked_auth || entering_recovery)
+                && (entering_recovery || now() - last_check >= interval);
             was_recovering = recovering;
             if due {
                 last_check = now();
+                let request_auth = activity.idle.auth_failed;
+                cached_revision = next_access.as_ref().map(|access| access.revision.clone());
+                gate.revisions(
+                    &self.held_revision,
+                    cached_revision.as_deref(),
+                    current_revision.as_deref(),
+                    self.held_expires_at,
+                    request_auth,
+                );
                 let mut access = match self.client.observe(&self.account_id) {
                     Ok(access) => access,
                     Err(_) => {
                         if recovering || next_access.is_some() {
-                            self.failed(
-                                &activity,
+                            gate.failed(
+                                &activity.idle,
                                 cause,
                                 super::restart_gate::RecoveryFailure::Observe,
                             );
                         }
+                        next_access = None;
                         last_check = now() - interval + timing.retry_ms;
                         continue;
                     }
@@ -890,6 +902,11 @@ impl Monitor {
                 if activity.idle.ended.is_some() || exec::signals::pending().is_some() {
                     continue;
                 }
+                if activity.idle.auth_failed.is_some() && activity.idle.auth_failed != request_auth
+                {
+                    next_access = None;
+                    continue;
+                }
                 // A successful Stop during the request can clear a transient failure.
                 let recovering = renew::held_token_dead(&self.inputs(&mut activity, &timing, None));
                 cause = if recovering {
@@ -901,17 +918,26 @@ impl Monitor {
                     gate.recovered();
                 }
                 if activity.idle.auth_failed.is_some() && access.revision == self.held_revision {
+                    current_revision = Some(access.revision.clone());
+                    gate.revisions(
+                        &self.held_revision,
+                        cached_revision.as_deref(),
+                        current_revision.as_deref(),
+                        self.held_expires_at,
+                        activity.idle.auth_failed,
+                    );
                     access = match self
                         .client
                         .acquire(&self.account_id, Some(&self.held_revision))
                     {
                         Ok(access) => access,
                         Err(_) => {
-                            self.failed(
-                                &activity,
+                            gate.failed(
+                                &activity.idle,
                                 cause,
                                 super::restart_gate::RecoveryFailure::Acquire,
                             );
+                            next_access = None;
                             last_check = now() - interval + timing.retry_ms;
                             continue;
                         }
@@ -923,13 +949,22 @@ impl Monitor {
                         gate.unknown(&activity.idle, cause, self.held_expires_at);
                     }
                 }
+                current_revision = Some(access.revision.clone());
+                gate.revisions(
+                    &self.held_revision,
+                    cached_revision.as_deref(),
+                    current_revision.as_deref(),
+                    self.held_expires_at,
+                    activity.idle.auth_failed,
+                );
                 if access.revision != self.held_revision && access.expires_at > now() {
-                    gate.request_at(cause, Instant::now());
                     next_access = Some(access);
+                    checked_auth = request_auth;
+                    checked_at = now();
                 } else {
                     if recovering {
-                        self.failed(
-                            &activity,
+                        gate.failed(
+                            &activity.idle,
                             cause,
                             super::restart_gate::RecoveryFailure::UnusableReplacement,
                         );
@@ -940,12 +975,25 @@ impl Monitor {
             let Some(access) = next_access.as_ref() else {
                 continue;
             };
-            let admitted = gate.check(&activity.idle, cause, self.held_expires_at);
+            if activity.idle.auth_failed.is_some() && activity.idle.auth_failed != checked_auth {
+                continue;
+            }
             let inputs = self.inputs(&mut activity, &timing, Some(access));
+            if !renew::restart_needed(&inputs) {
+                continue;
+            }
+            let admitted = gate.check(inputs.idle, cause, self.held_expires_at);
             let restart = renew::replacement_ready(&inputs)
                 && (gate.forced(cause).is_some()
                     || renew::decide(&inputs) == renew::Decision::Restart);
             if admitted && restart {
+                // A hold or long workload wait must not relaunch a superseded snapshot.
+                // Freshness has its own 30-second bound, independent of retry cadence.
+                if now() - checked_at > 30_000 {
+                    next_access = None;
+                    last_check = now() - interval;
+                    continue;
+                }
                 match self.stop_for_restart(&mut activity, &mut gate, &timing, cause) {
                     Ok(Some(session_id)) => {
                         signalled_at = Some(Instant::now());
@@ -957,6 +1005,7 @@ impl Monitor {
                                 ),
                                 session_id,
                                 cause,
+                                revisions: gate.recovery_context(),
                             },
                         ));
                     }
@@ -1026,6 +1075,12 @@ impl Monitor {
     ) -> std::result::Result<Option<String>, ()> {
         // Deferral must not publish renewing or signal before workload admission.
         // This guard and the locks do not close all input sources.
+        let observed_auth = activity.idle.auth_failed;
+        if cause != super::restart_gate::Cause::Failover
+            && !super::renew::restart_needed(&self.inputs(activity, timing, None))
+        {
+            return Err(());
+        }
         let _admission = gate.admit(&activity.idle, cause, self.held_expires_at)?;
         let forced = gate.forced(cause).is_some();
         if self.directory.join("hook-error").exists()
@@ -1040,6 +1095,14 @@ impl Monitor {
         if cause == super::restart_gate::Cause::Failover {
             inputs.restarts_last_hour = self.failover.as_ref().map_or(0, |f| f.last_hour);
         }
+        if cause != super::restart_gate::Cause::Failover
+            && (!super::renew::restart_needed(&inputs)
+                || inputs.idle.auth_failed != observed_auth
+                || (cause == super::restart_gate::Cause::AuthRecovery
+                    && !super::renew::held_token_dead(&inputs)))
+        {
+            return Err(());
+        }
         if (!forced && super::renew::idle_gate(&inputs).is_err())
             || inputs.idle.session.is_none()
             || inputs.idle.ended.is_some()
@@ -1051,8 +1114,8 @@ impl Monitor {
         let mut status = self.status.clone();
         status["renewal"] = "renewing".into();
         if atomic(&self.directory.join("session.json"), &status).is_err() {
-            self.failed(
-                activity,
+            gate.failed(
+                &activity.idle,
                 cause,
                 super::restart_gate::RecoveryFailure::StatusPublish,
             );
@@ -1077,8 +1140,8 @@ impl Monitor {
             return Ok(None);
         }
         if unsafe { libc::kill(self.pid as i32, libc::SIGTERM) } != 0 {
-            self.failed(
-                activity,
+            gate.failed(
+                &activity.idle,
                 cause,
                 super::restart_gate::RecoveryFailure::Signal,
             );
@@ -1254,7 +1317,11 @@ pub fn run(
     let mut failovers: Vec<i64> = Vec::new();
     let mut tried: Vec<String> = Vec::new();
     // The session the running Claude was relaunched to resume, until its result is known.
-    let mut resumed: Option<(String, super::restart_gate::Cause)> = None;
+    let mut resumed: Option<(
+        String,
+        super::restart_gate::Cause,
+        super::restart_gate::Revisions,
+    )> = None;
     let mut first = true;
     let mut cron_recovery = None;
     let mut relaunch: Option<super::restart_gate::RecoveryAttempt> = None;
@@ -1307,7 +1374,7 @@ pub fn run(
             renewable: hooks.is_some(),
             recovery_resume: resumed
                 .as_ref()
-                .is_some_and(|(_, cause)| *cause == super::restart_gate::Cause::AuthRecovery),
+                .is_some_and(|(_, cause, _)| *cause == super::restart_gate::Cause::AuthRecovery),
             restarts: restarts
                 .iter()
                 .filter(|&&at| now() - at < 3_600_000)
@@ -1336,6 +1403,7 @@ pub fn run(
                 session.directory(),
                 &restart.session_id,
                 restart.cause,
+                restart.revisions.clone(),
             ));
         }
         let descendants = if waited.is_ok() {
@@ -1367,6 +1435,7 @@ pub fn run(
             kind,
             session_id,
             cause,
+            revisions,
         }) = outcome.restart
         else {
             if let Some(notice) = &outcome.notice {
@@ -1377,7 +1446,7 @@ pub fn run(
             // say so and start a new session on the same token, once (SAW-12882). A stop by
             // signal, or a code from 128 up (130 is Ctrl-C), is the user's stop: it ends the
             // run as before.
-            if let Some((id, cause)) = resumed.take()
+            if let Some((id, cause, revisions)) = resumed.take()
                 && status.code().is_some_and(|code| (1..128).contains(&code))
                 && !session_started(&session.directory().join("events"))
             {
@@ -1387,6 +1456,7 @@ pub fn run(
                     Some(&id),
                     cause,
                     super::restart_gate::RecoveryFailure::Resume,
+                    revisions,
                 );
                 if let Some(terminal) = &terminal {
                     terminal.restore();
@@ -1417,7 +1487,7 @@ pub fn run(
             }
             return Ok(exec::exit_code_of(&status));
         };
-        resumed = Some((session_id.clone(), cause));
+        resumed = Some((session_id.clone(), cause, revisions));
         if let Some(terminal) = &terminal {
             terminal.restore();
         }
@@ -1625,6 +1695,7 @@ mod tests {
                 kind,
                 session_id: "limited".into(),
                 cause,
+                revisions: Default::default(),
             }
             .with_current_session(Some("new-live"))
             .unwrap();
@@ -1689,7 +1760,7 @@ mod tests {
             pid: child.0.id(),
             account_id: "a".repeat(64),
             held_revision: "old".into(),
-            held_expires_at: now() + 600_000,
+            held_expires_at: now() + 240_000,
             renewable: true,
             recovery_resume: false,
             restarts: 1,
@@ -1703,6 +1774,27 @@ mod tests {
             crons: None,
         };
         (home, child, monitor, activity)
+    }
+
+    #[cfg(unix)]
+    fn admission_hold(home: &Path, pid: u32) -> PathBuf {
+        let owner = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
+            .output()
+            .unwrap();
+        assert!(owner.status.success());
+        let started = String::from_utf8(owner.stdout).unwrap();
+        let path = home.join(".claudectl/server/holds/run-admission.json");
+        private_dir(path.parent().unwrap()).unwrap();
+        atomic(
+            &path,
+            &json!({"run":"run-admission","reason":"synthetic hold",
+            "owner_pid":pid,"owner_started":started.trim(),"at":now(),"alias":"work"}),
+        )
+        .unwrap();
+        path
     }
 
     #[cfg(unix)]
@@ -1816,6 +1908,504 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn captured_new_revision_does_not_restart_a_healthy_monitor() {
+        let captured: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/restart-cadence.json")).unwrap();
+        let held_for = captured["healthy_held"]["expires_at"].as_i64().unwrap()
+            - captured["healthy_held"]["forced_at"].as_i64().unwrap();
+        let waited = captured["healthy_held"]["forced_at"].as_i64().unwrap()
+            - captured["healthy_held"]["observed_at"].as_i64().unwrap();
+        for busy in [true, false] {
+            let (_home, mut child, mut monitor, mut activity) = admission_fixture();
+            monitor.held_expires_at = now() + held_for;
+            activity.idle.since = (!busy).then(|| now() - 600_001);
+            let mut gate = super::super::restart_gate::Gate::new(
+                &monitor.paths.home,
+                &monitor.directory,
+                monitor.pid,
+                &monitor.alias,
+            );
+            let cause = super::super::restart_gate::Cause::Renewal;
+            gate.request_at(
+                cause,
+                Instant::now() - Duration::from_millis(waited as u64),
+                monitor.held_expires_at,
+            );
+            assert_eq!(
+                monitor.stop_for_restart(
+                    &mut activity,
+                    &mut gate,
+                    &super::super::renew::timing(),
+                    cause,
+                ),
+                Err(()),
+                "a replacement revision must not restart a healthy child; busy={busy}",
+            );
+            assert!(child.0.try_wait().unwrap().is_none());
+            let status: Value = serde_json::from_slice(
+                &private_read(&monitor.directory.join("session.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(status["renewal"], "on");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_healthy_candidate_never_arms_the_margin_deadline_or_hold_notice() {
+        let (_home, mut child, mut monitor, mut activity) = admission_fixture();
+        monitor.held_expires_at = now() + 28_800_000;
+        activity.idle.since = None;
+        let mut gate = super::super::restart_gate::Gate::new(
+            &monitor.paths.home,
+            &monitor.directory,
+            monitor.pid,
+            &monitor.alias,
+        );
+        let hold = admission_hold(&monitor.paths.home, monitor.pid);
+        let start = Instant::now() - Duration::from_secs(601);
+        let cause = super::super::restart_gate::Cause::Renewal;
+        gate.request_at(cause, start, monitor.held_expires_at);
+        assert!(!gate.check_at(
+            &activity.idle,
+            cause,
+            monitor.held_expires_at,
+            Instant::now()
+        ));
+        let journal = monitor
+            .paths
+            .home
+            .join(".claudectl/server/restart-decisions.jsonl");
+        let records = std::fs::read_to_string(journal).unwrap();
+        assert!(
+            !records.contains("restart_blocked_by_hold"),
+            "a healthy candidate emitted a forced-restart hold notice"
+        );
+        std::fs::remove_file(hold).unwrap();
+
+        // Entering the real expiry margin starts its own clock. The old observation
+        // must not turn a busy child into an immediate forced restart.
+        monitor.held_expires_at = now() + 240_000;
+        gate.request_at(cause, Instant::now(), monitor.held_expires_at);
+        assert_eq!(
+            monitor.stop_for_restart(
+                &mut activity,
+                &mut gate,
+                &super::super::renew::timing(),
+                cause
+            ),
+            Err(())
+        );
+        assert!(child.0.try_wait().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_expiry_margin_and_fresh_rejection_still_restart_the_monitor() {
+        use super::super::restart_gate::Cause;
+        for (expires_in, rejected, cause) in [
+            (-1, false, Cause::AuthRecovery),
+            (240_000, false, Cause::Renewal),
+            (28_000_000, true, Cause::AuthRecovery),
+        ] {
+            let (_home, mut child, mut monitor, mut activity) = admission_fixture();
+            monitor.held_expires_at = now() + expires_in;
+            activity.idle.since = None;
+            if rejected {
+                use std::io::Write;
+                writeln!(std::fs::OpenOptions::new().append(true)
+                    .open(monitor.directory.join("events")).unwrap(), "{}",
+                    json!({"at":now(),"event":"StopFailure","session_id":"s","error":"authentication_failed"})).unwrap();
+                monitor.read_events(&mut activity).unwrap();
+            }
+            let mut gate = super::super::restart_gate::Gate::new(
+                &monitor.paths.home,
+                &monitor.directory,
+                monitor.pid,
+                &monitor.alias,
+            );
+            if cause == Cause::Renewal {
+                activity.idle.since = Some(now() - 600_001);
+                assert!(!gate.check_at(
+                    &activity.idle,
+                    cause,
+                    monitor.held_expires_at,
+                    Instant::now() - Duration::from_secs(601)
+                ));
+            }
+            gate.request_at(cause, Instant::now(), monitor.held_expires_at);
+            assert_eq!(
+                monitor.stop_for_restart(
+                    &mut activity,
+                    &mut gate,
+                    &super::super::renew::timing(),
+                    cause
+                ),
+                Ok(Some("s".into()))
+            );
+            assert!(!child.0.wait().unwrap().success());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_stop_cancels_auth_recovery_before_the_final_signal() {
+        use std::io::Write;
+        let (_home, mut child, mut monitor, mut activity) = admission_fixture();
+        monitor.held_expires_at = now() + 28_000_000;
+        let events = monitor.directory.join("events");
+        writeln!(std::fs::OpenOptions::new().append(true).open(&events).unwrap(), "{}",
+            json!({"at":now(),"event":"StopFailure","session_id":"s","error":"authentication_failed"})).unwrap();
+        monitor.read_events(&mut activity).unwrap();
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&events)
+                .unwrap(),
+            "{}",
+            json!({"at":now(),"event":"Stop","session_id":"s"})
+        )
+        .unwrap();
+        let mut gate = super::super::restart_gate::Gate::new(
+            &monitor.paths.home,
+            &monitor.directory,
+            monitor.pid,
+            &monitor.alias,
+        );
+        assert_eq!(
+            monitor.stop_for_restart(
+                &mut activity,
+                &mut gate,
+                &super::super::renew::timing(),
+                super::super::restart_gate::Cause::AuthRecovery
+            ),
+            Err(())
+        );
+        assert!(child.0.try_wait().unwrap().is_none());
+        let status: Value =
+            serde_json::from_slice(&private_read(&monitor.directory.join("session.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["renewal"], "on");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_auth_failure_revalidates_cached_candidate_in_monitor() {
+        const CHILD: &str = "CLAUDECTL_TEST_CADENCE_CANDIDATE";
+        if std::env::var_os(CHILD).is_none() {
+            for scenario in [
+                "current",
+                "observe-fails",
+                "acquire-fails",
+                "expiry-observe-fails",
+                "held-current",
+            ] {
+                let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "central::session::tests::captured_auth_failure_revalidates_cached_candidate_in_monitor",
+                    "--nocapture",
+                ])
+                .env(CHILD, scenario)
+                .env("CLAUDECTL_TEST_RENEW_FAST", "1")
+                .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
+                .output()
+                .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            return;
+        }
+        let scenario = std::env::var(CHILD).unwrap();
+        let observation_failure = match scenario.as_str() {
+            "observe-fails" => Some(("unavailable", "observe", "B")),
+            "acquire-fails" => Some(("old", "acquire", "old")),
+            "expiry-observe-fails" => Some(("unavailable", "observe", "B")),
+            _ => None,
+        };
+
+        use std::io::{BufRead, Read, Write};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (_home, mut child, mut monitor, _activity) = admission_fixture();
+        let captured: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/restart-cadence.json")).unwrap();
+        monitor.held_expires_at = now()
+            + captured["fresh_auth"]["held_expires_at"].as_i64().unwrap()
+            - captured["fresh_auth"]["at"].as_i64().unwrap();
+        if scenario == "expiry-observe-fails" {
+            monitor.held_expires_at = now() + 1_000;
+        }
+        let events = monitor.directory.join("events");
+        std::fs::write(
+            &events,
+            format!(
+                "{}\n{}\n",
+                json!({"at":now(),"event":"SessionStart","session_id":"s"}),
+                json!({"at":now(),"event":"UserPromptSubmit","session_id":"s"}),
+            ),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let current = Arc::new(Mutex::new("B"));
+        let finished = Arc::new(AtomicBool::new(false));
+        let server_current = current.clone();
+        let server_finished = finished.clone();
+        let server_events = events.clone();
+        let hold_path = monitor
+            .paths
+            .home
+            .join(".claudectl/server/holds/run-admission.json");
+        let server_home = monitor.paths.home.clone();
+        let held_pid = monitor.pid;
+        let delayed_signal = scenario == "held-current";
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut first = true;
+            while !server_finished.load(Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(stream) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("synthetic server: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&mut stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                drop(reader);
+                let (status, body) = if request.starts_with("POST /v2/anthropic/token ") {
+                    let input: Value = serde_json::from_slice(&body).unwrap();
+                    let current = *server_current.lock().unwrap();
+                    if delayed_signal && current == "C" {
+                        admission_hold(&server_home, held_pid);
+                    }
+                    let revision = if input["previous_revision"].is_string() {
+                        if current == "old" {
+                            "unavailable"
+                        } else {
+                            "unnecessary-forced-refresh"
+                        }
+                    } else {
+                        current
+                    };
+                    if first {
+                        first = false;
+                        writeln!(
+                            std::fs::OpenOptions::new()
+                                .append(true)
+                                .open(&server_events)
+                                .unwrap(),
+                            "{}",
+                            json!({"at":now(),"event":"Stop","session_id":"s"})
+                        )
+                        .unwrap();
+                    }
+                    if revision == "unavailable" {
+                        ("503 Unavailable", "{}".into())
+                    } else {
+                        ("200 OK", json!({"provider":"anthropic","account_id":"a".repeat(64),
+                        "user_id":"offline","identity":{"account_uuid":"synthetic","organization_uuid":"synthetic"},
+                        "access_token":"synthetic-only","expires_at":now()+28_800_000,
+                        "scopes":[],"revision":revision,"generation":2}).to_string())
+                    }
+                } else {
+                    ("503 Unavailable", "{}".into())
+                };
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        monitor.client.connection.server = origin;
+        let directory = monitor.directory.clone();
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let watcher = std::thread::spawn(move || monitor.watch(stopped));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = private_read(&directory.join("restart-status.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+            if status.is_some_and(|status| status["reason"] == "quiet_window") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Monitor never cached the first successor"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        *current.lock().unwrap() = observation_failure.map_or("C", |failure| failure.0);
+        if scenario != "expiry-observe-fails" {
+            writeln!(std::fs::OpenOptions::new().append(true).open(&events).unwrap(),
+            "{}", json!({"at":now(),"event":"StopFailure","session_id":"s","error":"authentication_failed"})).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        if delayed_signal {
+            let journal = directory
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("restart-decisions.jsonl");
+            for later_tick in [false, true] {
+                loop {
+                    let observed = std::fs::read_to_string(&journal).unwrap_or_default();
+                    if observed.lines().any(|line| {
+                        serde_json::from_str::<Value>(line).is_ok_and(|row| {
+                            row["current_revision"] == "C"
+                                && if later_tick {
+                                    row["event"] == "restart_deferred"
+                                        && row["session_id"] == "s-delayed"
+                                } else {
+                                    row["event"] == "restart_blocked_by_hold"
+                                }
+                        })
+                    }) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "held recovery did not reach its next tick"
+                    );
+                    assert!(child.0.try_wait().unwrap().is_none());
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if !later_tick {
+                    writeln!(
+                        std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&events)
+                            .unwrap(),
+                        "{}",
+                        json!({"at":now(),"event":"UserPromptSubmit","session_id":"s-delayed"})
+                    )
+                    .unwrap();
+                }
+            }
+            std::fs::remove_file(hold_path).unwrap();
+        }
+        if let Some((_, failed_stage, expected_current)) = observation_failure {
+            let journal = directory
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("restart-decisions.jsonl");
+            loop {
+                let observed = std::fs::read_to_string(&journal).unwrap_or_default();
+                if observed
+                    .lines()
+                    .filter(|line| {
+                        serde_json::from_str::<Value>(line).is_ok_and(|record| {
+                            record["event"] == "recovery_failed" && record["reason"] == failed_stage
+                        })
+                    })
+                    .count()
+                    >= 2
+                {
+                    break;
+                }
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "failed observation reused cached B on a later tick"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "failed observation was not reported"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "failed check used cached B"
+            );
+            let failure: Value = std::fs::read_to_string(&journal)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|record| {
+                    record["event"] == "recovery_failed" && record["reason"] == failed_stage
+                })
+                .unwrap();
+            assert_eq!(failure["held_revision"], "old");
+            assert_eq!(failure["cached_revision"], "B");
+            assert_eq!(failure["current_revision"], expected_current);
+            let status: Value =
+                serde_json::from_slice(&private_read(&directory.join("session.json")).unwrap())
+                    .unwrap();
+            assert_eq!(status["renewal"], "on");
+            stop.send(()).unwrap();
+            assert!(watcher.join().unwrap().restart.is_none());
+            finished.store(true, Ordering::SeqCst);
+            server.join().unwrap();
+            return;
+        }
+        while child.0.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "Monitor did not recover a rejected token"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.send(()).unwrap();
+        let outcome = watcher.join().unwrap();
+        finished.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let RestartKind::Renew(access) = outcome.restart.unwrap().kind else {
+            panic!("expected same-account recovery");
+        };
+        assert_eq!(
+            access.revision, "C",
+            "recovery reused the cached B revision"
+        );
+        let journal = std::fs::read_to_string(
+            directory
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("restart-decisions.jsonl"),
+        )
+        .unwrap();
+        let forced: Value = journal
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|record| record["event"] == "restart_forced")
+            .unwrap();
+        assert_eq!(forced["held_revision"], "old");
+        assert_eq!(forced["cached_revision"], "B");
+        assert_eq!(forced["current_revision"], "C");
+        assert!(
+            !journal.contains("synthetic-only"),
+            "token bytes leaked into diagnostics"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn renewal_deadline_uses_the_final_live_id_without_waiting_for_locks() {
         let (_home, mut child, monitor, mut activity) = admission_fixture();
         let lock = super::super::restart_gate::admission(&monitor.directory).unwrap();
@@ -1828,7 +2418,11 @@ mod tests {
             &monitor.alias,
         );
         let cause = super::super::restart_gate::Cause::Renewal;
-        gate.request_at(cause, Instant::now() - Duration::from_secs(600));
+        gate.request_at(
+            cause,
+            Instant::now() - Duration::from_secs(600),
+            monitor.held_expires_at,
+        );
         use std::io::Write;
         let live = "31555be4-b5c0-4323-ab8b-5afe6b2ca78e";
         writeln!(

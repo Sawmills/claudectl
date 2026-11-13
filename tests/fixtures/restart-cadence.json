@@ -1,0 +1,18 @@
+{
+  "source": "Mac restart-decisions.jsonl, captured 2026-11-13; token-free timing rows",
+  "source_tag": "v0.1.48-rc1",
+  "source_sha256": "b1884dd1d69fcc48a82059f9e670a1826ad7595e7ae825dbd6195a0638f2d737",
+  "healthy_held": {
+    "run": "run-0iYAiT",
+    "source_lines": [1783, 1808],
+    "observed_at": 1794559369259,
+    "forced_at": 1794560001622,
+    "expires_at": 1794588002608
+  },
+  "fresh_auth": {
+    "run": "run-0iYAiT",
+    "source_line": 1809,
+    "at": 1794560007799,
+    "held_expires_at": 1794588002608
+  }
+}

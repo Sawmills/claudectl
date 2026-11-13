@@ -47,8 +47,9 @@ Automatic `use` and `run` choose an eligible account with the earliest weekly re
 They exclude accounts with 5% or less weekly headroom and accounts that may bill
 extra usage. Authentication failure or token expiry immediately restarts the same
 session on the same account once a replacement token is available. Workload blockers,
-typing and unrelated hooks do not defer this recovery. Other token renewals wait at most
-ten minutes after a replacement revision is observed when no explicit hold is active.
+typing and unrelated hooks do not defer this recovery. Other token renewals become eligible
+only within five minutes of the held token's expiry and retain workload and quiet admission.
+A new revision alone starts neither a restart nor its deadline.
 Explicit production holds block every restart until `claudectl hold end`, including auth
 recovery and expiry. When a hold blocks dead-token recovery or an overdue renewal, a named
 `restart_blocked_by_hold` notice is written at most once per ten minutes. Unknown SessionEnd

@@ -154,9 +154,17 @@ signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 deadline = time.time() + float(os.environ.get("FAKE_WATCHDOG_S", "20"))
 while time.time() < deadline:
     time.sleep(0.05)
-# Preserve only the native status metadata before the wrapper cleans its run directory.
+# Seek a spurious renewal decision during mixed-operation tests instead of relying
+# on the phase of the final sample relative to the monitor's tick.
+status_path=os.path.join(os.environ["CLAUDECTL_SERVER_RUN"], "restart-status.json")
+status=json.load(open(status_path))
+sample_until=time.monotonic()+(.5 if os.environ.get("FAKE_SAMPLE_RENEWAL") else 0)
+while time.monotonic()<sample_until and status.get('cause')!='renewal':
+    time.sleep(.001)
+    status=json.load(open(status_path))
+# Preserve only native status metadata before the wrapper cleans its run directory.
 with open(os.environ["FAKE_LOG"] + ".deferred", "w") as out:
-    json.dump(json.load(open(os.path.join(os.environ["CLAUDECTL_SERVER_RUN"], "restart-status.json"))), out)
+    json.dump(status, out)
 sys.exit(99)
 "#;
 
@@ -165,6 +173,7 @@ struct Env {
     fake: Shared,
     claude: std::path::PathBuf,
     log: std::path::PathBuf,
+    sample_renewal: bool,
 }
 
 #[test]
@@ -274,6 +283,7 @@ impl Env {
             fake,
             claude,
             log,
+            sample_renewal: false,
         }
     }
     fn run(&self, args: &[&str], watchdog_s: &str) -> std::process::Output {
@@ -295,6 +305,9 @@ impl Env {
             .arg(&self.claude)
             .args(["--", "--model", "opus"])
             .args(settings);
+        if self.sample_renewal {
+            command.env("FAKE_SAMPLE_RENEWAL", "1");
+        }
         Command::from_std(command)
             .timeout(std::time::Duration::from_secs(60))
             .output()
@@ -414,20 +427,23 @@ fn a_throttle_cannot_bypass_unknown_input_admission() {
 
 #[test]
 fn a_new_revision_does_not_bypass_unknown_failover_admission() {
-    let env = Env::new();
+    let mut env = Env::new();
+    env.sample_renewal = true;
     {
         let mut fake = env.fake.lock().unwrap();
         fake.spare_full = true;
         fake.renew_work = true;
     }
     let output = env.run(&["run", "work", "--failover"], "3");
-    assert_deferred(&env, &output, "renewal");
+    assert!(env.fake.lock().unwrap().observed_renewal);
+    assert_deferred(&env, &output, "failover");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("server token renewed"));
 }
 
 #[test]
 fn a_pending_failover_still_observes_renewal_replacements() {
-    let env = Env::new();
+    let mut env = Env::new();
+    env.sample_renewal = true;
     let shared = env.fake.clone();
     let log = env.log.clone();
     let observer = std::thread::spawn(move || {
@@ -457,7 +473,7 @@ fn a_pending_failover_still_observes_renewal_replacements() {
     let observed = env.fake.lock().unwrap().observed_renewal;
     assert!(
         observed,
-        "a waiting failover must not suppress renewal observation and its deadline"
+        "a waiting failover must not suppress safe observation of a replacement"
     );
-    assert_deferred(&env, &output, "renewal");
+    assert_deferred(&env, &output, "failover");
 }
