@@ -978,10 +978,12 @@ impl Monitor {
             if activity.idle.auth_failed.is_some() && activity.idle.auth_failed != checked_auth {
                 continue;
             }
-            let admitted = gate.check(&activity.idle, cause, self.held_expires_at);
             let inputs = self.inputs(&mut activity, &timing, Some(access));
-            let restart = renew::restart_needed(&inputs)
-                && renew::replacement_ready(&inputs)
+            if !renew::restart_needed(&inputs) {
+                continue;
+            }
+            let admitted = gate.check(inputs.idle, cause, self.held_expires_at);
+            let restart = renew::replacement_ready(&inputs)
                 && (gate.forced(cause).is_some()
                     || renew::decide(&inputs) == renew::Decision::Restart);
             if admitted && restart {
