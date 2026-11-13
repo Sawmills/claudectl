@@ -257,10 +257,14 @@ snapshots can be rejected until restart is permitted. The historical `margin` ro
 metric label remains exported at zero for compatibility; explicit force, migration and
 expiry retain their existing reason labels.
 
-An ordinary renewal uses ten continuous minutes of observed quiet when possible. A
-replacement token revision starts a separate ten-minute deadline on its first observation;
-workload changes and repeated requests never reset it. At that deadline the restart is
-forced unless an explicit production hold or unknown SessionEnd intent vetoes it. Until a usable successor is obtained, the server is observed at most thirty seconds apart, including during work. A cached successor removes further token requests from restart admission.
+An ordinary renewal is eligible only within five minutes of the held token's expiry.
+A new token revision alone does not restart a healthy session, even after its pending
+ten-minute admission deadline. Eligible renewal uses observed quiet when possible;
+deadline admission cannot override the expiry requirement. Until a usable successor is
+obtained, the server is observed at most thirty seconds apart, including during work.
+Entering authentication or expiry recovery revalidates a cached successor. A fresh
+authentication failure cannot use a candidate checked before that failure. A candidate
+retained through a long workload or hold wait is observed again before signaling.
 Account failover retains its ten-minute quiet requirement and has no forced deadline.
 Authentication failure or expiry overrides ordinary workload blockers immediately. Explicit
 production holds prevent every restart until hold end, including authentication recovery
@@ -272,7 +276,7 @@ Unrelated hook, terminal, task and production-marker errors do not defer auth re
 Forced restarts can discard a running turn, background task or draft input. An explicit
 session exit and user interruption still end the run; claudectl does not invent a session
 ID when none was recorded. Failed recovery attempts are counted and retried at the existing
-thirty-second interval. There is no hourly cap on authentication recovery or deadline renewals.
+thirty-second interval. There is no hourly cap on authentication recovery or eligible deadline renewals.
 
 **Residual race:** command hooks cannot acknowledge that all input sources are closed and
 every submitted prompt is safe to hand over. Hooks publish pending intent before reading
@@ -456,6 +460,10 @@ these host metrics are separate from the remote account server's `/metrics` endp
 Records contain no tokens, raw provider errors or prompt contents. The journal is private
 and refuses symlinks. Diagnostic write failures do not prevent a forced recovery. Ordinary
 admission still closes on unavailable diagnostic evidence.
+Monitor records include `held_revision`, `cached_revision` and `current_revision`.
+The cached value is the candidate before the latest read; current is the last observed
+server revision. Forced records also include held expiry, auth-failure time and child pid.
+Unknown revision context is null. These are log fields, never metric labels or token values.
 
 This is not an OS sandbox. Tools inherit the access token environment and can
 access files available to the same OS user. The Mac experiment's fake `security`
@@ -476,9 +484,10 @@ directory.
 
 While Claude runs, the client refreshes usage about every five minutes in a background
 worker, including one-shot runs and pending recovery. Safe observing reads continue during work at most thirty seconds apart until a usable
-replacement is cached; admission then proceeds without further token I/O. Authentication failure and expiry recover on the next five-second monitor
-tick plus replacement-token I/O. Ordinary renewal is forced after ten minutes from first
-observing a replacement; failover keeps its observed-quiet policy. On server outage, the
+replacement is cached; recovery and long waits require a fresh observation before use.
+Authentication failure and expiry recover on the next five-second monitor tick plus
+replacement-token I/O. Ordinary renewal requires the real five-minute expiry margin;
+failover keeps its observed-quiet policy. On server outage, the
 running token works until provider expiry or rejection, and recovery errors are counted.
 Revocation stops new acquisitions; it cannot revoke an access token already delivered.
 

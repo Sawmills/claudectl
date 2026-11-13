@@ -95,8 +95,18 @@ pub(super) enum RecoveryFailure {
 }
 
 enum RecoveryEvent {
-    Forced(Forced),
-    Failed(RecoveryFailure),
+    Forced(Forced, Revisions),
+    Failed(RecoveryFailure, Revisions),
+}
+
+#[derive(Clone, Default)]
+struct Revisions {
+    held: Option<String>,
+    cached: Option<String>,
+    current: Option<String>,
+    held_expires_at: Option<i64>,
+    auth_failed_at: Option<i64>,
+    child_pid: Option<u32>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -200,17 +210,19 @@ fn recovery_event(
     cause: Cause,
     event: RecoveryEvent,
 ) -> Result<()> {
-    let failed = matches!(event, RecoveryEvent::Failed(_));
-    let (mut event, metric, reason) = match event {
-        RecoveryEvent::Forced(reason) => (
+    let failed = matches!(event, RecoveryEvent::Failed(..));
+    let (mut event, metric, reason, revisions) = match event {
+        RecoveryEvent::Forced(reason, revisions) => (
             "restart_forced",
             "claudectl_restart_forced_total",
             json!(reason),
+            revisions,
         ),
-        RecoveryEvent::Failed(reason) => (
+        RecoveryEvent::Failed(reason, revisions) => (
             "recovery_failed",
             "claudectl_recovery_failed_total",
             json!(reason),
+            revisions,
         ),
     };
     let mut route = Some("voice_inbox");
@@ -237,6 +249,9 @@ fn recovery_event(
             "at":now(),"event":event,"run":run_id(directory)?,"session_id":session,
             "cause":cause,"reason":reason,"stage":stage,"route":route,
             "throttle_state_unavailable":throttle_state_unavailable,
+            "held_revision":revisions.held,"cached_revision":revisions.cached,
+            "current_revision":revisions.current,"held_expires_at":revisions.held_expires_at,
+            "auth_failed_at":revisions.auth_failed_at,"child_pid":revisions.child_pid,
             "metric":{"name":metric,"value":1,"labels":{"cause":cause,"reason":reason,"stage":stage}},
         }),
     )
@@ -255,7 +270,7 @@ pub(super) fn recovery_failed(
         directory,
         session,
         cause,
-        RecoveryEvent::Failed(stage),
+        RecoveryEvent::Failed(stage, Revisions::default()),
     );
 }
 
@@ -437,6 +452,7 @@ pub(super) struct Gate {
     state: RestartState,
     last_hold_notice: Option<(i64, String, Instant)>,
     exit_intent_failed: bool,
+    revisions: Revisions,
 }
 
 impl Gate {
@@ -463,12 +479,43 @@ impl Gate {
             state: RestartState::Watching,
             last_hold_notice: None,
             exit_intent_failed: false,
+            revisions: Revisions::default(),
         }
     }
 
     pub(super) fn with_terminal(mut self, terminal: Option<PathBuf>) -> Self {
         self.terminal = terminal;
         self
+    }
+
+    /// Opaque revision IDs only; never credential values. Cached is the candidate
+    /// before the latest read, and current is that read's server revision.
+    pub(super) fn revisions(
+        &mut self,
+        held: &str,
+        cached: Option<&str>,
+        current: Option<&str>,
+        held_expires_at: i64,
+        auth_failed_at: Option<i64>,
+    ) {
+        self.revisions = Revisions {
+            held: Some(held.into()),
+            cached: cached.map(str::to_owned),
+            current: current.map(str::to_owned),
+            held_expires_at: Some(held_expires_at),
+            auth_failed_at,
+            child_pid: Some(self.pid),
+        };
+    }
+
+    pub(super) fn failed(&self, idle: &super::renew::Idle, cause: Cause, stage: RecoveryFailure) {
+        let _ = recovery_event(
+            &self.home,
+            &self.directory,
+            idle.session.as_deref(),
+            cause,
+            RecoveryEvent::Failed(stage, self.revisions.clone()),
+        );
     }
 
     pub(super) fn request_at(&mut self, cause: Cause, at: Instant) {
@@ -523,6 +570,8 @@ impl Gate {
             &json!({
                 "at":now(),"event":"restart_blocked_by_hold","run":hold.run,
                 "session_id":idle.session,"cause":cause,"reason":"explicit_hold","stage":"blocked",
+                "held_revision":self.revisions.held,"cached_revision":self.revisions.cached,
+                "current_revision":self.revisions.current,
                 "route":"voice_inbox","hold":{"run":hold.run,"reason":hold.reason,"at":hold.at}
             }),
         );
@@ -535,13 +584,7 @@ impl Gate {
         expires_at: i64,
     ) {
         if !self.exit_intent_failed {
-            recovery_failed(
-                &self.home,
-                &self.directory,
-                idle.session.as_deref(),
-                cause,
-                RecoveryFailure::SessionEndIntent,
-            );
+            self.failed(idle, cause, RecoveryFailure::SessionEndIntent);
             self.exit_intent_failed = true;
         }
         self.record(Some(Reason::ExitIntentUnknown), idle, cause, expires_at);
@@ -557,7 +600,7 @@ impl Gate {
                 &self.directory,
                 session,
                 cause,
-                RecoveryEvent::Forced(reason),
+                RecoveryEvent::Forced(reason, self.revisions.clone()),
             );
         }
         self.state = self.state.transition(RestartEvent::Signalled);
@@ -818,6 +861,9 @@ impl Gate {
                 let record = json!({"at":at,"event":"restart_deferred","session_id":session,
                 "run":run,"cause":d.cause,"reason":d.reason,"stage":d.stage,
                 "expires_at":expires_at,
+                "held_revision":self.revisions.held,"cached_revision":self.revisions.cached,
+                "current_revision":self.revisions.current,
+                "auth_failed_at":self.revisions.auth_failed_at,"child_pid":self.revisions.child_pid,
                 "metric":{"name":"claudectl_restart_deferred_total","value":1,
                     "labels":{"cause":d.cause,"reason":d.reason,"stage":d.stage}}});
                 append_restart_record(&self.home, &record)?;
