@@ -264,8 +264,8 @@ Eligible renewal uses observed quiet when possible;
 deadline admission cannot override the expiry requirement. Until a usable successor is
 obtained, the server is observed at most thirty seconds apart, including during work.
 Entering authentication or expiry recovery revalidates a cached successor. A fresh
-authentication failure cannot use a candidate checked before that failure. A candidate
-retained through a long workload or hold wait is observed again before signaling.
+authentication failure cannot use a candidate checked before that failure. Before
+signaling, reobserve any candidate retained through a long workload or hold wait.
 Account failover retains its ten-minute quiet requirement and has no forced deadline.
 Authentication failure or expiry overrides ordinary workload blockers immediately. Explicit
 production holds prevent every restart until hold end, including authentication recovery
