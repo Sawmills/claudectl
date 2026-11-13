@@ -259,9 +259,9 @@ expiry retain their existing reason labels.
 
 An ordinary renewal is eligible only within five minutes of the held token's expiry.
 A new token revision alone does not request a restart or start its deadline.
-The deadline clock starts when the held grant enters its expiry margin.
-Eligible renewal uses observed quiet when possible;
-deadline admission cannot override the expiry requirement. Until a usable successor is
+The ten-minute deadline clock starts at the five-minute margin, so actual expiry
+starts recovery before that deadline. Eligible renewal uses observed quiet when possible.
+Until a usable successor is
 obtained, the server is observed at most thirty seconds apart, including during work.
 Entering authentication or expiry recovery revalidates a cached successor. A fresh
 authentication failure cannot use a candidate checked before that failure. Before
@@ -463,7 +463,8 @@ and refuses symlinks. Diagnostic write failures do not prevent a forced recovery
 admission still closes on unavailable diagnostic evidence.
 Monitor records include `held_revision`, `cached_revision` and `current_revision`.
 The cached value is the candidate before the latest read; current is the last observed
-server revision. Forced records also include held expiry, auth-failure time and child pid.
+server revision. Deferred, forced and failed recovery records also include held expiry,
+auth-failure time and the decision's child pid. Relaunch failures retain that decision context.
 Unknown revision context is null. These are log fields, never metric labels or token values.
 
 This is not an OS sandbox. Tools inherit the access token environment and can

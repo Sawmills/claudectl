@@ -8,6 +8,8 @@ use super::atomic;
 pub(super) const IDLE_AFTER_STOP_MS: i64 = 600_000;
 /// No terminal input for this long before a restart (ms): protects a draft being typed.
 pub(super) const TTY_IDLE_MS: i64 = 600_000;
+/// Ordinary renewal becomes eligible this long before the held grant expires.
+pub(super) const EXPIRY_MARGIN_MS: i64 = 300_000;
 /// The first prompt of a renewal resume only (never a first launch, a manual resume or a
 /// failover). Claude Code can keep session cron jobs listed after a resume but stop firing
 /// them (SAW-12610, 10-09): the session creates them again, catches up each missed job once,
@@ -399,7 +401,7 @@ pub(super) fn held_token_dead(i: &Inputs) -> bool {
 /// A newer revision alone does not make the held grant unusable. Renew only for
 /// an observed rejection or within five minutes of the held grant's expiry.
 pub(super) fn restart_needed(i: &Inputs) -> bool {
-    held_token_dead(i) || i.held_expires_at.saturating_sub(i.now) <= 300_000
+    held_token_dead(i) || i.held_expires_at.saturating_sub(i.now) <= EXPIRY_MARGIN_MS
 }
 
 /// The error types of a failed turn in Claude Code's StopFailure hook (2.1.295).
@@ -1088,6 +1090,9 @@ mod tests {
         let mut same = inputs(&idle);
         same.server_revision = "r1";
         assert_eq!(decide(&same), Decision::Keep);
+        let mut healthy = inputs(&idle);
+        healthy.held_expires_at = 20_000_000;
+        assert_eq!(decide(&healthy), Decision::Keep);
         // Busy, too recent, typing, no session, or the budget used up. Extra processes in
         // Claude's group are no gate: this valid held token is within its expiry margin.
         let busy = Idle {

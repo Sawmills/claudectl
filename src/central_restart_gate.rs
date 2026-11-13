@@ -100,7 +100,7 @@ enum RecoveryEvent {
 }
 
 #[derive(Clone, Default)]
-struct Revisions {
+pub(super) struct Revisions {
     held: Option<String>,
     cached: Option<String>,
     current: Option<String>,
@@ -263,6 +263,7 @@ pub(super) fn recovery_failed(
     session: Option<&str>,
     cause: Cause,
     stage: RecoveryFailure,
+    revisions: Revisions,
 ) {
     // Telemetry failure must not disable token recovery or enter Claude's terminal.
     let _ = recovery_event(
@@ -270,7 +271,7 @@ pub(super) fn recovery_failed(
         directory,
         session,
         cause,
-        RecoveryEvent::Failed(stage, Revisions::default()),
+        RecoveryEvent::Failed(stage, revisions),
     );
 }
 
@@ -282,16 +283,24 @@ pub(super) struct RecoveryAttempt {
     session: String,
     cause: Cause,
     stage: Option<RecoveryFailure>,
+    revisions: Revisions,
 }
 
 impl RecoveryAttempt {
-    pub(super) fn new(home: &Path, directory: &Path, session: &str, cause: Cause) -> Self {
+    pub(super) fn new(
+        home: &Path,
+        directory: &Path,
+        session: &str,
+        cause: Cause,
+        revisions: Revisions,
+    ) -> Self {
         Self {
             home: home.to_path_buf(),
             directory: directory.to_path_buf(),
             session: session.to_owned(),
             cause,
             stage: Some(RecoveryFailure::Teardown),
+            revisions,
         }
     }
 
@@ -313,6 +322,7 @@ impl Drop for RecoveryAttempt {
                 Some(&self.session),
                 self.cause,
                 stage,
+                self.revisions.clone(),
             );
         }
     }
@@ -518,6 +528,10 @@ impl Gate {
         );
     }
 
+    pub(super) fn recovery_context(&self) -> Revisions {
+        self.revisions.clone()
+    }
+
     pub(super) fn request_at(&mut self, cause: Cause, at: Instant, held_expires_at: i64) {
         if cause == Cause::Failover {
             return;
@@ -528,7 +542,7 @@ impl Gate {
         }
         // A cached successor is not a pending restart. Start the admission clock
         // only when the held grant enters its real expiry margin.
-        if held_expires_at.saturating_sub(now()) > 300_000 {
+        if held_expires_at.saturating_sub(now()) > super::renew::EXPIRY_MARGIN_MS {
             self.state = RestartState::Watching;
             return;
         }
@@ -766,8 +780,9 @@ impl Gate {
         // Quiet eligibility does not mean a token read, budget or account choice
         // will succeed. Keep expiry attention until this child actually exits.
         let diagnostic = reason.or_else(|| {
-            (held_expires_at.saturating_sub(now()) <= 300_000 || idle.auth_failed.is_some())
-                .then_some(Reason::RestartPending)
+            (held_expires_at.saturating_sub(now()) <= super::renew::EXPIRY_MARGIN_MS
+                || idle.auth_failed.is_some())
+            .then_some(Reason::RestartPending)
         });
         let recorded = self.record(diagnostic, idle, cause, held_expires_at);
         admitted && recorded
@@ -816,7 +831,7 @@ impl Gate {
                 || reason == Reason::StaleHold
             {
                 Stage::Blocked
-            } else if held_expires_at - at <= 300_000 {
+            } else if held_expires_at - at <= super::renew::EXPIRY_MARGIN_MS {
                 Stage::Warn
             } else {
                 Stage::Deferred

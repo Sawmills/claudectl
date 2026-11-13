@@ -116,7 +116,8 @@ machine holds a retired grant: run `claude auth logout` there; claudectl never d
 
 7. **Verify renewal and failover:** use isolated fixtures. A new revision must not start
    a restart deadline while the held token has more than five minutes left.
-   Eligible near-expiry renewal and account failover retain their quiet admission.
+   Eligible near-expiry renewal retains quiet admission. Account failover still requires
+   ten continuous minutes of observed quiet.
    Fresh authentication failure or expiry recovers immediately on the same session and
    account, after observing the current replacement. Ordinary workload checks still block
    ordinary renewal; explicit holds and unknown SessionEnd intent veto every restart.

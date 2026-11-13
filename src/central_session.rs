@@ -435,6 +435,7 @@ struct Restart {
     kind: RestartKind,
     session_id: String,
     cause: super::restart_gate::Cause,
+    revisions: super::restart_gate::Revisions,
 }
 #[cfg(unix)]
 impl Restart {
@@ -833,6 +834,7 @@ impl Monitor {
                                 kind: RestartKind::Failover { account, access },
                                 session_id,
                                 cause,
+                                revisions: gate.recovery_context(),
                             },
                         ));
                         continue;
@@ -1001,6 +1003,7 @@ impl Monitor {
                                 ),
                                 session_id,
                                 cause,
+                                revisions: gate.recovery_context(),
                             },
                         ));
                     }
@@ -1312,7 +1315,11 @@ pub fn run(
     let mut failovers: Vec<i64> = Vec::new();
     let mut tried: Vec<String> = Vec::new();
     // The session the running Claude was relaunched to resume, until its result is known.
-    let mut resumed: Option<(String, super::restart_gate::Cause)> = None;
+    let mut resumed: Option<(
+        String,
+        super::restart_gate::Cause,
+        super::restart_gate::Revisions,
+    )> = None;
     let mut first = true;
     let mut cron_recovery = None;
     let mut relaunch: Option<super::restart_gate::RecoveryAttempt> = None;
@@ -1365,7 +1372,7 @@ pub fn run(
             renewable: hooks.is_some(),
             recovery_resume: resumed
                 .as_ref()
-                .is_some_and(|(_, cause)| *cause == super::restart_gate::Cause::AuthRecovery),
+                .is_some_and(|(_, cause, _)| *cause == super::restart_gate::Cause::AuthRecovery),
             restarts: restarts
                 .iter()
                 .filter(|&&at| now() - at < 3_600_000)
@@ -1394,6 +1401,7 @@ pub fn run(
                 session.directory(),
                 &restart.session_id,
                 restart.cause,
+                restart.revisions.clone(),
             ));
         }
         let descendants = if waited.is_ok() {
@@ -1425,6 +1433,7 @@ pub fn run(
             kind,
             session_id,
             cause,
+            revisions,
         }) = outcome.restart
         else {
             if let Some(notice) = &outcome.notice {
@@ -1435,7 +1444,7 @@ pub fn run(
             // say so and start a new session on the same token, once (SAW-12882). A stop by
             // signal, or a code from 128 up (130 is Ctrl-C), is the user's stop: it ends the
             // run as before.
-            if let Some((id, cause)) = resumed.take()
+            if let Some((id, cause, revisions)) = resumed.take()
                 && status.code().is_some_and(|code| (1..128).contains(&code))
                 && !session_started(&session.directory().join("events"))
             {
@@ -1445,6 +1454,7 @@ pub fn run(
                     Some(&id),
                     cause,
                     super::restart_gate::RecoveryFailure::Resume,
+                    revisions,
                 );
                 if let Some(terminal) = &terminal {
                     terminal.restore();
@@ -1475,7 +1485,7 @@ pub fn run(
             }
             return Ok(exec::exit_code_of(&status));
         };
-        resumed = Some((session_id.clone(), cause));
+        resumed = Some((session_id.clone(), cause, revisions));
         if let Some(terminal) = &terminal {
             terminal.restore();
         }
@@ -1683,6 +1693,7 @@ mod tests {
                 kind,
                 session_id: "limited".into(),
                 cause,
+                revisions: Default::default(),
             }
             .with_current_session(Some("new-live"))
             .unwrap();
