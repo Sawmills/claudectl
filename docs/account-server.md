@@ -258,10 +258,9 @@ metric label remains exported at zero for compatibility; explicit force, migrati
 expiry retain their existing reason labels.
 
 An ordinary renewal is eligible only within five minutes of the held token's expiry.
-A new token revision alone does not restart a healthy session, even after its pending
-ten-minute admission deadline. The deadline clock starts when the held grant enters
-its expiry margin, rather than when a replacement is first cached. Eligible renewal
-uses observed quiet when possible;
+A new token revision alone does not request a restart or start its deadline.
+The deadline clock starts when the held grant enters its expiry margin.
+Eligible renewal uses observed quiet when possible;
 deadline admission cannot override the expiry requirement. Until a usable successor is
 obtained, the server is observed at most thirty seconds apart, including during work.
 Entering authentication or expiry recovery revalidates a cached successor. A fresh
