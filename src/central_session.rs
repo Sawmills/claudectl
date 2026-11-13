@@ -884,6 +884,7 @@ impl Monitor {
                                 super::restart_gate::RecoveryFailure::Observe,
                             );
                         }
+                        next_access = None;
                         last_check = now() - interval + timing.retry_ms;
                         continue;
                     }
@@ -932,6 +933,7 @@ impl Monitor {
                                 cause,
                                 super::restart_gate::RecoveryFailure::Acquire,
                             );
+                            next_access = None;
                             last_check = now() - interval + timing.retry_ms;
                             continue;
                         }
@@ -981,7 +983,8 @@ impl Monitor {
                     || renew::decide(&inputs) == renew::Decision::Restart);
             if admitted && restart {
                 // A hold or long workload wait must not relaunch a superseded snapshot.
-                if now() - checked_at > interval.max(timing.tick_ms as i64) {
+                // Freshness has its own 30-second bound, independent of retry cadence.
+                if now() - checked_at > 30_000 {
                     next_access = None;
                     last_check = now() - interval;
                     continue;
@@ -1993,7 +1996,12 @@ mod tests {
     fn captured_auth_failure_revalidates_cached_candidate_in_monitor() {
         const CHILD: &str = "CLAUDECTL_TEST_CADENCE_CANDIDATE";
         if std::env::var_os(CHILD).is_none() {
-            for scenario in ["current", "observe-fails", "acquire-fails"] {
+            for scenario in [
+                "current",
+                "observe-fails",
+                "acquire-fails",
+                "expiry-observe-fails",
+            ] {
                 let output = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -2018,6 +2026,7 @@ mod tests {
         let observation_failure = match scenario.as_str() {
             "observe-fails" => Some(("unavailable", "observe", "B")),
             "acquire-fails" => Some(("old", "acquire", "old")),
+            "expiry-observe-fails" => Some(("unavailable", "observe", "B")),
             _ => None,
         };
 
@@ -2032,6 +2041,9 @@ mod tests {
         monitor.held_expires_at = now()
             + captured["fresh_auth"]["held_expires_at"].as_i64().unwrap()
             - captured["fresh_auth"]["at"].as_i64().unwrap();
+        if scenario == "expiry-observe-fails" {
+            monitor.held_expires_at = now() + 1_000;
+        }
         let events = monitor.directory.join("events");
         std::fs::write(
             &events,
@@ -2138,8 +2150,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         *current.lock().unwrap() = observation_failure.map_or("C", |failure| failure.0);
-        writeln!(std::fs::OpenOptions::new().append(true).open(&events).unwrap(),
+        if scenario != "expiry-observe-fails" {
+            writeln!(std::fs::OpenOptions::new().append(true).open(&events).unwrap(),
             "{}", json!({"at":now(),"event":"StopFailure","session_id":"s","error":"authentication_failed"})).unwrap();
+        }
         let deadline = Instant::now() + Duration::from_secs(10);
         if let Some((_, failed_stage, expected_current)) = observation_failure {
             let journal = directory
@@ -2150,13 +2164,22 @@ mod tests {
                 .join("restart-decisions.jsonl");
             loop {
                 let observed = std::fs::read_to_string(&journal).unwrap_or_default();
-                if observed.lines().any(|line| {
-                    serde_json::from_str::<Value>(line).is_ok_and(|record| {
-                        record["event"] == "recovery_failed" && record["reason"] == failed_stage
+                if observed
+                    .lines()
+                    .filter(|line| {
+                        serde_json::from_str::<Value>(line).is_ok_and(|record| {
+                            record["event"] == "recovery_failed" && record["reason"] == failed_stage
+                        })
                     })
-                }) {
+                    .count()
+                    >= 2
+                {
                     break;
                 }
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "failed observation reused cached B on a later tick"
+                );
                 assert!(
                     Instant::now() < deadline,
                     "failed observation was not reported"
