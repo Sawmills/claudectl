@@ -20,9 +20,10 @@ Test settings with your installed Claude version before rollout.
 
 After authentication failure or token expiry, Claude restarts immediately on the
 same session and account. Workload blockers and typing do not defer recovery.
-Other renewals wait at most ten minutes after a replacement revision is observed,
-then restart even if work remains active, except for explicit holds. An explicit
-production hold blocks every restart until hold end, including auth recovery.
+A new revision alone does not restart a healthy session.
+Ordinary renewal starts only within five minutes of the held token's expiry,
+with workload and observed-quiet admission. Its deadline starts in that margin.
+An explicit production hold blocks every restart until hold end, including auth recovery.
 Unknown SessionEnd intent also vetoes restart and records one recovery failure.
 Hold-blocked notices name the hold at most once per ten minutes.
 Failover requires ten minutes of observed quiet.

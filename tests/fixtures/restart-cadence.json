@@ -4,10 +4,7 @@
   "source_sha256": "b1884dd1d69fcc48a82059f9e670a1826ad7595e7ae825dbd6195a0638f2d737",
   "healthy_held": {
     "run": "run-0iYAiT",
-    "source_lines": [
-      1783,
-      1808
-    ],
+    "source_lines": [1783, 1808],
     "observed_at": 1794559369259,
     "forced_at": 1794560001622,
     "expires_at": 1794588002608

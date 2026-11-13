@@ -389,7 +389,8 @@ fn run_help_discloses_quiet_window_and_residual_race() {
         let help = String::from_utf8(output.stdout).unwrap();
         assert!(help.contains("restarts immediately"));
         assert!(help.contains("same session and account"));
-        assert!(help.contains("Other renewals wait at most ten minutes"));
+        assert!(help.contains("A new revision alone does not restart a healthy session"));
+        assert!(help.contains("five minutes of the held token's expiry"));
         assert!(help.contains("Request failover after ten minutes of observed quiet"));
         assert!(!help.contains("currently deferred"));
         assert!(help.contains("Forced restarts can discard background work and draft input"));

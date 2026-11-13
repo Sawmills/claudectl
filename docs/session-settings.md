@@ -34,9 +34,10 @@ The log contains no tokens or saved prompt contents.
 
 Authentication failure or expiry restarts the same conversation on the same account
 immediately, once a replacement token is available. Turns, background tasks, typing,
-production markers and unrelated hook errors do not defer that recovery. Other unheld renewals
-wait at most ten minutes after observing a replacement revision. Explicit production
-holds block every restart until hold end, including auth recovery. Unknown SessionEnd
+production markers and unrelated hook errors do not defer that recovery. Other renewals
+become eligible only within five minutes of the held token's expiry and retain workload
+and quiet admission. A new revision alone starts neither a restart nor its deadline.
+Explicit production holds block every restart until hold end, including auth recovery. Unknown SessionEnd
 intent also prevents restart, with one failure record while that uncertainty persists. Account failover still
 requires ten continuous minutes of observed quiet. A forced restart can discard a draft
 or background task. Recovery omits the original
