@@ -463,8 +463,9 @@ and refuses symlinks. Diagnostic write failures do not prevent a forced recovery
 admission still closes on unavailable diagnostic evidence.
 Monitor records include `held_revision`, `cached_revision` and `current_revision`.
 The cached value is the candidate before the latest read; current is the last observed
-server revision. Deferred, forced and failed recovery records also include held expiry,
-auth-failure time and the decision's child pid. Relaunch failures retain that decision context.
+server revision. Deferred records store held expiry as `expires_at`; forced and failed
+recovery records use `held_expires_at`. These records also include auth-failure time and
+the decision's child pid. Relaunch failures retain that decision context.
 Unknown revision context is null. These are log fields, never metric labels or token values.
 
 This is not an OS sandbox. Tools inherit the access token environment and can
