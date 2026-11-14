@@ -316,6 +316,121 @@ pub(super) fn fresh_args(args: &[OsString]) -> Option<Vec<OsString>> {
     Some(out)
 }
 
+/// The hook location belongs to the active conversation; never retain its contents.
+pub(super) fn record_model_transcript(
+    directory: &std::path::Path,
+    event: &serde_json::Value,
+) -> anyhow::Result<()> {
+    // /clear can deliver an old SessionEnd after the new SessionStart.
+    if event["hook_event_name"] == "SessionEnd" {
+        return Ok(());
+    }
+    if let (Some(path), Some(session)) = (
+        event["transcript_path"].as_str(),
+        event["session_id"].as_str(),
+    ) {
+        let file = directory.join("model-transcript.json");
+        let location = serde_json::json!({"path":path,"session_id":session});
+        let previous = std::fs::read(&file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        if previous.as_ref() != Some(&location) {
+            atomic(&file, &location)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn live_model(directory: &std::path::Path, session: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let location: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("model-transcript.json")).ok()?)
+            .ok()?;
+    if location["session_id"] != session {
+        return None;
+    }
+    let mut file = std::fs::File::open(location["path"].as_str()?).ok()?;
+    let info = file.metadata().ok()?;
+    if !info.is_file() {
+        return None;
+    }
+    let mut end = info.len();
+    let mut offset = end;
+    let mut block = [0u8; 64 * 1024];
+    // Scan backwards and stop at the newest main-conversation assistant model.
+    // Only byte offsets span blocks; a large transcript row is never buffered whole.
+    while offset > 0 {
+        let size = offset.min(block.len() as u64) as usize;
+        offset -= size as u64;
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        file.read_exact(&mut block[..size]).ok()?;
+        for index in (0..size).rev() {
+            if block[index] == b'\n' {
+                let start = offset + index as u64 + 1;
+                if let Some(model) = transcript_model(&mut file, start, end) {
+                    return Some(model);
+                }
+                end = start - 1;
+            }
+        }
+    }
+    transcript_model(&mut file, 0, end)
+}
+
+fn transcript_model(file: &mut std::fs::File, start: u64, end: u64) -> Option<String> {
+    use std::io::{BufReader, Read, Seek, SeekFrom};
+    #[derive(serde::Deserialize)]
+    struct Message {
+        model: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+        #[serde(default, rename = "isSidechain")]
+        sidechain: bool,
+        message: Option<Message>,
+    }
+    if start >= end {
+        return None;
+    }
+    file.seek(SeekFrom::Start(start)).ok()?;
+    // Deserialization ignores message contents rather than allocating a JSON value for them.
+    let entry: Entry = serde_json::from_reader(BufReader::new(file.take(end - start))).ok()?;
+    if entry.kind.as_deref() != Some("assistant") || entry.sidechain {
+        return None;
+    }
+    entry
+        .message?
+        .model
+        .filter(|model| !model.trim().is_empty() && model != "<synthetic>")
+}
+
+/// Replace launch model flags only when the conversation provides a live model.
+/// Otherwise the original launch model remains this session's saved default.
+pub(super) fn keep_live_model(args: &mut Vec<OsString>, model: Option<&str>) {
+    let Some(model) = model else { return };
+    let mut out = vec!["--model".into(), model.into()];
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let text = arg.to_string_lossy();
+        if text == "--" {
+            out.push(arg.clone());
+            out.extend(rest.cloned());
+            break;
+        }
+        if text == "--model" {
+            rest.next();
+        } else if !text.starts_with("--model=") {
+            out.push(arg.clone());
+            if super::failover::VALUE_FLAGS.contains(&text.as_ref()) {
+                out.extend(rest.next().cloned());
+            }
+        }
+    }
+    *args = out;
+}
+
 fn starts_with_dash(arg: &OsStr) -> bool {
     arg.to_string_lossy().starts_with('-')
 }
@@ -587,8 +702,8 @@ pub(super) fn hook_from(
 /// Append one hook event to `<session dir>/events`. Only the event name, session id,
 /// notification type and time are kept; the hook input is never stored. The directory must
 /// be a session directory under this machine's sessions root.
-/// An armed Operator cron recovery also keeps the Stop/idle transcript location in a
-/// separate private file so its monitor can verify the new inventory.
+/// Hooks also keep the current transcript location privately for restart model selection.
+/// Armed Operator cron recovery keeps its own Stop/idle location to verify the inventory.
 pub(super) fn record_hook(
     sessions: &std::path::Path,
     dir: &std::path::Path,
@@ -661,6 +776,11 @@ pub(super) fn record_hook(
         "notification_type": v["notification_type"],
         "error": error,
     });
+    if let Err(error) = record_model_transcript(&dir, &v) {
+        mark_hook_error(&dir);
+        let _ = std::fs::remove_file(&pending);
+        return Err(error);
+    }
     #[cfg(unix)]
     if let Err(error) = super::crons::record_transcript(&dir, &v) {
         mark_hook_error(&dir);

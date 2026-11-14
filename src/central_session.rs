@@ -1322,6 +1322,7 @@ pub fn run(
         super::restart_gate::Cause,
         super::restart_gate::Revisions,
     )> = None;
+    let mut resume_model = None;
     let mut first = true;
     let mut cron_recovery = None;
     let mut relaunch: Option<super::restart_gate::RecoveryAttempt> = None;
@@ -1482,12 +1483,14 @@ pub fn run(
                 );
                 launch_args =
                     super::renew::fresh_args(args).context("fresh start of a one-shot run")?;
+                super::renew::keep_live_model(&mut launch_args, resume_model.as_deref());
                 session.set_renewal("renewing")?;
                 continue;
             }
             return Ok(exec::exit_code_of(&status));
         };
         resumed = Some((session_id.clone(), cause, revisions));
+        resume_model = super::renew::live_model(session.directory(), &session_id);
         if let Some(terminal) = &terminal {
             terminal.restore();
         }
@@ -1574,6 +1577,7 @@ pub fn run(
                 }
             }
         }
+        super::renew::keep_live_model(&mut launch_args, resume_model.as_deref());
         first = false;
     }
 }

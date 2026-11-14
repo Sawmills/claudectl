@@ -128,6 +128,7 @@ with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps({"token": token, "args": args, "settings": config, "run": os.environ.get("CLAUDECTL_SERVER_RUN")}) + "\n")
 command = config["hooks"]["StopFailure"][0]["hooks"][0]["command"]
 if token != "token-work":
+    if os.environ.get("FAKE_FAIL_RESUME") and "--resume" in args: sys.exit(7)
     # A resumed Claude reports its session start, then this fake exits 7.
     resumed = args[args.index("--resume") + 1] if "--resume" in args else "sess-new"
     subprocess.run(["/bin/sh", "-c", command], check=True, input=json.dumps(
@@ -149,6 +150,8 @@ for event in ({"hook_event_name": "SessionStart", "session_id": "sess-1"},
               {"hook_event_name": "UserPromptSubmit", "session_id": "sess-1"},
               {"hook_event_name": "StopFailure", "session_id": "sess-1", "error": "rate_limit",
                "error_details": "usage limit", "last_assistant_message": "secret"}):
+    transcript = os.path.join(os.environ["HOME"], "live-model.jsonl")
+    if os.path.exists(transcript): event["transcript_path"] = transcript
     subprocess.run(["/bin/sh", "-c", command], input=json.dumps(event).encode(), check=True)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 deadline = time.time() + float(os.environ.get("FAKE_WATCHDOG_S", "20"))
@@ -174,6 +177,7 @@ struct Env {
     claude: std::path::PathBuf,
     log: std::path::PathBuf,
     sample_renewal: bool,
+    fail_resume: bool,
 }
 
 #[test]
@@ -284,6 +288,7 @@ impl Env {
             claude,
             log,
             sample_renewal: false,
+            fail_resume: false,
         }
     }
     fn run(&self, args: &[&str], watchdog_s: &str) -> std::process::Output {
@@ -308,8 +313,13 @@ impl Env {
         if self.sample_renewal {
             command.env("FAKE_SAMPLE_RENEWAL", "1");
         }
+        if self.fail_resume {
+            command.env("FAKE_FAIL_RESUME", "1");
+        }
         Command::from_std(command)
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(
+                60.max(watchdog_s.parse::<u64>().unwrap() + 30),
+            ))
             .output()
             .unwrap()
     }
@@ -365,6 +375,61 @@ fn assert_deferred(env: &Env, output: &std::process::Output, cause: &str) {
     // Stage-deduplicated journal rows retain the first cause; current status tracks the latest.
     assert_eq!(status["reason"], "quiet_window");
     assert_eq!(status["cause"], cause);
+}
+
+#[test]
+#[ignore = "exercises the real ten-minute account-failover quiet window"]
+fn a_failover_keeps_the_live_model_from_the_outgoing_run() {
+    let env = Env::new();
+    private_write(
+        &env.home.path().join("live-model.jsonl"),
+        &json!({"type":"assistant","sessionId":"sess-1","message":{"model":"claude-fable-5-1"}})
+            .to_string(),
+    );
+    let output = env.run(&["server", "run", "work", "--failover"], "660");
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let runs = env.runs();
+    assert_eq!(runs.len(), 2);
+    assert_ne!(runs[0]["run"], runs[1]["run"]);
+    let args = runs[1]["args"].as_array().unwrap();
+    let model = args.iter().position(|arg| arg == "--model").unwrap();
+    assert_eq!(args[model + 1], "claude-fable-5-1");
+    let resume = args.iter().position(|arg| arg == "--resume").unwrap();
+    assert_eq!(args[resume + 1], "sess-1");
+}
+
+#[test]
+#[ignore = "exercises the real ten-minute account-failover quiet window"]
+fn a_failed_failover_resume_keeps_the_live_model_when_starting_fresh() {
+    let mut env = Env::new();
+    env.fail_resume = true;
+    private_write(
+        &env.home.path().join("live-model.jsonl"),
+        &json!({"type":"assistant","sessionId":"sess-1","message":{"model":"claude-fable-5-1"}})
+            .to_string(),
+    );
+    let output = env.run(&["server", "run", "work", "--failover"], "660");
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let runs = env.runs();
+    assert_eq!(
+        runs.len(),
+        3,
+        "failed failover resume must start fresh once"
+    );
+    let args = runs[2]["args"].as_array().unwrap();
+    assert!(!args.iter().any(|arg| arg == "--resume"));
+    let model = args.iter().position(|arg| arg == "--model").unwrap();
+    assert_eq!(args[model + 1], "claude-fable-5-1");
 }
 
 #[test]

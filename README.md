@@ -59,6 +59,10 @@ can discard background tasks and draft input. Claude gets twenty seconds after S
 to save its session before SIGKILL. A failed recovery is counted and retried; it does not
 consume an hourly restart budget.
 
+Automatic server-session restarts keep the model ID from the last assistant turn, including
+after `/model` changes. With no assistant model, they keep the original launch `--model`;
+with neither, they add no model flag. See [restart behavior](docs/account-server.md) for details.
+
 **Residual risk:** idle and quiet observations do not prove all inputs are closed. A hook or new input can
 arrive after the final sample and before SIGTERM, so a submitted prompt can still be cut
 off. Claudectl does not collect or replay prompts.

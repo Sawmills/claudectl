@@ -287,7 +287,8 @@ Quiet is a heuristic, not all-input closure. No prompts are collected, stored or
 
 `server run` registers Claude hooks for `SessionStart`, `UserPromptSubmit`, `Stop`,
 `StopFailure`, `SessionEnd` and the `idle_prompt` notification. They record only the event,
-session ID and time in `<session dir>/events`. Workload evidence still distinguishes running
+session ID and time in `<session dir>/events`. A separate private file keeps the current
+transcript location and session ID, without copying transcript contents. Workload evidence still distinguishes running
 turns, background tasks and holds, but a clear workload sample is not input-admission proof.
 The monitor checks each session every five seconds. Ordinary deferrals warn five minutes
 before expiry. Expiry or an authentication failure starts recovery instead of waiting for
@@ -299,6 +300,15 @@ The wrapper sends SIGTERM to its owned Claude child and gives it twenty seconds 
 If it has not exited, the wrapper sends SIGKILL, confirms descendant cleanup, then resumes
 the conversation with the replacement token. Blocking hook/admission locks cannot stop a
 forced restart. Installing a new CLI does not upgrade a running wrapper.
+
+Automatic restarts use the model ID of the last main-conversation assistant turn in the
+current transcript, including after an in-session `/model` switch. Synthetic error rows and
+sidechain turns do not select the model. If no assistant model is available, the original
+launch `--model` is retained; if neither exists, no model flag is added. The recorded model
+ID takes precedence over launch aliases or variants such as `opusplan` and `[1m]`.
+This applies to authentication recovery, renewal, account failover and Operator cron recovery.
+If a permitted resume fails before starting its conversation, the fresh-session fallback
+keeps that same selected model.
 
 For a Fleet Operator, `HERDR_TAB_ID` selects the matching `operator_tab` in
 `~/Code/.fleet/*/operator.md`. Only lines that start with `operator_tab:` name an owner.

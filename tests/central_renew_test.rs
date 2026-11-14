@@ -171,6 +171,8 @@ def term(*_):
 signal.signal(signal.SIGTERM,term)
 command=settings['hooks']['Stop'][0]['hooks'][0]['command']
 def hook(event, **details):
+    transcript=home/(session_id+'.jsonl')
+    if transcript.exists(): details['transcript_path']=str(transcript)
     subprocess.run(['/bin/sh','-c',command],input=json.dumps({'hook_event_name':event,'session_id':session_id,**details}).encode(),check=True)
 def provider_status():
     request=urllib.request.Request(os.environ['FAKE_PROVIDER_URL'],headers={'Authorization':'Bearer '+os.environ['CLAUDE_CODE_OAUTH_TOKEN']})
@@ -266,6 +268,17 @@ impl Fixture {
     fn with_args(mode: &str, life_ms: i64, tty: bool, args: &[&str]) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
+        if mode == "auth_crons" {
+            let card = home.path().join("Code/.fleet/model-test/operator.md");
+            private_write(
+                &card,
+                "operator_tab: model-test-tab\ncron_prompts: check.txt */5 * * * *\n",
+            );
+            private_write(
+                &card.parent().unwrap().join("check.txt"),
+                "Check the owned lanes.",
+            );
+        }
         let state = Arc::new(Mutex::new(Fake {
             life_ms,
             generation: 1,
@@ -353,7 +366,7 @@ impl Fixture {
             .env("TMPDIR", home.path().join("tmp"))
             .env(
                 "FAKE_MODE",
-                if mode == "paused_usage" {
+                if matches!(mode, "paused_usage" | "auth_crons") {
                     "auth_recovery"
                 } else {
                     mode
@@ -368,6 +381,9 @@ impl Fixture {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if mode == "auth_crons" {
+            command.env("HERDR_TAB_ID", "model-test-tab");
+        }
         let child = command.spawn().unwrap();
         Self {
             home,
@@ -534,6 +550,189 @@ impl Fixture {
         assert!(!String::from_utf8_lossy(&output.stderr).contains("resuming session"));
         output
     }
+}
+
+#[test]
+fn claw_auth_recovery_keeps_fable_after_launching_on_opus() {
+    // Synthetic replay of the owner-reported Claw 91cb5a5d model chronology.
+    const LIVE: &str = "91cb5a5d";
+    let mut f = Fixture::with_args(
+        "auth_recovery",
+        600_000,
+        false,
+        &["--model", "claude-opus-5-5", "--resume", LIVE],
+    );
+    private_write(
+        &f.home.path().join(format!("{LIVE}.jsonl")),
+        &[
+            json!({"type":"assistant","sessionId":LIVE,"timestamp":"2026-11-13T23:30:00Z","message":{"role":"assistant","model":"claude-opus-5-5","content":[]}}),
+            json!({"type":"assistant","sessionId":LIVE,"timestamp":"2026-11-13T23:37:00Z","message":{"role":"assistant","model":"claude-fable-5-1","content":[]}}),
+            json!({"type":"assistant","sessionId":LIVE,"timestamp":"2026-11-14T03:20:00Z","message":{"role":"assistant","model":"claude-fable-5-1","content":[]}}),
+            json!({"type":"user","sessionId":LIVE,"message":{"role":"user","model":"claude-opus-5-5","content":"synthetic later user turn"}}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n"),
+    );
+    let runs = f.recover_after_switch(LIVE);
+    let args = runs[1]["args"].as_array().unwrap();
+    let resume = args.iter().position(|arg| arg == "--resume").unwrap();
+    assert_eq!(args[resume + 1], LIVE);
+    let model = args.iter().position(|arg| arg == "--model").unwrap();
+    assert_eq!(
+        args[model + 1],
+        "claude-fable-5-1",
+        "auth recovery must keep the last assistant model after /model, not the launch model"
+    );
+}
+
+#[test]
+fn auth_recovery_keeps_the_main_model_despite_a_damaged_transcript_tail() {
+    let mut f = Fixture::start("auth_recovery", 600_000, false);
+    let transcript = f.home.path().join("s.jsonl");
+    let mut bytes = json!({"type":"assistant","message":{"model":"claude-fable-5-1"}})
+        .to_string()
+        .into_bytes();
+    bytes.push(b'\n');
+    bytes.extend_from_slice(
+        json!({"type":"user","message":{"content":"noise".repeat(32_768)}})
+            .to_string()
+            .as_bytes(),
+    );
+    bytes.extend_from_slice(b"\n\xff\n");
+    bytes.extend_from_slice(
+        json!({"type":"assistant","isSidechain":true,"message":{"model":"claude-opus-5-5"}})
+            .to_string()
+            .as_bytes(),
+    );
+    std::fs::write(transcript, bytes).unwrap();
+    let runs = f.recover_after_switch("s");
+    let args = runs[1]["args"].as_array().unwrap();
+    let model = args.iter().position(|arg| arg == "--model").unwrap();
+    assert_eq!(args[model + 1], "claude-fable-5-1");
+}
+
+#[test]
+fn a_late_session_end_does_not_replace_the_live_model_location() {
+    use std::io::Write;
+    let mut f = Fixture::start("idle", 1_500, false);
+    f.wait("quiet_window", "warn");
+    f.state.lock().unwrap().life_ms = 600_000;
+    private_write(
+        &f.home.path().join("s.jsonl"),
+        &json!({"type":"assistant","message":{"model":"claude-fable-5-1"}}).to_string(),
+    );
+    f.switch_session("s");
+    let command = f.run()["settings"]["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut hook = Command::new("/bin/sh")
+        .args(["-c", &command])
+        .env_clear()
+        .env("HOME", f.home.path())
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    hook.stdin
+        .take()
+        .unwrap()
+        .write_all(
+            json!({"hook_event_name":"SessionEnd","session_id":"old-session","transcript_path":f.home.path().join("old-session.jsonl")})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+    assert!(hook.wait().unwrap().success());
+    let runs = f.wait_recovered();
+    let args = runs[1]["args"].as_array().unwrap();
+    let model = args.iter().position(|arg| arg == "--model").unwrap();
+    assert_eq!(args[model + 1], "claude-fable-5-1");
+    f.finish_recovered();
+}
+
+#[test]
+fn cron_recovery_keeps_the_live_model_without_a_launch_model() {
+    let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
+    private_write(
+        &f.home.path().join("s.jsonl"),
+        &json!({"type":"assistant","message":{"model":"claude-fable-5-1"}}).to_string(),
+    );
+    let runs = f.recover_after_switch("s");
+    let args = runs[1]["args"].as_array().unwrap();
+    let model = args.iter().position(|arg| arg == "--model").unwrap();
+    assert_eq!(args[model + 1], "claude-fable-5-1");
+    let delimiter = args.iter().position(|arg| arg == "--").unwrap();
+    assert!(model < delimiter);
+    assert!(args[delimiter + 1].as_str().unwrap().contains("CronCreate"));
+}
+
+#[test]
+fn auth_recovery_keeps_launch_model_when_transcript_has_no_assistant_model() {
+    let mut f = Fixture::with_args(
+        "auth_recovery",
+        600_000,
+        false,
+        &["--model=claude-opus-5-5", "--resume", "s"],
+    );
+    private_write(
+        &f.home.path().join("s.jsonl"),
+        &json!({"type":"user","message":{"role":"user","content":"synthetic first turn"}})
+            .to_string(),
+    );
+    let runs = f.recover_after_switch("s");
+    let args = runs[1]["args"].as_array().unwrap();
+    assert!(args.iter().any(|arg| arg == "--model=claude-opus-5-5"));
+    let resume = args.iter().position(|arg| arg == "--resume").unwrap();
+    assert_eq!(args[resume + 1], "s");
+}
+
+#[test]
+fn auth_recovery_replaces_all_launch_model_forms_but_preserves_option_values() {
+    let mut f = Fixture::with_args(
+        "auth_recovery",
+        600_000,
+        false,
+        &[
+            "--model=claude-opus-5-5",
+            "--model",
+            "opus",
+            "--append-system-prompt",
+            "--model",
+            "--resume",
+            "s",
+        ],
+    );
+    private_write(
+        &f.home.path().join("s.jsonl"),
+        &[
+            json!({"type":"assistant","message":{"model":"claude-opus-5-5"}}),
+            json!({"type":"assistant","message":{"model":"claude-fable-5-1"}}),
+            json!({"type":"assistant","message":{"model":"<synthetic>"}}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n"),
+    );
+    let runs = f.recover_after_switch("s");
+    let args = runs[1]["args"].as_array().unwrap();
+    assert_eq!(
+        &args[2..],
+        &json!([
+            "--model",
+            "claude-fable-5-1",
+            "--append-system-prompt",
+            "--model",
+            "--resume",
+            "s"
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
 }
 
 #[test]
