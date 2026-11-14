@@ -149,6 +149,8 @@ for event in ({"hook_event_name": "SessionStart", "session_id": "sess-1"},
               {"hook_event_name": "UserPromptSubmit", "session_id": "sess-1"},
               {"hook_event_name": "StopFailure", "session_id": "sess-1", "error": "rate_limit",
                "error_details": "usage limit", "last_assistant_message": "secret"}):
+    transcript = os.path.join(os.environ["HOME"], "live-model.jsonl")
+    if os.path.exists(transcript): event["transcript_path"] = transcript
     subprocess.run(["/bin/sh", "-c", command], input=json.dumps(event).encode(), check=True)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 deadline = time.time() + float(os.environ.get("FAKE_WATCHDOG_S", "20"))
@@ -309,7 +311,9 @@ impl Env {
             command.env("FAKE_SAMPLE_RENEWAL", "1");
         }
         Command::from_std(command)
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(
+                60.max(watchdog_s.parse::<u64>().unwrap() + 30),
+            ))
             .output()
             .unwrap()
     }
@@ -365,6 +369,32 @@ fn assert_deferred(env: &Env, output: &std::process::Output, cause: &str) {
     // Stage-deduplicated journal rows retain the first cause; current status tracks the latest.
     assert_eq!(status["reason"], "quiet_window");
     assert_eq!(status["cause"], cause);
+}
+
+#[test]
+#[ignore = "exercises the real ten-minute account-failover quiet window"]
+fn a_failover_keeps_the_live_model_from_the_outgoing_run() {
+    let env = Env::new();
+    private_write(
+        &env.home.path().join("live-model.jsonl"),
+        &json!({"type":"assistant","sessionId":"sess-1","message":{"model":"claude-fable-5-1"}})
+            .to_string(),
+    );
+    let output = env.run(&["server", "run", "work", "--failover"], "660");
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let runs = env.runs();
+    assert_eq!(runs.len(), 2);
+    assert_ne!(runs[0]["run"], runs[1]["run"]);
+    let args = runs[1]["args"].as_array().unwrap();
+    let model = args.iter().position(|arg| arg == "--model").unwrap();
+    assert_eq!(args[model + 1], "claude-fable-5-1");
+    let resume = args.iter().position(|arg| arg == "--resume").unwrap();
+    assert_eq!(args[resume + 1], "sess-1");
 }
 
 #[test]

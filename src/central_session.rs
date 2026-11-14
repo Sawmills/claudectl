@@ -1488,6 +1488,7 @@ pub fn run(
             return Ok(exec::exit_code_of(&status));
         };
         resumed = Some((session_id.clone(), cause, revisions));
+        let live_model = super::renew::live_model(session.directory(), &session_id);
         if let Some(terminal) = &terminal {
             terminal.restore();
         }
@@ -1574,6 +1575,7 @@ pub fn run(
                 }
             }
         }
+        super::renew::keep_live_model(&mut launch_args, live_model.as_deref());
         first = false;
     }
 }
