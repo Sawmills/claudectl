@@ -307,6 +307,8 @@ sidechain turns do not select the model. If no assistant model is available, the
 launch `--model` is retained; if neither exists, no model flag is added. The recorded model
 ID takes precedence over launch aliases or variants such as `opusplan` and `[1m]`.
 This applies to authentication recovery, renewal, account failover and Operator cron recovery.
+If a permitted resume fails before starting its conversation, the fresh-session fallback
+keeps that same selected model.
 
 For a Fleet Operator, `HERDR_TAB_ID` selects the matching `operator_tab` in
 `~/Code/.fleet/*/operator.md`. Only lines that start with `operator_tab:` name an owner.
