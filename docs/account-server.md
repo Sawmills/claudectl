@@ -328,8 +328,19 @@ participating card, file and schedule, asks Claude to read
 each prompt verbatim, keep matching recurring jobs and their IDs, preserve other session
 jobs, create only missing jobs once, run CronList again, and update
 each card's `cron_ids` and `claude_session_file`. claudectl reads that final inventory from the
-resumed session transcript, matched to its tool call and recovery prompt. Recovery does not
-replay missed fires or run saved prompts. After recovery, a renewal stops; a failover
+resumed session transcript, matched to its tool call and recovery prompt. Once the final
+CronList readback confirms every saved job is present, recovery may run the card's check
+prompt once. The first `cron_prompts` entry is the check job. Its `check:` command's
+`--name` identifies `~/.local/state/fleet/op-check-<name>.json`; the file's mtime must be
+older than one check period. The period comes from the saved cron schedule, using the
+interval between the most recent and next scheduled fire on the host's local clock.
+Free-form card cadence notes do not change it. The prompt names the check and checkpoint
+and requires another mtime read immediately before running the check. A recent, future,
+missing or non-file checkpoint does not authorize a check. An unavailable checkpoint,
+ambiguous name or invalid schedule leaves cron restoration active and names the unavailable
+check evidence in the prompt. Deep dives, watches, sweeps and all other saved prompts
+remain forbidden during recovery; shared checks are requested only once. After recovery,
+a renewal stops; a failover
 continues the previous request. Each completed recovery writes one result per session to
 `~/.claudectl/server/cron-recovery.jsonl`. A complete final inventory logs
 `crons intact: N jobs`, where N counts saved jobs, including any restored jobs.
@@ -338,7 +349,7 @@ Absent or unreadable evidence logs an explicit unverified notice.
 Results stay outside the live terminal. The log contains no saved prompt contents.
 Recovery preserves option values, including multi-value `--add-dir` and `--allowedTools`.
 Failover includes the original task verbatim in its single delivered recovery prompt.
-Renewal omits the original task and stops after restoring crons.
+Renewal omits the original task and stops after restoring crons and any eligible check.
 Verification matches that delivered text using a digest held in memory. If launch
 arguments cannot be classified as one prompt, recovery is disarmed with a skipped notice
 and the ordinary resume path continues.
@@ -348,8 +359,8 @@ The transcript read is limited to 8 MiB after the previous recorded position. An
 card, an unreadable saved prompt, a malformed entry, or a recovery-arm failure prints
 `cron recovery skipped: <reason>` and falls back to the ordinary resume arguments.
 Recovery after authentication failure or expiry omits the original task and the legacy
-cron catch-up note. Its matching saved-card recovery still restores definitions without
-replaying missed fires. Other renewals and failovers with no matching card keep their existing
+cron catch-up note. Its matching saved-card recovery uses the same check-only exception.
+Other renewals and failovers with no matching card keep their existing
 note; first launches and manual resumes do not use this recovery. Optional cron recovery
 never aborts a restart. Cards with no saved crons follow the same rules. Unreadable unrelated cards produce a
 discovery warning and do not stop ordinary renewal. Saved paths support absolute paths,

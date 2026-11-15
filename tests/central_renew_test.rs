@@ -670,6 +670,215 @@ fn cron_recovery_keeps_the_live_model_without_a_launch_model() {
 }
 
 #[test]
+fn cron_recovery_runs_only_the_stale_check_after_inventory_readback() {
+    let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
+    let card = f.home.path().join("Code/.fleet/model-test/operator.md");
+    let check = card.parent().unwrap().join("check.txt");
+    let deep_dive = card.parent().unwrap().join("deep-dive.txt");
+    private_write(
+        &card,
+        "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name model-test\ncron_prompts: check.txt */5 * * * *; deep-dive.txt 37 7 * * *\n",
+    );
+    private_write(&deep_dive, "Perform the daily deep dive.");
+    let state = f
+        .home
+        .path()
+        .join(".local/state/fleet/op-check-model-test.json");
+    private_write(&state, "{}");
+    std::fs::File::open(&state)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+        .unwrap();
+    private_write(
+        &f.home.path().join("s.jsonl"),
+        &json!({"type":"assistant","message":{"model":"claude-fable-5-1"}}).to_string(),
+    );
+
+    let runs = f.recover_after_switch("s");
+    let args = runs[1]["args"].as_array().unwrap();
+    let delimiter = args.iter().position(|arg| arg == "--").unwrap();
+    let prompt = args[delimiter + 1].as_str().unwrap();
+    let instruction = "Run the stale check prompt once:";
+    let run_check = prompt
+        .find(instruction)
+        .unwrap_or_else(|| panic!("stale check must run once; generated recovery: {prompt}"));
+    let readback = prompt
+        .find("Run CronList again after all creations.")
+        .unwrap();
+    assert!(run_check > readback);
+    assert_eq!(prompt.matches(instruction).count(), 1);
+    assert!(prompt.contains(&format!("check file: {}\n", check.display())));
+    assert!(prompt.contains(&format!("staleness source: {}\n", state.display())));
+    assert!(!prompt.contains(&format!("check file: {}\n", deep_dive.display())));
+    assert!(prompt.contains("Do not run any other saved job's prompt."));
+    assert!(prompt.contains("Do not create duplicate jobs."));
+    let resume = args.iter().position(|arg| arg == "--resume").unwrap();
+    assert_eq!(args[resume + 1], "s");
+    let model = args.iter().position(|arg| arg == "--model").unwrap();
+    assert_eq!(args[model + 1], "claude-fable-5-1");
+}
+
+#[test]
+fn cron_recovery_does_not_run_a_fresh_check() {
+    let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
+    let card = f.home.path().join("Code/.fleet/model-test/operator.md");
+    let check = card.parent().unwrap().join("check.txt");
+    private_write(
+        &card,
+        "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name model-test\ncron_prompts: check.txt */5 * * * *; deep-dive.txt 37 7 * * *\n",
+    );
+    private_write(
+        &card.parent().unwrap().join("deep-dive.txt"),
+        "Perform the daily deep dive.",
+    );
+    let state = f
+        .home
+        .path()
+        .join(".local/state/fleet/op-check-model-test.json");
+    private_write(&state, "{}");
+    std::fs::File::open(&state)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+        .unwrap();
+    private_write(
+        &f.home.path().join("s.jsonl"),
+        &json!({"type":"assistant","message":{"model":"claude-fable-5-1"}}).to_string(),
+    );
+
+    let runs = f.recover_after_switch("s");
+    let args = runs[1]["args"].as_array().unwrap();
+    let delimiter = args.iter().position(|arg| arg == "--").unwrap();
+    let prompt = args[delimiter + 1].as_str().unwrap();
+    assert!(prompt.contains(&format!("check file: {}\n", check.display())));
+    assert!(prompt.contains(&format!("staleness source: {}\n", state.display())));
+    assert!(prompt.contains("check period: 300 seconds\n"));
+    assert!(!prompt.contains("Run the stale check prompt once:"));
+    assert!(prompt.contains("Do not replay missed fires or run any saved job's prompt"));
+    assert!(prompt.contains("Do not create duplicate jobs."));
+    let resume = args.iter().position(|arg| arg == "--resume").unwrap();
+    assert_eq!(args[resume + 1], "s");
+    let model = args.iter().position(|arg| arg == "--model").unwrap();
+    assert_eq!(args[model + 1], "claude-fable-5-1");
+}
+
+#[test]
+fn cron_recovery_uses_the_saved_check_schedule_instead_of_card_cadence() {
+    for (age_seconds, should_run) in [(1200, false), (2400, true)] {
+        let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
+        let card = f.home.path().join("Code/.fleet/model-test/operator.md");
+        private_write(
+            &card,
+            "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name=model-test\ncadence: check every 15 minutes\ncron_prompts: check.txt 11,41 * * * *\n",
+        );
+        let state = f
+            .home
+            .path()
+            .join(".local/state/fleet/op-check-model-test.json");
+        private_write(&state, "{}");
+        std::fs::File::open(&state)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(age_seconds))
+            .unwrap();
+
+        let runs = f.recover_after_switch("s");
+        let args = runs[1]["args"].as_array().unwrap();
+        let delimiter = args.iter().position(|arg| arg == "--").unwrap();
+        let prompt = args[delimiter + 1].as_str().unwrap();
+        assert!(prompt.contains("check period: 1800 seconds\n"));
+        assert_eq!(
+            prompt.contains("Run the stale check prompt once:"),
+            should_run
+        );
+    }
+}
+
+#[test]
+fn cron_recovery_restores_jobs_without_running_an_unproven_check() {
+    for evidence in ["missing", "future", "directory"] {
+        let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
+        let card = f.home.path().join("Code/.fleet/model-test/operator.md");
+        private_write(
+            &card,
+            "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name model-test\ncron_prompts: check.txt */5 * * * *\n",
+        );
+        let state = f
+            .home
+            .path()
+            .join(".local/state/fleet/op-check-model-test.json");
+        if evidence == "future" {
+            private_write(&state, "{}");
+            std::fs::File::open(&state)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + Duration::from_secs(600))
+                .unwrap();
+        } else if evidence == "directory" {
+            std::fs::create_dir_all(&state).unwrap();
+            std::fs::File::open(&state)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+                .unwrap();
+        }
+
+        let runs = f.recover_after_switch("s");
+        let args = runs[1]["args"].as_array().unwrap();
+        let delimiter = args.iter().position(|arg| arg == "--").unwrap();
+        let prompt = args[delimiter + 1].as_str().unwrap();
+        assert!(
+            !prompt.contains("Run the stale check prompt once:"),
+            "{evidence}: {prompt}"
+        );
+        assert!(prompt.contains("Check catch-up unavailable"));
+        assert!(prompt.contains("Create only missing jobs with CronCreate"));
+        assert!(prompt.contains("Do not replay missed fires or run any saved job's prompt"));
+    }
+}
+
+#[test]
+fn cron_recovery_requests_a_shared_stale_check_only_once() {
+    let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
+    let card = f.home.path().join("Code/.fleet/model-test/operator.md");
+    let check = card.parent().unwrap().join("check.txt");
+    private_write(
+        &card,
+        "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name model-test\ncron_prompts: check.txt */5 * * * *\n",
+    );
+    private_write(
+        &f.home.path().join("Code/.fleet/shared/operator.md"),
+        &format!(
+            "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name model-test\ncron_prompts: '{}' */5 * * * *\n",
+            check.display(),
+        ),
+    );
+    let state = f
+        .home
+        .path()
+        .join(".local/state/fleet/op-check-model-test.json");
+    private_write(&state, "{}");
+    std::fs::File::open(&state)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+        .unwrap();
+
+    let runs = f.recover_after_switch("s");
+    let args = runs[1]["args"].as_array().unwrap();
+    let delimiter = args.iter().position(|arg| arg == "--").unwrap();
+    let prompt = args[delimiter + 1].as_str().unwrap();
+    assert_eq!(
+        prompt.matches("Run the stale check prompt once:").count(),
+        1
+    );
+    assert_eq!(
+        prompt
+            .lines()
+            .filter(|line| line.starts_with("file: "))
+            .count(),
+        1
+    );
+    assert!(prompt.contains("A shared file and schedule uses the same ID"));
+    assert!(prompt.contains("Do not create duplicate jobs."));
+}
+
+#[test]
 fn auth_recovery_keeps_launch_model_when_transcript_has_no_assistant_model() {
     let mut f = Fixture::with_args(
         "auth_recovery",
