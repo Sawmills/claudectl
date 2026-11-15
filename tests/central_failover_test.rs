@@ -17,6 +17,7 @@ use std::{
 
 const WORK: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SPARE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const THIRD: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
 #[derive(Default)]
 struct Fake {
@@ -33,6 +34,8 @@ struct Fake {
     usage_reads: Vec<(String, String)>,
     token_requests: Vec<String>,
     token_request_bodies: Vec<Value>,
+    start_accounts: Option<Value>,
+    start_usage: HashMap<String, Value>,
 }
 type Shared = Arc<Mutex<Fake>>;
 
@@ -40,7 +43,10 @@ fn identity(org: &str) -> Value {
     json!({"account_uuid": format!("claude-{org}"), "organization_uuid": org})
 }
 
-async fn accounts() -> Json<Value> {
+async fn accounts(State(shared): State<Shared>) -> Json<Value> {
+    if let Some(accounts) = &shared.lock().unwrap().start_accounts {
+        return Json(accounts.clone());
+    }
     Json(json!([
         {"provider": "anthropic", "account_id": WORK, "alias": "work",
             "identity": identity("org-work"), "available": true},
@@ -57,6 +63,13 @@ async fn usage(
     let id = q.get("account_id").cloned().unwrap_or_default();
     fake.usage_reads
         .push((id.clone(), q.get("cached").cloned().unwrap_or_default()));
+    if let Some(data) = fake.start_usage.get(&id) {
+        return Json(json!({
+            "data": data,
+            "observed_at": chrono::Utc::now().timestamp_millis(),
+            "next_retry_at": 0, "stale": false, "error": null,
+        }));
+    }
     let five = match id.as_str() {
         WORK if fake.work_used && !fake.throttle => 100.0,
         WORK => 10.0,
@@ -89,8 +102,10 @@ async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Va
     let (name, org) = if id == WORK {
         shared.lock().unwrap().work_used = true;
         ("work", "org-work")
-    } else {
+    } else if id == SPARE {
         ("spare", "org-spare")
+    } else {
+        ("third", "org-third")
     };
     let (token, revision, hours) = if renewed {
         (format!("token-{name}-2"), format!("revision-{name}-2"), 9)
@@ -126,6 +141,7 @@ settings = args[args.index("--settings") + 1]
 config = json.load(open(settings))
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps({"token": token, "args": args, "settings": config, "run": os.environ.get("CLAUDECTL_SERVER_RUN")}) + "\n")
+if os.environ.get("FAKE_START_ONLY"): sys.exit(7)
 command = config["hooks"]["StopFailure"][0]["hooks"][0]["command"]
 if token != "token-work":
     if os.environ.get("FAKE_FAIL_RESUME") and "--resume" in args: sys.exit(7)
@@ -178,6 +194,137 @@ struct Env {
     log: std::path::PathBuf,
     sample_renewal: bool,
     fail_resume: bool,
+    start_only: bool,
+}
+
+#[test]
+fn a_new_start_skips_amir_at_95_percent_when_cool_accounts_are_eligible() {
+    let env = Env::new_start([95.0, 0.0, 0.0]);
+
+    let output = env.run(&["run"], "3");
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        env.fake
+            .lock()
+            .unwrap()
+            .token_requests
+            .first()
+            .map(String::as_str),
+        Some(SPARE),
+        "a new start must choose cool amir5 over hot amir's earlier weekly reset"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for decision in [
+        "start candidate amir: 5h=95%, week=1%; skipped: 5h at or above 80%",
+        "start candidate amir5: 5h=0%, week=13%; eligible: weekly reset priority",
+        "start candidate amir4: 5h=0%, week=21%; eligible: weekly reset priority",
+        "starting Claude on amir5 (5h below 80%; weekly reset priority)",
+    ] {
+        assert!(
+            stderr.contains(decision),
+            "missing start decision {decision}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_new_start_excludes_80_percent_and_keeps_weekly_order_below_it() {
+    let env = Env::new_start([80.0, 79.9, 0.0]);
+    // amir4 has more five-hour and weekly room; amir5 still resets first.
+    env.fake.lock().unwrap().start_usage.get_mut(THIRD).unwrap()["seven_day"]["utilization"] =
+        json!(1.0);
+    let output = env.run(&["run"], "3");
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        env.fake
+            .lock()
+            .unwrap()
+            .token_requests
+            .first()
+            .map(String::as_str),
+        Some(SPARE)
+    );
+}
+
+#[test]
+fn a_new_start_preserves_the_weekly_fallback_when_all_eligible_accounts_are_hot() {
+    let env = Env::new_start([95.0, 80.0, 99.0]);
+    let output = env.run(&["run"], "3");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(7), "{stderr}");
+    assert_eq!(
+        env.fake
+            .lock()
+            .unwrap()
+            .token_requests
+            .first()
+            .map(String::as_str),
+        Some(WORK)
+    );
+    assert!(
+        stderr.contains(
+            "starting Claude on amir (no eligible account below 80%; existing weekly order)"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn an_ineligible_cool_account_does_not_remove_the_hot_fallback() {
+    for blocked in ["unavailable", "billed", "weekly_headroom"] {
+        let env = Env::new_start([95.0, 0.0, 0.0]);
+        let mut fake = env.fake.lock().unwrap();
+        for id in [SPARE, THIRD] {
+            match blocked {
+                "unavailable" => {
+                    let accounts = fake
+                        .start_accounts
+                        .as_mut()
+                        .unwrap()
+                        .as_array_mut()
+                        .unwrap();
+                    accounts.iter_mut().find(|a| a["account_id"] == id).unwrap()["available"] =
+                        json!(false);
+                }
+                "billed" => {
+                    fake.start_usage.get_mut(id).unwrap()["extra_usage"]["is_enabled"] = json!(true)
+                }
+                "weekly_headroom" => {
+                    fake.start_usage.get_mut(id).unwrap()["seven_day"]["utilization"] = json!(95.0)
+                }
+                _ => unreachable!(),
+            }
+        }
+        drop(fake);
+        let output = env.run(&["run"], "3");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(7), "{blocked}: {stderr}");
+        assert_eq!(
+            env.fake
+                .lock()
+                .unwrap()
+                .token_requests
+                .first()
+                .map(String::as_str),
+            Some(WORK),
+            "{blocked}"
+        );
+        assert!(
+            stderr.contains("start candidate amir5: 5h=0%, week="),
+            "{blocked}: {stderr}"
+        );
+        assert!(stderr.contains("; ineligible:"), "{blocked}: {stderr}");
+    }
 }
 
 #[test]
@@ -289,7 +436,41 @@ impl Env {
             log,
             sample_renewal: false,
             fail_resume: false,
+            start_only: false,
         }
+    }
+    fn new_start(five_hour: [f64; 3]) -> Self {
+        let mut env = Env::new();
+        env.start_only = true;
+        let now = chrono::Utc::now();
+        let mut fake = env.fake.lock().unwrap();
+        fake.start_accounts = Some(json!([
+            {"provider": "anthropic", "account_id": WORK, "alias": "amir",
+                "identity": identity("org-work"), "available": true},
+            {"provider": "anthropic", "account_id": SPARE, "alias": "amir5",
+                "identity": identity("org-spare"), "available": true},
+            {"provider": "anthropic", "account_id": THIRD, "alias": "amir4",
+                "identity": identity("org-third"), "available": true},
+        ]));
+        // Week13/21 are from the report. Reset times and amir's week use are
+        // synthetic: the old weekly order must prefer amir.
+        for (id, five, week, reset_hours) in [
+            (WORK, five_hour[0], 1.0, 1),
+            (SPARE, five_hour[1], 13.0, 72),
+            (THIRD, five_hour[2], 21.0, 120),
+        ] {
+            fake.start_usage.insert(
+                id.into(),
+                json!({
+                    "five_hour": {"utilization": five},
+                    "seven_day": {"utilization": week,
+                        "resets_at": (now + chrono::Duration::hours(reset_hours)).to_rfc3339()},
+                    "extra_usage": {"is_enabled": false},
+                }),
+            );
+        }
+        drop(fake);
+        env
     }
     fn run(&self, args: &[&str], watchdog_s: &str) -> std::process::Output {
         self.run_with(args, watchdog_s, &[])
@@ -315,6 +496,9 @@ impl Env {
         }
         if self.fail_resume {
             command.env("FAKE_FAIL_RESUME", "1");
+        }
+        if self.start_only {
+            command.env("FAKE_START_ONLY", "1");
         }
         Command::from_std(command)
             .timeout(std::time::Duration::from_secs(

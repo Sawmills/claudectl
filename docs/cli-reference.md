@@ -234,6 +234,15 @@ with an unknown reset time follow all known resets, ordered by weekly room. This
 rule applies to local profiles, server launches, and recovery. Server recovery also
 keeps its Ready-only, recent-target, and session-crowding guards.
 
+For a new `claudectl run` without an account name, eligible accounts below 80%
+five-hour use take priority. If any such account exists, accounts at or above 80%
+are excluded from that choice; the remaining accounts keep the weekly order above.
+If every eligible account is at or above 80%, the existing weekly order applies
+to the full eligible pool. Each automatic start reports every candidate's
+five-hour and weekly use, eligibility or skip reason, and the chosen account on
+stderr. Named runs keep the explicit account choice. Running sessions keep their
+renewal and failover rules.
+
 ### Run One Command on a Saved Account
 
 ```bash

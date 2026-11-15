@@ -905,10 +905,15 @@ pub fn candidate(row: &ServerRow) -> crate::accounts::Candidate {
 }
 
 const NOT_CONNECTED: &str = "this machine is not connected to an account server\nTry: claudectl server connect <server-url> --name <machine>";
+const START_FIVE_HOUR_LIMIT: f64 = 80.0;
 
-/// The server account `claudectl run` starts on when none is named: `accounts::best`
-/// over live usage. Refuses with the account list when none has room.
+/// The server account to switch to: `accounts::best` over live usage.
+/// Refuses with the account list when none has room.
 pub fn pick_account(paths: &Paths) -> Result<String> {
+    pick_account_inner(paths, false)
+}
+
+fn pick_account_inner(paths: &Paths, new_start: bool) -> Result<String> {
     let rows = match server_view(paths, false, &[], None) {
         ServerView::Rows(rows) => rows,
         ServerView::NotConnected => bail!(NOT_CONNECTED),
@@ -916,9 +921,60 @@ pub fn pick_account(paths: &Paths) -> Result<String> {
             bail!("the account server did not answer: {error}\nTry: claudectl status")
         }
     };
-    let candidates: Vec<_> = rows.iter().map(candidate).collect();
+    let mut candidates: Vec<_> = rows.iter().map(candidate).collect();
+    let cool = |c: &crate::accounts::Candidate| {
+        c.windows
+            .iter()
+            .find(|w| w.name == "5h")
+            .and_then(|w| w.used)
+            .is_some_and(|used| used < START_FIVE_HOUR_LIMIT)
+    };
+    let prefer_cool = new_start
+        && candidates
+            .iter()
+            .any(|c| crate::accounts::selection_reason(c).is_none() && cool(c));
+    if new_start {
+        for c in &candidates {
+            let used = |name| {
+                c.windows
+                    .iter()
+                    .find(|w| w.name == name)
+                    .and_then(|w| w.used)
+                    .map_or_else(|| "unknown".into(), |used| format!("{used}%"))
+            };
+            let reason = match crate::accounts::selection_reason(c) {
+                Some(reason) => format!("ineligible: {reason}"),
+                None if prefer_cool && !cool(c) => format!(
+                    "skipped: 5h at or above {START_FIVE_HOUR_LIMIT}%; an eligible account is below {START_FIVE_HOUR_LIMIT}%"
+                ),
+                None => "eligible: weekly reset priority".into(),
+            };
+            eprintln!(
+                "claudectl: start candidate {}: 5h={}, week={}; {reason}",
+                c.name,
+                used("5h"),
+                used("week"),
+            );
+        }
+    }
+    if prefer_cool {
+        candidates.retain(cool);
+    }
     match crate::accounts::best(&candidates) {
-        Some(i) => Ok(candidates[i].name.clone()),
+        Some(i) => {
+            let picked = candidates[i].name.clone();
+            if new_start {
+                let reason = if prefer_cool {
+                    format!("5h below {START_FIVE_HOUR_LIMIT}%; weekly reset priority")
+                } else {
+                    format!(
+                        "no eligible account below {START_FIVE_HOUR_LIMIT}%; existing weekly order"
+                    )
+                };
+                eprintln!("claudectl: starting Claude on {picked} ({reason})");
+            }
+            Ok(picked)
+        }
         None if candidates.is_empty() => {
             bail!("the account server has no accounts for you\nTry: claudectl add <name>")
         }
@@ -1202,8 +1258,8 @@ pub enum Command {
     /// Remove this machine's local connection; does not revoke it on the server
     Disconnect,
 }
-/// `claudectl run`: `server run` on the named account, or on `pick_account` when none is
-/// named. The account name resolves like every other (`accounts::resolve`).
+/// `claudectl run`: `server run` on the named account, or a cool eligible account in
+/// weekly order when none is named. Named accounts resolve with `accounts::resolve`.
 pub fn run(
     account: Option<&str>,
     claude: PathBuf,
@@ -1213,11 +1269,7 @@ pub fn run(
     let paths = crate::config::default_paths()?;
     let alias = match account {
         Some(name) => name.to_owned(),
-        None => {
-            let picked = pick_account(&paths)?;
-            eprintln!("claudectl: starting Claude on {picked} (weekly reset priority)");
-            picked
-        }
+        None => pick_account_inner(&paths, true)?,
     };
     dispatch(Command::Run {
         alias,

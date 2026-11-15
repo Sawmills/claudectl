@@ -60,7 +60,10 @@ claudectl run work -- --print 'Perform the scheduled task.'
 claudectl status --json
 ```
 
-The unnamed run uses the existing account picker. Both forms require current
+The unnamed run prefers eligible accounts below 80% five-hour use, then uses
+the existing weekly order. If all eligible accounts are at or above 80%, it keeps
+the full eligible pool and weekly order. Its start log reports each candidate's
+five-hour and weekly use and the choice reason. Both forms require current
 included capacity, with extra usage explicitly off, before executing any Claude
 build. Missing configuration, rejected credentials, stale usage and unavailable
 capacity refuse the job; they never fall back to a human machine credential.
