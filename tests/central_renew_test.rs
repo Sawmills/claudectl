@@ -382,7 +382,9 @@ impl Fixture {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if mode == "auth_crons" {
-            command.env("HERDR_TAB_ID", "model-test-tab");
+            command
+                .env("HERDR_TAB_ID", "model-test-tab")
+                .env("TZ", "UTC");
         }
         let child = command.spawn().unwrap();
         Self {
@@ -1074,6 +1076,46 @@ fn cron_recovery_allows_each_distinct_stale_check_without_conflicting_bans() {
         prompt.matches("Run the stale check prompt once:").count(),
         2
     );
+}
+
+#[test]
+fn cron_recovery_uses_the_last_completed_check_interval() {
+    use chrono::Timelike;
+    for (age_seconds, should_run) in [(120, true), (30, false)] {
+        let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
+        let minute = chrono::Utc::now().minute();
+        let card = f.home.path().join("Code/.fleet/model-test/operator.md");
+        private_write(
+            &card,
+            &format!(
+                "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name model-test\ncron_prompts: check.txt {},{} * * * *\n",
+                (minute + 58) % 60,
+                (minute + 59) % 60,
+            ),
+        );
+        let state = f
+            .home
+            .path()
+            .join(".local/state/fleet/op-check-model-test.json");
+        private_write(&state, "{}");
+        std::fs::File::open(&state)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(age_seconds))
+            .unwrap();
+
+        let runs = f.recover_after_switch("s");
+        let args = runs[1]["args"].as_array().unwrap();
+        let delimiter = args.iter().position(|arg| arg == "--").unwrap();
+        let prompt = args[delimiter + 1].as_str().unwrap();
+        assert!(
+            prompt.contains("check period: 60 seconds\n"),
+            "expected a completed one-minute interval: {prompt}"
+        );
+        assert_eq!(
+            prompt.contains("Run the stale check prompt once:"),
+            should_run
+        );
+    }
 }
 
 #[test]

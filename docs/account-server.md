@@ -337,7 +337,7 @@ is eligible only when its filename stem is `check`, `cron-check`, or starts with
 `cron-check-`. An unrecognized first job is not treated as a check. Its `check:` command's
 `--name` identifies `~/.local/state/fleet/op-check-<name>.json`; the file's mtime must be
 older than one check period. The period comes from the saved cron schedule, using the
-interval between the most recent and next scheduled fire on the host's local clock.
+most recently completed interval between scheduled fires on the host's local clock.
 Free-form card cadence notes do not change it. The prompt names the check and checkpoint
 and requires another mtime read immediately before running the check. A recent, future,
 missing or non-file checkpoint does not authorize a check. An unavailable checkpoint,

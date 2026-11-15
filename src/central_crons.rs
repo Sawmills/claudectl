@@ -135,8 +135,10 @@ impl Check {
         let cron: croner::Cron = schedule.parse().context("invalid check schedule")?;
         let now = chrono::Local::now();
         let previous = cron.find_previous_occurrence(&now, true)?;
-        let next = cron.find_next_occurrence(&previous, false)?;
-        let period = (next - previous).to_std().context("invalid check period")?;
+        let preceding = cron.find_previous_occurrence(&previous, false)?;
+        let period = (previous - preceding)
+            .to_std()
+            .context("invalid check period")?;
         Ok(Self {
             file: file.to_owned(),
             schedule: schedule.to_owned(),
