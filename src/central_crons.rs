@@ -48,6 +48,108 @@ impl Job {
     }
 }
 
+struct Check {
+    file: PathBuf,
+    schedule: String,
+    state: PathBuf,
+    modified: std::time::SystemTime,
+    period: std::time::Duration,
+    stale: bool,
+}
+
+impl Check {
+    fn read(home: &Path, card: &Path, text: &str, jobs: &[(PathBuf, String)]) -> Result<Self> {
+        let markers: Vec<_> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("cron_check_prompt:"))
+            .collect();
+        let (file, schedule) = if markers.is_empty() {
+            let first = jobs.first().context("card has no saved check job")?;
+            let named_check = first
+                .0
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name == "check" || name == "cron-check" || name.starts_with("cron-check-")
+                });
+            if !named_check {
+                bail!("first saved prompt is not identified as a check; set cron_check_prompt");
+            }
+            first
+        } else {
+            let [marker] = markers.as_slice() else {
+                bail!("cron_check_prompt must name one saved check");
+            };
+            let words = shell_words::split(marker).context("invalid cron_check_prompt quoting")?;
+            let [value] = words.as_slice() else {
+                bail!("cron_check_prompt must name one saved prompt file");
+            };
+            let marked = saved_path(home, card, value)?
+                .canonicalize()
+                .context("marked check file unavailable")?;
+            let mut matching = jobs.iter().filter(|(file, _)| file == &marked);
+            let job = matching.next().context("marked check is not a saved job")?;
+            if matching.next().is_some() {
+                bail!("marked check has multiple saved schedules");
+            }
+            job
+        };
+        let mut names = Vec::new();
+        for command in text.lines().filter_map(|line| line.strip_prefix("check:")) {
+            let words = shell_words::split(command).context("invalid check command quoting")?;
+            for (index, word) in words.iter().enumerate() {
+                if word == "--name" {
+                    names.push(
+                        words
+                            .get(index + 1)
+                            .context("check --name needs a value")?
+                            .clone(),
+                    );
+                } else if let Some(name) = word.strip_prefix("--name=") {
+                    names.push(name.to_owned());
+                }
+            }
+        }
+        let [name] = names.as_slice() else {
+            bail!("check command must name exactly one op-check state");
+        };
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        {
+            bail!("check --name is not a state filename");
+        }
+        let state = home.join(format!(".local/state/fleet/op-check-{name}.json"));
+        let metadata = std::fs::metadata(&state)
+            .with_context(|| format!("op-check checkpoint unavailable: {}", state.display()))?;
+        if !metadata.is_file() {
+            bail!("op-check checkpoint is not a file: {}", state.display());
+        }
+        let modified = metadata
+            .modified()
+            .context("op-check checkpoint mtime unavailable")?;
+        let age = std::time::SystemTime::now()
+            .duration_since(modified)
+            .context("op-check checkpoint mtime is in the future")?;
+        let cron: croner::Cron = schedule.parse().context("invalid check schedule")?;
+        let now = chrono::Local::now();
+        let previous = cron.find_previous_occurrence(&now, true)?;
+        let preceding = cron.find_previous_occurrence(&previous, false)?;
+        let period = (previous - preceding)
+            .to_std()
+            .context("invalid check period")?;
+        Ok(Self {
+            file: file.to_owned(),
+            schedule: schedule.to_owned(),
+            state,
+            modified,
+            period,
+            stale: age > period,
+        })
+    }
+}
+
 pub(super) struct Recovery {
     cards: Vec<PathBuf>,
     jobs: Vec<Job>,
@@ -56,6 +158,8 @@ pub(super) struct Recovery {
     attempt: String,
     continue_request: bool,
     launched_prompt: Option<[u8; 32]>,
+    checks: Vec<Check>,
+    check_notices: Vec<String>,
 }
 
 impl Recovery {
@@ -99,6 +203,8 @@ impl Recovery {
             attempt: format!("{:032x}", rand::random::<u128>()),
             continue_request: false,
             launched_prompt: None,
+            checks: Vec::new(),
+            check_notices: Vec::new(),
         };
         for directory in directories {
             let directory = directory?;
@@ -147,6 +253,7 @@ impl Recovery {
                 bail!("cron recovery: ambiguous Operator card ownership");
             }
             let earlier_cards = owned.jobs.len();
+            let mut card_jobs = Vec::new();
             for line in text
                 .lines()
                 .filter_map(|line| line.strip_prefix("cron_prompts:"))
@@ -166,6 +273,12 @@ impl Recovery {
                         format!("cron recovery: saved prompt unreadable: {}", file.display())
                     })?;
                     let schedule = words[1..].join(" ");
+                    if !card_jobs
+                        .iter()
+                        .any(|(path, cron)| path == &file && cron == &schedule)
+                    {
+                        card_jobs.push((file.clone(), schedule.clone()));
+                    }
                     if owned.jobs[..earlier_cards]
                         .iter()
                         .any(|job| job.file == file && job.schedule != schedule)
@@ -194,6 +307,13 @@ impl Recovery {
                         prompt,
                     });
                 }
+            }
+            match Check::read(home, &card, &text, &card_jobs) {
+                Ok(check) => owned.checks.push(check),
+                Err(error) => owned.check_notices.push(format!(
+                    "Check catch-up unavailable for {}: {error}. ",
+                    card.display()
+                )),
             }
             let previous = text
                 .lines()
@@ -426,9 +546,41 @@ impl Recovery {
              card to the kept or newly created IDs for that card's cron_prompts, in the same order. \
              A shared file and schedule uses the same ID on every owning card. \
              Update claude_session_file on each card \
-             to this session's actual transcript path. Do not replay missed fires or run \
-             any saved job's prompt as part of recovery. Do not create duplicate jobs. ",
+             to this session's actual transcript path. Do not create duplicate jobs. ",
         );
+        for notice in &self.check_notices {
+            prompt.push_str(notice);
+        }
+        let mut requested = std::collections::HashSet::new();
+        for check in &self.checks {
+            prompt.push_str(&format!(
+                "\ncheck file: {}\nstaleness source: {}\ncheckpoint mtime: {}\ncheck period: {} seconds\n",
+                check.file.display(),
+                check.state.display(),
+                chrono::DateTime::<chrono::Utc>::from(check.modified).to_rfc3339(),
+                check.period.as_secs(),
+            ));
+            if check.stale && requested.insert((&check.file, &check.schedule)) {
+                prompt.push_str(&format!(
+                    "Run the stale check prompt once: {}\nOnly AFTER the final CronList readback \
+                     confirms every saved job is present, \
+                     read the check file verbatim and run that check once. Immediately before \
+                     running it, re-read the staleness source mtime; skip the check if it is \
+                     unavailable, in the future, or no longer older than this check period. ",
+                    check.file.display(),
+                ));
+            }
+        }
+        if requested.is_empty() {
+            prompt.push_str(
+                "Do not replay missed fires or run any saved job's prompt as part of recovery. ",
+            );
+        } else {
+            prompt.push_str(
+                "Do not replay missed fires. Do not run any saved job's prompt other than \
+                 the stale checks listed above. Run each listed stale check at most once. ",
+            );
+        }
         prompt.push_str(if self.continue_request {
             super::failover::RECOVERY_PROMPT
         } else {

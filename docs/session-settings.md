@@ -40,9 +40,13 @@ and quiet admission. A new revision alone starts neither a restart nor its deadl
 Explicit production holds block every restart until hold end, including auth recovery. Unknown SessionEnd
 intent also prevents restart, with one failure record while that uncertainty persists. Account failover still
 requires ten continuous minutes of observed quiet. A forced restart can discard a draft
-or background task. Recovery omits the original
-task and missed fires; saved-card cron recovery
-still restores its job definitions. A failed authentication resume reports an error and
+or background task. Recovery omits the original task and restores saved-card cron definitions.
+After the final CronList readback confirms those jobs, it may run an identified saved check
+prompt once when the card's op-check checkpoint mtime is older than one saved check period.
+The card can mark that saved file with `cron_check_prompt:`. Otherwise, the first entry
+must have a `check`, `cron-check`, or `cron-check-...` filename stem.
+It rechecks freshness before running; all other saved prompts keep the no-replay rule.
+A failed authentication resume reports an error and
 stops instead of opening a different conversation. These workload samples do not close all
 input sources: a late or invisible prompt can still be cut off. Claudectl does not collect
 or replay prompts.
