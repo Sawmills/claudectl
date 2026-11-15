@@ -710,7 +710,11 @@ fn cron_recovery_runs_only_the_stale_check_after_inventory_readback() {
     assert!(prompt.contains(&format!("check file: {}\n", check.display())));
     assert!(prompt.contains(&format!("staleness source: {}\n", state.display())));
     assert!(!prompt.contains(&format!("check file: {}\n", deep_dive.display())));
-    assert!(prompt.contains("Do not run any other saved job's prompt."));
+    assert!(
+        prompt.contains(
+            "Do not run any saved job's prompt other than the stale checks listed above."
+        )
+    );
     assert!(prompt.contains("Do not create duplicate jobs."));
     let resume = args.iter().position(|arg| arg == "--resume").unwrap();
     assert_eq!(args[resume + 1], "s");
@@ -975,7 +979,9 @@ fn cron_recovery_runs_only_a_uniquely_marked_saved_check() {
                 card.parent().unwrap().join("status check.txt").display()
             )));
             assert!(prompt.contains("check period: 300 seconds\n"));
-            assert!(prompt.contains("Do not run any other saved job's prompt."));
+            assert!(prompt.contains(
+                "Do not run any saved job's prompt other than the stale checks listed above."
+            ));
         } else {
             assert!(prompt.contains("Check catch-up unavailable"));
             assert!(prompt.contains("Do not replay missed fires or run any saved job's prompt"));
@@ -1020,6 +1026,54 @@ fn cron_recovery_recognizes_the_cron_check_filename() {
         1
     );
     assert!(prompt.contains(&format!("check file: {}\n", check.display())));
+}
+
+#[test]
+fn cron_recovery_allows_each_distinct_stale_check_without_conflicting_bans() {
+    let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
+    let mut checks = Vec::new();
+    for name in ["model-test", "second"] {
+        let card = f
+            .home
+            .path()
+            .join(format!("Code/.fleet/{name}/operator.md"));
+        let check = card.parent().unwrap().join("check.txt");
+        private_write(
+            &card,
+            &format!(
+                "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name {name}\ncron_prompts: check.txt */5 * * * *\n"
+            ),
+        );
+        private_write(&check, &format!("Check the lanes on {name}."));
+        let state = f
+            .home
+            .path()
+            .join(format!(".local/state/fleet/op-check-{name}.json"));
+        private_write(&state, "{}");
+        std::fs::File::open(&state)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+            .unwrap();
+        checks.push(check);
+    }
+
+    let runs = f.recover_after_switch("s");
+    let args = runs[1]["args"].as_array().unwrap();
+    let delimiter = args.iter().position(|arg| arg == "--").unwrap();
+    let prompt = args[delimiter + 1].as_str().unwrap();
+    let exclusion = "Do not run any saved job's prompt other than the stale checks listed above.";
+    assert_eq!(prompt.matches(exclusion).count(), 1, "{prompt}");
+    assert!(!prompt.contains("Do not run any other saved job's prompt."));
+    for check in checks {
+        assert!(prompt.contains(&format!(
+            "Run the stale check prompt once: {}\n",
+            check.display()
+        )));
+    }
+    assert_eq!(
+        prompt.matches("Run the stale check prompt once:").count(),
+        2
+    );
 }
 
 #[test]

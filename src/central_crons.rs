@@ -559,19 +559,24 @@ impl Recovery {
                 check.period.as_secs(),
             ));
             if check.stale && requested.insert((&check.file, &check.schedule)) {
-                prompt.push_str(
-                    "Run the stale check prompt once: only AFTER the final CronList readback \
+                prompt.push_str(&format!(
+                    "Run the stale check prompt once: {}\nOnly AFTER the final CronList readback \
                      confirms every saved job is present, \
                      read the check file verbatim and run that check once. Immediately before \
                      running it, re-read the staleness source mtime; skip the check if it is \
-                     unavailable, in the future, or no longer older than this check period. \
-                     Do not replay missed fires. Do not run any other saved job's prompt. ",
-                );
+                     unavailable, in the future, or no longer older than this check period. ",
+                    check.file.display(),
+                ));
             }
         }
         if requested.is_empty() {
             prompt.push_str(
                 "Do not replay missed fires or run any saved job's prompt as part of recovery. ",
+            );
+        } else {
+            prompt.push_str(
+                "Do not replay missed fires. Do not run any saved job's prompt other than \
+                 the stale checks listed above. Run each listed stale check at most once. ",
             );
         }
         prompt.push_str(if self.continue_request {
