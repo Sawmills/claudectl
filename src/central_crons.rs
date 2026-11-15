@@ -58,9 +58,44 @@ struct Check {
 }
 
 impl Check {
-    fn read(home: &Path, card: &str, file: &Path, schedule: &str) -> Result<Self> {
+    fn read(home: &Path, card: &Path, text: &str, jobs: &[(PathBuf, String)]) -> Result<Self> {
+        let markers: Vec<_> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("cron_check_prompt:"))
+            .collect();
+        let (file, schedule) = if markers.is_empty() {
+            let first = jobs.first().context("card has no saved check job")?;
+            let named_check = first
+                .0
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name == "check" || name == "cron-check" || name.starts_with("cron-check-")
+                });
+            if !named_check {
+                bail!("first saved prompt is not identified as a check; set cron_check_prompt");
+            }
+            first
+        } else {
+            let [marker] = markers.as_slice() else {
+                bail!("cron_check_prompt must name one saved check");
+            };
+            let words = shell_words::split(marker).context("invalid cron_check_prompt quoting")?;
+            let [value] = words.as_slice() else {
+                bail!("cron_check_prompt must name one saved prompt file");
+            };
+            let marked = saved_path(home, card, value)?
+                .canonicalize()
+                .context("marked check file unavailable")?;
+            let mut matching = jobs.iter().filter(|(file, _)| file == &marked);
+            let job = matching.next().context("marked check is not a saved job")?;
+            if matching.next().is_some() {
+                bail!("marked check has multiple saved schedules");
+            }
+            job
+        };
         let mut names = Vec::new();
-        for command in card.lines().filter_map(|line| line.strip_prefix("check:")) {
+        for command in text.lines().filter_map(|line| line.strip_prefix("check:")) {
             let words = shell_words::split(command).context("invalid check command quoting")?;
             for (index, word) in words.iter().enumerate() {
                 if word == "--name" {
@@ -216,7 +251,7 @@ impl Recovery {
                 bail!("cron recovery: ambiguous Operator card ownership");
             }
             let earlier_cards = owned.jobs.len();
-            let mut first_job = true;
+            let mut card_jobs = Vec::new();
             for line in text
                 .lines()
                 .filter_map(|line| line.strip_prefix("cron_prompts:"))
@@ -236,15 +271,11 @@ impl Recovery {
                         format!("cron recovery: saved prompt unreadable: {}", file.display())
                     })?;
                     let schedule = words[1..].join(" ");
-                    if first_job {
-                        match Check::read(home, &text, &file, &schedule) {
-                            Ok(check) => owned.checks.push(check),
-                            Err(error) => owned.check_notices.push(format!(
-                                "Check catch-up unavailable for {}: {error}. ",
-                                card.display()
-                            )),
-                        }
-                        first_job = false;
+                    if !card_jobs
+                        .iter()
+                        .any(|(path, cron)| path == &file && cron == &schedule)
+                    {
+                        card_jobs.push((file.clone(), schedule.clone()));
                     }
                     if owned.jobs[..earlier_cards]
                         .iter()
@@ -274,6 +305,13 @@ impl Recovery {
                         prompt,
                     });
                 }
+            }
+            match Check::read(home, &card, &text, &card_jobs) {
+                Ok(check) => owned.checks.push(check),
+                Err(error) => owned.check_notices.push(format!(
+                    "Check catch-up unavailable for {}: {error}. ",
+                    card.display()
+                )),
             }
             let previous = text
                 .lines()

@@ -330,14 +330,18 @@ jobs, create only missing jobs once, run CronList again, and update
 each card's `cron_ids` and `claude_session_file`. claudectl reads that final inventory from the
 resumed session transcript, matched to its tool call and recovery prompt. Once the final
 CronList readback confirms every saved job is present, recovery may run the card's check
-prompt once. The first `cron_prompts` entry is the check job. Its `check:` command's
+prompt once. An optional `cron_check_prompt:` field identifies a saved check prompt file,
+using the same path and quoting rules as `cron_prompts`. It must match exactly one saved
+file/schedule pair on that card; it never adds a job. Without that marker, the first entry
+is eligible only when its filename stem is `check`, `cron-check`, or starts with
+`cron-check-`. An unrecognized first job is not treated as a check. Its `check:` command's
 `--name` identifies `~/.local/state/fleet/op-check-<name>.json`; the file's mtime must be
 older than one check period. The period comes from the saved cron schedule, using the
 interval between the most recent and next scheduled fire on the host's local clock.
 Free-form card cadence notes do not change it. The prompt names the check and checkpoint
 and requires another mtime read immediately before running the check. A recent, future,
 missing or non-file checkpoint does not authorize a check. An unavailable checkpoint,
-ambiguous name or invalid schedule leaves cron restoration active and names the unavailable
+ambiguous check selection/name or invalid schedule leaves cron restoration active and names the unavailable
 check evidence in the prompt. Deep dives, watches, sweeps and all other saved prompts
 remain forbidden during recovery; shared checks are requested only once. After recovery,
 a renewal stops; a failover

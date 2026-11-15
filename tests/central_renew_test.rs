@@ -879,6 +879,150 @@ fn cron_recovery_requests_a_shared_stale_check_only_once() {
 }
 
 #[test]
+fn cron_recovery_does_not_treat_non_check_first_jobs_as_checks() {
+    for file in ["cron-deepdive.txt", "cron-watch.txt", "cron-prsweep.txt"] {
+        let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
+        let card = f.home.path().join("Code/.fleet/model-test/operator.md");
+        private_write(
+            &card,
+            &format!(
+                "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name model-test\ncron_prompts: {file} 47 */4 * * *\n",
+            ),
+        );
+        private_write(
+            &card.parent().unwrap().join(file),
+            "Perform the saved work.",
+        );
+        let state = f
+            .home
+            .path()
+            .join(".local/state/fleet/op-check-model-test.json");
+        private_write(&state, "{}");
+        std::fs::File::open(&state)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(5 * 3600))
+            .unwrap();
+
+        let runs = f.recover_after_switch("s");
+        let args = runs[1]["args"].as_array().unwrap();
+        let delimiter = args.iter().position(|arg| arg == "--").unwrap();
+        let prompt = args[delimiter + 1].as_str().unwrap();
+        assert!(
+            !prompt.contains("Run the stale check prompt once:"),
+            "{file}: {prompt}"
+        );
+        assert!(prompt.contains("Check catch-up unavailable"));
+        assert!(prompt.contains("Create only missing jobs with CronCreate"));
+        assert!(prompt.contains("Do not replay missed fires or run any saved job's prompt"));
+    }
+}
+
+#[test]
+fn cron_recovery_runs_only_a_uniquely_marked_saved_check() {
+    for (kind, should_run) in [("saved", true), ("unlisted", false), ("ambiguous", false)] {
+        let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
+        let card = f.home.path().join("Code/.fleet/model-test/operator.md");
+        let marker = if kind == "unlisted" {
+            "not saved.txt"
+        } else {
+            "status check.txt"
+        };
+        let extra = if kind == "ambiguous" {
+            "; 'status check.txt' */10 * * * *"
+        } else {
+            ""
+        };
+        private_write(
+            &card,
+            &format!(
+                "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name model-test\ncron_check_prompt: '{marker}'\ncron_prompts: deep-dive.txt 47 */4 * * *; 'status check.txt' */5 * * * *{extra}\n",
+            ),
+        );
+        private_write(
+            &card.parent().unwrap().join("deep-dive.txt"),
+            "Perform the daily deep dive.",
+        );
+        private_write(
+            &card.parent().unwrap().join("status check.txt"),
+            "Check the owned lanes.",
+        );
+        private_write(
+            &card.parent().unwrap().join("not saved.txt"),
+            "This is not a saved job.",
+        );
+        let state = f
+            .home
+            .path()
+            .join(".local/state/fleet/op-check-model-test.json");
+        private_write(&state, "{}");
+        std::fs::File::open(&state)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+            .unwrap();
+
+        let runs = f.recover_after_switch("s");
+        let args = runs[1]["args"].as_array().unwrap();
+        let delimiter = args.iter().position(|arg| arg == "--").unwrap();
+        let prompt = args[delimiter + 1].as_str().unwrap();
+        assert_eq!(
+            prompt.contains("Run the stale check prompt once:"),
+            should_run,
+            "{kind}: {prompt}"
+        );
+        if should_run {
+            assert!(prompt.contains(&format!(
+                "check file: {}\n",
+                card.parent().unwrap().join("status check.txt").display()
+            )));
+            assert!(prompt.contains("check period: 300 seconds\n"));
+            assert!(prompt.contains("Do not run any other saved job's prompt."));
+        } else {
+            assert!(prompt.contains("Check catch-up unavailable"));
+            assert!(prompt.contains("Do not replay missed fires or run any saved job's prompt"));
+        }
+        assert!(!prompt.contains(&format!(
+            "check file: {}\n",
+            card.parent().unwrap().join("deep-dive.txt").display()
+        )));
+        assert!(!prompt.contains(&format!(
+            "file: {}\n",
+            card.parent().unwrap().join("not saved.txt").display()
+        )));
+    }
+}
+
+#[test]
+fn cron_recovery_recognizes_the_cron_check_filename() {
+    let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
+    let card = f.home.path().join("Code/.fleet/model-test/operator.md");
+    let check = card.parent().unwrap().join("cron-check-model-test.txt");
+    private_write(
+        &card,
+        "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name model-test\ncron_prompts: cron-check-model-test.txt */5 * * * *\n",
+    );
+    private_write(&check, "Check the owned lanes.");
+    let state = f
+        .home
+        .path()
+        .join(".local/state/fleet/op-check-model-test.json");
+    private_write(&state, "{}");
+    std::fs::File::open(&state)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+        .unwrap();
+
+    let runs = f.recover_after_switch("s");
+    let args = runs[1]["args"].as_array().unwrap();
+    let delimiter = args.iter().position(|arg| arg == "--").unwrap();
+    let prompt = args[delimiter + 1].as_str().unwrap();
+    assert_eq!(
+        prompt.matches("Run the stale check prompt once:").count(),
+        1
+    );
+    assert!(prompt.contains(&format!("check file: {}\n", check.display())));
+}
+
+#[test]
 fn auth_recovery_keeps_launch_model_when_transcript_has_no_assistant_model() {
     let mut f = Fixture::with_args(
         "auth_recovery",
