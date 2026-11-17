@@ -413,8 +413,10 @@ also confirms it before the next provider poll when its known weekly reset is st
 in the future. Stale or failed reads do not qualify. This exception belongs to the
 same session and failed turn; a new prompt, completed turn or session invalidates it.
 Foreground work, background tasks, production markers, pending hooks, explicit holds
-and terminal-input quiet checks still block failover. Other limits and ordinary renewal
-keep their existing quiet delays.
+and terminal-input quiet checks still block failover. Model-specific weekly limits,
+five-hour limits and ordinary renewal keep their existing quiet delays. Cache expiry
+or the known weekly reset invalidates the exception, including during target-account
+reads and the final signal checks.
 
 After admission opens, `restart_pending` retains expiry attention while a token read,
 restart budget or account choice still prevents a restart. Gate eligibility does not clear

@@ -391,7 +391,9 @@ fn run_help_discloses_quiet_window_and_residual_race() {
         assert!(help.contains("same session and account"));
         assert!(help.contains("A new revision alone does not restart a healthy session"));
         assert!(help.contains("five minutes of the held token's expiry"));
-        assert!(help.contains("Request failover after ten minutes of observed quiet"));
+        assert!(help.contains("Request failover when the account reaches a usage limit"));
+        assert!(help.contains("Ordinary failover requires ten minutes of observed quiet"));
+        assert!(help.contains("full weekly account window"));
         assert!(!help.contains("currently deferred"));
         assert!(help.contains("Forced restarts can discard background work and draft input"));
         assert!(help.contains("a late prompt can be cut off at SIGTERM"));

@@ -80,6 +80,7 @@ async fn usage(
         }));
     }
     let five = match id.as_str() {
+        WORK if fake.work_used && fake.weekly_limit => 0.0,
         WORK if fake.work_used && !fake.throttle && !fake.weekly_limit => 100.0,
         WORK => 10.0,
         _ if fake.spare_full => 100.0,
@@ -97,7 +98,8 @@ async fn usage(
         "data": {"five_hour": {"utilization": five}, "seven_day": {"utilization": week},
             "extra_usage": {"is_enabled": false}},
         "observed_at": chrono::Utc::now().timestamp_millis(),
-        "next_retry_at": 0, "stale": false, "error": null,
+        "next_retry_at": chrono::Utc::now().timestamp_millis() + 300_000,
+        "stale": false, "error": null,
     }))
 }
 
@@ -236,6 +238,8 @@ while time.time() < deadline:
         elif mode == "hold":
             subprocess.run([os.environ["FAKE_WRAPPER_BIN"], "hold", "start", "--reason",
                             "FLT-900 synthetic production step"], check=True)
+        elif mode == "evidence_expiry":
+            time.sleep(2.2)
         else:
             raise AssertionError("unknown late blocker: " + mode)
         blocked = True
@@ -750,7 +754,7 @@ fn current_weekly_limit_cache() -> Value {
     let observed = chrono::Utc::now();
     json!({
         "data": {
-            "five_hour": {"utilization": 10.0},
+            "five_hour": {"utilization": 0.0},
             "seven_day": {"utilization": 100.0,
                 "resets_at": (observed + chrono::Duration::hours(1)).to_rfc3339()},
             "extra_usage": {"is_enabled": false}
@@ -777,6 +781,43 @@ fn a_current_weekly_limit_cache_does_not_wait_for_the_next_provider_poll() {
     assert!(started.elapsed() < std::time::Duration::from_secs(120));
     assert_eq!(env.runs().len(), 2);
     assert_eq!(env.runs()[1]["token"], "token-spare");
+}
+
+#[test]
+fn weekly_limit_evidence_must_survive_target_reads() {
+    for expiry in ["cache", "reset"] {
+        let mut env = Env::new();
+        let mut usage = current_weekly_limit_cache();
+        if expiry == "cache" {
+            usage["next_retry_at"] = (chrono::Utc::now().timestamp_millis() + 1_500).into();
+        } else {
+            usage["data"]["seven_day"]["resets_at"] = (chrono::Utc::now()
+                + chrono::Duration::seconds(2))
+            .to_rfc3339()
+            .into();
+        }
+        env.late_blocker = Some("evidence_expiry");
+        {
+            let mut fake = env.fake.lock().unwrap();
+            fake.post_start_usage = Some(usage);
+            fake.target_barrier = Some((
+                env.log.with_extension("log.block"),
+                env.log.with_extension("log.blocked"),
+            ));
+        }
+        let output = env.run(&["run", "work", "--failover"], "5");
+        assert_eq!(
+            output.status.code(),
+            Some(99),
+            "{expiry}: expired account proof moved the session"
+        );
+        assert!(env.log.with_extension("log.blocked").exists());
+        assert_eq!(env.runs().len(), 1);
+        assert!(
+            env.records().is_empty(),
+            "{expiry}: account was reserved on expired proof"
+        );
+    }
 }
 
 #[test]
@@ -818,7 +859,7 @@ fn deferred_limit_turns_leave_timestamps_after_run_cleanup() {
     env.limit_crons = true;
     env.delay_limit = true;
     env.fake.lock().unwrap().post_start_usage = Some(json!({
-        "data": {"five_hour": {"utilization": 10.0}, "seven_day": {"utilization": 100.0}},
+        "data": {"five_hour": {"utilization": 0.0}, "seven_day": {"utilization": 100.0}},
         "observed_at": chrono::Utc::now().timestamp_millis(),
         "next_retry_at": 0, "stale": true, "error": null
     }));

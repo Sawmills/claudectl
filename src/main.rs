@@ -19,7 +19,7 @@ pub struct Cli {
 const RUN_EXAMPLES: &str = "Examples:
   claudectl run                 start Claude on the account whose week resets first
   claudectl run amir2           start on amir2 (full name, email name, or a unique prefix)
-  claudectl run amir2 --failover   fail over after 10 minutes of observed quiet
+  claudectl run amir2 --failover   request an account switch at a usage limit
   claudectl run -- --resume ID  pass arguments to Claude after --";
 
 #[derive(Subcommand)]
@@ -32,7 +32,7 @@ enum Commands {
         /// Claude executable to run (default: `claude` on PATH)
         #[arg(long, default_value = "claude")]
         claude: std::path::PathBuf,
-        /// Request failover after ten minutes of observed quiet
+        /// Request failover when the account reaches a usage limit
         #[arg(long, conflicts_with = "no_failover")]
         failover: bool,
         /// Stay on the account at a usage limit (default with a named account)

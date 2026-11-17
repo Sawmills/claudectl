@@ -442,6 +442,12 @@ struct ObservedQuiet {
     started_at: i64,
 }
 
+struct WeeklyLimit {
+    session: String,
+    failed_at: i64,
+    until: i64,
+}
+
 const QUIET_WINDOW: Duration = Duration::from_secs(600);
 
 /// Holds ordinary restart admission until the final evidence check and signal.
@@ -465,7 +471,7 @@ pub(super) struct Gate {
     log_error: bool,
     unknown_evidence: bool,
     quiet: Option<ObservedQuiet>,
-    weekly_limit: Option<(String, i64)>,
+    weekly_limit: Option<WeeklyLimit>,
     terminal: Option<PathBuf>,
     production: ProductionEvidence,
     state: RestartState,
@@ -701,15 +707,25 @@ impl Gate {
         self.check_at_mode(idle, Cause::Failover, held_expires_at, Instant::now(), true)
     }
 
-    pub(super) fn confirm_weekly_limit(&mut self, idle: &super::renew::Idle, weekly: bool) {
-        self.weekly_limit = if weekly { idle.limited.clone() } else { None };
+    pub(super) fn confirm_weekly_limit(&mut self, idle: &super::renew::Idle, until: Option<i64>) {
+        self.weekly_limit = idle.limited.as_ref().and_then(|(session, failed_at)| {
+            until.map(|until| WeeklyLimit {
+                session: session.clone(),
+                failed_at: *failed_at,
+                until,
+            })
+        });
     }
 
     fn weekly_limit_matches(&self, idle: &super::renew::Idle, cause: Cause) -> bool {
         cause == Cause::Failover
-            && self.weekly_limit == idle.limited
-            && self.weekly_limit.as_ref().is_some_and(|(session, at)| {
-                idle.session.as_ref() == Some(session) && idle.since == Some(*at)
+            && self.weekly_limit.as_ref().is_some_and(|proof| {
+                now() < proof.until
+                    && idle.session.as_ref() == Some(&proof.session)
+                    && idle.since == Some(proof.failed_at)
+                    && idle.limited.as_ref().is_some_and(|(session, at)| {
+                        *session == proof.session && *at == proof.failed_at
+                    })
             })
     }
 

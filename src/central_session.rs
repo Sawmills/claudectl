@@ -1171,6 +1171,20 @@ impl Monitor {
         inputs.restarts_last_hour = state.last_hour;
         inputs.idle_after_ms = 0;
         super::renew::idle_gate(&inputs).ok()?;
+        inputs.idle_after_ms = timing.idle_after_ms;
+        // Once admission opens, failed reads must not suspend the confirmation bound.
+        if gate.check(
+            inputs.idle,
+            super::restart_gate::Cause::Failover,
+            self.held_expires_at,
+        ) && gate
+            .idle_gate(&inputs, super::restart_gate::Cause::Failover)
+            .is_ok()
+            && pending.deadline.expired(failed_at, now())
+        {
+            pending.handled = Some(failed_at);
+            return None;
+        }
         if now() - pending.last_read < timing.retry_ms {
             return None;
         }
@@ -1180,9 +1194,11 @@ impl Monitor {
         let confirmation = failover::confirm(&usage, failed_at);
         gate.confirm_weekly_limit(
             inputs.idle,
-            matches!(confirmation, Confirm::Limit { weekly: true }),
+            match confirmation {
+                Confirm::Limit { weekly_until } => weekly_until,
+                _ => None,
+            },
         );
-        inputs.idle_after_ms = timing.idle_after_ms;
         if !gate.check(
             inputs.idle,
             super::restart_gate::Cause::Failover,
@@ -2529,6 +2545,52 @@ mod tests {
                 assert_eq!(deferred["reason"], "quiet_window");
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_usage_observation_keeps_the_confirmation_deadline() {
+        let (_home, _child, monitor, mut activity) = admission_fixture();
+        let failed_at = activity.idle.since.unwrap();
+        activity.idle.limited = Some(("s".into(), failed_at));
+        let mut gate = super::super::restart_gate::Gate::new(
+            &monitor.paths.home,
+            &monitor.directory,
+            monitor.pid,
+            &monitor.alias,
+        );
+        let observed = Instant::now() - Duration::from_secs(601);
+        assert!(!gate.check_at(
+            &activity.idle,
+            super::super::restart_gate::Cause::Failover,
+            monitor.held_expires_at,
+            observed,
+        ));
+        assert!(gate.check(
+            &activity.idle,
+            super::super::restart_gate::Cause::Failover,
+            monitor.held_expires_at,
+        ));
+        let mut pending = Pending::default();
+        assert!(
+            monitor
+                .failover_target(
+                    &mut activity,
+                    &mut gate,
+                    &super::super::renew::timing(),
+                    &mut pending,
+                    failed_at,
+                )
+                .is_none()
+        );
+        assert!(pending.last_read > 0);
+        assert!(
+            pending.deadline.expired(
+                failed_at,
+                now() + super::super::failover::CONFIRM_FOR_MS + 1,
+            ),
+            "a failed usage read must not stop the six-minute confirmation clock"
+        );
     }
 
     #[cfg(unix)]
