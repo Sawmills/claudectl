@@ -429,10 +429,17 @@ struct Deferred {
     stage: Stage,
 }
 
+struct RecordedFailover {
+    decision: Deferred,
+    session: Option<String>,
+    failed_at: i64,
+}
+
 struct ObservedQuiet {
     idle: super::renew::Idle,
     input_at: Option<std::time::SystemTime>,
     since: Instant,
+    started_at: i64,
 }
 
 const QUIET_WINDOW: Duration = Duration::from_secs(600);
@@ -454,9 +461,11 @@ pub(super) struct Gate {
     recorded_stage: Option<Stage>,
     last_session: Option<String>,
     recorded_session: Option<String>,
+    recorded_failover: Option<RecordedFailover>,
     log_error: bool,
     unknown_evidence: bool,
     quiet: Option<ObservedQuiet>,
+    weekly_limit: Option<(String, i64)>,
     terminal: Option<PathBuf>,
     production: ProductionEvidence,
     state: RestartState,
@@ -481,9 +490,11 @@ impl Gate {
             recorded_stage: None,
             last_session: None,
             recorded_session: None,
+            recorded_failover: None,
             log_error: false,
             unknown_evidence: false,
             quiet: None,
+            weekly_limit: None,
             terminal: None,
             production: ProductionEvidence::default(),
             state: RestartState::Watching,
@@ -672,6 +683,59 @@ impl Gate {
         held_expires_at: i64,
         observed_at: std::time::Instant,
     ) -> bool {
+        self.check_at_mode(idle, cause, held_expires_at, observed_at, false)
+    }
+
+    /// Read-only usage observation may cross quiet timing, never a workload veto.
+    pub(super) fn can_confirm_limit(
+        &mut self,
+        idle: &super::renew::Idle,
+        failed_at: i64,
+        held_expires_at: i64,
+    ) -> bool {
+        if idle.limited.as_ref().is_none_or(|(session, at)| {
+            idle.session.as_ref() != Some(session) || *at != failed_at || idle.since != Some(*at)
+        }) {
+            return false;
+        }
+        self.check_at_mode(idle, Cause::Failover, held_expires_at, Instant::now(), true)
+    }
+
+    pub(super) fn confirm_weekly_limit(&mut self, idle: &super::renew::Idle, weekly: bool) {
+        self.weekly_limit = if weekly { idle.limited.clone() } else { None };
+    }
+
+    fn weekly_limit_matches(&self, idle: &super::renew::Idle, cause: Cause) -> bool {
+        cause == Cause::Failover
+            && self.weekly_limit == idle.limited
+            && self.weekly_limit.as_ref().is_some_and(|(session, at)| {
+                idle.session.as_ref() == Some(session) && idle.since == Some(*at)
+            })
+    }
+
+    pub(super) fn idle_gate(
+        &self,
+        inputs: &super::renew::Inputs<'_>,
+        cause: Cause,
+    ) -> std::result::Result<(), &'static str> {
+        super::renew::idle_gate(&super::renew::Inputs {
+            idle_after_ms: if self.weekly_limit_matches(inputs.idle, cause) {
+                0
+            } else {
+                inputs.idle_after_ms
+            },
+            ..*inputs
+        })
+    }
+
+    fn check_at_mode(
+        &mut self,
+        idle: &super::renew::Idle,
+        cause: Cause,
+        held_expires_at: i64,
+        observed_at: std::time::Instant,
+        observe_limit: bool,
+    ) -> bool {
         if cause == Cause::AuthRecovery {
             self.state = self.state.transition(RestartEvent::AuthFailed);
         }
@@ -753,6 +817,16 @@ impl Gate {
             reason
         } else {
             let input_at = input_at.expect("terminal evidence was checked");
+            let terminal_quiet = input_at.is_none_or(|at| {
+                std::time::SystemTime::now()
+                    .duration_since(at)
+                    .unwrap_or_default()
+                    >= QUIET_WINDOW
+            });
+            if observe_limit && terminal_quiet {
+                // Keep the current deferred status until account evidence admits a restart.
+                return true;
+            }
             let changed = self
                 .quiet
                 .as_ref()
@@ -762,16 +836,13 @@ impl Gate {
                     idle: idle.clone(),
                     input_at,
                     since: observed_at,
+                    started_at: now(),
                 });
             }
             let quiet = self.quiet.as_ref().expect("quiet clock initialized");
-            let terminal_quiet = input_at.is_none_or(|at| {
-                std::time::SystemTime::now()
-                    .duration_since(at)
-                    .unwrap_or_default()
-                    >= QUIET_WINDOW
-            });
-            (observed_at.saturating_duration_since(quiet.since) < QUIET_WINDOW || !terminal_quiet)
+            ((!self.weekly_limit_matches(idle, cause)
+                && observed_at.saturating_duration_since(quiet.since) < QUIET_WINDOW)
+                || !terminal_quiet)
                 .then_some(Reason::QuietWindow)
         };
         // Workload observations do not close all inputs. A hook can still be
@@ -837,10 +908,7 @@ impl Gate {
                 Stage::Deferred
             },
         });
-        if self
-            .publish(decision, idle.session.as_deref(), held_expires_at, at)
-            .is_err()
-        {
+        if self.publish(decision, idle, held_expires_at, at).is_err() {
             self.log_error = true;
             // An uncertain journal write must not be retried and counted twice.
             self.retry_error_status(idle, held_expires_at);
@@ -867,21 +935,45 @@ impl Gate {
     fn publish(
         &mut self,
         decision: Option<Deferred>,
-        session: Option<&str>,
+        idle: &super::renew::Idle,
         expires_at: i64,
         at: i64,
     ) -> Result<()> {
-        if self.last == decision && self.last_session.as_deref() == session {
+        let session = idle.session.as_deref();
+        let failover_changed = decision.is_some_and(|decision| {
+            decision.cause == Cause::Failover
+                && idle.limited.as_ref().is_some_and(|(_, failed_at)| {
+                    self.recorded_failover.as_ref().is_none_or(|previous| {
+                        previous.decision != decision
+                            || previous.session.as_deref() != session
+                            || previous.failed_at != *failed_at
+                    })
+                })
+        });
+        if self.last == decision && self.last_session.as_deref() == session && !failover_changed {
             return Ok(());
         }
         let run = run_id(&self.directory)?;
+        let activity = json!({
+            "idle_since":idle.since,
+            "limit_failed_at":idle.limited.as_ref().map(|(_, at)| *at),
+            "quiet_since":self.quiet.as_ref().map(|quiet| quiet.started_at),
+            "terminal_input_at":self.quiet.as_ref().and_then(|quiet| quiet.input_at)
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok()),
+        });
         let mut status = json!({"at":at,"session_id":session,"run":run,"alias":self.alias,
             "expires_at":expires_at,"deferred":decision.is_some(),
+            "activity":activity,
             "restart_deferred_total":self.total});
         if let Some(d) = decision {
-            if self.recorded_stage != Some(d.stage) || self.recorded_session.as_deref() != session {
+            if self.recorded_stage != Some(d.stage)
+                || self.recorded_session.as_deref() != session
+                || failover_changed
+            {
                 let record = json!({"at":at,"event":"restart_deferred","session_id":session,
                 "run":run,"cause":d.cause,"reason":d.reason,"stage":d.stage,
+                "activity":activity,
                 "expires_at":expires_at,
                 "held_revision":self.revisions.held,"cached_revision":self.revisions.cached,
                 "current_revision":self.revisions.current,
@@ -892,6 +984,15 @@ impl Gate {
                 self.total += 1;
                 self.recorded_stage = Some(d.stage);
                 self.recorded_session = session.map(str::to_owned);
+                if d.cause == Cause::Failover
+                    && let Some((_, failed_at)) = idle.limited.as_ref()
+                {
+                    self.recorded_failover = Some(RecordedFailover {
+                        decision: d,
+                        session: session.map(str::to_owned),
+                        failed_at: *failed_at,
+                    });
+                }
             }
             status["cause"] = json!(d.cause);
             status["reason"] = json!(d.reason);
@@ -905,6 +1006,7 @@ impl Gate {
         if decision.is_none() {
             self.recorded_stage = None;
             self.recorded_session = None;
+            self.recorded_failover = None;
         }
         Ok(())
     }

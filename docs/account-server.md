@@ -407,6 +407,15 @@ explicit production holds remain a veto until hold end. The task check reads liv
 file under `<tmp>/claude-<uid>/.../tasks/*.output` holds admission. MCP/LSP servers and
 `caffeinate` without task-output descriptors do not add a workload blocker.
 
+A failed `rate_limit` turn can skip the ten-minute turn and observed-quiet delays when
+the server confirms that the account's weekly window is full. A current server cache
+also confirms it before the next provider poll when its known weekly reset is still
+in the future. Stale or failed reads do not qualify. This exception belongs to the
+same session and failed turn; a new prompt, completed turn or session invalidates it.
+Foreground work, background tasks, production markers, pending hooks, explicit holds
+and terminal-input quiet checks still block failover. Other limits and ordinary renewal
+keep their existing quiet delays.
+
 After admission opens, `restart_pending` retains expiry attention while a token read,
 restart budget or account choice still prevents a restart. Gate eligibility does not clear
 that alert. During the window the status reason is `quiet_window`; damaged or missing evidence is
@@ -446,7 +455,7 @@ digits, `:`, `_`, `-`, and internal `/` or `.` qualifiers; other internal punctu
 Unicode makes an ID unusable. Supplied IDs that cannot identify a lane report unknown
 evidence. A standalone session with neither ID and no goal file skips lane outboxes. An open marker defers admission even when Claude has no local task-output child. Missing or unreadable marker evidence is reported as
 `evidence_unknown` and keeps admission closed. Restoring clear workload evidence starts a
-new admission check and, for valid-token renewal or failover, a new quiet window. It does
+new admission check and, except for a confirmed weekly-limit failover, a new quiet window. It does
 not provide input-admission proof. Explicit holds remain the preferred production boundary.
 
 Marker history is tracked independently in each source. The ticket and full step label
@@ -485,6 +494,13 @@ After ten consecutive failures, only every tenth failure is routed. Intervening
 `recovery_metric` rows keep their counter increment with a null route. A successful Stop
 resets the consecutive failure count. The fleet owns journal collection and Voice routing;
 these host metrics are separate from the remote account server's `/metrics` endpoint.
+
+Pending failovers retain a durable `restart_deferred` row when their failure time,
+reason or stage changes, even if an earlier renewal already recorded the same stage.
+Repeated polls of the same decision add no row. The row and current status include an
+`activity` object with `idle_since`, `limit_failed_at`, `quiet_since` and `terminal_input_at`.
+These timestamps use Unix milliseconds; unavailable values are null. The journal keeps
+this evidence after the temporary run directory is removed.
 
 Records contain no tokens, raw provider errors or prompt contents. The journal is private
 and refuses symlinks. Diagnostic write failures do not prevent a forced recovery. Ordinary

@@ -27,6 +27,7 @@ struct Fake {
     spare_full: bool,
     /// `work` keeps room: the failed turn was a short throttle.
     throttle: bool,
+    weekly_limit: bool,
     /// An observing read after the first grant returns a newer token (a renewal follows).
     renew_work: bool,
     observed_renewal: bool,
@@ -36,6 +37,8 @@ struct Fake {
     token_request_bodies: Vec<Value>,
     start_accounts: Option<Value>,
     start_usage: HashMap<String, Value>,
+    post_start_usage: Option<Value>,
+    target_barrier: Option<(std::path::PathBuf, std::path::PathBuf)>,
 }
 type Shared = Arc<Mutex<Fake>>;
 
@@ -63,6 +66,12 @@ async fn usage(
     let id = q.get("account_id").cloned().unwrap_or_default();
     fake.usage_reads
         .push((id.clone(), q.get("cached").cloned().unwrap_or_default()));
+    if id == WORK
+        && fake.work_used
+        && let Some(usage) = &fake.post_start_usage
+    {
+        return Json(usage.clone());
+    }
     if let Some(data) = fake.start_usage.get(&id) {
         return Json(json!({
             "data": data,
@@ -71,13 +80,19 @@ async fn usage(
         }));
     }
     let five = match id.as_str() {
-        WORK if fake.work_used && !fake.throttle => 100.0,
+        WORK if fake.work_used && !fake.throttle && !fake.weekly_limit => 100.0,
         WORK => 10.0,
         _ if fake.spare_full => 100.0,
         _ => 20.0,
     };
     // `work` has the most room at the start, so `run` picks it.
-    let week = if id == WORK { 5.0 } else { 30.0 };
+    let week = if id == WORK && fake.work_used && fake.weekly_limit {
+        100.0
+    } else if id == WORK {
+        5.0
+    } else {
+        30.0
+    };
     Json(json!({
         "data": {"five_hour": {"utilization": five}, "seven_day": {"utilization": week},
             "extra_usage": {"is_enabled": false}},
@@ -92,6 +107,22 @@ async fn token(State(shared): State<Shared>, Json(body): Json<Value>) -> Json<Va
         let mut fake = shared.lock().unwrap();
         fake.token_requests.push(id.clone());
         fake.token_request_bodies.push(body.clone());
+    }
+    let barrier = if id == SPARE {
+        shared.lock().unwrap().target_barrier.clone()
+    } else {
+        None
+    };
+    if let Some((request, ready)) = barrier {
+        std::fs::write(request, "").unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < until {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            ready.exists(),
+            "fake child did not publish the late workload"
+        );
     }
     let renewed = {
         let mut fake = shared.lock().unwrap();
@@ -166,12 +197,58 @@ for event in ({"hook_event_name": "SessionStart", "session_id": "sess-1"},
               {"hook_event_name": "UserPromptSubmit", "session_id": "sess-1"},
               {"hook_event_name": "StopFailure", "session_id": "sess-1", "error": "rate_limit",
                "error_details": "usage limit", "last_assistant_message": "secret"}):
+    if os.environ.get("FAKE_DELAY_LIMIT") and event["hook_event_name"] == "StopFailure":
+        subprocess.run(["/bin/sh", "-c", command], input=json.dumps(
+            {"hook_event_name": "Stop", "session_id": "sess-1"}).encode(), check=True)
+        until = time.monotonic() + 2
+        while time.monotonic() < until:
+            try:
+                previous = json.load(open(os.path.join(os.environ["CLAUDECTL_SERVER_RUN"], "restart-status.json")))
+                if previous.get("session_id") == "sess-1" and previous.get("cause") == "renewal" and previous.get("reason") == "quiet_window":
+                    break
+            except FileNotFoundError:
+                pass
+            time.sleep(.01)
+        else:
+            raise AssertionError("initial renewal quiet deferral was never observed")
     transcript = os.path.join(os.environ["HOME"], "live-model.jsonl")
     if os.path.exists(transcript): event["transcript_path"] = transcript
     subprocess.run(["/bin/sh", "-c", command], input=json.dumps(event).encode(), check=True)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 deadline = time.time() + float(os.environ.get("FAKE_WATCHDOG_S", "20"))
+limit_turns = 1
+next_limit = time.monotonic() + .25
+blocked = False
 while time.time() < deadline:
+    if not blocked and os.path.exists(os.environ["FAKE_LOG"] + ".block"):
+        mode = os.environ["FAKE_LATE_BLOCKER"]
+        if mode == "foreground":
+            subprocess.run(["/bin/sh", "-c", command], input=json.dumps(
+                {"hook_event_name": "UserPromptSubmit", "session_id": "sess-1"}).encode(), check=True)
+        elif mode == "background":
+            task_dir = os.path.join(os.environ["TMPDIR"], "claude-" + str(os.getuid()), "project", "tasks")
+            os.makedirs(task_dir, exist_ok=True)
+            with open(os.path.join(task_dir, "late.output"), "w") as out:
+                subprocess.Popen(["sleep", "15"], stdout=out, stderr=out)
+        elif mode == "production":
+            with open(os.environ["LANE_GOAL_FILE"], "a") as out:
+                out.write("flt900:lane [starting] FLT-900 synthetic production step\n")
+        elif mode == "hold":
+            subprocess.run([os.environ["FAKE_WRAPPER_BIN"], "hold", "start", "--reason",
+                            "FLT-900 synthetic production step"], check=True)
+        else:
+            raise AssertionError("unknown late blocker: " + mode)
+        blocked = True
+        open(os.environ["FAKE_LOG"] + ".blocked", "w").close()
+    if os.environ.get("FAKE_LIMIT_CRONS") and time.monotonic() >= next_limit:
+        for event in ({"hook_event_name": "UserPromptSubmit", "session_id": "sess-1"},
+                      {"hook_event_name": "StopFailure", "session_id": "sess-1", "error": "rate_limit",
+                       "error_details": "You've hit your weekly limit · resets 9pm"}):
+            subprocess.run(["/bin/sh", "-c", command], input=json.dumps(event).encode(), check=True)
+        limit_turns += 1
+        next_limit = time.monotonic() + .25
+        with open(os.environ["FAKE_LOG"] + ".limit-turns", "w") as out:
+            out.write(str(limit_turns))
     time.sleep(0.05)
 # Seek a spurious renewal decision during mixed-operation tests instead of relying
 # on the phase of the final sample relative to the monitor's tick.
@@ -195,6 +272,9 @@ struct Env {
     sample_renewal: bool,
     fail_resume: bool,
     start_only: bool,
+    limit_crons: bool,
+    late_blocker: Option<&'static str>,
+    delay_limit: bool,
 }
 
 #[test]
@@ -437,6 +517,9 @@ impl Env {
             sample_renewal: false,
             fail_resume: false,
             start_only: false,
+            limit_crons: false,
+            late_blocker: None,
+            delay_limit: false,
         }
     }
     fn new_start(five_hour: [f64; 3]) -> Self {
@@ -476,6 +559,7 @@ impl Env {
         self.run_with(args, watchdog_s, &[])
     }
     fn run_with(&self, args: &[&str], watchdog_s: &str, settings: &[&str]) -> std::process::Output {
+        std::fs::create_dir_all(self.home.path().join("tmp")).unwrap();
         let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("claudectl"));
         command
             .env_clear()
@@ -486,6 +570,11 @@ impl Env {
             .env("CLAUDECTL_TEST_RENEW_FAST", "1")
             .env("FAKE_LOG", &self.log)
             .env("FAKE_WATCHDOG_S", watchdog_s)
+            .env("TMPDIR", self.home.path().join("tmp"))
+            .env(
+                "FAKE_WRAPPER_BIN",
+                assert_cmd::cargo::cargo_bin("claudectl"),
+            )
             .args(args)
             .arg("--claude")
             .arg(&self.claude)
@@ -499,6 +588,22 @@ impl Env {
         }
         if self.start_only {
             command.env("FAKE_START_ONLY", "1");
+        }
+        if self.limit_crons {
+            command.env("FAKE_LIMIT_CRONS", "1");
+        }
+        if self.delay_limit {
+            command.env("FAKE_DELAY_LIMIT", "1");
+        }
+        if let Some(blocker) = self.late_blocker {
+            command.env("FAKE_LATE_BLOCKER", blocker);
+            if blocker == "production" {
+                let goal = self.home.path().join("goal.md");
+                private_write(&goal, "");
+                command
+                    .env("LANE_GOAL_FILE", goal)
+                    .env("HERDR_TAB_ID", "flt900:lane");
+            }
         }
         Command::from_std(command)
             .timeout(std::time::Duration::from_secs(
@@ -614,6 +719,198 @@ fn a_failed_failover_resume_keeps_the_live_model_when_starting_fresh() {
     assert!(!args.iter().any(|arg| arg == "--resume"));
     let model = args.iter().position(|arg| arg == "--model").unwrap();
     assert_eq!(args[model + 1], "claude-fable-5-1");
+}
+
+#[test]
+fn weekly_limited_idle_cron_turns_failover_within_two_minutes() {
+    let mut env = Env::new();
+    env.fake.lock().unwrap().weekly_limit = true;
+    env.limit_crons = true;
+
+    let started = std::time::Instant::now();
+    let output = env.run(&["run", "work", "--failover"], "3");
+    let status = std::fs::read_to_string(env.log.with_extension("log.deferred"));
+    let turns = std::fs::read_to_string(env.log.with_extension("log.limit-turns"));
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "weekly-limited idle run did not move within the admission budget: {}\nstatus={status:?}\nlimit turns={turns:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(120));
+    let runs = env.runs();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1]["token"], "token-spare");
+    let args = runs[1]["args"].as_array().unwrap();
+    let resume = args.iter().position(|arg| arg == "--resume").unwrap();
+    assert_eq!(args[resume + 1], "sess-1");
+}
+
+fn current_weekly_limit_cache() -> Value {
+    let observed = chrono::Utc::now();
+    json!({
+        "data": {
+            "five_hour": {"utilization": 10.0},
+            "seven_day": {"utilization": 100.0,
+                "resets_at": (observed + chrono::Duration::hours(1)).to_rfc3339()},
+            "extra_usage": {"is_enabled": false}
+        },
+        "observed_at": observed.timestamp_millis() - 1_000,
+        "next_retry_at": observed.timestamp_millis() + 299_000,
+        "stale": false, "error": null
+    })
+}
+
+#[test]
+fn a_current_weekly_limit_cache_does_not_wait_for_the_next_provider_poll() {
+    let mut env = Env::new();
+    env.limit_crons = true;
+    env.fake.lock().unwrap().post_start_usage = Some(current_weekly_limit_cache());
+    let started = std::time::Instant::now();
+    let output = env.run(&["run", "work", "--failover"], "3");
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(120));
+    assert_eq!(env.runs().len(), 2);
+    assert_eq!(env.runs()[1]["token"], "token-spare");
+}
+
+#[test]
+fn a_weekly_limit_message_cannot_replace_current_account_evidence() {
+    for invalid in [
+        "stale",
+        "error",
+        "reset_passed",
+        "reset_missing",
+        "cache_expired",
+        "room",
+    ] {
+        let mut usage = current_weekly_limit_cache();
+        match invalid {
+            "stale" => usage["stale"] = true.into(),
+            "error" => usage["error"] = "usage_unavailable".into(),
+            "reset_passed" => {
+                usage["data"]["seven_day"]["resets_at"] = (chrono::Utc::now()
+                    - chrono::Duration::hours(1))
+                .to_rfc3339()
+                .into()
+            }
+            "reset_missing" => usage["data"]["seven_day"]["resets_at"] = Value::Null,
+            "cache_expired" => usage["next_retry_at"] = 0.into(),
+            "room" => usage["data"]["seven_day"]["utilization"] = 10.0.into(),
+            _ => unreachable!(),
+        }
+        let mut env = Env::new();
+        env.limit_crons = true;
+        env.fake.lock().unwrap().post_start_usage = Some(usage);
+        let output = env.run(&["run", "work", "--failover"], "3");
+        assert_deferred(&env, &output, "failover");
+    }
+}
+
+#[test]
+fn deferred_limit_turns_leave_timestamps_after_run_cleanup() {
+    let mut env = Env::new();
+    env.limit_crons = true;
+    env.delay_limit = true;
+    env.fake.lock().unwrap().post_start_usage = Some(json!({
+        "data": {"five_hour": {"utilization": 10.0}, "seven_day": {"utilization": 100.0}},
+        "observed_at": chrono::Utc::now().timestamp_millis(),
+        "next_retry_at": 0, "stale": true, "error": null
+    }));
+    let output = env.run(&["run", "work", "--failover"], "3");
+    assert_eq!(output.status.code(), Some(99));
+    let rows: Vec<Value> = std::fs::read_to_string(
+        env.home
+            .path()
+            .join(".claudectl/server/restart-decisions.jsonl"),
+    )
+    .unwrap()
+    .lines()
+    .map(|line| serde_json::from_str(line).unwrap())
+    .collect();
+    assert!(
+        rows.iter()
+            .any(|row| row["cause"] == "renewal" && row["session_id"] == "sess-1")
+    );
+    let deferred: Vec<_> = rows
+        .iter()
+        .filter(|row| row["cause"] == "failover" && row["reason"] == "quiet_window")
+        .collect();
+    assert!(
+        !deferred.is_empty(),
+        "failover deferrals disappeared behind the earlier renewal: {rows:?}"
+    );
+    let failures: std::collections::BTreeSet<_> = deferred
+        .iter()
+        .map(|row| {
+            row["activity"]["limit_failed_at"]
+                .as_i64()
+                .expect("durable failure timestamp")
+        })
+        .collect();
+    assert!(
+        failures.len() > 1,
+        "later limit-only turns need their own durable timing evidence"
+    );
+    for row in deferred {
+        assert_eq!(
+            row["activity"]["idle_since"],
+            row["activity"]["limit_failed_at"]
+        );
+        assert!(row["activity"]["quiet_since"].as_i64().is_some());
+        assert!(
+            row["at"].as_i64().unwrap() >= row["activity"]["limit_failed_at"].as_i64().unwrap()
+        );
+    }
+    let runs = env.runs();
+    assert!(!Path::new(runs[0]["run"].as_str().unwrap()).exists());
+}
+
+#[test]
+fn weekly_limit_confirmation_keeps_late_workload_vetoes() {
+    for (blocker, reason, cause) in [
+        ("foreground", "running_turn", "renewal"),
+        ("background", "background_task", "failover"),
+        ("production", "open_production_step", "failover"),
+        ("hold", "explicit_hold", "failover"),
+    ] {
+        let mut env = Env::new();
+        env.late_blocker = Some(blocker);
+        {
+            let mut fake = env.fake.lock().unwrap();
+            fake.weekly_limit = true;
+            fake.target_barrier = Some((
+                env.log.with_extension("log.block"),
+                env.log.with_extension("log.blocked"),
+            ));
+        }
+        let output = env.run(&["run", "work", "--failover"], "3");
+        assert_eq!(
+            output.status.code(),
+            Some(99),
+            "{blocker}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            env.log.with_extension("log.blocked").exists(),
+            "{blocker}: account was never confirmed"
+        );
+        assert_eq!(env.runs().len(), 1, "{blocker}");
+        assert!(
+            env.records().is_empty(),
+            "{blocker}: account was reserved while busy"
+        );
+        let status: Value =
+            serde_json::from_slice(&std::fs::read(env.log.with_extension("log.deferred")).unwrap())
+                .unwrap();
+        assert_eq!(status["reason"], reason, "{blocker}: {status}");
+        assert_eq!(status["cause"], cause, "{blocker}");
+    }
 }
 
 #[test]

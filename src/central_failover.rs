@@ -9,8 +9,8 @@ use std::{collections::HashMap, ffi::OsString};
 #[derive(Debug, PartialEq)]
 pub(super) enum Confirm {
     /// A full window: the account is at a usage limit.
-    Limit,
-    /// No current answer yet (stale, failed, or observed before the failure): ask again.
+    Limit { weekly: bool },
+    /// No current confirmation yet: ask again.
     NotYet,
     /// Observed after the failure without a full window: a short throttle, never a switch.
     Throttle,
@@ -25,11 +25,27 @@ pub(super) fn confirm(usage: &Usage, failed_at: i64) -> Confirm {
     let (Some(parsed), Some(observed_at)) = (parsed, usage.observed_at) else {
         return Confirm::NotYet;
     };
-    if usage.stale || observed_at < failed_at {
+    if usage.stale || usage.error.is_some() {
         return Confirm::NotYet;
     }
-    match crate::accounts::state(&crate::accounts::windows(&parsed)) {
-        crate::accounts::State::Limit { .. } => Confirm::Limit,
+    let windows = crate::accounts::windows(&parsed);
+    let weekly = windows
+        .iter()
+        .find(|window| window.name == "week" && window.used >= Some(100.0));
+    // The server can return a current full weekly cache until its next poll, even
+    // for a live read. Its known reset must still be ahead before trusting older data.
+    let at = now();
+    let current_weekly = usage.next_retry_at > at
+        && weekly
+            .and_then(|window| window.resets_at)
+            .is_some_and(|reset| reset > at / 1_000);
+    if observed_at < failed_at && !current_weekly {
+        return Confirm::NotYet;
+    }
+    match crate::accounts::state(&windows) {
+        crate::accounts::State::Limit { .. } => Confirm::Limit {
+            weekly: weekly.is_some(),
+        },
         crate::accounts::State::Unknown => Confirm::NotYet,
         _ => Confirm::Throttle,
     }
@@ -437,7 +453,10 @@ mod tests {
 
     #[test]
     fn only_a_fresh_full_window_confirms_a_limit() {
-        assert_eq!(confirm(&usage(full(), 2_000, false), 1_000), Confirm::Limit);
+        assert_eq!(
+            confirm(&usage(full(), 2_000, false), 1_000),
+            Confirm::Limit { weekly: false }
+        );
         // A stale or older answer proves nothing yet.
         assert_eq!(confirm(&usage(full(), 2_000, true), 1_000), Confirm::NotYet);
         assert_eq!(
@@ -461,7 +480,10 @@ mod tests {
         let fable = json!({"five_hour": {"utilization": 1.0}, "seven_day": {"utilization": 1.0},
             "limits": [{"kind": "weekly_scoped", "percent": 100,
                 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}]});
-        assert_eq!(confirm(&usage(fable, 2_000, false), 1_000), Confirm::Limit);
+        assert_eq!(
+            confirm(&usage(fable, 2_000, false), 1_000),
+            Confirm::Limit { weekly: false }
+        );
     }
 
     #[test]
