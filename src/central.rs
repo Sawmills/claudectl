@@ -26,7 +26,9 @@ with workload and observed-quiet admission. Its deadline starts in that margin.
 An explicit production hold blocks every restart until hold end, including auth recovery.
 Unknown SessionEnd intent also vetoes restart and records one recovery failure.
 Hold-blocked notices name the hold at most once per ten minutes.
-Failover requires ten minutes of observed quiet.
+Ordinary failover requires ten minutes of observed quiet.
+A confirmed full weekly account window skips turn and observed-quiet delays.
+Workload, hold and terminal-input quiet checks still apply.
 Forced restarts can discard background work and draft input.
 Claude gets twenty seconds to save after SIGTERM before SIGKILL.
 Idle and quiet do not close all inputs: a late prompt can be cut off at SIGTERM.
@@ -1186,7 +1188,7 @@ pub enum Command {
         /// Claude executable to run (default: `claude` on PATH)
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
-        /// Request failover after ten minutes of observed quiet
+        /// Request failover when the account reaches a usage limit
         #[arg(long)]
         failover: bool,
         /// Arguments for Claude, after `--`
