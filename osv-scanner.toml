@@ -19,3 +19,13 @@ reason = "RUSTSEC-2023-0071, all rsa versions, no fix; runtime use is public-key
 id = "RUSTSEC-2023-0071"
 ignoreUntil = 2027-01-09
 reason = "Same advisory as GHSA-4grx-2x9w-596c above; runtime use is public-key signature verification only (openidconnect); tests sign with throwaway keys"
+
+# RUSTSEC-2026-0543 is an informational maintenance-status advisory, not a
+# reported vulnerability. Chrono 0.4.45 is the latest release and the advisory
+# marks all versions affected with no fixed release. Replacing chrono changes
+# application and transitive contracts beyond this dependency-remediation PR.
+# Time-box this exception while the owner decides the replacement scope.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+ignoreUntil = 2026-12-02
+reason = "Informational unmaintained advisory; latest chrono 0.4.45 has no fixed release; preserve existing behavior while owner decides replacement scope (FLT-905); revisit by 2026-12-02"
