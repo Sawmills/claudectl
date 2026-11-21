@@ -78,9 +78,11 @@ leases, scopes, billing permission or automatic reset redemption.
 `server disconnect` refuses in service mode so it cannot delete a human machine's
 saved connection. Unset both service variables before disconnecting that machine.
 
-The server's existing usage read requests optional limit-reset offers. When present,
+The server's existing usage read requests optional limit-reset offers using the
+Claude Code CLI `User-Agent` required by the provider's offer gate. When present,
 `claudectl status` (including `--details` and `--json`) and the `/accounts` dashboard
-show the remaining count, affected limits and expiry. Paused offers, future starts
+show the remaining count, affected limits (including Fable weekly grants and
+`gives_back_weekly` notes) and expiry. Paused offers, future starts
 and offers that cannot currently be used are labeled. Empty offers are hidden;
 unknown expiry is labeled, and old observations remain marked as old data. The
 dashboard uses cached usage and makes no additional provider request. These are
@@ -88,7 +90,8 @@ read-only hints by default: use `/limit-reset` in Claude Code or Settings > Usag
 claude.ai to apply a reset. The browser dashboard Apply reset action is an explicit
 staging opt-in (`CLAUDECTL_CENTRAL_BROWSER_RESETS=1`). It requires a recent company
 sign-in, the dashboard session and form token, and the exact configured Origin. It
-only enables for a fresh exhausted window and keeps the provider request ID sealed in
+enables for a fresh usable offer (an exhausted window including Fable or an explicit
+provider anytime grant) and keeps the provider request ID sealed in
 the account record so a timeout retry reuses it. The provider call is outside the
 store transaction, and the action writes an `account_reset` audit row without tokens.
 
@@ -99,7 +102,8 @@ synthetic timeout replay on the new image before any live staging use.
 
 On the first successful usage poll for each account in a server process, the
 `limit_reset_offers` log records only `present` (the provider returned an offer
-block) and `count` (remaining unexpired resets), without account or
+block), `eligible`, bounded `ineligible_reason` (such as `surface` or `cli_version`),
+and `count` (remaining unexpired resets), without account or
 grant identifiers. Optional offer metadata can be absent or malformed without
 failing the ordinary usage read.
 

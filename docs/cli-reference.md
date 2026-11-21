@@ -64,14 +64,19 @@ claudectl status --details        # token expiry, old usage, and fetch diagnosti
 claudectl status --json           # machine-readable report (version 1)
 claudectl resets                  # list usable limit-reset offers
 claudectl resets --json           # machine-readable reset offers
+claudectl reset <alias> --dry-run # preview the offer and request without redeeming
 claudectl reset <alias>           # apply one offer after confirmation
 claudectl reset <alias> --yes     # apply from a non-interactive shell
 ```
 
-`reset` requires a fresh exhausted window and a usable offer. It chooses the offer
-closest to expiry. Server accounts use the account server's audited, idempotent
-Apply path; local profiles call the provider directly. The command never runs as
-part of billing or Claude session recovery, and service-account tokens cannot redeem.
+`reset` requires fresh usage and a usable offer (an exhausted window that the offer
+clears, including Fable weekly limits and grants that give back weekly usage, or an
+explicit provider anytime offer). It chooses the offer closest to expiry, preferring
+grants that clear an exhausted window. `--dry-run` validates and prints the selected
+offer and request without writing pending state or redeeming a reset. Server accounts
+use the account server's audited, idempotent Apply path; local profiles call the
+provider directly. The command never runs as part of billing or Claude session recovery,
+and service-account tokens cannot redeem.
 
 `status --json` prints `{"version": 1, "accounts": [...]}`, sorted by alias. Each
 account has `alias`, `label`, `active`, `plan`, `pace_points`, `billing_class`, `exhausted`,

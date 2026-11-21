@@ -555,7 +555,8 @@ fn reset_grant(
     usage: &crate::server::engine::Usage,
     offers: Option<&crate::limit_resets::Offers>,
 ) -> Option<String> {
-    if usage.stale {
+    let now = chrono::Utc::now().timestamp();
+    if usage.stale || usage.selected_offer_expired_at(now) {
         return None;
     }
     let parsed = usage
@@ -570,8 +571,7 @@ fn reset_grant(
     }
     let offers = offers?;
     (usage.reset_grant_id.is_some()
-        && usage.reset_at_limit.is_none_or(|at_limit| at_limit)
-        && offers.has_usable_offer(&exhausted, chrono::Utc::now().timestamp()))
+        && offers.has_usable_offer_at(&exhausted, usage.reset_at_limit, now))
     .then(|| "available".into())
 }
 
@@ -901,6 +901,139 @@ mod tests {
             serde_json::json!({"five_hour": {"utilization": 1.0}}),
         ));
         assert!(missing.billed);
+    }
+
+    #[test]
+    fn reset_grant_handles_fable_anytime_and_surface_ineligible_offers() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let make = |raw: serde_json::Value, at_limit: Option<bool>, grant_id: Option<&str>| {
+            let offers: Option<crate::limit_resets::Offers> = raw
+                .get("cedar_ember")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok());
+            let mut data = raw;
+            if let Some(ref o) = offers {
+                data["cedar_ember"] = serde_json::to_value(o).unwrap();
+            }
+            let usage = crate::server::engine::Usage {
+                data: Some(data),
+                observed_at: Some(now_ms),
+                next_retry_at: now_ms + 300_000,
+                stale: false,
+                reset_grant_id: grant_id.map(str::to_owned),
+                reset_windows: offers
+                    .as_ref()
+                    .map(|o| {
+                        o.provider_exhausted()
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                reset_at_limit: at_limit,
+                ..Default::default()
+            };
+            let observed = windows(&usage);
+            reset_grant(&usage, observed.limit_reset_offers.as_ref())
+        };
+
+        // 1. Live v2 fixture (weekly exhausted + weekly/Fable grants) -> available.
+        let v2: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/limit-reset-offers-v2.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            make(v2.clone(), Some(true), Some("g1")).as_deref(),
+            Some("available")
+        );
+
+        // 2. Anytime grants (use_requires_limit=false, usable_now=true) when at_limit=false -> available.
+        let mut anytime = v2.clone();
+        anytime["seven_day"]["utilization"] = serde_json::json!(46.0);
+        anytime["cedar_ember"]["at_limit"] = serde_json::json!(false);
+        anytime["cedar_ember"]["exhausted"] = serde_json::json!([]);
+        assert_eq!(
+            make(anytime, Some(false), Some("g1")).as_deref(),
+            Some("available")
+        );
+
+        // 3. Fable-only exhausted (seven_day=80%, fable_weekly=100%) -> available.
+        let fable_only = serde_json::json!({
+            "five_hour": {"utilization": 5.0},
+            "seven_day": {"utilization": 80.0},
+            "limits": [{"kind": "weekly_scoped", "percent": 100.0,
+                "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}],
+            "cedar_ember": {
+                "eligible": true,
+                "at_limit": true,
+                "exhausted": ["seven_day_overage_included"],
+                "grants": [{
+                    "id": "g-fable",
+                    "resets_left": 1,
+                    "clears": ["seven_day_overage_included"],
+                    "gives_back_weekly": true,
+                    "use_requires_limit": true,
+                    "usable_now": true,
+                    "ends_at": "2100-03-09T07:59:00Z"
+                }]
+            }
+        });
+        assert_eq!(
+            make(fable_only, Some(true), Some("g-fable")).as_deref(),
+            Some("available")
+        );
+
+        // 4. Limit-gated Fable gives_back_weekly on seven_day exhaustion -> available.
+        let gated_fable = serde_json::json!({
+            "seven_day": {"utilization": 100.0},
+            "cedar_ember": {
+                "eligible": true,
+                "at_limit": true,
+                "exhausted": ["seven_day"],
+                "grants": [{
+                    "id": "g-fable",
+                    "resets_left": 1,
+                    "clears": ["seven_day_overage_included"],
+                    "gives_back_weekly": true,
+                    "use_requires_limit": true,
+                    "usable_now": true,
+                    "ends_at": "2100-03-09T07:59:00Z"
+                }]
+            }
+        });
+        assert_eq!(
+            make(gated_fable, Some(true), Some("g-fable")).as_deref(),
+            Some("available")
+        );
+
+        // 5. Limit-gated grant (default use_requires_limit=true) with at_limit=false -> disabled.
+        let gated_not_limited = serde_json::json!({
+            "seven_day": {"utilization": 50.0},
+            "cedar_ember": {
+                "eligible": true,
+                "at_limit": false,
+                "grants": [{
+                    "id": "g-gated",
+                    "resets_left": 1,
+                    "clears": ["seven_day"],
+                    "usable_now": true,
+                    "ends_at": "2100-03-09T07:59:00Z"
+                }]
+            }
+        });
+        assert_eq!(make(gated_not_limited, Some(false), Some("g-gated")), None);
+
+        // 6. Surface-ineligible (eligible=false) -> disabled.
+        let ineligible = serde_json::json!({
+            "seven_day": {"utilization": 100.0},
+            "cedar_ember": {
+                "eligible": false,
+                "ineligible_reason": "surface",
+                "at_limit": false,
+                "grants": []
+            }
+        });
+        assert_eq!(make(ineligible, Some(false), None), None);
     }
 }
 

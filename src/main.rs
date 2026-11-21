@@ -115,6 +115,9 @@ enum Commands {
         /// Apply without an interactive confirmation
         #[arg(long)]
         yes: bool,
+        /// Show the offer and request without redeeming a reset
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Log into a Claude account via OAuth and save it as a profile
     #[command(hide = true)]
@@ -307,7 +310,11 @@ fn main() {
             json,
         ),
         Commands::Resets { json } => commands::resets::list(json),
-        Commands::Reset { ref account, yes } => commands::resets::reset(account, yes),
+        Commands::Reset {
+            ref account,
+            yes,
+            dry_run,
+        } => commands::resets::reset(account, yes, dry_run),
         Commands::Login { ref alias } => commands::login::run(alias),
         Commands::Save { ref alias } => commands::save::run(alias.as_deref()),
         Commands::Use { ref alias } => commands::use_profile::run(alias.as_deref()),

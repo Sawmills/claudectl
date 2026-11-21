@@ -451,7 +451,7 @@ async fn usage_reset_offers_are_requested_and_retained_without_provider_identifi
     let (query, headers) = request.lock().unwrap().take().unwrap();
     assert_eq!(query.as_deref(), Some("cedar_ember=1"));
     assert_eq!(headers["anthropic-beta"], "oauth-2025-04-20");
-    assert!(!headers.contains_key("user-agent"));
+    assert_eq!(headers["user-agent"], crate::api::CLAUDE_CLI_USER_AGENT);
     let data = usage.data.unwrap();
     assert_eq!(data["five_hour"]["utilization"], 100);
     assert_eq!(data["cedar_ember"]["grants"][0]["resets_left"], 2);
@@ -472,6 +472,193 @@ async fn usage_reset_offers_are_requested_and_retained_without_provider_identifi
             .unwrap(),
         data
     );
+}
+
+#[tokio::test]
+async fn usage_and_reset_send_cli_user_agent_and_retain_fable_and_anytime_offers() {
+    let reset_headers = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let seen_reset_headers = reset_headers.clone();
+    let provider = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/api/oauth/usage",
+            get(move |headers: axum::http::HeaderMap| async move {
+                let ua = headers
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if ua != crate::api::CLAUDE_CLI_USER_AGENT {
+                    return Json(json!({
+                        "seven_day": {"utilization": 100.0},
+                        "cedar_ember": {
+                            "eligible": false,
+                            "ineligible_reason": "surface",
+                            "at_limit": false,
+                            "exhausted": [],
+                            "grants": []
+                        }
+                    }));
+                }
+                let mut payload: Value = serde_json::from_str(include_str!(
+                    "../../../tests/fixtures/limit-reset-offers-v2.json"
+                ))
+                .unwrap();
+                // Also verify anytime grants survive when at_limit is false.
+                payload["seven_day"]["utilization"] = json!(80.0);
+                payload["cedar_ember"]["at_limit"] = json!(false);
+                payload["cedar_ember"]["exhausted"] = json!([]);
+                Json(payload)
+            }),
+        )
+        .route(
+            "/api/organizations/o/reset_rate_limits",
+            post(move |headers: axum::http::HeaderMap| {
+                let seen_reset_headers = seen_reset_headers.clone();
+                async move {
+                    seen_reset_headers.lock().unwrap().push(
+                        headers
+                            .get("user-agent")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_owned(),
+                    );
+                    Json(json!({"result": "reset"}))
+                }
+            }),
+        );
+    let fixture = Fixture::new(provider).await;
+    let engine = fixture.engine().await;
+    let account = engine
+        .admit(
+            "person",
+            "machine",
+            "first",
+            grant_until("a", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let usage = engine
+        .usage("person", &account.account_id, false)
+        .await
+        .unwrap();
+    assert_eq!(usage.reset_offers.len(), 2);
+    assert_eq!(usage.reset_at_limit, Some(false));
+    assert_eq!(
+        usage.reset_grant_id.as_deref(),
+        Some("synthetic-weekly-grant-not-for-display")
+    );
+    let encoded = serde_json::to_string(&usage.data).unwrap();
+    assert!(!encoded.contains("not-for-display"));
+    assert_eq!(
+        engine
+            .apply_reset_for_machine("person", "machine", "machine:machine", &account.account_id)
+            .await
+            .unwrap(),
+        "reset"
+    );
+    assert_eq!(
+        *reset_headers.lock().unwrap(),
+        vec![crate::api::CLAUDE_CLI_USER_AGENT.to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn expiring_selected_grant_clamps_cache_ttl_and_refuses_stale_redemption() {
+    let soon = chrono::Utc::now() + chrono::Duration::seconds(2);
+    let soon_rfc = soon.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let soon_ms = chrono::DateTime::parse_from_rfc3339(&soon_rfc)
+        .unwrap()
+        .timestamp_millis();
+    let reset_calls = Arc::new(AtomicUsize::new(0));
+    let seen_calls = reset_calls.clone();
+    let provider = Router::new()
+        .route("/api/oauth/profile", get(|| async { profile() }))
+        .route(
+            "/api/oauth/usage",
+            get(move || {
+                let soon_rfc = soon_rfc.clone();
+                async move {
+                    Json(json!({
+                        "seven_day": {"utilization": 100.0},
+                        "cedar_ember": {
+                            "eligible": true,
+                            "at_limit": true,
+                            "exhausted": ["seven_day"],
+                            "grants": [
+                                {
+                                    "id": "grant-expiring-soon",
+                                    "resets_left": 1,
+                                    "clears": ["seven_day"],
+                                    "usable_now": true,
+                                    "use_requires_limit": false,
+                                    "ends_at": soon_rfc
+                                },
+                                {
+                                    "id": "grant-later",
+                                    "resets_left": 1,
+                                    "clears": ["seven_day"],
+                                    "usable_now": true,
+                                    "use_requires_limit": false,
+                                    "ends_at": "2099-03-09T07:59:00Z"
+                                }
+                            ]
+                        }
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/api/organizations/o/reset_rate_limits",
+            post(move || {
+                let seen_calls = seen_calls.clone();
+                async move {
+                    seen_calls.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"result": "reset"}))
+                }
+            }),
+        );
+    let fixture = Fixture::new(provider).await;
+    let engine = fixture.engine().await;
+    let account = engine
+        .admit(
+            "person",
+            "machine",
+            "first",
+            grant_until("a", now() + 3_600_000),
+            None,
+        )
+        .await
+        .unwrap();
+    let usage = engine
+        .usage("person", &account.account_id, false)
+        .await
+        .unwrap();
+    assert_eq!(usage.reset_grant_id.as_deref(), Some("grant-expiring-soon"));
+    assert!(
+        usage.next_retry_at <= soon_ms,
+        "next_retry_at {} must clamp to earliest selected grant expiry {}",
+        usage.next_retry_at,
+        soon_ms
+    );
+    assert!(usage.selected_offer_expired_at(soon_ms / 1000));
+    assert!(!usage.selected_offer_expired_at(soon_ms / 1000 - 1));
+
+    // Wait past Grant A's expiry: cached redemption must refuse to submit expired Grant A
+    // even though Grant B is still unexpired.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let cached = engine
+        .usage("person", &account.account_id, true)
+        .await
+        .unwrap();
+    assert!(cached.stale);
+    assert!(
+        engine
+            .apply_reset_for_machine("person", "machine", "machine:machine", &account.account_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(reset_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

@@ -23,11 +23,23 @@ pub struct Usage {
     pub failure: Option<&'static str>,
 }
 impl Usage {
+    /// True when the cached selected reset grant has already passed its expiry, even if
+    /// the surrounding usage observation window has not yet reached `next_retry_at`.
+    pub fn selected_offer_expired_at(&self, now_secs: i64) -> bool {
+        self.reset_grant_id.is_some()
+            && self
+                .reset_offers
+                .first()
+                .and_then(crate::limit_resets::OfferSummary::expiry)
+                .is_some_and(|at| at <= now_secs)
+    }
+
     fn is_stale_at(&self, at: i64) -> bool {
         self.data.is_none()
             || self.error.is_some()
             || at >= self.next_retry_at
             || self.observed_at.is_some_and(|t| t > at + USABLE)
+            || self.selected_offer_expired_at(at / 1000)
     }
     fn while_refreshing(mut self) -> Result<Self> {
         if self.data.is_none() {
@@ -221,6 +233,10 @@ impl Engine {
             .query(&[("cedar_ember", "1")])
             .bearer_auth(&loaded.record.grant.access_token)
             .header("anthropic-beta", BETA)
+            .header(
+                reqwest::header::USER_AGENT,
+                crate::api::CLAUDE_CLI_USER_AGENT,
+            )
             .send()
             .await;
         result.next_retry_at = now() + 300_000;
@@ -256,9 +272,6 @@ impl Engine {
                             .as_ref()
                             .and_then(crate::limit_resets::Offers::at_limit);
                         let selection = offers.as_ref().and_then(|offers| {
-                            if offers.at_limit() == Some(false) {
-                                return None;
-                            }
                             let parsed = serde_json::from_value::<crate::api::UsageResponse>(
                                 Value::Object(value.clone()),
                             )
@@ -269,10 +282,11 @@ impl Engine {
                                     exhausted.push(window.as_str());
                                 }
                             }
+                            let selection_now = now() / 1000;
                             let grant = offers
-                                .closest_usable_grant_id(&exhausted, now() / 1000)
+                                .closest_usable_grant_id(&exhausted, selection_now)
                                 .map(str::to_owned);
-                            Some((grant, offers.usable_summaries(&exhausted, now() / 1000)))
+                            Some((grant, offers.usable_summaries(&exhausted, selection_now)))
                         });
                         (result.reset_grant_id, result.reset_offers) =
                             selection.unwrap_or_default();
@@ -284,7 +298,17 @@ impl Engine {
                         {
                             eprintln!(
                                 "{}",
-                                json!({"operation":"limit_reset_offers", "present":offers.is_some(), "count":count})
+                                json!({
+                                    "operation": "limit_reset_offers",
+                                    "present": offers.is_some(),
+                                    "eligible": offers
+                                        .as_ref()
+                                        .and_then(crate::limit_resets::Offers::eligible_flag),
+                                    "ineligible_reason": offers
+                                        .as_ref()
+                                        .and_then(crate::limit_resets::Offers::ineligible_reason),
+                                    "count": count,
+                                })
                             );
                         }
                         let mut data: serde_json::Map<String, Value> = value
@@ -343,10 +367,19 @@ impl Engine {
                                 }
                             }
                         }
+                        if let Some(expiry_secs) = result
+                            .reset_offers
+                            .first()
+                            .and_then(crate::limit_resets::OfferSummary::expiry)
+                        {
+                            result.next_retry_at =
+                                result.next_retry_at.min(expiry_secs.saturating_mul(1000));
+                        }
+                        let observed = now();
                         result.data = Some(Value::Object(data));
-                        result.observed_at = Some(now());
+                        result.observed_at = Some(observed);
                         result.error = None;
-                        result.stale = false;
+                        result.stale = result.is_stale_at(observed);
                         throttle.failures = 0;
                     }
                     _ => result.error = Some("invalid_usage".into()),

@@ -41,6 +41,9 @@ pub fn reset_rate_limits_url(
 }
 pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 pub const OAUTH_BETA_HEADER: (&str, &str) = ("anthropic-beta", "oauth-2025-04-20");
+/// Anthropic gates optional `cedar_ember` reset offers (and redemption) on a supported
+/// Claude Code CLI `User-Agent` surface and minimum version (>= 2.1.301).
+pub const CLAUDE_CLI_USER_AGENT: &str = "claude-cli/2.1.329 (external, cli)";
 
 /// The same organization-to-subscription mapping used by Claude Code.
 pub fn subscription_type(profile: &serde_json::Value) -> Option<&'static str> {
@@ -183,6 +186,31 @@ pub async fn fetch_usage_async(
     fetch_usage_at(client, access_token, &usage_url()).await
 }
 
+/// Blocking read-only GET /api/oauth/usage without touching caches, locks, or refresh tokens.
+pub fn fetch_usage_blocking(access_token: &str) -> Result<UsageResponse> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let resp = client
+        .get(usage_url())
+        .query(&[("cedar_ember", "1")])
+        .bearer_auth(access_token)
+        .header(OAUTH_BETA_HEADER.0, OAUTH_BETA_HEADER.1)
+        .header(reqwest::header::USER_AGENT, CLAUDE_CLI_USER_AGENT)
+        .send()
+        .map_err(|_| anyhow::anyhow!("failed to reach usage API"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(UsageHttpError {
+            status: status.as_u16(),
+            retry_after: retry_after(resp.headers(), chrono::Utc::now()),
+            message: usage_http_error(status, resp.headers(), chrono::Utc::now()),
+        }
+        .into());
+    }
+    resp.json().context("failed to parse usage response")
+}
+
 pub(crate) async fn fetch_usage_at(
     client: &reqwest::Client,
     access_token: &str,
@@ -193,6 +221,7 @@ pub(crate) async fn fetch_usage_at(
         .query(&[("cedar_ember", "1")])
         .bearer_auth(access_token)
         .header(OAUTH_BETA_HEADER.0, OAUTH_BETA_HEADER.1)
+        .header(reqwest::header::USER_AGENT, CLAUDE_CLI_USER_AGENT)
         .send()
         .await
         .context("failed to reach usage API")?;

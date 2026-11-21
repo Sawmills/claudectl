@@ -1207,7 +1207,11 @@ impl Engine {
             pending
         } else {
             let usage: Usage = self.stored(id).await?;
-            if usage.stale || usage.error.is_some() || now() >= usage.next_retry_at {
+            if usage.stale
+                || usage.error.is_some()
+                || now() >= usage.next_retry_at
+                || usage.selected_offer_expired_at(now() / 1000)
+            {
                 bail!("reset requires a fresh exhausted limit");
             }
             let parsed = usage
@@ -1227,14 +1231,14 @@ impl Engine {
                 .cedar_ember
                 .as_ref()
                 .context("no usable reset offer")?;
-            if usage.reset_at_limit == Some(false) {
+            let usable = offers.has_usable_offer_at(&exhausted, usage.reset_at_limit, now() / 1000);
+            if !usable && usage.reset_at_limit == Some(false) {
                 bail!("reset requires an exhausted limit");
             }
             let grant_id = usage
                 .reset_grant_id
                 .as_deref()
-                .filter(|_| usage.reset_at_limit != Some(false))
-                .filter(|_| offers.has_usable_offer(&exhausted, now() / 1000))
+                .filter(|_| usable)
                 .context("no usable reset offer for an exhausted limit")?;
             let pending = PendingReset {
                 request_id: vault::secret(),
@@ -1263,6 +1267,10 @@ impl Engine {
                 ))
                 .bearer_auth(&loaded.record.grant.access_token)
                 .header("anthropic-beta", BETA)
+                .header(
+                    reqwest::header::USER_AGENT,
+                    crate::api::CLAUDE_CLI_USER_AGENT,
+                )
                 .json(&json!({
                     "program": "cedar_ember",
                     "grant_id": pending.grant_id,
@@ -1270,7 +1278,7 @@ impl Engine {
                 }))
                 .send()
                 .await
-                .context("limit reset provider request failed")?;
+                .map_err(|_| anyhow::anyhow!("limit reset provider request failed"))?;
             if !response.status().is_success() {
                 if matches!(response.status().as_u16(), 400 | 401 | 403 | 404 | 422) {
                     let mut record = loaded.record.clone();

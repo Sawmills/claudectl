@@ -1,0 +1,84 @@
+{
+  "five_hour": null,
+  "seven_day": { "utilization": 100.0, "resets_at": "2099-01-05T00:00:00Z" },
+  "extra_usage": { "is_enabled": false },
+  "limits": [
+    {
+      "kind": "weekly_all",
+      "percent": 100,
+      "resets_at": "2099-01-05T00:00:00Z",
+      "scope": null,
+      "severity": "critical",
+      "is_active": true
+    },
+    {
+      "kind": "weekly_scoped",
+      "percent": 83,
+      "resets_at": "2099-01-05T00:00:00Z",
+      "scope": {
+        "model": { "id": null, "display_name": "Fable" },
+        "surface": null
+      },
+      "severity": "warning",
+      "is_active": false
+    }
+  ],
+  "cedar_ember": {
+    "eligible": true,
+    "ineligible_reason": null,
+    "at_limit": true,
+    "cooldown_until": null,
+    "paused_held": false,
+    "weekly_resets_at": "2099-01-05T00:00:00Z",
+    "exhausted": ["seven_day"],
+    "next_grant_id": "synthetic-weekly-grant-not-for-display",
+    "event_props": {
+      "surface": "claude_code_cli",
+      "tier": "claude_max_20x"
+    },
+    "grants": [
+      {
+        "id": "synthetic-weekly-grant-not-for-display",
+        "label": "synthetic-weekly-label-not-for-display",
+        "arm": null,
+        "type": "weekly",
+        "resets_total": 1,
+        "resets_left": 1,
+        "starts_at": "2020-01-01T00:00:00Z",
+        "ends_at": "2099-12-10T22:00:00Z",
+        "clears": ["seven_day", "seven_day_overage_included"],
+        "blocking": [],
+        "percent_used": {
+          "seven_day": 100,
+          "seven_day_overage_included": 83
+        },
+        "gives_back_weekly": false,
+        "paused": false,
+        "usable_now": true,
+        "use_requires_limit": false,
+        "unavailable_reason": null
+      },
+      {
+        "id": "synthetic-fable-grant-not-for-display",
+        "label": "synthetic-fable-label-not-for-display",
+        "arm": null,
+        "type": "full",
+        "resets_total": 1,
+        "resets_left": 1,
+        "starts_at": "2020-01-01T00:00:00Z",
+        "ends_at": "2100-03-09T07:59:00Z",
+        "clears": ["seven_day_overage_included"],
+        "blocking": [],
+        "percent_used": {
+          "seven_day": 100,
+          "seven_day_overage_included": 83
+        },
+        "gives_back_weekly": true,
+        "paused": false,
+        "usable_now": true,
+        "use_requires_limit": false,
+        "unavailable_reason": null
+      }
+    ]
+  }
+}

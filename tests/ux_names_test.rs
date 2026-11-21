@@ -163,6 +163,33 @@ fn status_shows_read_only_limit_reset_offers_from_the_server() {
 }
 
 #[test]
+fn status_shows_fable_and_anytime_limit_reset_offers_without_ids() {
+    let data: Value =
+        serde_json::from_str(include_str!("fixtures/limit-reset-offers-v2.json")).unwrap();
+    let env = Env::with_usage(Some(json!({
+        "data": data,
+        "observed_at": chrono::Utc::now().timestamp_millis(),
+        "next_retry_at": 0, "stale": false, "error": null
+    })));
+    let output = env.claudectl(&["status"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("weekly + Fable weekly"), "{text}");
+    assert!(text.contains("2099-12-10"), "{text}");
+    assert!(text.contains("2100-03-09"), "{text}");
+    assert!(text.contains("gives back weekly"), "{text}");
+    assert!(!text.contains("not-for-display"), "{text}");
+    let json_out = env.claudectl(&["status", "--json"]);
+    assert!(json_out.status.success());
+    let report: Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    let offers = report["server"]["accounts"][0]["limit_reset_offers"]
+        .as_array()
+        .unwrap();
+    assert_eq!(offers.len(), 2);
+    assert!(!report.to_string().contains("not-for-display"));
+}
+
+#[test]
 fn status_labels_paused_future_and_currently_unusable_reset_offers() {
     let mut data: Value =
         serde_json::from_str(include_str!("fixtures/limit-reset-offers.json")).unwrap();
