@@ -1225,19 +1225,22 @@ fn display_pace(points: Option<f64>) -> String {
 }
 
 fn offer_count(f: &FetchedUsage, now: i64) -> String {
-    if !f.on_server {
-        return "-".into();
-    }
-    f.usage
-        .as_ref()
-        .and_then(|usage| {
-            usage.cedar_ember.as_ref().map(|offers| {
-                let exhausted = claudectl::limit_resets::exhausted_windows(usage);
-                offers.usable_count(&exhausted, now)
-            })
+    let offers = f.usage.as_ref().and_then(|usage| {
+        usage.cedar_ember.as_ref().map(|offers| {
+            let mut exhausted = claudectl::limit_resets::exhausted_windows(usage);
+            for window in offers.provider_exhausted() {
+                if !exhausted.contains(&window) {
+                    exhausted.push(window);
+                }
+            }
+            offers.usable_count(&exhausted, now)
         })
-        .unwrap_or(0)
-        .to_string()
+    });
+    match offers {
+        Some(count) => count.to_string(),
+        None if f.on_server => "0".into(),
+        None => "-".into(),
+    }
 }
 
 fn summary_table(accounts: &[AccountStatus], no_color: bool) -> Table {

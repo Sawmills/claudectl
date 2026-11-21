@@ -223,3 +223,71 @@ fn an_error_row_with_fresh_weekly_numbers_has_no_pace() {
     let report: Value = serde_json::from_str(&status(home.path(), true)).unwrap();
     assert!(report["server"]["accounts"][0]["pace_points"].is_null());
 }
+
+#[test]
+fn server_offers_column_counts_fable_anytime_and_fable_only_exhausted_offers() {
+    let home = tempfile::tempdir().unwrap();
+    let v2: Value =
+        serde_json::from_str(include_str!("fixtures/limit-reset-offers-v2.json")).unwrap();
+    server(home.path(), "weekly-exhausted", v2.clone());
+
+    let mut anytime = v2;
+    anytime["seven_day"]["utilization"] = json!(46.0);
+    anytime["cedar_ember"]["at_limit"] = json!(false);
+    anytime["cedar_ember"]["exhausted"] = json!([]);
+    server(home.path(), "anytime", anytime);
+
+    server(
+        home.path(),
+        "fable-only",
+        json!({
+            "five_hour": {"utilization": 5.0},
+            "seven_day": {"utilization": 80.0},
+            "extra_usage": {"is_enabled": false},
+            "limits": [{
+                "kind": "weekly_scoped",
+                "percent": 100.0,
+                "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}
+            }],
+            "cedar_ember": {
+                "eligible": true,
+                "at_limit": true,
+                "exhausted": ["seven_day_overage_included"],
+                "grants": [{
+                    "id": "fable-only-sentinel",
+                    "resets_left": 1,
+                    "clears": ["seven_day_overage_included"],
+                    "gives_back_weekly": true,
+                    "use_requires_limit": true,
+                    "usable_now": true,
+                    "ends_at": "2100-03-09T07:59:00Z"
+                }]
+            }
+        }),
+    );
+
+    let table = status(home.path(), false);
+    let row = |name: &str| {
+        table
+            .lines()
+            .find(|l| l.split_whitespace().any(|w| w == name))
+            .unwrap()
+            .to_owned()
+    };
+    assert!(row("weekly-exhausted").contains("  2  "), "{table}");
+    assert!(row("anytime").contains("  2  "), "{table}");
+    assert!(row("fable-only").contains("  1  "), "{table}");
+    assert!(table.contains("weekly + Fable weekly"), "{table}");
+    assert!(table.contains("gives back weekly"), "{table}");
+    assert!(!table.contains("not-for-display"), "{table}");
+    assert!(!table.contains("fable-only-sentinel"), "{table}");
+
+    let report: Value = serde_json::from_str(&status(home.path(), true)).unwrap();
+    let accounts = report["server"]["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 3);
+    for account in accounts {
+        assert!(!account["limit_reset_offers"].as_array().unwrap().is_empty());
+    }
+    assert!(!report.to_string().contains("not-for-display"));
+    assert!(!report.to_string().contains("fable-only-sentinel"));
+}

@@ -172,10 +172,34 @@ async fn issuer() -> (Issuer, tokio::task::JoinHandle<()>) {
         )
         .route(
             "/api/oauth/usage",
-            get(|State(i): State<Issuer>| async move {
-                i.usage_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                i.usage.lock().unwrap().clone().map(Json).ok_or(axum::http::StatusCode::NOT_FOUND)
-            }),
+            get(
+                |State(i): State<Issuer>, headers: axum::http::HeaderMap| async move {
+                    i.usage_reads
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some(mut payload) = i.usage.lock().unwrap().clone() else {
+                        return Err(axum::http::StatusCode::NOT_FOUND);
+                    };
+                    let ua = headers
+                        .get("user-agent")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    if ua != claudectl::api::CLAUDE_CLI_USER_AGENT
+                        && let Some(obj) = payload.as_object_mut()
+                    {
+                        obj.insert(
+                            "cedar_ember".into(),
+                            json!({
+                                "eligible": false,
+                                "ineligible_reason": "surface",
+                                "at_limit": false,
+                                "exhausted": [],
+                                "grants": []
+                            }),
+                        );
+                    }
+                    Ok(Json(payload))
+                },
+            ),
         )
         .with_state(issuer.clone());
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -821,6 +845,82 @@ async fn dashboard_shows_cached_read_only_limit_reset_offers_without_polling() {
             .load(std::sync::atomic::Ordering::SeqCst),
         reads
     );
+}
+
+#[tokio::test]
+async fn dashboard_shows_fable_and_anytime_offers_and_hides_surface_ineligible() {
+    let f = Fixture::new().await;
+    let user = f.user_id("amir@sawmills.ai");
+    f.seed(&user, "fable-account").await;
+    f.seed(&user, "anytime-account").await;
+    f.seed(&user, "ineligible-account").await;
+    let accounts = f.server.engine().accounts(&user).await.unwrap();
+    let id_of = |alias: &str| {
+        accounts
+            .iter()
+            .find(|a| a.alias == alias)
+            .unwrap()
+            .account_id
+            .clone()
+    };
+
+    let v2: Value =
+        serde_json::from_str(include_str!("fixtures/limit-reset-offers-v2.json")).unwrap();
+    *f.issuer.usage.lock().unwrap() = Some(v2.clone());
+    f.server
+        .engine()
+        .usage(&user, &id_of("fable-account"), false)
+        .await
+        .unwrap();
+
+    let mut anytime = v2;
+    anytime["seven_day"]["utilization"] = json!(46.0);
+    anytime["cedar_ember"]["at_limit"] = json!(false);
+    anytime["cedar_ember"]["exhausted"] = json!([]);
+    *f.issuer.usage.lock().unwrap() = Some(anytime);
+    f.server
+        .engine()
+        .usage(&user, &id_of("anytime-account"), false)
+        .await
+        .unwrap();
+
+    *f.issuer.usage.lock().unwrap() = Some(json!({
+        "seven_day": {"utilization": 100.0},
+        "extra_usage": {"is_enabled": false},
+        "cedar_ember": {
+            "eligible": false,
+            "ineligible_reason": "surface",
+            "at_limit": false,
+            "exhausted": [],
+            "grants": []
+        }
+    }));
+    f.server
+        .engine()
+        .usage(&user, &id_of("ineligible-account"), false)
+        .await
+        .unwrap();
+
+    let session = f.session("amir@sawmills.ai").await;
+    let response = f.get("/accounts", Some(&session)).await;
+    assert_eq!(response.status().as_u16(), 200);
+    let body = response.text().await.unwrap();
+    for expected in [
+        "weekly + Fable weekly",
+        "2099-12-10 22:00 UTC",
+        "Fable weekly",
+        "2100-03-09 07:59 UTC",
+        "gives back weekly",
+    ] {
+        assert!(body.contains(expected), "missing {expected} in {body}");
+    }
+    assert_eq!(
+        body.matches("Limit resets:").count(),
+        2,
+        "only fable-account and anytime-account should render offers: {body}"
+    );
+    assert!(!body.contains("not-for-display"), "{body}");
+    assert!(!body.contains("event_props"), "{body}");
 }
 
 #[tokio::test]

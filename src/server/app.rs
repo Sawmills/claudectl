@@ -573,19 +573,28 @@ async fn resets(State(server): Shared, headers: HeaderMap) -> Result<Response, H
                     }
                 }
             }
+            let stale = usage.is_none_or(|usage| {
+                usage.stale
+                    || usage.error.is_some()
+                    || now.saturating_mul(1000) >= usage.next_retry_at
+                    || usage
+                        .observed_at
+                        .is_some_and(|at| at > now.saturating_mul(1000).saturating_add(300_000))
+                    || usage.selected_offer_expired_at(now)
+            });
             let offers = usage
                 .filter(|stored| {
-                    stored.reset_at_limit != Some(false) && stored.reset_grant_id.is_some()
+                    !stale
+                        && stored.reset_grant_id.is_some()
+                        && !stored.selected_offer_expired_at(now)
                 })
                 .map(|stored| {
                     stored
                         .reset_offers
                         .iter()
                         .filter(|offer| {
-                            offer.ends_at.as_deref().is_none_or(|expiry| {
-                                chrono::DateTime::parse_from_rfc3339(expiry)
-                                    .is_ok_and(|at| at.timestamp() > now)
-                            })
+                            (!offer.use_requires_limit || stored.reset_at_limit != Some(false))
+                                && offer.expiry().is_none_or(|at| at > now)
                         })
                         .cloned()
                         .collect::<Vec<_>>()
@@ -595,14 +604,7 @@ async fn resets(State(server): Shared, headers: HeaderMap) -> Result<Response, H
                 alias: account.alias,
                 account_id: account.account_id,
                 available: account.available,
-                stale: usage.is_none_or(|usage| {
-                    usage.stale
-                        || usage.error.is_some()
-                        || now.saturating_mul(1000) >= usage.next_retry_at
-                        || usage
-                            .observed_at
-                            .is_some_and(|at| at > now.saturating_mul(1000).saturating_add(300_000))
-                }),
+                stale,
                 exhausted,
                 offers,
             }
