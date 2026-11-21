@@ -147,7 +147,7 @@ pub(super) struct Idle {
     /// When Claude ended its session with no new session since: Claude is exiting.
     pub ended: Option<i64>,
     /// The latest unresolved `authentication_failed`. A successful Stop clears it; a prompt,
-    /// idle notification, other failure or new session alone does not prove recovery.
+    /// idle notification or other failure does not prove recovery. A different session starts clear.
     pub auth_failed: Option<i64>,
     /// Count metadata events, including idle notifications, without storing prompt text.
     pub observed_events: u64,
@@ -169,6 +169,9 @@ pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
         }
         match event {
             Event::SessionStart(session) => {
+                if idle.session.as_ref() != Some(session) {
+                    idle.auth_failed = None;
+                }
                 idle.session = Some(session.clone());
                 idle.since = Some(*at);
                 idle.limited = None;
@@ -176,6 +179,9 @@ pub(super) fn fold(idle: &mut Idle, events: &[(i64, Event)]) {
             }
             // The session goes on under another ID: Claude is not exiting.
             Event::Session(session) => {
+                if idle.session.as_ref() != Some(session) {
+                    idle.auth_failed = None;
+                }
                 idle.session = Some(session.clone());
                 idle.ended = None;
             }
@@ -375,6 +381,119 @@ pub(super) fn live_model(directory: &std::path::Path, session: &str) -> Option<S
         }
     }
     transcript_model(&mut file, 0, end)
+}
+
+/// Incrementally read scheduler metadata without retaining prompts or tool output.
+#[cfg(unix)]
+#[derive(Default)]
+pub(super) struct CronActivity {
+    source: Option<(String, std::path::PathBuf, u64)>,
+    offset: u64,
+    last: Option<i64>,
+}
+
+#[cfg(unix)]
+impl CronActivity {
+    pub(super) fn last_fire(&mut self, directory: &std::path::Path, session: &str) -> Option<i64> {
+        self.read_fire(directory, session).or_else(|| {
+            self.source
+                .as_ref()
+                .filter(|(previous, _, _)| previous == session)
+                .and(self.last)
+        })
+    }
+
+    fn read_fire(&mut self, directory: &std::path::Path, session: &str) -> Option<i64> {
+        use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+        use std::os::unix::fs::MetadataExt;
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            #[serde(rename = "type")]
+            kind: Option<String>,
+            #[serde(rename = "sessionId")]
+            session: Option<String>,
+            #[serde(default, rename = "isSidechain")]
+            sidechain: bool,
+            #[serde(rename = "wakeupSource")]
+            wakeup: Option<String>,
+            #[serde(rename = "turnOrigin")]
+            origin: Option<String>,
+            timestamp: Option<String>,
+        }
+        let location: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("model-transcript.json")).ok()?)
+                .ok()?;
+        if location["session_id"] != session {
+            return None;
+        }
+        let path = std::path::PathBuf::from(location["path"].as_str()?);
+        let mut file = std::fs::File::open(&path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        let source = (session.to_owned(), path, metadata.ino());
+        if self.source.as_ref() != Some(&source) || metadata.len() < self.offset {
+            if self
+                .source
+                .as_ref()
+                .is_none_or(|(previous, _, _)| previous != session)
+            {
+                self.last = None;
+            }
+            self.source = Some(source);
+            self.offset = 0;
+        }
+        file.seek(SeekFrom::Start(self.offset)).ok()?;
+        let mut reader = BufReader::new(file.take(metadata.len() - self.offset));
+        let mut row = Vec::new();
+        loop {
+            row.clear();
+            let bytes = (&mut reader)
+                .take((HOOK_INPUT_LIMIT + 1) as u64)
+                .read_until(b'\n', &mut row)
+                .ok()?;
+            if bytes == 0 {
+                break;
+            }
+            if row.last() != Some(&b'\n') {
+                // Stream past oversized rows without allocating their prompt/output.
+                let mut skipped = bytes as u64;
+                while row.last() != Some(&b'\n') {
+                    row.clear();
+                    let bytes = (&mut reader)
+                        .take((HOOK_INPUT_LIMIT + 1) as u64)
+                        .read_until(b'\n', &mut row)
+                        .ok()?;
+                    skipped += bytes as u64;
+                    if bytes == 0 {
+                        return self.last;
+                    }
+                }
+                self.offset += skipped;
+                continue;
+            }
+            self.offset += bytes as u64;
+            let Ok(entry) = serde_json::from_slice::<Entry>(&row) else {
+                continue;
+            };
+            if entry.kind.as_deref() == Some("user")
+                && !entry.sidechain
+                && entry.session.as_deref() == Some(session)
+                && (matches!(
+                    entry.wakeup.as_deref(),
+                    Some("schedule_wakeup" | "loop_wakeup")
+                ) || entry.origin.as_deref() == Some("scheduled"))
+                && let Some(at) = entry
+                    .timestamp
+                    .as_deref()
+                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            {
+                self.last = Some(self.last.unwrap_or(i64::MIN).max(at.timestamp_millis()));
+            }
+        }
+        self.last
+    }
 }
 
 fn transcript_model(file: &mut std::fs::File, start: u64, end: u64) -> Option<String> {
@@ -1306,6 +1425,91 @@ mod tests {
         assert_eq!(decide(&budget), Decision::Restart);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cron_activity_uses_only_current_session_scheduler_turns_and_tracks_appends() {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join("transcript.jsonl");
+        atomic(
+            &directory.path().join("model-transcript.json"),
+            &serde_json::json!({"path":transcript,"session_id":"s"}),
+        )
+        .unwrap();
+        let row = |session: &str, kind: &str, source: &str, sidechain: bool, at: i64| {
+            serde_json::json!({"type":kind,"sessionId":session,"wakeupSource":source,
+                "isSidechain":sidechain,"timestamp":chrono::DateTime::from_timestamp_millis(at).unwrap().to_rfc3339()})
+        };
+        let mut file = std::fs::File::create(&transcript).unwrap();
+        let mut activity = CronActivity::default();
+        for ignored in [
+            row("other", "user", "schedule_wakeup", false, 1000),
+            row("s", "assistant", "schedule_wakeup", false, 1000),
+            row("s", "user", "schedule_wakeup", true, 1000),
+            row("s", "user", "human", false, 1000),
+        ] {
+            writeln!(file, "{ignored}").unwrap();
+        }
+        assert_eq!(activity.last_fire(directory.path(), "s"), None);
+        writeln!(file, "{}", row("s", "user", "schedule_wakeup", false, 2000)).unwrap();
+        // A large tool response after the fire must not hide it from a tail scan.
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"user","message":{"content":"x".repeat(2 << 20)}})
+        )
+        .unwrap();
+        assert_eq!(activity.last_fire(directory.path(), "s"), Some(2000));
+        write!(file, "{}", row("s", "user", "loop_wakeup", false, 3000)).unwrap();
+        assert_eq!(activity.last_fire(directory.path(), "s"), Some(2000));
+        writeln!(file).unwrap();
+        assert_eq!(activity.last_fire(directory.path(), "s"), Some(3000));
+        assert_eq!(activity.last_fire(directory.path(), "other"), None);
+        writeln!(file, "{}", serde_json::json!({"type":"user","sessionId":"s","turnOrigin":"scheduled","timestamp":"1970-01-01T00:00:04Z"})).unwrap();
+        assert_eq!(activity.last_fire(directory.path(), "s"), Some(4000));
+        // Transcript rotation within this conversation cannot erase its cooldown.
+        std::fs::write(&transcript, "").unwrap();
+        assert_eq!(activity.last_fire(directory.path(), "s"), Some(4000));
+        // Losing the source after observation cannot erase the cooldown.
+        std::fs::remove_file(&transcript).unwrap();
+        assert_eq!(activity.last_fire(directory.path(), "s"), Some(4000));
+    }
+
+    #[test]
+    fn incremental_same_session_hooks_preserve_the_unresolved_auth_failure() {
+        let mut idle = Idle::default();
+        for (at, event) in [
+            (1, "SessionStart"),
+            (2, "StopFailure"),
+            (3, "Notification"),
+            (4, "UserPromptSubmit"),
+            (5, "StopFailure"),
+        ] {
+            let error = if at == 2 {
+                "authentication_failed"
+            } else {
+                "overloaded"
+            };
+            fold(
+                &mut idle,
+                &parse_events(
+                    &serde_json::json!({
+                "at":at,"event":event,"session_id":"s","error":error,
+                "notification_type":"idle_prompt"})
+                    .to_string(),
+                ),
+            );
+            if at >= 2 {
+                assert_eq!(idle.auth_failed, Some(2));
+            }
+        }
+        fold(
+            &mut idle,
+            &parse_events(r#"{"at":6,"event":"UserPromptSubmit","session_id":"another"}"#),
+        );
+        assert_eq!(idle.auth_failed, None);
+    }
+
     #[test]
     fn a_failed_authentication_stays_unresolved_until_success_or_relaunch() {
         // A forced rotation revokes the held token before its expiry: the failed turn says so.
@@ -1328,14 +1532,14 @@ mod tests {
         // Same revision: the server has no newer token yet, so nothing to follow.
         typing.server_revision = "r1";
         assert_eq!(decide(&typing), Decision::Keep);
-        // /clear or /resume starts a session in the same process, on the same dead token.
+        // A different conversation must not inherit another session's failure.
         let mut events = parse_events(&text);
         events.push((7, Event::SessionStart("s2".into())));
         let cleared = idle_state(&events);
-        assert_eq!(cleared.auth_failed, Some(5));
+        assert_eq!(cleared.auth_failed, None);
         let mut still = inputs(&cleared);
         still.now = 8;
-        assert!(held_token_dead(&still));
+        assert!(!held_token_dead(&still));
         // Neither another API failure nor an idle notification proves the token works.
         let mut recovering = cleared.clone();
         fold(&mut recovering, &parse_events(&[
@@ -1343,7 +1547,7 @@ mod tests {
             r#"{"at":10,"event":"StopFailure","session_id":"s2","error":"overloaded"}"#,
             r#"{"at":11,"event":"Notification","session_id":"s2","notification_type":"idle_prompt"}"#,
         ].join("\n")));
-        assert_eq!(recovering.auth_failed, Some(5));
+        assert_eq!(recovering.auth_failed, None);
         fold(
             &mut recovering,
             &parse_events(r#"{"at":12,"event":"Stop","session_id":"s2"}"#),

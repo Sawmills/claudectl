@@ -118,19 +118,23 @@ machine holds a retired grant: run `claude auth logout` there; claudectl never d
    a restart deadline while the held token has more than five minutes left.
    Eligible near-expiry renewal retains quiet admission. Account failover still requires
    ten continuous minutes of observed quiet.
-   Fresh authentication failure or expiry recovers immediately on the same session and
-   account, after observing the current replacement. Ordinary workload checks still block
-   ordinary renewal; explicit holds and unknown SessionEnd intent veto every restart.
+   Only a session's own authentication failure starts auth recovery; expiry follows
+   renewal. Both wait for running turns and quiet up to `CLAUDECTL_RESTART_MAX_WAIT_SECS`
+   (600 seconds by default), preserving an earlier pending renewal deadline. Every
+   automatic restart honors the post-fire cron cooldown (120 seconds by default,
+   `CLAUDECTL_RESTART_CRON_COOLDOWN_SECS`). Explicit holds and unknown SessionEnd intent
+   veto every restart. Replacement-token observations and account selection stay unchanged.
    Exercise hooks that wait for input or a lock. Verify
    one restart per failed observation, terminal foreground, saved-card cron recovery and no
    original-task or missed-fire replay. Check warning journal/metric/status five minutes
    before expiry and blocked attention for each busy or unknown workload. Damaged/missing
    evidence stays blocked.
    For a terminal, keep typing across its coarse timestamps and confirm recovery stays
-   blocked; after typing ends, unchanged idle/input samples must span 16 seconds.
+   blocked until the workload deadline; after typing ends, ordinary admission requires
+   ten minutes of unchanged idle/input samples.
    Do not start a test session on a shared account or force a shared account refresh.
    Quiet does not close all inputs: a late or invisible hook can still lose a prompt at
-   SIGTERM. No prompt collection/replay or forced kill deadline is provided. Live acceptance
+   SIGTERM. No prompt collection/replay is provided. Live acceptance
    and rollout follow the normal release and installation gates.
 
 ## Alerts

@@ -363,6 +363,7 @@ impl Fixture {
             .env("TERM", "xterm")
             .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
             .env("CLAUDECTL_TEST_RENEW_FAST", "1")
+            .env("CLAUDECTL_RESTART_MAX_WAIT_SECS", "1")
             .env("TMPDIR", home.path().join("tmp"))
             .env(
                 "FAKE_MODE",
@@ -1351,6 +1352,25 @@ fn a_revoked_idle_child_automatically_resumes_the_same_session_and_account() {
 }
 
 #[test]
+fn auth_recovery_waits_for_a_running_turn_before_its_configured_deadline() {
+    let mut f = Fixture::start("auth_recovery", 600_000, false);
+    f.wait("quiet_window", "deferred");
+    f.revoke();
+    std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+    f.wait("quiet_window", "blocked");
+    std::fs::write(f.home.path().join("submit"), "").unwrap();
+    f.wait("running_turn", "blocked");
+    assert_eq!(
+        f.runs().len(),
+        1,
+        "do not interrupt the turn on auth failure"
+    );
+    assert!(!f.home.path().join("terminated").exists());
+    f.wait_recovered();
+    f.finish_recovered();
+}
+
+#[test]
 fn revoked_token_restarts_despite_background_task() {
     let mut f = Fixture::start("task", 600_000, false);
     f.wait("background_task", "deferred");
@@ -1701,7 +1721,7 @@ fn an_auth_recovery_preserves_terminal_foreground_for_the_same_session() {
 }
 
 #[test]
-fn terminal_input_does_not_defer_auth_recovery() {
+fn terminal_input_defers_auth_recovery_until_its_configured_deadline() {
     use std::io::Write;
     let mut f = Fixture::start("auth_typing", 600_000, true);
     f.wait("quiet_window", "deferred");
@@ -1727,7 +1747,7 @@ fn terminal_input_does_not_defer_auth_recovery() {
     let runs = f.wait_recovered();
     assert!(
         start.elapsed() < Duration::from_secs(4),
-        "typing cannot add a terminal observation delay"
+        "recovery must proceed after the configured one-second deadline"
     );
     assert!(
         runs.iter()
@@ -1737,13 +1757,21 @@ fn terminal_input_does_not_defer_auth_recovery() {
 }
 
 #[test]
-fn a_naturally_expired_busy_child_resumes_before_its_turn_finishes() {
+fn a_naturally_expired_busy_child_uses_the_renewal_deadline() {
     let mut f = Fixture::start("busy", 1_500, false);
     f.wait("running_turn", "warn");
     assert!(f.home.path().join("busy-progress").exists());
     f.state.lock().unwrap().life_ms = 600_000;
     f.wait_recovered();
     assert!(!f.home.path().join("become-idle").exists());
+    let forced: Vec<_> = f
+        .journal()
+        .into_iter()
+        .filter(|e| e["event"] == "restart_forced")
+        .collect();
+    assert_eq!(forced.len(), 1);
+    assert_eq!(forced[0]["cause"], "renewal");
+    assert!(forced[0]["auth_failed_at"].is_null());
     f.finish_recovered();
 }
 
@@ -2197,29 +2225,15 @@ fn expired_sessions_recover_despite_each_workload_blocker() {
 }
 
 #[test]
-fn an_expired_child_without_a_session_id_reports_one_failed_recovery() {
+fn an_expired_child_without_a_session_id_never_claims_auth_recovery() {
     let mut f = Fixture::start("no_hooks", 1_500, false);
     f.wait("evidence_unknown", "warn");
-    let end = Instant::now() + Duration::from_secs(4);
-    loop {
-        let count = f
-            .journal()
-            .iter()
-            .filter(|event| event["event"] == "recovery_failed" && event["reason"] == "no_session")
-            .count();
-        if count > 0 || Instant::now() >= end {
-            assert_eq!(count, 1);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(f.runs().len(), 1);
+    assert!(
         f.journal()
             .iter()
-            .filter(|event| event["event"] == "recovery_failed")
-            .count(),
-        1
+            .all(|event| event["cause"] != "auth_recovery")
     );
     f.finish();
 }

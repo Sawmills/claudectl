@@ -1,5 +1,5 @@
-//! Admission for automatic renewal/failover. Authentication recovery overrides workload
-//! deferral; explicit holds and unknown exit intent remain lifecycle vetoes.
+//! Admission for automatic renewal/failover and session-local authentication recovery.
+//! Forced recovery waits for quiet up to its deadline; holds and exit intent remain vetoes.
 use super::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -345,7 +345,7 @@ enum RestartState {
 enum RestartEvent {
     RenewalRequested(Instant),
     AuthFailed,
-    Tick(Instant),
+    Tick(Instant, Duration),
     Recovered,
     Signalled,
 }
@@ -386,8 +386,8 @@ impl RestartState {
                 requested_at: Some(at),
             },
             (Watching, RenewalRequested(requested_at)) => Waiting { requested_at },
-            (Waiting { requested_at }, Tick(at))
-                if at.saturating_duration_since(requested_at) >= QUIET_WINDOW =>
+            (Waiting { requested_at }, Tick(at, maximum))
+                if at.saturating_duration_since(requested_at) >= maximum =>
             {
                 Ready {
                     reason: Forced::RenewalDeadline,
@@ -412,6 +412,8 @@ enum Reason {
     ExitIntentUnknown,
     QuietWindow,
     RestartPending,
+    AuthNotFailed,
+    CronCooldown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -478,6 +480,21 @@ pub(super) struct Gate {
     last_hold_notice: Option<(i64, String, Instant)>,
     exit_intent_failed: bool,
     revisions: Revisions,
+    auth_wait: Option<(String, Instant)>,
+    auth_ready: bool,
+    max_wait: Duration,
+    cron_cooldown: Duration,
+    last_cron_fire: Option<i64>,
+    cron_activity: super::renew::CronActivity,
+}
+
+fn seconds_setting(name: &str, default: u64) -> Duration {
+    Duration::from_secs(
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default),
+    )
 }
 
 impl Gate {
@@ -507,6 +524,12 @@ impl Gate {
             last_hold_notice: None,
             exit_intent_failed: false,
             revisions: Revisions::default(),
+            auth_wait: None,
+            auth_ready: false,
+            max_wait: seconds_setting("CLAUDECTL_RESTART_MAX_WAIT_SECS", 600),
+            cron_cooldown: seconds_setting("CLAUDECTL_RESTART_CRON_COOLDOWN_SECS", 120),
+            last_cron_fire: None,
+            cron_activity: super::renew::CronActivity::default(),
         }
     }
 
@@ -568,11 +591,13 @@ impl Gate {
 
     pub(super) fn recovered(&mut self) {
         self.state = self.state.transition(RestartEvent::Recovered);
+        self.auth_wait = None;
+        self.auth_ready = false;
     }
 
     pub(super) fn forced(&self, cause: Cause) -> Option<Forced> {
         match (cause, self.state) {
-            (Cause::AuthRecovery, _) => Some(Forced::AuthRecovery),
+            (Cause::AuthRecovery, _) if self.auth_ready => Some(Forced::AuthRecovery),
             (
                 Cause::Renewal,
                 RestartState::Ready {
@@ -753,9 +778,33 @@ impl Gate {
         observe_limit: bool,
     ) -> bool {
         if cause == Cause::AuthRecovery {
+            if idle.auth_failed.is_none() {
+                self.recovered();
+                self.record(Some(Reason::AuthNotFailed), idle, cause, held_expires_at);
+                return false;
+            }
+            if let Some(session) = &idle.session {
+                if self
+                    .auth_wait
+                    .as_ref()
+                    .is_none_or(|(previous, _)| previous != session)
+                {
+                    // Rejection must not extend a renewal request already in flight.
+                    let requested_at = self
+                        .state
+                        .requested_at()
+                        .map_or(observed_at, |at| at.min(observed_at));
+                    self.auth_wait = Some((session.clone(), requested_at));
+                }
+                self.auth_ready = self.auth_wait.as_ref().is_some_and(|(_, at)| {
+                    observed_at.saturating_duration_since(*at) >= self.max_wait
+                });
+            }
             self.state = self.state.transition(RestartEvent::AuthFailed);
         }
-        self.state = self.state.transition(RestartEvent::Tick(observed_at));
+        self.state = self
+            .state
+            .transition(RestartEvent::Tick(observed_at, self.max_wait));
         match super::renew::session_end_intent(&self.directory, idle.session.as_deref()) {
             Ok(Some(_)) => {
                 self.exit_intent_failed = false;
@@ -766,6 +815,20 @@ impl Gate {
                 self.exit_intent_unknown(idle, cause, held_expires_at);
                 return false;
             }
+        }
+        self.last_cron_fire = idle
+            .session
+            .as_deref()
+            .and_then(|session| self.cron_activity.last_fire(&self.directory, session));
+        if !self.cron_cooldown.is_zero()
+            && self.last_cron_fire.is_some_and(|at| {
+                now().saturating_sub(at)
+                    < i64::try_from(self.cron_cooldown.as_millis()).unwrap_or(i64::MAX)
+            })
+        {
+            self.quiet = None;
+            self.record(Some(Reason::CronCooldown), idle, cause, held_expires_at);
+            return false;
         }
         if self.forced(cause).is_some() {
             if idle.session.is_none() || idle.ended.is_some() {
@@ -972,6 +1035,7 @@ impl Gate {
         let run = run_id(&self.directory)?;
         let activity = json!({
             "idle_since":idle.since,
+            "last_cron_fire_at":self.last_cron_fire,
             "limit_failed_at":idle.limited.as_ref().map(|(_, at)| *at),
             "quiet_since":self.quiet.as_ref().map(|quiet| quiet.started_at),
             "terminal_input_at":self.quiet.as_ref().and_then(|quiet| quiet.input_at)
@@ -983,7 +1047,16 @@ impl Gate {
             "activity":activity,
             "restart_deferred_total":self.total});
         if let Some(d) = decision {
-            if self.recorded_stage != Some(d.stage)
+            if d.reason == Reason::AuthNotFailed {
+                append_restart_record(
+                    &self.home,
+                    &json!({
+                        "at":at,"event":"restart_skipped","session_id":session,"run":run,
+                        "cause":d.cause,"reason":d.reason,"stage":d.stage,"activity":activity,
+                        "expires_at":expires_at,"auth_failed_at":self.revisions.auth_failed_at,
+                    }),
+                )?;
+            } else if self.recorded_stage != Some(d.stage)
                 || self.recorded_session.as_deref() != session
                 || failover_changed
             {
@@ -1009,6 +1082,19 @@ impl Gate {
                         failed_at: *failed_at,
                     });
                 }
+            } else if self
+                .last
+                .is_some_and(|previous| previous.reason != d.reason)
+            {
+                // A changed skip reason is useful evidence, not another deferral count.
+                append_restart_record(
+                    &self.home,
+                    &json!({
+                        "at":at,"event":"restart_skipped","session_id":session,"run":run,
+                        "cause":d.cause,"reason":d.reason,"stage":d.stage,"activity":activity,
+                        "expires_at":expires_at,"auth_failed_at":self.revisions.auth_failed_at,
+                    }),
+                )?;
             }
             status["cause"] = json!(d.cause);
             status["reason"] = json!(d.reason);
@@ -1844,6 +1930,186 @@ mod tests {
     }
 
     #[test]
+    fn auth_recovery_requires_this_sessions_auth_failure() {
+        let (_home, mut gate, idle) = setup();
+        assert!(!gate.check_at(&idle, Cause::AuthRecovery, now() - 1, Instant::now()));
+        let status: Value = serde_json::from_slice(
+            &private_read(&gate.directory.join("restart-status.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["reason"], "auth_not_failed");
+        assert_eq!(status["restart_deferred_total"], 0);
+        let journal =
+            std::fs::read_to_string(gate.home.join(".claudectl/server/restart-decisions.jsonl"))
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(journal.trim()).unwrap()["event"],
+            "restart_skipped"
+        );
+    }
+
+    #[test]
+    fn auth_recovery_waits_for_running_turn_and_quiet_with_a_deadline() {
+        for running in [false, true] {
+            let (_home, mut gate, mut idle) = setup();
+            idle.auth_failed = Some(now());
+            idle.since = (!running).then_some(0);
+            let start = Instant::now();
+            assert!(!gate.check_at(&idle, Cause::AuthRecovery, i64::MAX, start));
+            let status: Value = serde_json::from_slice(
+                &private_read(&gate.directory.join("restart-status.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                status["reason"],
+                if running {
+                    "running_turn"
+                } else {
+                    "quiet_window"
+                }
+            );
+            assert!(!gate.check_at(
+                &idle,
+                Cause::AuthRecovery,
+                i64::MAX,
+                start + Duration::from_secs(599)
+            ));
+            assert!(gate.check_at(
+                &idle,
+                Cause::AuthRecovery,
+                i64::MAX,
+                start + Duration::from_secs(600)
+            ));
+        }
+    }
+
+    #[test]
+    fn cron_cooldown_vetoes_every_cause_even_after_the_forced_deadline() {
+        for cause in [Cause::AuthRecovery, Cause::Renewal, Cause::Failover] {
+            let (_home, mut gate, mut idle) = setup();
+            if cause == Cause::AuthRecovery {
+                idle.auth_failed = Some(now());
+            }
+            let transcript = gate.directory.join("transcript.jsonl");
+            atomic(
+                &gate.directory.join("model-transcript.json"),
+                &json!({"path":transcript,"session_id":idle.session}),
+            )
+            .unwrap();
+            let start = Instant::now();
+            gate.request_at(cause, start, now());
+            assert!(!gate.check_at(&idle, cause, now(), start));
+            let fire = json!({"type":"user","sessionId":idle.session,
+                "wakeupSource":"schedule_wakeup", "timestamp":chrono::Utc::now().to_rfc3339()});
+            std::fs::write(&transcript, format!("{fire}\n")).unwrap();
+            assert!(!gate.check_at(&idle, cause, now(), start + Duration::from_secs(600)));
+            let status: Value = serde_json::from_slice(
+                &private_read(&gate.directory.join("restart-status.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(status["reason"], "cron_cooldown");
+            assert!(status["activity"]["last_cron_fire_at"].is_i64());
+            let records = std::fs::read_to_string(
+                gate.home.join(".claudectl/server/restart-decisions.jsonl"),
+            )
+            .unwrap();
+            assert!(records.lines().any(
+                |line| serde_json::from_str::<Value>(line).unwrap()["reason"] == "cron_cooldown"
+            ));
+            // A zero cooldown is an explicit configuration choice.
+            gate.cron_cooldown = Duration::ZERO;
+            if cause == Cause::Failover {
+                assert!(!gate.check_at(&idle, cause, now(), start + Duration::from_secs(600)));
+            }
+            assert!(gate.check_at(&idle, cause, now(), start + Duration::from_secs(1200)));
+        }
+    }
+
+    #[test]
+    fn auth_failure_cannot_extend_an_existing_renewal_deadline() {
+        let (_home, mut gate, mut idle) = setup();
+        let start = Instant::now();
+        idle.since = None;
+        gate.request_at(Cause::Renewal, start, now() + 240_000);
+        assert!(!gate.check_at(&idle, Cause::Renewal, now(), start));
+        idle.auth_failed = Some(now());
+        assert!(!gate.check_at(
+            &idle,
+            Cause::AuthRecovery,
+            now(),
+            start + Duration::from_secs(300)
+        ));
+        assert!(!gate.check_at(
+            &idle,
+            Cause::AuthRecovery,
+            now(),
+            start + Duration::from_secs(599)
+        ));
+        assert!(gate.check_at(
+            &idle,
+            Cause::AuthRecovery,
+            now(),
+            start + Duration::from_secs(600)
+        ));
+    }
+
+    #[test]
+    fn auth_recovery_can_finish_quiet_before_a_longer_deadline() {
+        let (_home, mut gate, mut idle) = setup();
+        gate.max_wait = Duration::from_secs(1200);
+        idle.auth_failed = Some(now());
+        let start = Instant::now();
+        assert!(!gate.check_at(&idle, Cause::AuthRecovery, now(), start));
+        assert!(gate.check_at(
+            &idle,
+            Cause::AuthRecovery,
+            now(),
+            start + Duration::from_secs(600)
+        ));
+        assert_eq!(gate.forced(Cause::AuthRecovery), None);
+    }
+
+    #[test]
+    fn cron_cooldown_expires_at_the_configured_boundary() {
+        for age in [119, 121] {
+            let (_home, mut gate, mut idle) = setup();
+            gate.max_wait = Duration::ZERO;
+            idle.auth_failed = Some(now());
+            let transcript = gate.directory.join("transcript.jsonl");
+            atomic(
+                &gate.directory.join("model-transcript.json"),
+                &json!({"path":transcript,"session_id":idle.session}),
+            )
+            .unwrap();
+            let fire = json!({"type":"user","sessionId":idle.session,
+                "wakeupSource":"loop_wakeup", "timestamp":(chrono::Utc::now() - chrono::Duration::seconds(age)).to_rfc3339()});
+            std::fs::write(&transcript, format!("{fire}\n")).unwrap();
+            assert_eq!(gate.check(&idle, Cause::AuthRecovery, now()), age == 121);
+        }
+    }
+
+    #[test]
+    fn a_session_change_starts_its_own_auth_wait() {
+        let (_home, mut gate, mut idle) = setup();
+        idle.auth_failed = Some(now());
+        let start = Instant::now();
+        assert!(!gate.check_at(&idle, Cause::AuthRecovery, now(), start));
+        idle.session = Some("another-session".into());
+        assert!(!gate.check_at(
+            &idle,
+            Cause::AuthRecovery,
+            now(),
+            start + Duration::from_secs(600)
+        ));
+        assert!(gate.check_at(
+            &idle,
+            Cause::AuthRecovery,
+            now(),
+            start + Duration::from_secs(1200)
+        ));
+    }
+
+    #[test]
     fn option_b_requires_ten_continuous_minutes_of_observed_quiet() {
         for cause in [Cause::Renewal, Cause::Failover] {
             let (_home, mut gate, idle) = setup();
@@ -2048,19 +2314,27 @@ mod tests {
     }
 
     #[test]
-    fn auth_recovery_does_not_wait_for_terminal_observation() {
-        let (_home, mut gate, idle) = setup();
+    fn auth_recovery_waits_for_terminal_observation_until_the_deadline() {
+        let (_home, mut gate, mut idle) = setup();
+        idle.auth_failed = Some(now());
         let terminal = gate.directory.join("synthetic-terminal");
-        let file = File::create(&terminal).unwrap();
+        File::create(&terminal).unwrap();
         gate = gate.with_terminal(Some(terminal.clone()));
         let start = Instant::now();
-        assert!(!gate.check_at(&idle, Cause::Renewal, i64::MAX, start));
-        assert!(gate.check_at(&idle, Cause::AuthRecovery, now() - 1, start));
-        file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()))
-            .unwrap();
-        assert!(gate.check_at(&idle, Cause::AuthRecovery, now() - 1, start));
+        assert!(!gate.check_at(&idle, Cause::AuthRecovery, now() - 1, start));
         std::fs::remove_file(terminal).unwrap();
-        assert!(gate.check_at(&idle, Cause::AuthRecovery, now() - 1, start));
+        assert!(!gate.check_at(
+            &idle,
+            Cause::AuthRecovery,
+            now() - 1,
+            start + Duration::from_secs(599)
+        ));
+        assert!(gate.check_at(
+            &idle,
+            Cause::AuthRecovery,
+            now() - 1,
+            start + Duration::from_secs(600)
+        ));
     }
 
     #[test]
@@ -2080,10 +2354,16 @@ mod tests {
             waiting
         );
         assert_eq!(
-            waiting.transition(RestartEvent::Tick(start + Duration::from_secs(599))),
+            waiting.transition(RestartEvent::Tick(
+                start + Duration::from_secs(599),
+                QUIET_WINDOW
+            )),
             waiting
         );
-        let ready = waiting.transition(RestartEvent::Tick(start + Duration::from_secs(600)));
+        let ready = waiting.transition(RestartEvent::Tick(
+            start + Duration::from_secs(600),
+            QUIET_WINDOW,
+        ));
         assert_eq!(
             ready,
             RestartState::Ready {
@@ -2125,7 +2405,10 @@ mod tests {
             .transition(RestartEvent::Recovered);
         assert_eq!(recovered, waiting);
         assert_eq!(
-            recovered.transition(RestartEvent::Tick(start + Duration::from_secs(600))),
+            recovered.transition(RestartEvent::Tick(
+                start + Duration::from_secs(600),
+                QUIET_WINDOW
+            )),
             RestartState::Ready {
                 reason: Forced::RenewalDeadline,
                 requested_at: Some(start)
@@ -2274,13 +2557,26 @@ mod tests {
         let rows =
             std::fs::read_to_string(gate.home.join(".claudectl/server/restart-decisions.jsonl"))
                 .unwrap();
-        assert_eq!(rows.lines().count(), 1);
+        assert_eq!(
+            rows.lines()
+                .filter(|line| serde_json::from_str::<Value>(line).unwrap()["event"]
+                    == "restart_deferred")
+                .count(),
+            1
+        );
+        assert!(rows.lines().any(|line| {
+            let row: Value = serde_json::from_str(line).unwrap();
+            row["event"] == "restart_skipped" && row["metric"].is_null()
+        }));
         assert!(!gate.check(&idle, Cause::Failover, now() + 300_000));
         let rows =
             std::fs::read_to_string(gate.home.join(".claudectl/server/restart-decisions.jsonl"))
                 .unwrap();
         assert_eq!(
-            rows.lines().count(),
+            rows.lines()
+                .filter(|line| serde_json::from_str::<Value>(line).unwrap()["event"]
+                    == "restart_deferred")
+                .count(),
             2,
             "warning still creates its own alert"
         );
@@ -2354,11 +2650,14 @@ mod tests {
     #[test]
     fn an_explicit_hold_blocks_restarts_and_throttles_named_notices() {
         for (cause, pending_replacement, first_check_seconds, notices) in [
-            (Cause::AuthRecovery, false, 0, 3),
+            (Cause::AuthRecovery, false, 0, 2),
             (Cause::Renewal, true, 0, 2),
             (Cause::AuthRecovery, true, 300, 2),
         ] {
             let (_home, mut gate, mut idle) = setup();
+            if cause == Cause::AuthRecovery {
+                idle.auth_failed = Some(now());
+            }
             let path = hold_path(&gate.home, &gate.directory).unwrap();
             atomic(
                 &path,

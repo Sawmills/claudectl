@@ -45,10 +45,13 @@ claudectl run -- --resume SESSION_ID
 
 Automatic `use` and `run` choose an eligible account with the earliest weekly reset.
 They exclude accounts with 5% or less weekly headroom and accounts that may bill
-extra usage. Authentication failure or token expiry immediately restarts the same
-session on the same account once a replacement token is available. Workload blockers,
-typing and unrelated hooks do not defer this recovery. Other token renewals become eligible
-only within five minutes of the held token's expiry and retain workload and quiet admission.
+extra usage. Authentication recovery requires that session's own failure; token expiry
+follows renewal. Both wait for running turns and quiet, up to ten minutes by default,
+before a forced restart on the same account with an available replacement token.
+Every restart also waits two minutes after the session's latest observed cron fire.
+Configure these waits with `CLAUDECTL_RESTART_MAX_WAIT_SECS` and
+`CLAUDECTL_RESTART_CRON_COOLDOWN_SECS`. Other token renewals become eligible only within
+five minutes of the held token's expiry and retain workload and quiet admission.
 A new revision alone starts neither a restart nor its deadline.
 Explicit production holds block every restart until `claudectl hold end`, including auth
 recovery and expiry. When a hold blocks dead-token recovery or an overdue renewal, a named

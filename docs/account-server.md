@@ -294,9 +294,11 @@ session ID and time in `<session dir>/events`. A separate private file keeps the
 transcript location and session ID, without copying transcript contents. Workload evidence still distinguishes running
 turns, background tasks and holds, but a clear workload sample is not input-admission proof.
 The monitor checks each session every five seconds. Ordinary deferrals warn five minutes
-before expiry. Expiry or an authentication failure starts recovery instead of waiting for
-workload admission. A failed hook or unreadable event log keeps ordinary admission closed;
-monitoring continues so the known session can still recover at expiry. A missing session
+before expiry. Expiry follows renewal; only that session's own authentication failure
+starts auth recovery. Both wait for workload admission until their configured maximum
+wait, and every restart honors the post-cron cooldown. A failed hook or unreadable event
+log keeps ordinary admission closed; monitoring continues so the known session can still
+recover after its deadline. A missing session
 ID emits one failed-recovery notice until evidence changes.
 
 The wrapper sends SIGTERM to its owned Claude child and gives it twenty seconds to save.
@@ -362,7 +364,7 @@ outside the saved-job count.
 The transcript read is limited to 8 MiB after the previous recorded position. An ambiguous
 card, an unreadable saved prompt, a malformed entry, or a recovery-arm failure prints
 `cron recovery skipped: <reason>` and falls back to the ordinary resume arguments.
-Recovery after authentication failure or expiry omits the original task and the legacy
+Recovery after this session's authentication failure omits the original task and the legacy
 cron catch-up note. Its matching saved-card recovery uses the same check-only exception.
 Other renewals and failovers with no matching card keep their existing
 note; first launches and manual resumes do not use this recovery. Optional cron recovery
@@ -393,7 +395,10 @@ This remains a best-effort workaround for Claude Code's resume behavior, with th
 - The defect belongs to Claude Code; an upstream report waits on the owner's decision. Remove
   the note once Claude Code fires restored jobs reliably.
 
-Authentication recovery preserves the same conversation and account. When the server
+Authentication recovery requires an unresolved authentication failure in that session and
+preserves the same conversation and account. Expiry alone follows the renewal path;
+a newer shared revision never marks another session as auth-failed. A successful Stop or
+a change of conversation clears the session's failure. When the server
 still holds the rejected revision, claudectl replaces that exact revision through the
 existing fenced refresh. A usable successor can have a shorter lifetime than the rejected
 token's recorded expiry. Authentication error details are normalized to the known
@@ -401,9 +406,24 @@ token's recorded expiry. Authentication error details are normalized to the know
 clears a transient failure observed during a pending token read.
 
 Ordinary admission checks foreground turns, background tasks, production markers, pending
-hooks and explicit holds. Those checks govern failover and renewal before its deadline;
-authentication recovery and deadline renewal override ordinary workload checks, while
-explicit production holds remain a veto until hold end. The task check reads live descendants' stdout/stderr: a Claude task
+hooks and explicit holds. Authentication recovery and renewal both wait for running
+turns and the quiet window, up to a maximum of ten minutes from their own restart request.
+Set `CLAUDECTL_RESTART_MAX_WAIT_SECS` on the wrapper to change that maximum. Repeated
+failures and new prompts do not reset it. After the deadline, ordinary workload checks
+can be overridden; explicit production holds remain a veto until hold end.
+
+Every automatic restart, including a forced restart and weekly-limit failover, also waits
+at least two minutes after the current session's latest observed cron fire. Set
+`CLAUDECTL_RESTART_CRON_COOLDOWN_SECS` to change this cooldown. A new fire extends it,
+even past the forced-restart deadline. The gate reads `schedule_wakeup`, `loop_wakeup`
+and `turnOrigin: scheduled` user-turn metadata from Claude's hook-linked transcript,
+without retaining prompts. This protects observed fires; it cannot see a queued fire
+that Claude has not recorded yet. Missing scheduler metadata cannot establish a fire.
+Both settings accept nonnegative integer seconds (zero disables that wait); missing or
+invalid values use the defaults. Skips are logged as `running_turn`, `quiet_window`,
+`auth_not_failed` or `cron_cooldown`, with the latest cron time in activity diagnostics.
+
+The task check reads live descendants' stdout/stderr: a Claude task
 file under `<tmp>/claude-<uid>/.../tasks/*.output` holds admission. MCP/LSP servers and
 `caffeinate` without task-output descriptors do not add a workload blocker.
 
@@ -484,11 +504,13 @@ After the wrapper exits, explicitly clear its recorded hold with
 
 `claudectl status` and the inherited status line show ordinary deferral reasons.
 `status --json` includes their run, stage and deferred counter. Ordinary workload deferrals
-never delay auth recovery. Explicit holds remain until hold end; unknown SessionEnd intent
+delay auth recovery until its configured deadline. Explicit holds remain until hold end; unknown SessionEnd intent
 remains a lifecycle veto until it is known.
 
 `~/.claudectl/server/restart-decisions.jsonl` retains the existing `restart_deferred`
-events and adds `restart_forced`, `recovery_failed` and `restart_blocked_by_hold`. The counter names are
+events and adds `restart_forced`, `recovery_failed`, `restart_blocked_by_hold` and
+`restart_skipped`. A changed skip reason at the same deferral stage adds a
+`restart_skipped` row without increasing the deferred counter. The counter names are
 `claudectl_restart_forced_total` and `claudectl_recovery_failed_total`; each actual event
 adds one. Labels contain only bounded cause, reason and stage values. Run and session IDs
 are log fields, as are the blocked hold's run and reason. Routed notices carry `route: voice_inbox`; claudectl sends no message itself.
@@ -500,7 +522,8 @@ these host metrics are separate from the remote account server's `/metrics` endp
 Pending failovers retain a durable `restart_deferred` row when their failure time,
 reason or stage changes, even if an earlier renewal already recorded the same stage.
 Repeated polls of the same decision add no row. The row and current status include an
-`activity` object with `idle_since`, `limit_failed_at`, `quiet_since` and `terminal_input_at`.
+`activity` object with `idle_since`, `limit_failed_at`, `quiet_since`, `terminal_input_at`
+and `last_cron_fire_at`.
 These timestamps use Unix milliseconds; unavailable values are null. The journal keeps
 this evidence after the temporary run directory is removed.
 
