@@ -1,8 +1,8 @@
 //! One server account per Claude process. The process keeps the host Claude config (its
 //! conversations, skills, hooks and trust) and receives only a server access token in
 //! CLAUDE_CODE_OAUTH_TOKEN. The token cannot change inside a running Claude (see
-//! experiments/settings-renewal/host-config.py). Authentication failure forces recovery;
-//! unheld renewal waits at most ten minutes. Explicit holds and unknown SessionEnd intent
+//! experiments/settings-renewal/host-config.py). Authentication recovery and unheld renewal
+//! wait at most ten minutes for quiet. Explicit holds and unknown SessionEnd intent
 //! veto every automatic restart.
 //! `session.json` records its expiry.
 use super::*;
@@ -753,12 +753,17 @@ impl Monitor {
                     self.held_expires_at,
                 );
             }
-            let recovering = renew::held_token_dead(&self.inputs(&mut activity, &timing, None));
+            let recovering = activity.idle.auth_failed.is_some();
+            let token_dead = renew::held_token_dead(&self.inputs(&mut activity, &timing, None));
             if activity.idle.session.is_none() {
-                if recovering && !no_session_reported {
+                if token_dead && !no_session_reported {
                     gate.failed(
                         &activity.idle,
-                        super::restart_gate::Cause::AuthRecovery,
+                        if recovering {
+                            super::restart_gate::Cause::AuthRecovery
+                        } else {
+                            super::restart_gate::Cause::Renewal
+                        },
                         super::restart_gate::RecoveryFailure::NoSession,
                     );
                     no_session_reported = true;
@@ -805,7 +810,7 @@ impl Monitor {
             if !recovering {
                 gate.recovered();
             }
-            let failover_pending = !recovering
+            let failover_pending = !token_dead
                 && self.failover.is_some()
                 && activity.idle.limited.as_ref().is_some_and(|(session, at)| {
                     activity.idle.session.as_ref() == Some(session) && pending.handled != Some(*at)
@@ -850,7 +855,7 @@ impl Monitor {
             };
             // Observing an unexpired grant cannot rotate it. Read before workload
             // admission so a busy session can discover a pending renewal.
-            let interval = if recovering {
+            let interval = if token_dead {
                 timing.retry_ms
             } else {
                 timing.poll_near_ms.min(timing.poll_far_ms).min(30_000)
@@ -862,10 +867,10 @@ impl Monitor {
                 .is_none_or(|access| access.expires_at <= now());
             let unchecked_auth =
                 activity.idle.auth_failed.is_some() && activity.idle.auth_failed != checked_auth;
-            let entering_recovery = recovering && !was_recovering;
+            let entering_recovery = token_dead && !was_recovering;
             let due = (needs_token || unchecked_auth || entering_recovery)
                 && (entering_recovery || now() - last_check >= interval);
-            was_recovering = recovering;
+            was_recovering = token_dead;
             if due {
                 last_check = now();
                 let request_auth = activity.idle.auth_failed;
@@ -880,7 +885,7 @@ impl Monitor {
                 let mut access = match self.client.observe(&self.account_id) {
                     Ok(access) => access,
                     Err(_) => {
-                        if recovering || next_access.is_some() {
+                        if token_dead || next_access.is_some() {
                             gate.failed(
                                 &activity.idle,
                                 cause,
@@ -907,7 +912,7 @@ impl Monitor {
                     continue;
                 }
                 // A successful Stop during the request can clear a transient failure.
-                let recovering = renew::held_token_dead(&self.inputs(&mut activity, &timing, None));
+                let recovering = activity.idle.auth_failed.is_some();
                 cause = if recovering {
                     super::restart_gate::Cause::AuthRecovery
                 } else {
@@ -1098,7 +1103,7 @@ impl Monitor {
             && (!super::renew::restart_needed(&inputs)
                 || inputs.idle.auth_failed != observed_auth
                 || (cause == super::restart_gate::Cause::AuthRecovery
-                    && !super::renew::held_token_dead(&inputs)))
+                    && inputs.idle.auth_failed.is_none()))
         {
             return Err(());
         }
@@ -2038,7 +2043,7 @@ mod tests {
     fn real_expiry_margin_and_fresh_rejection_still_restart_the_monitor() {
         use super::super::restart_gate::Cause;
         for (expires_in, rejected, cause) in [
-            (-1, false, Cause::AuthRecovery),
+            (-1, false, Cause::Renewal),
             (240_000, false, Cause::Renewal),
             (28_000_000, true, Cause::AuthRecovery),
         ] {
@@ -2058,7 +2063,7 @@ mod tests {
                 monitor.pid,
                 &monitor.alias,
             );
-            if cause == Cause::Renewal {
+            {
                 activity.idle.since = Some(now() - 600_001);
                 assert!(!gate.check_at(
                     &activity.idle,
@@ -2142,6 +2147,7 @@ mod tests {
                 ])
                 .env(CHILD, scenario)
                 .env("CLAUDECTL_TEST_RENEW_FAST", "1")
+                .env("CLAUDECTL_RESTART_MAX_WAIT_SECS", "1")
                 .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
                 .output()
                 .unwrap();
@@ -2203,6 +2209,7 @@ mod tests {
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let mut first = true;
+            let mut held_once = false;
             while !server_finished.load(Ordering::SeqCst) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(stream) => stream,
@@ -2235,8 +2242,9 @@ mod tests {
                 let (status, body) = if request.starts_with("POST /v2/anthropic/token ") {
                     let input: Value = serde_json::from_slice(&body).unwrap();
                     let current = *server_current.lock().unwrap();
-                    if delayed_signal && current == "C" {
+                    if delayed_signal && current == "C" && !held_once {
                         admission_hold(&server_home, held_pid);
+                        held_once = true;
                     }
                     let revision = if input["previous_revision"].is_string() {
                         if current == "old" {
@@ -2334,7 +2342,7 @@ mod tests {
                             .open(&events)
                             .unwrap(),
                         "{}",
-                        json!({"at":now(),"event":"UserPromptSubmit","session_id":"s-delayed"})
+                        json!({"at":now(),"event":"StopFailure","session_id":"s-delayed","error":"authentication_failed"})
                     )
                     .unwrap();
                 }
@@ -2430,7 +2438,10 @@ mod tests {
             .find(|record| record["event"] == "restart_forced")
             .unwrap();
         assert_eq!(forced["held_revision"], "old");
-        assert_eq!(forced["cached_revision"], "B");
+        assert_eq!(
+            forced["cached_revision"],
+            if delayed_signal { "C" } else { "B" }
+        );
         assert_eq!(forced["current_revision"], "C");
         assert!(
             !journal.contains("synthetic-only"),

@@ -55,7 +55,9 @@ Renewal and failover also write deferred restart decisions to
 `~/.claudectl/server/restart-decisions.jsonl`. A running turn, live Claude task-output
 child or explicit run hold prevents ordinary restart admission. `claudectl status`, `status --json` and
 the session's status line show the reason. Five minutes before token expiry the wrapper
-warns; expiry or authentication failure starts recovery, except when an explicit hold or unknown SessionEnd intent vetoes restart.
+warns. Expiry follows renewal; that session's own authentication failure starts auth
+recovery. Both wait for running turns and quiet up to the configured maximum. Every
+restart honors the post-cron cooldown, explicit holds and unknown SessionEnd intent.
 See [production holds and deferred restarts](account-server.md#production-holds-and-deferred-restarts).
 
 Most failures name the next command on a last line that starts with `Try:`. Setup

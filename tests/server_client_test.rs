@@ -286,7 +286,9 @@ fn live_child_token_case(lifetime: i64, peer: Peer) {
     std::fs::create_dir(&control).unwrap();
     let mut command = live_token_command(live_home.path(), &binary, &control, &server.api, "live");
     if matches!(peer, Peer::Observe43AfterExpiry) {
-        command.env("D3_LIVE_SECONDS", "90");
+        command
+            .env("D3_LIVE_SECONDS", "90")
+            .env("CLAUDECTL_RESTART_MAX_WAIT_SECS", "1");
     }
     let mut live = LiveTokenChild {
         process: Some(command.spawn().unwrap()),
@@ -429,6 +431,20 @@ fn live_child_token_case(lifetime: i64, peer: Peer) {
         let args = after["args"].as_array().unwrap();
         let resume = args.iter().position(|arg| arg == "--resume").unwrap();
         assert_eq!(args[resume + 1], "synthetic-live");
+        let journal = std::fs::read_to_string(
+            live_home
+                .path()
+                .join(".claudectl/server/restart-decisions.jsonl"),
+        )
+        .unwrap();
+        let forced: Vec<serde_json::Value> = journal
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| row["event"] == "restart_forced")
+            .collect();
+        assert_eq!(forced.len(), 1);
+        assert_eq!(forced[0]["cause"], "renewal");
+        assert!(forced[0]["auth_failed_at"].is_null());
     } else {
         assert_eq!(before["pid"], after["pid"]);
         assert_eq!(before["token_sha256"], after["token_sha256"]);
