@@ -356,8 +356,10 @@ continues the previous request. Each completed recovery writes one result per se
 `crons intact: N jobs`, where N counts saved jobs, including any restored jobs.
 Missing jobs log `missing cron: <file> (<schedule>)`.
 Absent or unreadable evidence logs an explicit unverified notice.
-After Code Mode REPL calls, verification requires a direct CronList that starts
-after their results. Without that evidence the log says
+After a correlated synchronous REPL result, a later direct CronList can verify
+recovery. An asynchronous dispatch acknowledgment keeps the REPL pending. The
+verifier skips virtual tool records. A transcript with dispatch acknowledgments
+and virtual calls alone produces the notice
 `cron recovery unverified: verifier cannot read Code Mode`.
 Results stay outside the live terminal. The log contains no saved prompt contents.
 Recovery preserves option values, including multi-value `--add-dir` and `--allowedTools`.

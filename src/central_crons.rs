@@ -455,7 +455,9 @@ impl Recovery {
                 continue;
             }
             let row: Value = serde_json::from_slice(raw)?;
-            if row["sessionId"].as_str() != Some(self.session_id.as_str()) {
+            if row["sessionId"].as_str() != Some(self.session_id.as_str())
+                || row["isVirtual"] == true
+            {
                 continue;
             }
             let content = &row["message"]["content"];
@@ -517,7 +519,9 @@ impl Recovery {
                     ) else {
                         continue;
                     };
-                    if let Some(pending) = &mut pending_repl {
+                    if let Some(pending) = &mut pending_repl
+                        && row["toolUseResult"]["asyncDispatched"] != true
+                    {
                         pending.remove(&(id.to_owned(), assistant.to_owned()));
                     }
                     if call.as_ref().is_some_and(|(expected_id, expected_row)| {

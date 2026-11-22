@@ -795,6 +795,9 @@ fn cron_recovery_catches_a_missed_check_with_a_young_checkpoint() {
 
 #[test]
 fn cron_recovery_requires_a_fresh_direct_list_after_code_mode() {
+    // The guide's async REPL receipt and the virtual list it dispatched.
+    let captured: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/flt1420-guide-codemode.json")).unwrap();
     let repl = json!({
         "type": "assistant", "sessionId": "s", "uuid": "repl-assistant",
         "message": {"content": [{
@@ -825,8 +828,24 @@ fn cron_recovery_requires_a_fresh_direct_list_after_code_mode() {
         "type": "assistant", "sessionId": "s", "uuid": "delete-assistant",
         "message": {"content": [{"type": "tool_use", "name": "CronDelete", "id": "direct-delete"}]}
     });
+    let mut virtual_result = list_result.clone();
+    virtual_result["sourceToolAssistantUUID"] = "guide-list-assistant".into();
+    virtual_result["message"]["content"][0]["tool_use_id"] = "guide-list".into();
+    virtual_result["isVirtual"] = true.into();
+    let captured_rows: Vec<_> = captured.iter().collect();
+    let mut captured_with_virtual_jobs = captured_rows.clone();
+    captured_with_virtual_jobs.push(&virtual_result);
+    let mut captured_with_overlapping_direct_list = captured_rows.clone();
+    captured_with_overlapping_direct_list.extend([&list, &list_result]);
     let unverified = "cron recovery unverified: verifier cannot read Code Mode";
     let cases = [
+        (captured_rows, unverified),
+        (captured_with_virtual_jobs, unverified),
+        (captured_with_overlapping_direct_list, unverified),
+        (
+            vec![&repl, &repl_result, &captured[2], &virtual_result],
+            unverified,
+        ),
         (vec![&repl, &repl_result], unverified),
         (vec![&repl, &list, &list_result, &repl_result], unverified),
         (vec![&list, &list_result, &repl, &repl_result], unverified),
