@@ -42,7 +42,8 @@ intent also prevents restart, with one failure record while that uncertainty per
 requires ten continuous minutes of observed quiet. A forced restart can discard a draft
 or background task. Recovery omits the original task and restores saved-card cron definitions.
 After the final CronList readback confirms those jobs, it may run an identified saved check
-prompt once when the card's op-check checkpoint mtime is older than one saved check period.
+prompt once when its schedule has a fire after the card's op-check checkpoint mtime and
+at or before recovery.
 The card can mark that saved file with `cron_check_prompt:`. Otherwise, the first entry
 must have a `check`, `cron-check`, or `cron-check-...` filename stem.
 It rechecks freshness before running; all other saved prompts keep the no-replay rule.

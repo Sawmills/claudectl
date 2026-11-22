@@ -2,6 +2,7 @@
 //! existing resume note; only the owning HerdR tab can select cards with saved jobs.
 use super::*;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 
 const ARMED: &str = "cron-recovery";
@@ -48,13 +49,19 @@ impl Job {
     }
 }
 
+enum Inventory {
+    Missing,
+    CodeMode,
+    Jobs(Vec<Value>),
+}
+
 struct Check {
     file: PathBuf,
     schedule: String,
     state: PathBuf,
-    modified: std::time::SystemTime,
+    modified: chrono::DateTime<chrono::Utc>,
     period: std::time::Duration,
-    stale: bool,
+    missed_fire: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl Check {
@@ -126,26 +133,29 @@ impl Check {
         if !metadata.is_file() {
             bail!("op-check checkpoint is not a file: {}", state.display());
         }
-        let modified = metadata
-            .modified()
-            .context("op-check checkpoint mtime unavailable")?;
-        let age = std::time::SystemTime::now()
-            .duration_since(modified)
-            .context("op-check checkpoint mtime is in the future")?;
-        let cron: croner::Cron = schedule.parse().context("invalid check schedule")?;
+        let modified = chrono::DateTime::<chrono::Utc>::from(
+            metadata
+                .modified()
+                .context("op-check checkpoint mtime unavailable")?,
+        );
         let now = chrono::Local::now();
+        if modified > now {
+            bail!("op-check checkpoint mtime is in the future");
+        }
+        let cron: croner::Cron = schedule.parse().context("invalid check schedule")?;
         let previous = cron.find_previous_occurrence(&now, true)?;
         let preceding = cron.find_previous_occurrence(&previous, false)?;
         let period = (previous - preceding)
             .to_std()
             .context("invalid check period")?;
+        let last_fire = previous.to_utc();
         Ok(Self {
             file: file.to_owned(),
             schedule: schedule.to_owned(),
             state,
             modified,
             period,
-            stale: age > period,
+            missed_fire: (modified < last_fire).then_some(last_fire),
         })
     }
 }
@@ -388,10 +398,18 @@ impl Recovery {
         if bytes.len() as u64 > TRANSCRIPT_LIMIT {
             bail!("cron transcript exceeds recovery read limit");
         }
-        let Some(mut actual) = self.inventory(&bytes)? else {
-            return Ok(Some(
-                "cron recovery unverified: no post-restart CronList".into(),
-            ));
+        let mut actual = match self.inventory(&bytes)? {
+            Inventory::Jobs(jobs) => jobs,
+            Inventory::CodeMode => {
+                return Ok(Some(
+                    "cron recovery unverified: verifier cannot read Code Mode".into(),
+                ));
+            }
+            Inventory::Missing => {
+                return Ok(Some(
+                    "cron recovery unverified: no post-restart CronList".into(),
+                ));
+            }
         };
         let mut missing = Vec::new();
         for job in &self.jobs {
@@ -422,13 +440,14 @@ impl Recovery {
         }))
     }
 
-    fn inventory(&self, bytes: &[u8]) -> Result<Option<Vec<Value>>> {
+    fn inventory(&self, bytes: &[u8]) -> Result<Inventory> {
         let prompt = self
             .launched_prompt
             .unwrap_or_else(|| Sha256::digest(self.prompt().as_bytes()).into());
         let matches_prompt =
             |text: &str| <[u8; 32]>::from(Sha256::digest(text.as_bytes())) == prompt;
         let mut anchored = false;
+        let mut pending_repl: Option<HashSet<(String, String)>> = None;
         let mut call: Option<(String, String)> = None;
         let mut jobs = None;
         for raw in bytes.split_inclusive(|byte| *byte == b'\n') {
@@ -450,6 +469,7 @@ impl Recovery {
                     }))
             {
                 anchored = true;
+                pending_repl = None;
                 jobs = None;
                 call = None;
                 continue;
@@ -460,7 +480,7 @@ impl Recovery {
             for block in content.as_array().into_iter().flatten() {
                 if row["type"] == "assistant" && block["type"] == "tool_use" {
                     match block["name"].as_str() {
-                        Some("CronList") => {
+                        Some("CronList") if pending_repl.as_ref().is_none_or(HashSet::is_empty) => {
                             jobs = None;
                             call = Some((
                                 block["id"].as_str().context("CronList id missing")?.into(),
@@ -474,24 +494,53 @@ impl Recovery {
                             jobs = None;
                             call = None;
                         }
+                        Some("REPL") => {
+                            // REPL can change jobs through nested tools. A direct list
+                            // must start after the matching REPL results.
+                            jobs = None;
+                            call = None;
+                            let (Some(id), Some(assistant)) =
+                                (block["id"].as_str(), row["uuid"].as_str())
+                            else {
+                                return Ok(Inventory::CodeMode);
+                            };
+                            pending_repl
+                                .get_or_insert_with(HashSet::new)
+                                .insert((id.to_owned(), assistant.to_owned()));
+                        }
                         _ => (),
                     }
-                } else if row["type"] == "user"
-                    && block["type"] == "tool_result"
-                    && let Some((id, assistant)) = &call
-                    && block["tool_use_id"] == *id
-                    && row["sourceToolAssistantUUID"] == *assistant
-                {
-                    if block["is_error"] == true {
-                        jobs = None;
-                    } else {
-                        jobs = row["toolUseResult"]["jobs"].as_array().cloned();
+                } else if row["type"] == "user" && block["type"] == "tool_result" {
+                    let (Some(id), Some(assistant)) = (
+                        block["tool_use_id"].as_str(),
+                        row["sourceToolAssistantUUID"].as_str(),
+                    ) else {
+                        continue;
+                    };
+                    if let Some(pending) = &mut pending_repl {
+                        pending.remove(&(id.to_owned(), assistant.to_owned()));
                     }
-                    call = None;
+                    if call.as_ref().is_some_and(|(expected_id, expected_row)| {
+                        id == expected_id && assistant == expected_row
+                    }) {
+                        if block["is_error"] == true {
+                            jobs = None;
+                        } else {
+                            jobs = row["toolUseResult"]["jobs"].as_array().cloned();
+                            if jobs.is_some() {
+                                pending_repl = None;
+                            }
+                        }
+                        call = None;
+                    }
                 }
             }
         }
-        Ok(jobs)
+        Ok(match jobs {
+            Some(jobs) => Inventory::Jobs(jobs),
+            None if pending_repl.is_some() => Inventory::CodeMode,
+            None => Inventory::Missing,
+        })
     }
 
     pub(super) fn continue_request(&mut self) {
@@ -551,23 +600,28 @@ impl Recovery {
         for notice in &self.check_notices {
             prompt.push_str(notice);
         }
-        let mut requested = std::collections::HashSet::new();
+        let mut requested = HashSet::new();
         for check in &self.checks {
             prompt.push_str(&format!(
                 "\ncheck file: {}\nstaleness source: {}\ncheckpoint mtime: {}\ncheck period: {} seconds\n",
                 check.file.display(),
                 check.state.display(),
-                chrono::DateTime::<chrono::Utc>::from(check.modified).to_rfc3339(),
+                check.modified.to_rfc3339(),
                 check.period.as_secs(),
             ));
-            if check.stale && requested.insert((&check.file, &check.schedule)) {
+            if let Some(fire) = check.missed_fire
+                && requested.insert((&check.file, &check.schedule))
+            {
                 prompt.push_str(&format!(
-                    "Run the stale check prompt once: {}\nOnly AFTER the final CronList readback \
+                    "missed check fire: {}\nRun the stale check prompt once: {}\n\
+                     Only AFTER the final CronList readback \
                      confirms every saved job is present, \
                      read the check file verbatim and run that check once. Immediately before \
-                     running it, re-read the staleness source mtime; skip the check if it is \
-                     unavailable, in the future, or no longer older than this check period. ",
+                     running it, re-read the checkpoint mtime at {}; skip the check if it is \
+                     unavailable, in the future, or at or after the missed check fire above. ",
+                    fire.to_rfc3339(),
                     check.file.display(),
+                    check.state.display(),
                 ));
             }
         }
@@ -577,7 +631,7 @@ impl Recovery {
             );
         } else {
             prompt.push_str(
-                "Do not replay missed fires. Do not run any saved job's prompt other than \
+                "Do not replay any other missed fires. Do not run any saved job's prompt other than \
                  the stale checks listed above. Run each listed stale check at most once. ",
             );
         }

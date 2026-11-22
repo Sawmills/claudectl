@@ -341,12 +341,12 @@ using the same path and quoting rules as `cron_prompts`. It must match exactly o
 file/schedule pair on that card; it never adds a job. Without that marker, the first entry
 is eligible only when its filename stem is `check`, `cron-check`, or starts with
 `cron-check-`. An unrecognized first job is not treated as a check. Its `check:` command's
-`--name` identifies `~/.local/state/fleet/op-check-<name>.json`; the file's mtime must be
-older than one check period. The period comes from the saved cron schedule, using the
-most recently completed interval between scheduled fires on the host's local clock.
-Free-form card cadence notes do not change it. The prompt names the check and checkpoint
-and requires another mtime read immediately before running the check. A recent, future,
-missing or non-file checkpoint does not authorize a check. An unavailable checkpoint,
+`--name` identifies `~/.local/state/fleet/op-check-<name>.json`. The check is eligible
+when its saved schedule has a fire after that file's mtime and at or before recovery.
+The schedule uses the host's local clock. Free-form card cadence notes do not change it.
+The prompt names the check, checkpoint, and last missed fire. It requires another mtime
+read immediately before running and skips the check if the checkpoint is unavailable,
+in the future, or at or after that fire. An unavailable checkpoint,
 ambiguous check selection/name or invalid schedule leaves cron restoration active and names the unavailable
 check evidence in the prompt. Deep dives, watches, sweeps and all other saved prompts
 remain forbidden during recovery; shared checks are requested only once. After recovery,
@@ -356,6 +356,9 @@ continues the previous request. Each completed recovery writes one result per se
 `crons intact: N jobs`, where N counts saved jobs, including any restored jobs.
 Missing jobs log `missing cron: <file> (<schedule>)`.
 Absent or unreadable evidence logs an explicit unverified notice.
+After Code Mode REPL calls, verification requires a direct CronList that starts
+after their results. Without that evidence the log says
+`cron recovery unverified: verifier cannot read Code Mode`.
 Results stay outside the live terminal. The log contains no saved prompt contents.
 Recovery preserves option values, including multi-value `--add-dir` and `--allowedTools`.
 Failover includes the original task verbatim in its single delivered recovery prompt.
