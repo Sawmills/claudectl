@@ -22,7 +22,7 @@ jobs:
   check:
     name: Check
     # trunk-ignore(actionlint/runner-label): Existing Namespace profile
-    runs-on: namespace-profile-fleet-small
+    runs-on: ${{ vars.RUNNER_PROVIDER == 'runson' && format('runs-on={0}/cpu=4/ram=8/family=c8a.xlarge/image=ubuntu24-full-x64/spot=false/retry=false/ssh=false', github.run_id) || 'namespace-profile-fleet-small' }}
     env:
       CARGO_BUILD_JOBS: 1
       CARGO_INCREMENTAL: 0
