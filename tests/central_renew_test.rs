@@ -179,6 +179,13 @@ def provider_status():
     try:
         with urllib.request.urlopen(request,timeout=2) as response: return response.status
     except urllib.error.HTTPError as error: return error.code
+recovery_rows=home/'cron-recovery-rows.json'
+if not first_launch and recovery_rows.is_file():
+    prompt=args[args.index('--')+1]
+    rows=[{'type':'user','sessionId':session_id,'message':{'content':prompt}}]
+    rows.extend(json.loads(recovery_rows.read_text()))
+    with (home/(session_id+'.jsonl')).open('a') as transcript:
+        for row in rows: transcript.write(json.dumps(row)+'\n')
 if mode != 'no_hooks':
     hook('SessionStart'); hook('UserPromptSubmit')
     if mode != 'busy' or not first_launch: hook('Stop')
@@ -726,13 +733,161 @@ fn cron_recovery_runs_only_the_stale_check_after_inventory_readback() {
 }
 
 #[test]
+fn cron_recovery_catches_a_missed_check_with_a_young_checkpoint() {
+    use chrono::Timelike;
+
+    let instruction = "Run the stale check prompt once:";
+    for (checkpoint_age, expected_runs) in [(1_520, 1), (60, 0)] {
+        let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
+        let started_at = std::time::SystemTime::now();
+        // Shift the guide's :19/:49 schedule to keep the last fire about two minutes back.
+        let last_fire =
+            chrono::DateTime::<chrono::Utc>::from(started_at - Duration::from_secs(120)).minute();
+        let other_fire = (last_fire + 30) % 60;
+        let card = f.home.path().join("Code/.fleet/model-test/operator.md");
+        let check = card.parent().unwrap().join("whip.txt");
+        private_write(&check, "Check the guide's lanes.");
+        private_write(
+            &card.parent().unwrap().join("deep-dive.txt"),
+            "Run the daily deep dive.",
+        );
+        private_write(
+            &card,
+            &format!(
+                "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name model-test\n\
+                 cron_check_prompt: whip.txt\n\
+                 cron_prompts: whip.txt {last_fire},{other_fire} * * * *; deep-dive.txt 37 7 * * *\n"
+            ),
+        );
+        let state = f
+            .home
+            .path()
+            .join(".local/state/fleet/op-check-model-test.json");
+        private_write(&state, "{}");
+        std::fs::File::open(&state)
+            .unwrap()
+            .set_modified(started_at - Duration::from_secs(checkpoint_age))
+            .unwrap();
+
+        let runs = f.recover_after_switch("s");
+        let args = runs[1]["args"].as_array().unwrap();
+        let delimiter = args.iter().position(|arg| arg == "--").unwrap();
+        let prompt = args[delimiter + 1].as_str().unwrap();
+        assert!(prompt.contains("check period: 1800 seconds\n"));
+        assert_eq!(
+            prompt.matches(instruction).count(),
+            expected_runs,
+            "{prompt}"
+        );
+        if let Some(check_run) = prompt.find(instruction) {
+            assert!(
+                check_run
+                    > prompt
+                        .find("Run CronList again after all creations.")
+                        .unwrap()
+            );
+            assert!(prompt.contains(&format!("{instruction} {}\n", check.display())));
+            assert!(prompt.contains("at or after the missed check fire above"));
+        }
+        assert!(prompt.contains("Do not create duplicate jobs."));
+    }
+}
+
+#[test]
+fn cron_recovery_requires_a_fresh_direct_list_after_code_mode() {
+    // The guide's async REPL receipt and the virtual list it dispatched.
+    let captured: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/flt1420-guide-codemode.json")).unwrap();
+    let repl = json!({
+        "type": "assistant", "sessionId": "s", "uuid": "repl-assistant",
+        "message": {"content": [{
+            "type": "tool_use", "name": "REPL", "id": "repl-list",
+            "input": {"code": "console.log(await tools.CronList({}));"}
+        }]}
+    });
+    let repl_result = json!({
+        "type": "user", "sessionId": "s", "sourceToolAssistantUUID": "repl-assistant",
+        "message": {"content": [{
+            "type": "tool_result", "tool_use_id": "repl-list",
+            "content": [{"type": "text", "text": "Redacted CronList output"}]
+        }]}
+    });
+    let list = json!({
+        "type": "assistant", "sessionId": "s", "uuid": "list-assistant",
+        "message": {"content": [{"type": "tool_use", "name": "CronList", "id": "direct-list"}]}
+    });
+    let list_result = json!({
+        "type": "user", "sessionId": "s", "sourceToolAssistantUUID": "list-assistant",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "direct-list"}]},
+        "toolUseResult": {"jobs": [{
+            "id": "check-id", "cron": "*/5 * * * *", "prompt": "Check the owned lanes.",
+            "recurring": true, "durable": false
+        }]}
+    });
+    let delete = json!({
+        "type": "assistant", "sessionId": "s", "uuid": "delete-assistant",
+        "message": {"content": [{"type": "tool_use", "name": "CronDelete", "id": "direct-delete"}]}
+    });
+    let mut virtual_result = list_result.clone();
+    virtual_result["sourceToolAssistantUUID"] = "guide-list-assistant".into();
+    virtual_result["message"]["content"][0]["tool_use_id"] = "guide-list".into();
+    virtual_result["isVirtual"] = true.into();
+    let captured_rows: Vec<_> = captured.iter().collect();
+    let mut captured_with_virtual_jobs = captured_rows.clone();
+    captured_with_virtual_jobs.push(&virtual_result);
+    let mut captured_with_overlapping_direct_list = captured_rows.clone();
+    captured_with_overlapping_direct_list.extend([&list, &list_result]);
+    let unverified = "cron recovery unverified: verifier cannot read Code Mode";
+    let cases = [
+        (captured_rows, unverified),
+        (captured_with_virtual_jobs, unverified),
+        (captured_with_overlapping_direct_list, unverified),
+        (
+            vec![&repl, &repl_result, &captured[2], &virtual_result],
+            unverified,
+        ),
+        (vec![&repl, &repl_result], unverified),
+        (vec![&repl, &list, &list_result, &repl_result], unverified),
+        (vec![&list, &list_result, &repl, &repl_result], unverified),
+        (
+            vec![&repl, &repl_result, &list, &list_result],
+            "crons intact: 1 jobs",
+        ),
+        (
+            vec![&repl, &repl_result, &list, &list_result, &delete],
+            "cron recovery unverified: no post-restart CronList",
+        ),
+    ];
+    for (rows, expected) in cases {
+        let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
+        private_write(
+            &f.home.path().join("cron-recovery-rows.json"),
+            &serde_json::to_string(&rows).unwrap(),
+        );
+        f.recover_after_switch("s");
+        let path = f.home.path().join(".claudectl/server/cron-recovery.jsonl");
+        let log = std::fs::read_to_string(path).unwrap();
+        let row: Value = serde_json::from_str(log.trim()).unwrap();
+        assert_eq!(row["message"], expected);
+    }
+}
+
+#[test]
 fn cron_recovery_does_not_run_a_fresh_check() {
+    use chrono::Timelike;
+
     let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
+    let started_at = std::time::SystemTime::now();
+    let last_fire = chrono::DateTime::<chrono::Utc>::from(started_at - Duration::from_secs(120));
+    let offset = last_fire.minute() % 5;
     let card = f.home.path().join("Code/.fleet/model-test/operator.md");
     let check = card.parent().unwrap().join("check.txt");
     private_write(
         &card,
-        "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name model-test\ncron_prompts: check.txt */5 * * * *; deep-dive.txt 37 7 * * *\n",
+        &format!(
+            "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name model-test\n\
+             cron_prompts: check.txt {offset}-59/5 * * * *; deep-dive.txt 37 7 * * *\n"
+        ),
     );
     private_write(
         &card.parent().unwrap().join("deep-dive.txt"),
@@ -745,7 +900,7 @@ fn cron_recovery_does_not_run_a_fresh_check() {
     private_write(&state, "{}");
     std::fs::File::open(&state)
         .unwrap()
-        .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+        .set_modified(started_at - Duration::from_secs(60))
         .unwrap();
     private_write(
         &f.home.path().join("s.jsonl"),
@@ -770,12 +925,22 @@ fn cron_recovery_does_not_run_a_fresh_check() {
 
 #[test]
 fn cron_recovery_uses_the_saved_check_schedule_instead_of_card_cadence() {
+    use chrono::Timelike;
+
     for (age_seconds, should_run) in [(1200, false), (2400, true)] {
         let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
+        let started_at = std::time::SystemTime::now();
+        let last_fire =
+            chrono::DateTime::<chrono::Utc>::from(started_at - Duration::from_secs(21 * 60))
+                .minute();
+        let other_fire = (last_fire + 30) % 60;
         let card = f.home.path().join("Code/.fleet/model-test/operator.md");
         private_write(
             &card,
-            "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name=model-test\ncadence: check every 15 minutes\ncron_prompts: check.txt 11,41 * * * *\n",
+            &format!(
+                "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name=model-test\n\
+                 cadence: check every 15 minutes\ncron_prompts: check.txt {last_fire},{other_fire} * * * *\n"
+            ),
         );
         let state = f
             .home
@@ -784,7 +949,7 @@ fn cron_recovery_uses_the_saved_check_schedule_instead_of_card_cadence() {
         private_write(&state, "{}");
         std::fs::File::open(&state)
             .unwrap()
-            .set_modified(std::time::SystemTime::now() - Duration::from_secs(age_seconds))
+            .set_modified(started_at - Duration::from_secs(age_seconds))
             .unwrap();
 
         let runs = f.recover_after_switch("s");
@@ -1084,14 +1249,16 @@ fn cron_recovery_uses_the_last_completed_check_interval() {
     use chrono::Timelike;
     for (age_seconds, should_run) in [(120, true), (30, false)] {
         let mut f = Fixture::with_args("auth_crons", 600_000, false, &["--resume", "s"]);
-        let minute = chrono::Utc::now().minute();
+        let started_at = std::time::SystemTime::now();
+        let last_fire =
+            chrono::DateTime::<chrono::Utc>::from(started_at - Duration::from_secs(60)).minute();
         let card = f.home.path().join("Code/.fleet/model-test/operator.md");
         private_write(
             &card,
             &format!(
                 "operator_tab: model-test-tab\ncheck: \"$OP/op-check\" --name model-test\ncron_prompts: check.txt {},{} * * * *\n",
-                (minute + 58) % 60,
-                (minute + 59) % 60,
+                (last_fire + 59) % 60,
+                last_fire,
             ),
         );
         let state = f
@@ -1101,7 +1268,7 @@ fn cron_recovery_uses_the_last_completed_check_interval() {
         private_write(&state, "{}");
         std::fs::File::open(&state)
             .unwrap()
-            .set_modified(std::time::SystemTime::now() - Duration::from_secs(age_seconds))
+            .set_modified(started_at - Duration::from_secs(age_seconds))
             .unwrap();
 
         let runs = f.recover_after_switch("s");

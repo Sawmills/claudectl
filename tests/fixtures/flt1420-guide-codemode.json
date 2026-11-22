@@ -1,0 +1,65 @@
+[
+  {
+    "type": "assistant",
+    "sessionId": "s",
+    "uuid": "guide-repl-assistant",
+    "isSidechain": false,
+    "message": {
+      "content": [
+        {
+          "type": "tool_use",
+          "name": "REPL",
+          "id": "guide-repl",
+          "caller": {
+            "type": "direct"
+          },
+          "input": {
+            "code": "/* redacted CronList call */",
+            "description": "Read saved crons"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "type": "user",
+    "sessionId": "s",
+    "sourceToolAssistantUUID": "guide-repl-assistant",
+    "message": {
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "guide-repl",
+          "content": "[redacted]",
+          "is_error": false
+        }
+      ]
+    },
+    "toolUseResult": {
+      "code": "[redacted]",
+      "result": "[redacted]",
+      "stdout": "",
+      "stderr": "",
+      "evalId": 1,
+      "asyncDispatched": true
+    }
+  },
+  {
+    "type": "assistant",
+    "sessionId": "s",
+    "uuid": "guide-list-assistant",
+    "isSidechain": false,
+    "isVirtual": true,
+    "madeBy": "other",
+    "message": {
+      "content": [
+        {
+          "type": "tool_use",
+          "name": "CronList",
+          "id": "guide-list",
+          "input": {}
+        }
+      ]
+    }
+  }
+]
