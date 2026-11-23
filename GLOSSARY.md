@@ -36,8 +36,9 @@ migration retires its usable credentials.
 _Avoid_: local account
 
 **Active profile**:
-The local profile from the last activation recorded by claudectl. A direct
-Claude Code sign-in can change the live login independently of that record.
+The local profile named by claudectl's active profile marker. Claudectl sets
+the marker when activating a profile or saving the live login, and a direct
+Claude Code sign-in can change the live login independently.
 
 **Server account**:
 A Claude login held on the account server under one company user and alias.
@@ -45,8 +46,9 @@ Machines enrolled by that user can use the account.
 _Avoid_: remote profile
 
 **Default server account**:
-The server account selected for plain Claude Code launches when the shell finds
-claudectl's configured launcher first in its search path.
+The server account for plain Claude Code launches when claudectl's launcher
+is enabled, configured for server use, and found first in the shell's search
+path.
 
 **Migration**:
 Transferring ownership of a local profile's Claude credentials to the account
@@ -72,8 +74,8 @@ Usage beyond the included Claude allowance that can incur charges when enabled.
 **Eligible account**:
 An account claudectl can choose automatically because it has current usage
 data, room within its limits, more than five percent weekly headroom, and
-extra usage confirmed off. A local profile also needs a known subscription
-plan.
+extra usage confirmed off. A server account must also be available, and a
+local profile needs a known subscription plan.
 
 **Limit-reset offer**:
 A provider offer that can restore capacity for specified usage limits before
