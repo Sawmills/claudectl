@@ -1,7 +1,11 @@
-//! The browser projection, ported from the codexctl #153 dashboard. It receives only the
+//! The browser projection for the claudectl account server. It receives only the
 //! secret-free snapshot; rendering never mutates accounts.
 use super::enrollment::escape;
 use crate::accounts::Window;
+
+const WORDMARK_ICON: &str = r#"<svg class="wordmark-icon" viewBox="0 0 16 16" width="15" height="15" fill="none" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="2.5" stroke="currentColor" stroke-width="1.4"/><path d="M4.75 6.25L7 8.25L4.75 10.25M8.5 10.25H11.25" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+const CHEVRON_ICON: &str = r#"<svg class="chev" viewBox="0 0 12 12" width="12" height="12" fill="none" aria-hidden="true"><path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+const BACK_ICON: &str = r#"<svg viewBox="0 0 14 14" width="14" height="14" fill="none" aria-hidden="true"><path d="M8.75 3.5L5.25 7L8.75 10.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
 
 pub(super) struct Snapshot {
     pub email: String,
@@ -23,7 +27,11 @@ pub(super) struct Account {
     pub migration: String,
     pub windows: Vec<Window>,
     pub limit_reset_offers: Option<crate::limit_resets::Offers>,
+    /// Usable reset count from the server-sealed `reset_offers` list.
+    pub usable_resets: u64,
     pub reset_grant: Option<String>,
+    /// Human-safe summary of the reset offer that `POST /accounts/reset` will redeem.
+    pub reset_offer_summary: Option<String>,
     /// Unix seconds of the server's last usage observation.
     pub observed_at: Option<i64>,
     pub usage_stale: bool,
@@ -59,10 +67,13 @@ impl Account {
             return ("pending", "Migration pending".into());
         }
         let state = crate::accounts::state(&self.windows);
+        fn limit_label(window: &str) -> &str {
+            if window == "week" { "Week" } else { window }
+        }
         // A known full window stays visible, even on old data (the CLI's "(old data)").
         if let State::Limit { window, .. } = &state {
             let old = if self.usage_stale { " (old data)" } else { "" };
-            return ("bad", format!("{window} limit{old}"));
+            return ("bad", format!("{} limit{old}", limit_label(window)));
         }
         if self.usage_stale {
             return ("warn", "Stale usage".into());
@@ -73,7 +84,7 @@ impl Account {
             // Room, but never the account to use: the billing reason is visible.
             (State::Ready, true) => ("warn", "Available, may bill".into()),
             (State::Low { window }, true) => ("warn", format!("Low ({window}), may bill")),
-            (State::Limit { window, .. }, _) => ("bad", format!("{window} limit")),
+            (State::Limit { window, .. }, _) => ("bad", format!("{} limit", limit_label(window))),
             (State::Unknown, _) => ("warn", "No usage data".into()),
         }
     }
@@ -97,7 +108,7 @@ impl Account {
 fn command(id: &str, text: &str) -> String {
     let text = escape(text);
     format!(
-        r#"<div class="command"><pre tabindex="0"><code id="{id}" translate="no">{text}</code></pre><button class="button primary copy" type="button" data-copy="{id}" aria-label="Copy {text}">Copy</button></div>"#
+        r#"<div class="command"><pre tabindex="0"><code id="{id}" translate="no">{text}</code></pre><button class="button small primary copy" type="button" data-copy="{id}" aria-label="Copy {text}">Copy</button></div>"#
     )
 }
 fn date(at: i64) -> String {
@@ -145,10 +156,10 @@ fn window(w: Option<&Window>, label: &str, now: i64) -> String {
     let value = left
         .map(|n| format!("{n:.0}<small>% left</small>"))
         .unwrap_or_else(|| "Unknown".into());
-    let severity = if left.is_some_and(|n| n < 20.0) {
-        "warn"
-    } else {
-        ""
+    let severity = match left {
+        Some(n) if n <= 0.0 => "bad",
+        Some(n) if n < 20.0 => "warn",
+        _ => "",
     };
     let meter = match left {
         Some(n) => format!(
@@ -164,13 +175,13 @@ fn window(w: Option<&Window>, label: &str, now: i64) -> String {
         String::new()
     };
     format!(
-        r#"<span class="cell-label" aria-hidden="true">{label}</span><div class="usage {severity} {unknown}"><div class="usage-top"><span class="usage-value">{value}</span><span class="usage-reset">{time}</span></div>{meter}</div>"#
+        r#"<span class="cell-label" aria-hidden="true">{label}</span><div class="usage {severity} {unknown}"><div class="usage-top"><span class="usage-value">{value}</span></div>{meter}<div class="usage-reset">{time}</div></div>"#
     )
 }
 fn answer(accounts: &[Account], names: &[String], now: i64) -> String {
     if accounts.is_empty() {
         return format!(
-            r#"<h1 id="answer-title">No server accounts yet</h1><p>Move the Claude accounts saved on a connected machine to this server. Run it on a machine you connected with this Google account.</p>{}<p class="hint">Machines an operator registered on the server host belong to a separate server user, so their accounts do not show here.</p>"#,
+            r#"<div class="panel hero-empty"><h1 id="answer-title">No server accounts yet</h1><p>Move the Claude accounts saved on a connected machine to this server. Run it on a machine you connected with this Google account.</p>{}<p class="hint">Machines an operator registered on the server host belong to a separate server user, so their accounts do not show here.</p></div>"#,
             command(
                 "cmd-migrate",
                 "claudectl server migrate --all --exclusive-owner"
@@ -187,8 +198,20 @@ fn answer(accounts: &[Account], names: &[String], now: i64) -> String {
         0 => String::new(),
         n => format!(" ({n} more may bill)"),
     };
-    let count = format!(
-        r#"<p class="context">{room} of {} accounts have room{more}. Usage as the server last observed it; this page refreshes every 60 seconds.</p>"#,
+    let total_resets = accounts
+        .iter()
+        .filter(|a| !a.usage_stale)
+        .fold(0_u64, |sum, a| sum.saturating_add(a.usable_resets));
+    let resets_stat = if total_resets == 0 {
+        String::new()
+    } else {
+        let plural = if total_resets == 1 { "" } else { "s" };
+        format!(
+            r#"<span class="sep" aria-hidden="true">·</span><span class="hero-resets-stat">{total_resets} reset{plural} available</span>"#
+        )
+    };
+    let summary_bar = format!(
+        r#"<div class="hero-meta"><span>{room} of {} accounts have room{more}</span>{resets_stat}</div><p class="hero-foot">Usage as the server last observed it; this page refreshes every 60 seconds.</p>"#,
         accounts.len()
     );
     let candidates: Vec<_> = accounts.iter().map(Account::candidate).collect();
@@ -204,7 +227,7 @@ fn answer(accounts: &[Account], names: &[String], now: i64) -> String {
             .collect();
         if let Some(i) = crate::accounts::best(&may_bill) {
             return format!(
-                r#"<h1 id="answer-title">No account without billing has room</h1>{count}<p class="next-step">{} has room but may use extra usage billing, so it is never picked automatically.</p>{}"#,
+                r#"<div class="panel hero-card"><div class="hero-main"><div class="hero-heading"><h1 id="answer-title">No account without billing has room</h1></div><p class="hero-meta">{} has room but may use extra usage billing, so it is never picked automatically.</p>{summary_bar}</div><div class="hero-side">{}</div></div>"#,
                 escape(&names[i]),
                 command(
                     "cmd-run",
@@ -213,7 +236,7 @@ fn answer(accounts: &[Account], names: &[String], now: i64) -> String {
             );
         }
         return format!(
-            r#"<h1 id="answer-title">No account can be picked automatically</h1>{count}<p class="next-step">Automatic picks require fresh included usage and more than 5% weekly room. The table below shows the latest limits.</p>"#
+            r#"<div class="panel hero-card"><div class="hero-main"><div class="hero-heading"><h1 id="answer-title">No account can be picked automatically</h1></div><p class="hero-meta">Automatic picks require fresh included usage and more than 5% weekly room. The table below shows the latest limits.</p>{summary_bar}</div></div>"#
         );
     };
     let a = &accounts[best];
@@ -229,7 +252,7 @@ fn answer(accounts: &[Account], names: &[String], now: i64) -> String {
         .map(|at| format!(", 5h resets {}", crate::accounts::until(at, now)))
         .unwrap_or_default();
     format!(
-        r#"<h1 id="answer-title">Use {name}</h1><p class="next-step">{} of the 5-hour window and {} of the week left{next}.</p>{}{count}"#,
+        r#"<div class="panel hero-card"><div class="hero-main"><div class="hero-heading"><h1 id="answer-title">Use {name}</h1><span class="hero-meta">{} of the 5-hour window and {} of the week left{next}.</span></div>{summary_bar}</div><div class="hero-side">{}</div></div>"#,
         left(five),
         left(a.window("week")),
         command(
@@ -238,12 +261,79 @@ fn answer(accounts: &[Account], names: &[String], now: i64) -> String {
         ),
     )
 }
+fn resets_cell(a: &Account, offers: &[crate::limit_resets::Offer], now: i64) -> String {
+    if offers.is_empty() {
+        return r#"<span class="cell-label" aria-hidden="true">Resets</span><span class="offers-empty" aria-label="No reset offers">—</span>"#.into();
+    }
+    let total = a
+        .limit_reset_offers
+        .as_ref()
+        .map(|o| o.count(now))
+        .unwrap_or(0);
+    let plural = if total == 1 { "" } else { "s" };
+    let old = if a.usage_stale { " (old data)" } else { "" };
+    let pill_label = if a.usage_stale {
+        format!("{total} reset{plural} · old")
+    } else if a.usable_resets == 0 {
+        format!("{total} reset{plural} · unavailable")
+    } else if a.usable_resets < total {
+        format!("{} of {total} resets", a.usable_resets)
+    } else {
+        format!("{total} reset{plural}")
+    };
+    let items = offers
+        .iter()
+        .map(|offer| {
+            format!(
+                r#"<li class="offer-item">{}</li>"#,
+                escape(&offer.summary(now))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let hint = escape(crate::limit_resets::HINT);
+    format!(
+        r#"<span class="cell-label" aria-hidden="true">Resets</span><details class="popover-menu offers-menu"><summary class="offer-pill"><span>{pill_label}</span>{CHEVRON_ICON}</summary><div class="popover offers-popover"><div class="popover-head"><span>Limit resets{old}:</span><span>{total}</span></div><ul class="offer-list">{items}</ul><p class="popover-hint">{hint}</p></div></details>"#
+    )
+}
+fn reset_control(
+    snapshot: &Snapshot,
+    account: &Account,
+    short_name: &str,
+    offers: &[crate::limit_resets::Offer],
+    now: i64,
+) -> String {
+    if !snapshot.browser_resets {
+        return String::new();
+    }
+    let Some(_grant) = &account.reset_grant else {
+        return r#"<button class="button small ghost" type="button" disabled title="No eligible reset offer">Reset</button>"#.into();
+    };
+    let offer_detail = account
+        .reset_offer_summary
+        .clone()
+        .or_else(|| offers.first().map(|o| o.summary(now)))
+        .unwrap_or_else(|| "Uses the earliest expiring eligible reset for this account.".into());
+    format!(
+        r#"<details class="popover-menu confirm-menu"><summary class="button small">Reset</summary><div class="popover confirm-popover"><div class="popover-head"><span>Reset {}?</span></div><p class="confirm-copy">{}</p><div class="confirm-actions"><button class="button small ghost" type="button" data-close-details>Cancel</button><form class="action" method="post" action="/accounts/reset"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="account" value="{}"><button class="button small primary" type="submit">Apply reset</button></form></div></div></details>"#,
+        escape(short_name),
+        escape(&offer_detail),
+        escape(&snapshot.csrf),
+        escape(&account.id),
+    )
+}
 fn ledger(snapshot: &Snapshot, names: &[String], now: i64) -> String {
     let accounts = &snapshot.accounts;
     if accounts.is_empty() {
         return String::new();
     }
     let show_fable = accounts.iter().any(|a| a.window("Fable").is_some());
+    let show_resets = snapshot.browser_resets
+        || accounts.iter().any(|a| {
+            a.limit_reset_offers
+                .as_ref()
+                .is_some_and(|o| !o.active(now).is_empty())
+        });
     let candidates: Vec<_> = accounts.iter().map(Account::candidate).collect();
     let best = crate::accounts::best(&candidates);
     let mut order: Vec<usize> = (0..accounts.len()).collect();
@@ -267,6 +357,7 @@ fn ledger(snapshot: &Snapshot, names: &[String], now: i64) -> String {
     let mut rows = String::new();
     for i in order {
         let a = &accounts[i];
+        let is_best = Some(i) == best;
         let (class, state) = a.state();
         let fable = if show_fable {
             let cell = a
@@ -281,50 +372,40 @@ fn ledger(snapshot: &Snapshot, names: &[String], now: i64) -> String {
         let note = if note.is_empty() {
             String::new()
         } else {
-            format!(r#"<span class="note">{note}</span>"#)
+            format!(r#"<span class="badge-note">{note}</span>"#)
+        };
+        let next_badge = if is_best {
+            r#"<span class="badge-next">Next</span>"#
+        } else {
+            ""
         };
         let offers = a
             .limit_reset_offers
             .as_ref()
             .map(|offers| offers.active(now))
             .unwrap_or_default();
-        let reset_note = if offers.is_empty() {
-            String::new()
-        } else {
-            let old = if a.usage_stale { " (old data)" } else { "" };
-            let summaries = offers
-                .iter()
-                .map(|offer| escape(&offer.summary(now)))
-                .collect::<Vec<_>>()
-                .join("; ");
+        let resets_col = if show_resets {
             format!(
-                r#"<span class="note">Limit resets{old}: {summaries}</span><span class="note">{}</span>"#,
-                escape(crate::limit_resets::HINT)
+                r#"<td role="cell" class="cell-resets">{}</td>"#,
+                resets_cell(a, &offers, now)
             )
+        } else {
+            String::new()
         };
+        let row_class = match (is_best, a.usage_stale) {
+            (true, true) => "recommended stale",
+            (true, false) => "recommended",
+            (false, true) => "stale",
+            (false, false) => "",
+        };
+        let reset_btn = reset_control(snapshot, a, &names[i], &offers, now);
         rows += &format!(
-            r#"<tr role="row" class="{}"><td role="cell" class="cell-account"><div class="account-name"><strong translate="no">{}</strong>{note}{reset_note}<a class="manage" href="/accounts/manage?account={}">Manage</a>{}</div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td>{fable}<td role="cell" class="cell-state"><div class="status"><span class="state {class}">{state}</span><span class="status-detail">{}</span></div></td></tr>"#,
-            if a.usage_stale { "stale" } else { "" },
+            r#"<tr role="row" class="{row_class}"><td role="cell" class="cell-account"><div class="account-cell"><div class="account-title"><strong translate="no">{}</strong>{next_badge}</div>{note}</div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td>{fable}{resets_col}<td role="cell" class="cell-state"><div class="status"><span class="state {class}">{state}</span><span class="status-detail">{}</span></div></td><td role="cell" class="cell-actions"><div class="row-actions">{reset_btn}<a class="button small ghost" href="/accounts/manage?account={}">Manage</a></div></td></tr>"#,
             escape(&names[i]),
-            escape(&a.id),
-            if snapshot.browser_resets {
-                match &a.reset_grant {
-                    Some(_grant) => format!(
-                        r#"<form class="action" method="post" action="/accounts/reset"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="account" value="{}"><button class="link-button" type="submit">Apply reset</button></form>"#,
-                        escape(&snapshot.csrf),
-                        escape(&a.id),
-                    ),
-                    None => {
-                        r#"<button class="link-button" type="button" disabled>Apply reset</button>"#
-                            .into()
-                    }
-                }
-            } else {
-                String::new()
-            },
             window(a.window("5h"), "5-hour", now),
             window(a.window("week"), "7-day", now),
-            observed(a, now)
+            observed(a, now),
+            escape(&a.id),
         );
     }
     let fable_head = if show_fable {
@@ -332,15 +413,20 @@ fn ledger(snapshot: &Snapshot, names: &[String], now: i64) -> String {
     } else {
         ""
     };
+    let resets_head = if show_resets {
+        r#"<th scope="col" class="col-resets">Resets</th>"#
+    } else {
+        ""
+    };
     format!(
-        r#"<section class="section" aria-labelledby="accounts-title"><div class="section-head"><h2 id="accounts-title">Accounts <span class="count">{}</span></h2><a class="button small" href="/accounts/add">Add account</a></div><table class="ledger" role="table" aria-labelledby="accounts-title"><thead role="rowgroup"><tr role="row"><th scope="col">Account</th><th scope="col" class="col-usage">5-hour window</th><th scope="col" class="col-usage">7-day window</th>{fable_head}<th scope="col" class="col-state">State</th></tr></thead><tbody role="rowgroup">{rows}</tbody></table></section>"#,
+        r#"<section class="section" aria-labelledby="accounts-title"><div class="section-head"><h2 id="accounts-title">Accounts <span class="count">{}</span></h2><a class="button small" href="/accounts/add">Add account</a></div><div class="panel ledger-panel"><table class="ledger" role="table" aria-labelledby="accounts-title"><thead role="rowgroup"><tr role="row"><th scope="col" class="col-account">Account</th><th scope="col" class="col-usage">5-hour window</th><th scope="col" class="col-usage">7-day window</th>{fable_head}{resets_head}<th scope="col" class="col-state">State</th><th scope="col" class="col-actions">Actions</th></tr></thead><tbody role="rowgroup">{rows}</tbody></table></div></section>"#,
         accounts.len()
     )
 }
 /// A one-button POST form with this session's token.
 fn action(path: &str, field: &str, value: &str, csrf: &str, label: &str) -> String {
     format!(
-        r#"<form class="action" method="post" action="{path}"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="{field}" value="{}"><button class="link-button" type="submit">{label}</button></form>"#,
+        r#"<form class="action" method="post" action="{path}"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="{field}" value="{}"><button class="button small ghost" type="submit">{label}</button></form>"#,
         escape(csrf),
         escape(value)
     )
@@ -364,7 +450,7 @@ fn machines(snapshot: &Snapshot) -> String {
         }
         count += 1;
         rows += &format!(
-            r#"<tr role="row"><td role="cell">{}</td><td role="cell" class="cell-account"><span class="alias" translate="no">{}</span></td><td role="cell" class="cell-state"><div class="status"><span class="state ok">Connected</span><span class="status-detail">{}</span></div>{}</td></tr>"#,
+            r#"<tr role="row"><td role="cell">{}</td><td role="cell" class="cell-machine-id"><span class="alias" translate="no">{}</span></td><td role="cell" class="cell-state"><div class="status"><span class="state ok">Connected</span><span class="status-detail">{}</span></div></td><td role="cell" class="cell-actions">{}</td></tr>"#,
             escape(name),
             escape(suffix),
             match m.last_seen_at {
@@ -394,7 +480,7 @@ fn machines(snapshot: &Snapshot) -> String {
         ""
     };
     format!(
-        r#"<section class="section" aria-labelledby="machines-title"><div class="section-head"><h2 id="machines-title">Machines <span class="count">{count}</span></h2><p>Machines that receive access tokens for your accounts</p></div><table class="machines" role="table" aria-labelledby="machines-title"><thead role="rowgroup"><tr role="row"><th scope="col">Machine</th><th scope="col">ID</th><th scope="col" class="col-state">State</th></tr></thead><tbody role="rowgroup">{rows}</tbody></table>{empty}{disclosure}</section>"#
+        r#"<section class="section" aria-labelledby="machines-title"><div class="section-head"><h2 id="machines-title">Machines <span class="count">{count}</span></h2><p>Machines that receive access tokens for your accounts</p></div><div class="panel"><table class="machines" role="table" aria-labelledby="machines-title"><thead role="rowgroup"><tr role="row"><th scope="col">Machine</th><th scope="col">ID</th><th scope="col" class="col-state">State</th><th scope="col" class="col-actions">Actions</th></tr></thead><tbody role="rowgroup">{rows}</tbody></table>{empty}</div>{disclosure}</section>"#
     )
 }
 
@@ -424,7 +510,7 @@ pub(super) fn overview(snapshot: &Snapshot) -> String {
 /// An action page: the top bar and one main column, never auto-refreshed.
 fn frame(email: &str, title: &str, content: &str) -> String {
     format!(
-        r#"<div id="action"><header class="topbar"><div class="wrap topbar-inner"><a class="wordmark" href="/accounts" translate="no" aria-label="claudectl accounts">claudectl<span class="caret" aria-hidden="true"></span></a><div class="identity"><span class="email" translate="no">{}</span></div></div></header><main id="main" class="wrap"><p><a href="/accounts">Back to accounts</a></p><section class="action-page"><h1>{title}</h1>{content}</section></main></div>"#,
+        r#"<div id="action"><header class="topbar"><div class="wrap topbar-inner"><a class="wordmark" href="/accounts" translate="no" aria-label="claudectl accounts">{WORDMARK_ICON}<span>claudectl</span></a><div class="identity"><span class="email" translate="no">{}</span></div></div></header><main id="main" class="wrap"><div class="action-shell"><a class="back-link" href="/accounts">{BACK_ICON}<span>Back to accounts</span></a><section class="action-page panel"><h1>{title}</h1>{content}</section></div></main></div>"#,
         escape(email)
     )
 }
@@ -440,7 +526,7 @@ pub(super) fn add_page(email: &str, csrf: &str) -> String {
         email,
         "Add a Claude account",
         &format!(
-            r#"<p>Name the account (for example amir8), then sign in to Claude with it.</p><form class="form" method="post" action="/accounts/add">{}<label for="alias">Account name</label><input id="alias" name="alias" required maxlength="64" autocomplete="off" spellcheck="false"><button class="button primary" type="submit">Continue to Claude sign-in</button></form>"#,
+            r#"<p>Name the account (for example amir8), then sign in to Claude with it.</p><form class="form" method="post" action="/accounts/add">{}<label for="alias">Account name</label><input id="alias" name="alias" required maxlength="64" autocomplete="off" spellcheck="false" placeholder="amir8"><button class="button primary" type="submit">Continue to Claude sign-in</button></form>"#,
             csrf_field(csrf)
         ),
     )
@@ -461,7 +547,7 @@ pub(super) fn manage_page(
         email,
         &escape(alias),
         &format!(
-            r#"<h2>Renew</h2><p>Sign in to Claude with this account again. Use it when its login needs attention.</p><form class="form" method="post" action="/accounts/renew">{csrf}<input type="hidden" name="account" value="{id}"><button class="button" type="submit">Renew the sign-in</button></form><h2>Remove</h2><p>{who} the accounts of this server. After the removal, running sessions on this account stop at their next token renewal.</p><form class="form" method="post" action="/accounts/remove">{csrf}<input type="hidden" name="account" value="{id}"><label for="confirm">Type <strong translate="no">{alias}</strong> to remove it</label><input id="confirm" name="confirm" required autocomplete="off" spellcheck="false"><button class="button" type="submit">Remove the account</button></form>"#,
+            r#"<div class="action-block"><h2>Renew sign-in</h2><p>Sign in to Claude with this account again. Use it when its login needs attention.</p><form class="form" method="post" action="/accounts/renew">{csrf}<input type="hidden" name="account" value="{id}"><button class="button" type="submit">Renew the sign-in</button></form></div><div class="action-block danger-zone"><h2>Remove account</h2><p>{who} the accounts of this server. After the removal, running sessions on this account stop at their next token renewal.</p><form class="form" method="post" action="/accounts/remove">{csrf}<input type="hidden" name="account" value="{id}"><label for="confirm">Type <strong translate="no">{alias}</strong> to remove it</label><input id="confirm" name="confirm" required autocomplete="off" spellcheck="false"><button class="button danger" type="submit">Remove the account</button></form></div>"#,
             csrf = csrf_field(csrf),
             id = escape(id),
             alias = escape(alias),
@@ -532,7 +618,9 @@ mod tests {
                 },
             ],
             limit_reset_offers: None,
+            usable_resets: 0,
             reset_grant: None,
+            reset_offer_summary: None,
             observed_at: Some(NOW - 30),
             usage_stale: false,
             billed: false,
@@ -577,21 +665,94 @@ mod tests {
     }
 
     #[test]
-    fn browser_reset_button_is_enabled_only_for_a_qualifying_offer() {
+    fn browser_reset_uses_inline_confirmation_only_for_a_qualifying_offer() {
         let mut eligible = account("amir5", Some(100.0), Some(30.0));
-        eligible.reset_grant = Some("grant-1".into());
+        eligible.reset_grant = Some("available".into());
+        eligible.reset_offer_summary =
+            Some("1 reset · weekly + Fable weekly · use by 2099-12-10 22:00 UTC".into());
         let mut snapshot = snapshot(
             vec![eligible, account("amir6", Some(20.0), Some(30.0))],
             vec![],
         );
         snapshot.browser_resets = true;
         let html = overview(&snapshot);
-        assert_eq!(html.matches("Apply reset").count(), 2, "{html}");
-        assert!(html.contains(r#"action="/accounts/reset""#), "{html}");
-        assert!(
-            html.contains(r#"type="button" disabled>Apply reset"#),
+        assert_eq!(
+            html.matches(r#"action="/accounts/reset""#).count(),
+            1,
             "{html}"
         );
+        assert!(html.contains("Reset amir5?"), "{html}");
+        assert!(
+            html.contains("1 reset · weekly + Fable weekly · use by 2099-12-10 22:00 UTC"),
+            "{html}"
+        );
+        assert!(html.contains(">Apply reset</button>"), "{html}");
+        assert!(
+            html.contains(
+                r#"type="button" disabled title="No eligible reset offer">Reset</button>"#
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn resets_column_aggregates_offers_and_shows_summary_in_hero() {
+        let mut a = account("amir3", Some(0.0), Some(100.0));
+        a.usable_resets = 2;
+        a.limit_reset_offers = Some(
+            serde_json::from_value(serde_json::json!({
+                "eligible": true,
+                "grants": [
+                    {
+                        "id": "g1",
+                        "resets_left": 1,
+                        "clears": ["seven_day", "seven_day_overage_included"],
+                        "ends_at": "2099-12-10T22:00:00Z"
+                    },
+                    {
+                        "id": "g2",
+                        "resets_left": 1,
+                        "clears": ["seven_day_overage_included"],
+                        "gives_back_weekly": true,
+                        "ends_at": "2100-03-09T07:59:00Z"
+                    }
+                ]
+            }))
+            .unwrap(),
+        );
+        let mut paused = account("amir4", Some(0.0), Some(100.0));
+        paused.usable_resets = 0;
+        paused.limit_reset_offers = Some(
+            serde_json::from_value(serde_json::json!({
+                "eligible": true,
+                "grants": [{
+                    "id": "g3",
+                    "resets_left": 1,
+                    "clears": ["seven_day"],
+                    "paused": true,
+                    "ends_at": "2099-12-10T22:00:00Z"
+                }]
+            }))
+            .unwrap(),
+        );
+        let mut stale = account("amir5", Some(0.0), Some(100.0));
+        stale.usage_stale = true;
+        stale.usable_resets = 2;
+        stale.limit_reset_offers = a.limit_reset_offers.clone();
+        let html = overview(&snapshot(vec![a, paused, stale], vec![]));
+        assert!(html.contains("2 resets available"), "{html}");
+        assert!(
+            html.contains(r#"<th scope="col" class="col-resets">Resets</th>"#),
+            "{html}"
+        );
+        assert!(html.contains("<span>2 resets</span>"), "{html}");
+        assert!(
+            html.contains("<span>1 reset · unavailable</span>"),
+            "{html}"
+        );
+        assert!(html.contains("<span>2 resets · old</span>"), "{html}");
+        assert!(html.contains("paused"), "{html}");
+        assert!(html.contains("Week limit"), "{html}");
     }
 
     #[test]

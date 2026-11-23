@@ -6,19 +6,49 @@
         href="/accounts"
         translate="no"
         aria-label="claudectl accounts"
-        >claudectl<span class="caret" aria-hidden="true"></span
-      ></a>
+        ><svg
+          class="wordmark-icon"
+          viewBox="0 0 16 16"
+          width="15"
+          height="15"
+          fill="none"
+          aria-hidden="true"
+        >
+          <rect
+            x="1.5"
+            y="2.5"
+            width="13"
+            height="11"
+            rx="2.5"
+            stroke="currentColor"
+            stroke-width="1.4"
+          />
+          <path
+            d="M4.75 6.25L7 8.25L4.75 10.25M8.5 10.25H11.25"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          /></svg
+        ><span>claudectl</span></a
+      >
       <div class="identity" id="browser-identity">
         <span class="email" translate="no" id="identity-email">{email}</span>
         <form action="/accounts/sign-out" method="post">
-          <button class="link-button" type="submit">Sign out</button>
+          <button class="button small ghost" type="submit">Sign out</button>
         </form>
       </div>
     </div>
   </header>
   <main id="main" class="wrap">
     <div class="lead">
-      <section class="answer" id="answer-current">{answer}</section>
+      <section
+        class="answer"
+        id="answer-current"
+        aria-labelledby="answer-title"
+      >
+        {answer}
+      </section>
     </div>
     <p
       id="copy-status"
