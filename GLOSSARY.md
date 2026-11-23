@@ -9,7 +9,9 @@ access changes.
 ### People and machines
 
 **Company user**:
-A person identified by their company's sign-in on the account server.
+A person known to the account server by their company email, usually through
+company sign-in. An operator on the server host can also register them without
+sign-in.
 
 **Machine**:
 An identity authorized to obtain access tokens from the account server for a
