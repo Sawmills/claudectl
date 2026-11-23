@@ -1197,13 +1197,7 @@ impl Monitor {
         // A fresh read, not this machine's copy: only a current full window is a limit.
         let usage = self.client.usage(&self.account_id, false).ok()?;
         let confirmation = failover::confirm(&usage, failed_at);
-        gate.confirm_weekly_limit(
-            inputs.idle,
-            match confirmation {
-                Confirm::Limit { weekly_until } => weekly_until,
-                _ => None,
-            },
-        );
+        gate.confirm_weekly_limit(inputs.idle, &confirmation);
         if !gate.check(
             inputs.idle,
             super::restart_gate::Cause::Failover,
