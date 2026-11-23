@@ -9,9 +9,11 @@ access changes.
 ### People and machines
 
 **Company user**:
-A person who signs in to the account server with their company sign-in. The
-server keys the user by the sign-in identity and checks the company email
-against the allow list.
+A person known to the account server. A user who signs in with company sign-in
+(SSO) is keyed by the SSO issuer and subject, and the server checks the company
+email against the allow list. An operator on the server host can also register
+a user by email without SSO; the server then derives the user ID from the
+lowercased email.
 
 **Machine**:
 An identity authorized to obtain access tokens from the account server for a
