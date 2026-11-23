@@ -12,7 +12,9 @@ access changes.
 A person identified by their company's sign-in on the account server.
 
 **Machine**:
-A computer enrolled with the account server to use a company user's accounts.
+An identity authorized to obtain access tokens from the account server for a
+company user. It represents an enrolled computer or a shared credential that
+lets unattended jobs connect directly.
 
 **Account server**:
 The service that holds Claude refresh credentials and supplies access tokens to
@@ -29,12 +31,13 @@ A name assigned to a profile or server account.
 _Avoid_: account name alone
 
 **Profile**:
-A Claude login saved under an alias on one machine.
+A local record of a Claude login saved under an alias. It can remain after
+migration retires its usable credentials.
 _Avoid_: local account
 
 **Active profile**:
-The profile selected as the machine's live local Claude Code login. Claude Code
-manages refresh for that login.
+The local profile from the last activation recorded by claudectl. A direct
+Claude Code sign-in can change the live login independently of that record.
 
 **Server account**:
 A Claude login held on the account server under one company user and alias.
@@ -42,11 +45,13 @@ Machines enrolled by that user can use the account.
 _Avoid_: remote profile
 
 **Default server account**:
-The server account selected for new ordinary Claude Code launches on a machine.
+The server account selected for plain Claude Code launches when the shell finds
+claudectl's configured launcher first in its search path.
 
 **Migration**:
-Moving a local profile onto the account server so the server takes over
-refreshing the login.
+Transferring ownership of a local profile's Claude credentials to the account
+server. The machine keeps the profile record after retiring its usable
+credentials.
 
 **Login renewal**:
 A new Claude sign-in that gives an existing server account fresh credentials for
@@ -65,9 +70,10 @@ The percentage of the weekly usage allowance still available.
 Usage beyond the included Claude allowance that can incur charges when enabled.
 
 **Eligible account**:
-An account that can be chosen automatically. It has current usage data, room
-within its limits, more than five percent weekly headroom, and extra usage
-confirmed off.
+An account claudectl can choose automatically because it has current usage
+data, room within its limits, more than five percent weekly headroom, and
+extra usage confirmed off. A local profile also needs a known subscription
+plan.
 
 **Limit-reset offer**:
 A provider offer that can restore capacity for specified usage limits before
@@ -88,5 +94,6 @@ A restart that attempts to resume an interactive session on another eligible
 server account after a confirmed usage limit.
 
 **Production hold**:
-A user-declared hold on a running Claude Code session that defers its automatic
-restarts until the hold ends.
+A hold that defers automatic restarts for one supervised Claude Code run on a
+server account until the user ends it. The request comes from within the run
+and uses that run's identity.
