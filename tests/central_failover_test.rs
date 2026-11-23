@@ -821,39 +821,6 @@ fn weekly_limit_evidence_must_survive_target_reads() {
 }
 
 #[test]
-fn a_weekly_limit_message_cannot_replace_current_account_evidence() {
-    for invalid in [
-        "stale",
-        "error",
-        "reset_passed",
-        "reset_missing",
-        "cache_expired",
-        "room",
-    ] {
-        let mut usage = current_weekly_limit_cache();
-        match invalid {
-            "stale" => usage["stale"] = true.into(),
-            "error" => usage["error"] = "usage_unavailable".into(),
-            "reset_passed" => {
-                usage["data"]["seven_day"]["resets_at"] = (chrono::Utc::now()
-                    - chrono::Duration::hours(1))
-                .to_rfc3339()
-                .into()
-            }
-            "reset_missing" => usage["data"]["seven_day"]["resets_at"] = Value::Null,
-            "cache_expired" => usage["next_retry_at"] = 0.into(),
-            "room" => usage["data"]["seven_day"]["utilization"] = 10.0.into(),
-            _ => unreachable!(),
-        }
-        let mut env = Env::new();
-        env.limit_crons = true;
-        env.fake.lock().unwrap().post_start_usage = Some(usage);
-        let output = env.run(&["run", "work", "--failover"], "3");
-        assert_deferred(&env, &output, "failover");
-    }
-}
-
-#[test]
 fn deferred_limit_turns_leave_timestamps_after_run_cleanup() {
     let mut env = Env::new();
     env.limit_crons = true;

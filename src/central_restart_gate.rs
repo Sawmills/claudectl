@@ -732,7 +732,15 @@ impl Gate {
         self.check_at_mode(idle, Cause::Failover, held_expires_at, Instant::now(), true)
     }
 
-    pub(super) fn confirm_weekly_limit(&mut self, idle: &super::renew::Idle, until: Option<i64>) {
+    pub(super) fn confirm_weekly_limit(
+        &mut self,
+        idle: &super::renew::Idle,
+        confirmation: &super::failover::Confirm,
+    ) {
+        let until = match confirmation {
+            super::failover::Confirm::Limit { weekly_until } => *weekly_until,
+            _ => None,
+        };
         self.weekly_limit = idle.limited.as_ref().and_then(|(session, failed_at)| {
             until.map(|until| WeeklyLimit {
                 session: session.clone(),
@@ -865,7 +873,7 @@ impl Gate {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound
         );
         let held = hold_reason(&self.home, &self.directory);
-        let pending = hook_pending(&self.directory);
+        let pending = hook_pending(&self.directory, process_live);
         let pending_reason = match pending {
             Ok(Some(_)) => Some(Reason::QueuedHook),
             Ok(None) => None,
@@ -1221,7 +1229,7 @@ fn hold_reason(home: &Path, directory: &Path) -> Result<Option<Reason>> {
     ))
 }
 
-fn hook_pending(directory: &Path) -> Result<Option<u32>> {
+fn hook_pending(directory: &Path, is_live: impl Fn(u32) -> Result<bool>) -> Result<Option<u32>> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1257,10 +1265,15 @@ fn hook_pending(directory: &Path) -> Result<Option<u32>> {
         if saved != pid {
             bail!("hook pending PID does not match its owner file");
         }
-        if process_live(pid)? {
+        if is_live(pid)? {
             return Ok(Some(pid));
         }
-        std::fs::remove_file(path)?;
+        // A hook can remove its marker and exit between the read and this cleanup.
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error.into());
+        }
     }
     Ok(None)
 }
@@ -1919,7 +1932,11 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let dir = home.path().join(".claudectl/server/sessions/run-gate");
         private_dir(&dir).unwrap();
-        let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let child = Command::new("/bin/sh")
+            .args(["-c", "read -r _"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
         let gate = Gate::new(home.path(), &dir, child.id(), "work");
         let idle = super::super::renew::Idle {
             session: Some("same-session".into()),
@@ -1927,6 +1944,130 @@ mod tests {
             ..Default::default()
         };
         (Fixture { _home: home, child }, gate, idle)
+    }
+
+    #[test]
+    fn a_weekly_limit_message_cannot_replace_current_account_evidence() {
+        use super::super::{Usage, failover, renew};
+
+        let failed_at = 1_800_000_000_000;
+        let sampled_at = failed_at + 1_000;
+        let poll_at = sampled_at + 300_000;
+        let iso_time = |at| {
+            chrono::DateTime::from_timestamp_millis(at)
+                .unwrap()
+                .to_rfc3339()
+        };
+        let fresh_cache = json!({
+            "data": {
+                "five_hour": {"utilization": 0.0},
+                "seven_day": {"utilization": 100.0, "resets_at": iso_time(sampled_at + 3_600_000)},
+                "extra_usage": {"is_enabled": false}
+            },
+            "observed_at": failed_at - 1_000,
+            "next_retry_at": poll_at,
+            "stale": false,
+            "error": null
+        });
+        let validate = |usage| {
+            let usage: Usage = serde_json::from_value(usage).unwrap();
+            failover::confirm_with_clock(&usage, failed_at, || sampled_at)
+        };
+        assert_eq!(
+            validate(fresh_cache.clone()),
+            failover::Confirm::Limit {
+                weekly_until: Some(poll_at)
+            },
+            "a full, current weekly cache is an eligible positive control"
+        );
+
+        for (case, pointer, value) in [
+            ("stale", "/stale", json!(true)),
+            ("provider error", "/error", json!("usage_unavailable")),
+            (
+                "reset reached",
+                "/data/seven_day/resets_at",
+                json!(iso_time(sampled_at)),
+            ),
+            ("missing reset", "/data/seven_day/resets_at", Value::Null),
+            ("cache expired", "/next_retry_at", json!(sampled_at)),
+            ("room left", "/data/seven_day/utilization", json!(10.0)),
+        ] {
+            let mut usage = fresh_cache.clone();
+            *usage.pointer_mut(pointer).unwrap() = value;
+            let confirmation = validate(usage);
+            assert_eq!(confirmation, failover::Confirm::NotYet, "{case}");
+
+            let (_fixture, mut gate, _) = setup();
+            let directory = &gate.directory;
+            for (at, event) in [
+                (
+                    failed_at - 2,
+                    json!({"hook_event_name":"SessionStart","session_id":"s"}),
+                ),
+                (
+                    failed_at - 1,
+                    json!({"hook_event_name":"UserPromptSubmit","session_id":"s"}),
+                ),
+                (
+                    failed_at,
+                    json!({"hook_event_name":"StopFailure","session_id":"s",
+                    "error":"rate_limit","error_details":"You've hit your weekly limit · resets 9pm"}),
+                ),
+            ] {
+                renew::record_hook(
+                    directory.parent().unwrap(),
+                    directory,
+                    &event.to_string(),
+                    at,
+                )
+                .unwrap();
+            }
+            let events = std::fs::read_to_string(directory.join("events")).unwrap();
+            let mut idle = renew::Idle::default();
+            renew::fold(&mut idle, &renew::parse_events(&events));
+            assert_eq!(idle.limited, Some(("s".into(), failed_at)));
+            let pending = directory.join(format!("hook-pending.{}", std::process::id()));
+            let status_path = directory.join("restart-status.json");
+            gate.confirm_weekly_limit(&idle, &confirmation);
+
+            let assert_blocked = |gate: &mut Gate, at, reason: &str| {
+                assert!(
+                    !gate.check_at(&idle, Cause::Failover, i64::MAX, at),
+                    "{case}"
+                );
+                let status: Value =
+                    serde_json::from_slice(&private_read(&status_path).unwrap()).unwrap();
+                assert_eq!(status["reason"], reason, "{case}");
+                assert_eq!(status["cause"], "failover", "{case}");
+            };
+            let start = Instant::now();
+            assert_blocked(&mut gate, start, "quiet_window");
+
+            // Sample the queued intent and the new quiet window after it clears.
+            atomic(&pending, &json!({"pid": std::process::id()})).unwrap();
+            let next = start + QUIET_WINDOW;
+            assert_blocked(&mut gate, next, "queued_hook");
+            std::fs::remove_file(&pending).unwrap();
+            assert_blocked(&mut gate, next, "quiet_window");
+
+            // Malformed hook evidence also blocks and resets observed quiet.
+            atomic(&pending, &json!({"pid": 0})).unwrap();
+            let invalid_at = next + QUIET_WINDOW;
+            assert_blocked(&mut gate, invalid_at, "evidence_unknown");
+            std::fs::remove_file(pending).unwrap();
+            assert_blocked(&mut gate, invalid_at, "quiet_window");
+            let quiet_at = invalid_at + QUIET_WINDOW;
+            assert_blocked(
+                &mut gate,
+                quiet_at - Duration::from_millis(1),
+                "quiet_window",
+            );
+            assert!(
+                gate.check_at(&idle, Cause::Failover, i64::MAX, quiet_at),
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -2776,6 +2917,22 @@ mod tests {
         atomic(&pending, &json!({"pid": pid})).unwrap();
         assert!(!gate.check(&idle, Cause::Renewal, now() + 600_000));
         assert!(!pending.exists());
+    }
+
+    #[test]
+    fn a_hook_that_finishes_during_the_scan_is_no_longer_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let marker = directory.path().join(format!("hook-pending.{pid}"));
+        atomic(&marker, &json!({"pid": pid})).unwrap();
+
+        let pending = hook_pending(directory.path(), |observed| {
+            assert_eq!(observed, pid);
+            // The owner finishes after the scanner read the marker but before cleanup.
+            std::fs::remove_file(&marker).unwrap();
+            Ok(false)
+        });
+        assert_eq!(pending.unwrap(), None);
     }
 
     #[test]

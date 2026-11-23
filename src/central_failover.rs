@@ -18,6 +18,14 @@ pub(super) enum Confirm {
 
 /// Whether `usage` confirms the limit a turn hit at `failed_at` (ms).
 pub(super) fn confirm(usage: &Usage, failed_at: i64) -> Confirm {
+    confirm_with_clock(usage, failed_at, now)
+}
+
+pub(super) fn confirm_with_clock(
+    usage: &Usage,
+    failed_at: i64,
+    clock: impl FnOnce() -> i64,
+) -> Confirm {
     let parsed = usage
         .data
         .clone()
@@ -34,7 +42,7 @@ pub(super) fn confirm(usage: &Usage, failed_at: i64) -> Confirm {
         .find(|window| window.name == "week" && window.used >= Some(100.0));
     // The server can return a current full weekly cache until its next poll, even
     // for a live read. Its known reset must still be ahead before trusting older data.
-    let at = now();
+    let at = clock();
     let weekly_until = weekly
         .map(|window| {
             window.resets_at.map_or(usage.next_retry_at, |reset| {
