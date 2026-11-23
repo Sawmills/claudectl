@@ -251,6 +251,39 @@ if mode not in ['no_hooks','hook_error','damaged']: hook('SessionEnd')
 sys.exit(23)
 "#;
 
+fn read_launch_log(path: &Path) -> Vec<Value> {
+    // The poll can see the final record before the child appends its newline.
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .split_inclusive('\n')
+        .take_while(|line| line.ends_with('\n'))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn launch_log_poll_waits_for_a_complete_line() {
+    use std::io::Write;
+
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("claude.log");
+    std::fs::write(&path, b"{\"pid\":1}\n{\"pid\":2").unwrap();
+    assert_eq!(read_launch_log(&path), vec![json!({"pid": 1})]);
+
+    let mut writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writer.write_all(b"}").unwrap();
+    assert_eq!(read_launch_log(&path), vec![json!({"pid": 1})]);
+
+    writer.write_all(b"\n").unwrap();
+    assert_eq!(
+        read_launch_log(&path),
+        vec![json!({"pid": 1}), json!({"pid": 2})]
+    );
+}
+
 struct Fixture {
     home: tempfile::TempDir,
     state: Shared,
@@ -415,11 +448,7 @@ impl Fixture {
         .unwrap()
     }
     fn runs(&self) -> Vec<Value> {
-        std::fs::read_to_string(self.home.path().join("claude.log"))
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
+        read_launch_log(&self.home.path().join("claude.log"))
     }
     fn revoke(&self) {
         let mut fake = self.state.lock().unwrap();
