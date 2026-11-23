@@ -2,20 +2,55 @@
   <header class="topbar">
     <div class="wrap topbar-inner">
       <a class="wordmark" href="/" translate="no"
-        >claudectl<span class="caret" aria-hidden="true"></span
-      ></a>
+        ><svg
+          class="wordmark-icon"
+          viewBox="0 0 16 16"
+          width="15"
+          height="15"
+          fill="none"
+          aria-hidden="true"
+        >
+          <rect
+            x="1.5"
+            y="2.5"
+            width="13"
+            height="11"
+            rx="2.5"
+            stroke="currentColor"
+            stroke-width="1.4"
+          />
+          <path
+            d="M4.75 6.25L7 8.25L4.75 10.25M8.5 10.25H11.25"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          /></svg
+        ><span>claudectl</span></a
+      >
     </div>
   </header>
   <main id="main" class="wrap">
-    <h1>Your accounts could not be loaded</h1>
-    <div class="notice" id="connection" role="status">
-      <p id="connection-text">
-        Retry now, or sign in again. Retrying automatically within 60 seconds.
-      </p>
-      <form action="/accounts" method="get">
-        <button class="button small" id="retry" type="submit">Retry now</button>
-      </form>
+    <div class="action-shell">
+      <section class="action-page panel error-panel">
+        <h1>Your accounts could not be loaded</h1>
+        <div class="notice" id="connection" role="status">
+          <p id="connection-text">
+            Retry now, or sign in again. Retrying automatically within 60
+            seconds.
+          </p>
+          <div class="error-actions">
+            <form action="/accounts" method="get">
+              <button class="button small primary" id="retry" type="submit">
+                Retry now
+              </button>
+            </form>
+            <a class="button small" href="/accounts/sign-in"
+              >Sign in with Google</a
+            >
+          </div>
+        </div>
+      </section>
     </div>
-    <a href="/accounts/sign-in">Sign in with Google</a>
   </main>
 </div>

@@ -127,11 +127,19 @@ async fn snapshot(
             None => Default::default(),
         };
         let observed = windows(&usage);
+        let now_secs = chrono::Utc::now().timestamp();
         let reset_grant = if server.browser_resets_enabled() {
             reset_grant(&usage, observed.limit_reset_offers.as_ref())
         } else {
             None
         };
+        let reset_offer_summary = reset_grant.as_ref().and_then(|_| {
+            usage
+                .reset_offers
+                .first()
+                .map(crate::limit_resets::OfferSummary::summary)
+        });
+        let usable_resets = usable_reset_count(&usage, now_secs);
         accounts.push(Account {
             id: account.account_id.clone(),
             alias: account.alias,
@@ -139,7 +147,9 @@ async fn snapshot(
             migration: account.migration.into(),
             windows: observed.windows,
             limit_reset_offers: observed.limit_reset_offers,
+            usable_resets,
             reset_grant,
+            reset_offer_summary,
             observed_at: usage.observed_at.map(|ms| ms / 1000),
             usage_stale: observed.stale,
             billed: observed.billed,
@@ -551,6 +561,19 @@ struct Observed {
     billed: bool,
 }
 
+/// Count usable resets from the server-sealed `reset_offers` list (already filtered by
+/// canonical window exhaustion, provider grant ID presence, pause/blocking flags, and start time).
+fn usable_reset_count(usage: &crate::server::engine::Usage, now_secs: i64) -> u64 {
+    if usage.stale || usage.selected_offer_expired_at(now_secs) {
+        return 0;
+    }
+    usage
+        .reset_offers
+        .iter()
+        .filter(|o| o.expiry().is_none_or(|at| at > now_secs))
+        .fold(0_u64, |sum, o| sum.saturating_add(o.resets_left))
+}
+
 fn reset_grant(
     usage: &crate::server::engine::Usage,
     offers: Option<&crate::limit_resets::Offers>,
@@ -854,13 +877,16 @@ mod tests {
                 .unwrap();
             String::from_utf8(body.to_vec()).unwrap()
         };
-        assert!(badge(server.clone()).await.contains("Account server ready"));
+        let ready_body = badge(server.clone()).await;
+        assert!(ready_body.contains("Account server ready"), "{ready_body}");
+        assert!(ready_body.contains(r#"class="state ok""#), "{ready_body}");
         // The same signal as /ready: a draining replica is not ready, even with a live store.
         server.begin_drain();
         assert!(!server.ready().await);
         let body = badge(server.clone()).await;
         assert!(body.contains("Account server not ready"), "{body}");
-        assert!(!body.contains(r#"<span class="state ok">"#), "{body}");
+        assert!(body.contains(r#"class="state bad""#), "{body}");
+        assert!(!body.contains(r#"class="state ok""#), "{body}");
     }
 
     #[test]
@@ -1062,41 +1088,144 @@ mod preview {
             used: Some(used),
             resets_at: Some(now + hours * 3600 + 300),
         };
-        let account = |alias: &str, five, week, migration: &str| Account {
-            id: alias.replace('@', "-at-"),
-            alias: alias.into(),
-            available: true,
-            migration: migration.into(),
-            windows: vec![window("5h", five, 2), window("week", week, 142)],
-            limit_reset_offers: None,
-            reset_grant: None,
-            observed_at: Some(now - 42),
-            usage_stale: false,
-            billed: false,
-        };
-        let mut pending = account("amir6@sawmills.ai", 0.0, 0.0, "pending");
-        for w in &mut pending.windows {
-            w.used = None;
-        }
-        pending.observed_at = None;
-        pending.usage_stale = true;
-        let with_fable = |mut a: Account, used: f64| {
-            a.windows.push(Window {
-                name: "Fable",
-                used: Some(used),
-                resets_at: None,
-            });
-            a
-        };
+        let account =
+            |alias: &str, five, week, week_hours, migration: &str, age_secs: i64| Account {
+                id: alias.replace('@', "-at-"),
+                alias: alias.into(),
+                available: true,
+                migration: migration.into(),
+                windows: vec![
+                    Window {
+                        name: "5h",
+                        used: Some(five),
+                        resets_at: if five > 0.0 {
+                            Some(now + 58 * 60)
+                        } else {
+                            None
+                        },
+                    },
+                    window("week", week, week_hours),
+                ],
+                limit_reset_offers: None,
+                usable_resets: 0,
+                reset_grant: None,
+                reset_offer_summary: None,
+                observed_at: Some(now - age_secs),
+                usage_stale: false,
+                billed: false,
+            };
+        let two_offers: crate::limit_resets::Offers = serde_json::from_value(serde_json::json!({
+            "eligible": true,
+            "at_limit": false,
+            "grants": [
+                {
+                    "id": "preview-1",
+                    "resets_left": 1,
+                    "clears": ["seven_day", "seven_day_overage_included"],
+                    "use_requires_limit": false,
+                    "usable_now": true,
+                    "ends_at": "2026-12-10T22:00:00Z"
+                },
+                {
+                    "id": "preview-2",
+                    "resets_left": 1,
+                    "clears": ["seven_day_overage_included"],
+                    "gives_back_weekly": true,
+                    "use_requires_limit": false,
+                    "usable_now": true,
+                    "ends_at": "2027-03-09T07:59:00Z"
+                }
+            ]
+        }))
+        .unwrap();
+        let three_offers: crate::limit_resets::Offers = serde_json::from_value(serde_json::json!({
+            "eligible": true,
+            "at_limit": true,
+            "exhausted": ["seven_day_overage_included"],
+            "grants": [
+                {
+                    "id": "preview-a",
+                    "resets_left": 1,
+                    "clears": ["five_hour", "seven_day", "seven_day_overage_included"],
+                    "use_requires_limit": false,
+                    "usable_now": true,
+                    "ends_at": "2026-12-10T22:00:00Z"
+                },
+                {
+                    "id": "preview-b",
+                    "resets_left": 1,
+                    "clears": ["five_hour", "seven_day_overage_included"],
+                    "gives_back_weekly": true,
+                    "use_requires_limit": false,
+                    "usable_now": true,
+                    "ends_at": "2027-03-09T07:59:00Z"
+                },
+                {
+                    "id": "preview-c",
+                    "resets_left": 1,
+                    "clears": ["five_hour", "seven_day_overage_included"],
+                    "gives_back_weekly": true,
+                    "use_requires_limit": false,
+                    "usable_now": true,
+                    "ends_at": "2027-03-09T07:59:00Z"
+                }
+            ]
+        }))
+        .unwrap();
+        let with_fable_offers =
+            |mut a: Account, fable_used: f64, offers: Option<crate::limit_resets::Offers>| {
+                a.windows.push(Window {
+                    name: "Fable",
+                    used: Some(fable_used),
+                    resets_at: None,
+                });
+                if let Some(ref o) = offers {
+                    a.usable_resets = o.count(now);
+                    a.reset_grant = Some("available".into());
+                    a.reset_offer_summary = o.active(now).first().map(|offer| offer.summary(now));
+                }
+                a.limit_reset_offers = offers;
+                a
+            };
         let full = Snapshot {
             email: "amir@sawmills.ai".into(),
             server_time: now,
             accounts: vec![
-                with_fable(account("amir3@sawmills.ai", 2.0, 1.0, "rotated"), 0.0),
-                with_fable(account("amir@sawmills.ai", 55.0, 76.0, "rotated"), 16.0),
-                with_fable(account("amir4@sawmills.ai", 0.0, 98.0, "rotated"), 100.0),
-                with_fable(account("amir5@sawmills.ai", 93.0, 88.0, "unrotated"), 40.0),
-                pending,
+                with_fable_offers(
+                    account("amir2@sawmills.ai", 0.0, 90.0, 131, "rotated", 240),
+                    81.0,
+                    Some(two_offers.clone()),
+                ),
+                with_fable_offers(
+                    account("amir4@sawmills.ai", 0.0, 56.0, 151, "rotated", 120),
+                    50.0,
+                    Some(two_offers.clone()),
+                ),
+                with_fable_offers(
+                    account("amir@sawmills.ai", 27.0, 82.0, 61, "rotated", 60),
+                    100.0,
+                    Some(three_offers),
+                ),
+                with_fable_offers(
+                    account("amir3@sawmills.ai", 0.0, 100.0, 68, "rotated", 58),
+                    83.0,
+                    Some(two_offers.clone()),
+                ),
+                with_fable_offers(
+                    account("amir5@sawmills.ai", 0.0, 100.0, 2, "rotated", 120),
+                    59.0,
+                    Some(two_offers.clone()),
+                ),
+                with_fable_offers(
+                    account("amir6@sawmills.ai", 0.0, 100.0, 43, "rotated", 90),
+                    27.0,
+                    Some(two_offers.clone()),
+                ),
+                with_fable_offers(
+                    account("amir7@sawmills.ai", 0.0, 100.0, 76, "rotated", 150),
+                    80.0,
+                    Some(two_offers),
+                ),
             ],
             machines: vec![
                 Machine {
@@ -1107,7 +1236,7 @@ mod preview {
                 Machine {
                     id: "devbox-81d0aa5c9e13".into(),
                     revoked: false,
-                    last_seen_at: None,
+                    last_seen_at: Some((now - 45) * 1000),
                 },
                 Machine {
                     id: "old-laptop-0c4e19b2d7aa".into(),
@@ -1117,7 +1246,7 @@ mod preview {
             ],
             csrf: "preview".into(),
             done: None,
-            browser_resets: false,
+            browser_resets: true,
         };
         let empty = Snapshot {
             email: full.email.clone(),

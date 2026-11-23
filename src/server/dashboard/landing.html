@@ -1,9 +1,33 @@
 <header class="topbar">
   <div class="wrap topbar-inner">
     <a class="wordmark" href="/" translate="no" aria-label="claudectl home"
-      >claudectl<span class="caret" aria-hidden="true"></span
-    ></a>
-    <a class="identity" href="/accounts/sign-in">Sign in</a>
+      ><svg
+        class="wordmark-icon"
+        viewBox="0 0 16 16"
+        width="15"
+        height="15"
+        fill="none"
+        aria-hidden="true"
+      >
+        <rect
+          x="1.5"
+          y="2.5"
+          width="13"
+          height="11"
+          rx="2.5"
+          stroke="currentColor"
+          stroke-width="1.4"
+        />
+        <path
+          d="M4.75 6.25L7 8.25L4.75 10.25M8.5 10.25H11.25"
+          stroke="currentColor"
+          stroke-width="1.4"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        /></svg
+      ><span>claudectl</span></a
+    >
+    <a class="button small" href="/accounts/sign-in">Sign in</a>
   </div>
 </header>
 
@@ -11,17 +35,19 @@
   <section class="signin" aria-labelledby="title">
     <h1 id="title">Your Claude accounts, in one place</h1>
     <p class="lede">
-      See how much each of your Claude accounts has left and which machines are
-      connected.
+      See remaining capacity, manage limit resets, and control connected
+      machines across your Claude accounts.
     </p>
-    <a class="button primary" href="/accounts/sign-in">Sign in with Google</a>
-    <p class="server-status" role="status" aria-live="polite">
-      <span class="state <!-- READY_STATE -->"><!-- READY_LABEL --></span>
-    </p>
+    <div class="signin-actions">
+      <a class="button primary" href="/accounts/sign-in">Sign in with Google</a>
+      <span class="state <!-- READY_STATE -->" role="status" aria-live="polite"
+        ><!-- READY_LABEL --></span
+      >
+    </div>
   </section>
 
-  <section aria-labelledby="connect-title">
-    <div class="steps-head">
+  <section class="panel landing-steps" aria-labelledby="connect-title">
+    <div class="panel-head">
       <h2 id="connect-title">Connect a new machine</h2>
       <p>One command, then one approval</p>
     </div>
