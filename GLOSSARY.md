@@ -9,9 +9,9 @@ access changes.
 ### People and machines
 
 **Company user**:
-A person known to the account server by their company email, usually through
-company sign-in. An operator on the server host can also register them without
-sign-in.
+A person who signs in to the account server with their company sign-in. The
+server keys the user by the sign-in identity and checks the company email
+against the allow list.
 
 **Machine**:
 An identity authorized to obtain access tokens from the account server for a
@@ -53,9 +53,9 @@ is enabled, configured for server use, and found first in the shell's search
 path.
 
 **Migration**:
-Transferring ownership of a local profile's Claude credentials to the account
-server. The machine keeps the profile record after retiring its usable
-credentials.
+Transferring ownership of Claude credentials from a saved profile or the
+matching live Claude Code login to the account server. The machine keeps the
+profile record after retiring the profile's saved credentials.
 
 **Login renewal**:
 A new Claude sign-in that gives an existing server account fresh credentials for
