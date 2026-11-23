@@ -873,7 +873,7 @@ impl Gate {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound
         );
         let held = hold_reason(&self.home, &self.directory);
-        let pending = hook_pending(&self.directory);
+        let pending = hook_pending(&self.directory, process_live);
         let pending_reason = match pending {
             Ok(Some(_)) => Some(Reason::QueuedHook),
             Ok(None) => None,
@@ -1229,7 +1229,7 @@ fn hold_reason(home: &Path, directory: &Path) -> Result<Option<Reason>> {
     ))
 }
 
-fn hook_pending(directory: &Path) -> Result<Option<u32>> {
+fn hook_pending(directory: &Path, is_live: impl Fn(u32) -> Result<bool>) -> Result<Option<u32>> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1265,10 +1265,15 @@ fn hook_pending(directory: &Path) -> Result<Option<u32>> {
         if saved != pid {
             bail!("hook pending PID does not match its owner file");
         }
-        if process_live(pid)? {
+        if is_live(pid)? {
             return Ok(Some(pid));
         }
-        std::fs::remove_file(path)?;
+        // A hook can remove its marker and exit between the read and this cleanup.
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error.into());
+        }
     }
     Ok(None)
 }
@@ -2912,6 +2917,22 @@ mod tests {
         atomic(&pending, &json!({"pid": pid})).unwrap();
         assert!(!gate.check(&idle, Cause::Renewal, now() + 600_000));
         assert!(!pending.exists());
+    }
+
+    #[test]
+    fn a_hook_that_finishes_during_the_scan_is_no_longer_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let marker = directory.path().join(format!("hook-pending.{pid}"));
+        atomic(&marker, &json!({"pid": pid})).unwrap();
+
+        let pending = hook_pending(directory.path(), |observed| {
+            assert_eq!(observed, pid);
+            // The owner finishes after the scanner read the marker but before cleanup.
+            std::fs::remove_file(&marker).unwrap();
+            Ok(false)
+        });
+        assert_eq!(pending.unwrap(), None);
     }
 
     #[test]

@@ -2598,6 +2598,124 @@ mod tests {
         );
     }
 
+    #[cfg(all(unix, feature = "server"))]
+    #[test]
+    fn initially_invalid_weekly_evidence_does_not_start_failover() {
+        use super::super::restart_gate::{Cause, Gate};
+        use axum::{Json, Router, extract::Request, http::StatusCode};
+        use std::sync::{Arc, Mutex};
+
+        // Isolate the loopback opt-in and machine credentials from other tests.
+        const CHILD: &str = "CLAUDECTL_TEST_INVALID_WEEKLY_EVIDENCE_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "central::session::tests::initially_invalid_weekly_evidence_does_not_start_failover", "--nocapture"])
+                .env_clear()
+                .env(CHILD, "1")
+                .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let (_home, mut child, mut monitor, mut activity) = admission_fixture();
+        let failed_at = 1;
+        activity.idle.since = Some(failed_at);
+        activity.idle.limited = Some(("s".into(), failed_at));
+        monitor.held_expires_at = i64::MAX;
+        let mut gate = Gate::new(
+            &monitor.paths.home,
+            &monitor.directory,
+            monitor.pid,
+            &monitor.alias,
+        );
+        let quiet_at = Instant::now();
+        assert!(!gate.check_at(
+            &activity.idle,
+            Cause::Failover,
+            i64::MAX,
+            quiet_at - Duration::from_secs(600)
+        ));
+        assert!(gate.check_at(&activity.idle, Cause::Failover, i64::MAX, quiet_at));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server_dir = root(&monitor.paths);
+        let machine = server_dir.join("machine.json");
+        atomic(&machine, &"synthetic").unwrap();
+        atomic(
+            &server_dir.join("connection.json"),
+            &json!({
+                "server": format!("http://{}", listener.local_addr().unwrap()),
+                "user_id": "synthetic", "token_file": machine,
+            }),
+        )
+        .unwrap();
+        monitor.client = Client::load(&monitor.paths).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().fallback({
+            let requests = requests.clone();
+            move |request: Request| {
+                requests.lock().unwrap().push(format!("{} {}", request.method(), request.uri()));
+                let is_usage = request.uri().path() == "/v2/anthropic/usage";
+                async move {
+                    if is_usage {
+                        (StatusCode::OK, Json(json!({
+                            "data": {"five_hour": {"utilization": 0.0}, "seven_day": {
+                                "utilization": 100.0, "resets_at": "9999-01-01T00:00:00Z"}},
+                            "observed_at": 0, "next_retry_at": i64::MAX, "stale": true, "error": null
+                        })))
+                    } else {
+                        (StatusCode::NOT_FOUND, Json(json!({"error": "unexpected request"})))
+                    }
+                }
+            }
+        });
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                        .with_graceful_shutdown(async {
+                            let _ = stopped.await;
+                        })
+                        .await
+                        .unwrap();
+                });
+        });
+        let mut pending = Pending::default();
+        let target = monitor.failover_target(
+            &mut activity,
+            &mut gate,
+            &super::super::renew::timing(),
+            &mut pending,
+            failed_at,
+        );
+        stop.send(()).unwrap();
+        server.join().unwrap();
+
+        assert!(target.is_none());
+        assert_eq!(
+            *requests.lock().unwrap(),
+            [format!(
+                "GET /v2/anthropic/usage?account_id={}&cached=false",
+                monitor.account_id
+            )]
+        );
+        assert!(!server_dir.join("failovers.lock").exists());
+        assert!(!server_dir.join("failovers.jsonl").exists());
+        assert!(child.0.try_wait().unwrap().is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn unknown_admission_does_not_consume_failover_deadline_or_accounting() {
