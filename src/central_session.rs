@@ -35,6 +35,52 @@ fn write_hook_settings(dir: &Path, hook: &Path) -> Result<PathBuf> {
     )?;
     Ok(settings)
 }
+
+/// Report Claude hook events on a native hc terminal without the legacy hook context.
+#[cfg(unix)]
+pub(super) fn report_native_status(event: &Value) {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+
+    let has_env = |name| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    let legacy_hook = std::env::var("HERDR_ENV").as_deref() == Ok("1")
+        && has_env("HERDR_SOCKET_PATH")
+        && has_env("HERDR_PANE_ID");
+    let subagent = event["agent_id"].as_str().is_some_and(|id| !id.is_empty());
+    if legacy_hook || !has_env("HC_TERMINAL_ID") || subagent {
+        return;
+    }
+    let Some(socket) = std::env::var_os("HC_TERMINAL_SOCKET") else {
+        return;
+    };
+    if !std::fs::metadata(PathBuf::from(socket)).is_ok_and(|meta| meta.file_type().is_socket()) {
+        return;
+    }
+    let state = match (
+        event["hook_event_name"].as_str(),
+        event["notification_type"].as_str(),
+    ) {
+        (Some("SessionStart"), _) | (Some("Notification"), Some("idle_prompt")) => "idle",
+        (Some("UserPromptSubmit"), _) => "working",
+        (Some("Stop"), _) => "done",
+        (Some("StopFailure"), _) => "error",
+        _ => return,
+    };
+    // Claude captures hook stdout. The controlling terminal carries the report to hc.
+    if let Ok(mut terminal) = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open("/dev/tty")
+    {
+        let frame = format!("\x1b]7501;state={state}:app=claude-code\x1b\\");
+        Foreground::with_sigttou_blocked(|| {
+            // SAFETY: the fd belongs to this terminal. Both calls only read process state.
+            let owns_terminal = unsafe { libc::tcgetpgrp(terminal.as_raw_fd()) == libc::getpgrp() };
+            owns_terminal && terminal.write_all(frame.as_bytes()).is_ok()
+        });
+    }
+}
 impl Session {
     pub fn new(paths: &Paths, account: &Account, access: Access) -> Result<Self> {
         validate(account, &access)?;
@@ -1619,18 +1665,24 @@ pub fn run(_: &Paths, _: &Client, _: &str, _: &Path, _: &[OsString], _: bool) ->
 struct Foreground(Option<libc::pid_t>);
 #[cfg(unix)]
 impl Foreground {
-    fn set(group: libc::pid_t) -> bool {
-        // Ignore terminal background-write suspension only while transferring foreground.
+    fn with_sigttou_blocked(action: impl FnOnce() -> bool) -> bool {
+        // SAFETY: change and restore this thread's signal mask around the terminal operation.
         unsafe {
             let mut set: libc::sigset_t = std::mem::zeroed();
             let mut old: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut set);
             libc::sigaddset(&mut set, libc::SIGTTOU);
-            libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
-            let ok = libc::tcsetpgrp(libc::STDIN_FILENO, group) == 0;
+            if libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old) != 0 {
+                return false;
+            }
+            let ok = action();
             libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
             ok
         }
+    }
+    fn set(group: libc::pid_t) -> bool {
+        // SAFETY: tcsetpgrp assigns the terminal foreground to the already selected group.
+        Self::with_sigttou_blocked(|| unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, group) == 0 })
     }
     fn take(pid: u32) -> Self {
         let old = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
