@@ -932,6 +932,12 @@ pub(super) fn record_hook(
     }
     std::fs::remove_file(pending).ok();
     std::fs::remove_file(dir.join(format!("session-end-intent.{}", std::process::id()))).ok();
+    #[cfg(unix)]
+    {
+        // Keep hook ordering while the nonblocking report runs outside the restart lock.
+        drop(_admission);
+        super::session::report_native_status(&v);
+    }
     Ok(())
 }
 

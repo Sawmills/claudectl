@@ -297,6 +297,8 @@ Quiet is a heuristic, not all-input closure. No prompts are collected, stored or
 session ID and time in `<session dir>/events`. A separate private file keeps the current
 transcript location and session ID, without copying transcript contents. Workload evidence still distinguishes running
 turns, background tasks and holds, but a clear workload sample is not input-admission proof.
+Interactive hc launches with incomplete HerdR hook variables use these events to report
+Claude status to the foreground native terminal.
 The monitor checks each session every five seconds. Ordinary deferrals warn five minutes
 before expiry. Expiry follows renewal; only that session's own authentication failure
 starts auth recovery. Both wait for workload admission until their configured maximum

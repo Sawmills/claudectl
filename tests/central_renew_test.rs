@@ -16,6 +16,14 @@ use std::{
 };
 
 const ACCOUNT: &str = "abababababababababababababababababababababababababababababababab";
+const HERDR_LAUNCH: [(&str, &str); 6] = [
+    ("HERDR_ENV", "1"),
+    ("HERDR_SOCKET_PATH", "/fixture/herdr.sock"),
+    ("HERDR_PANE_ID", "w1:p1"),
+    ("HERDR_TAB_ID", "w1:t1"),
+    ("HERDR_WORKSPACE_ID", "w1"),
+    ("HERDR_MACHINE", "local"),
+];
 #[derive(Default)]
 struct Fake {
     requests: Vec<Value>,
@@ -139,7 +147,8 @@ for index,arg in enumerate(args):
 settings=json.load(open(args[args.index('--settings')+1]))
 run=Path(os.environ['CLAUDECTL_SERVER_RUN'])
 with log.open('a') as out:
-    out.write(json.dumps({'token':os.environ['CLAUDE_CODE_OAUTH_TOKEN'],'args':args,'settings':settings,'run':str(run),'session':json.load(open(run/'session.json')),'pid':os.getpid(),'tty':os.isatty(0),'foreground':not os.isatty(0) or os.tcgetpgrp(0)==os.getpgrp()})+'\n')
+    terminal_env={key:value for key,value in os.environ.items() if key.startswith(('HERDR_', 'HC_'))}
+    out.write(json.dumps({'token':os.environ['CLAUDE_CODE_OAUTH_TOKEN'],'args':args,'settings':settings,'run':str(run),'session':json.load(open(run/'session.json')),'pid':os.getpid(),'tty':os.isatty(0),'foreground':not os.isatty(0) or os.tcgetpgrp(0)==os.getpgrp(),'terminal_env':terminal_env})+'\n')
 if mode=='auth_resume_fails' and not first_launch: sys.exit(7)
 if mode=='one_shot':
     (home/'ready').touch()
@@ -170,10 +179,12 @@ def term(*_):
     sys.exit(143)
 signal.signal(signal.SIGTERM,term)
 command=settings['hooks']['Stop'][0]['hooks'][0]['command']
-def hook(event, **details):
+def hook(event, background=False, **details):
     transcript=home/(session_id+'.jsonl')
     if transcript.exists(): details['transcript_path']=str(transcript)
-    subprocess.run(['/bin/sh','-c',command],input=json.dumps({'hook_event_name':event,'session_id':session_id,**details}).encode(),check=True)
+    relay_fixture=mode in ('hc_renewal','herdr_renewal')
+    active_command=settings['hooks'][event][0]['hooks'][0]['command'] if relay_fixture else command
+    subprocess.run(['/bin/sh','-c',active_command],input=json.dumps({'hook_event_name':event,'session_id':session_id,**details}).encode(),check=True,capture_output=relay_fixture,preexec_fn=os.setpgrp if background else None)
 def provider_status():
     request=urllib.request.Request(os.environ['FAKE_PROVIDER_URL'],headers={'Authorization':'Bearer '+os.environ['CLAUDE_CODE_OAUTH_TOKEN']})
     try:
@@ -188,7 +199,9 @@ if not first_launch and recovery_rows.is_file():
         for row in rows: transcript.write(json.dumps(row)+'\n')
 if mode != 'no_hooks':
     hook('SessionStart'); hook('UserPromptSubmit')
+    if mode=='hc_renewal': hook('Notification', notification_type='permission_prompt')
     if mode != 'busy' or not first_launch: hook('Stop')
+if mode=='hc_renewal': hook('Notification', background=True, notification_type='idle_prompt')
 task=None
 if mode=='task' and first_launch:
     folder=Path(os.environ['TMPDIR'])/('claude-'+str(os.getuid()))/'project/tasks'
@@ -427,6 +440,18 @@ impl Fixture {
                 .env("HERDR_TAB_ID", "model-test-tab")
                 .env("TZ", "UTC");
         }
+        if mode == "herdr_renewal" {
+            command.envs(HERDR_LAUNCH);
+        }
+        if matches!(mode, "hc_renewal" | "herdr_renewal") {
+            let socket = home.path().join("hc.sock");
+            // Leave the socket file in place, as hc does for a live terminal.
+            let _ = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            command
+                .env("HC_TERMINAL_ID", "t39q")
+                .env("HC_SCOPE", "fixture")
+                .env("HC_TERMINAL_SOCKET", socket);
+        }
         let child = command.spawn().unwrap();
         Self {
             home,
@@ -494,7 +519,7 @@ impl Fixture {
                 .unwrap_or_default()
         );
     }
-    fn finish_recovered(&mut self) {
+    fn finish_recovered(&mut self) -> Output {
         std::fs::write(self.home.path().join("release"), "").unwrap();
         let output = self.child.take().unwrap().wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(23));
@@ -519,6 +544,7 @@ impl Fixture {
                 .iter()
                 .all(|r| r["account_id"] == ACCOUNT)
         );
+        output
     }
     fn directory(&self) -> PathBuf {
         PathBuf::from(self.run()["run"].as_str().unwrap())
@@ -1602,6 +1628,54 @@ fn revoked_token_restarts_despite_background_task() {
     assert_eq!(forced[0]["route"], "voice_inbox");
     std::thread::sleep(Duration::from_millis(450));
     f.finish_recovered();
+}
+
+#[test]
+fn a_natural_renewal_preserves_the_original_herdr_environment() {
+    let mut f = Fixture::start("herdr_renewal", 1_500, true);
+    f.wait("quiet_window", "warn");
+    f.state.lock().unwrap().life_ms = 600_000;
+    let runs = f.wait_recovered();
+    for (key, value) in HERDR_LAUNCH {
+        assert_eq!(runs[0]["terminal_env"][key], value, "first launch {key}");
+        assert_eq!(runs[1]["terminal_env"][key], value, "renewed launch {key}");
+    }
+    for key in ["HC_TERMINAL_ID", "HC_SCOPE", "HC_TERMINAL_SOCKET"] {
+        assert!(runs[0]["terminal_env"][key].is_string());
+        assert_eq!(runs[1]["terminal_env"][key], runs[0]["terminal_env"][key]);
+    }
+    let output = f.finish_recovered();
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("\u{1b}]7501;"));
+}
+
+#[test]
+fn native_claude_reports_status_after_token_renewal_without_herdr_environment() {
+    let mut f = Fixture::start("hc_renewal", 1_500, true);
+    f.wait("quiet_window", "warn");
+    f.state.lock().unwrap().life_ms = 600_000;
+    let runs = f.wait_recovered();
+    for run in &runs {
+        for (key, _) in HERDR_LAUNCH {
+            assert!(run["terminal_env"][key].is_null());
+        }
+        assert_eq!(run["terminal_env"]["HC_TERMINAL_ID"], "t39q");
+    }
+    let output = f.finish_recovered();
+    let terminal = String::from_utf8_lossy(&output.stdout);
+    let (original, renewed) = terminal
+        .split_once("claudectl: server token renewed; resuming session")
+        .expect("a real token renewal must separate the two launches");
+    for (launch, transcript) in [("renewed", renewed), ("original", original)] {
+        assert!(!transcript.contains("\u{1b}]7501;state=blocked:"));
+        for state in ["idle", "working", "done"] {
+            let frame = format!("\u{1b}]7501;state={state}:app=claude-code\u{1b}\\");
+            assert_eq!(
+                transcript.matches(&frame).count(),
+                1,
+                "{launch} Claude must report {state} once from the terminal foreground"
+            );
+        }
+    }
 }
 
 #[test]
