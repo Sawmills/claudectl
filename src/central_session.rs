@@ -1369,7 +1369,7 @@ pub fn run(
     std::fs::rename(&build.file, &snapshot)?;
     // A one-shot `-p` run is never restarted; an interactive session follows the account's
     // token revision (SAW-12610).
-    let renewable = super::renew::relaunch_args(args, "probe").is_some();
+    let renewable = !super::renew::is_one_shot(args);
     let mut hooks = if renewable {
         Some(session.hook_settings()?)
     } else {
@@ -1556,8 +1556,8 @@ pub fn run(
                      conversation with /resume {id}.",
                     exec::exit_code_of(&status)
                 );
-                launch_args =
-                    super::renew::fresh_args(args).context("fresh start of a one-shot run")?;
+                launch_args = super::failover::fresh_args(args)
+                    .context("building fresh-fallback arguments")?;
                 super::renew::keep_live_model(&mut launch_args, resume_model.as_deref());
                 session.set_renewal("renewing")?;
                 continue;
@@ -1581,7 +1581,7 @@ pub fn run(
                     super::failover::unprompted_resume(args, &session_id)?
                 } else {
                     super::failover::prompted_resume(args, &session_id, super::renew::CRON_NOTE)
-                        .context("renewal of a one-shot run")?
+                        .context("building renewal arguments")?
                 };
                 session.renew(access)?;
                 restarts.push(now());
@@ -1593,7 +1593,7 @@ pub fn run(
                 // before Claude starts again. The checked binary moves with it.
                 // The switch was recorded when the account was reserved (`failover::reserve`).
                 launch_args = super::failover::resume_args(args, &session_id)
-                    .context("failover of a one-shot run")?;
+                    .context("building failover arguments")?;
                 let from = session.account().alias.clone();
                 let next = Session::new(paths, &account, access)?;
                 let moved = next.directory().join("claude");

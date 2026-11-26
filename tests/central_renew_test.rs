@@ -1631,6 +1631,24 @@ fn revoked_token_restarts_despite_background_task() {
 }
 
 #[test]
+fn a_renewal_drops_a_launch_prompt_after_the_option_delimiter() {
+    const PROMPT: &str = "--literal first request";
+    let mut f = Fixture::with_args("idle", 1_500, false, &["--model", "opus", "--", PROMPT]);
+    f.wait("quiet_window", "warn");
+    f.state.lock().unwrap().life_ms = 600_000;
+    let runs = f.wait_recovered();
+    assert_eq!(
+        &runs[0]["args"].as_array().unwrap()[2..],
+        ["--model", "opus", "--", PROMPT]
+    );
+    assert_eq!(
+        &runs[1]["args"].as_array().unwrap()[2..],
+        ["--model", "opus", "--resume", "s"]
+    );
+    f.finish_recovered();
+}
+
+#[test]
 fn a_natural_renewal_preserves_the_original_herdr_environment() {
     let mut f = Fixture::start("herdr_renewal", 1_500, true);
     f.wait("quiet_window", "warn");

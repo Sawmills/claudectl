@@ -212,41 +212,34 @@ fn failover_recovery_verifies_its_continuation_prompt() {
 }
 
 fn assert_recovery_resume(continue_request: bool) {
-    for (given, kept, original) in [
+    for (given, kept) in [
         (
             vec!["--add-dir", "../lib", "../shared"],
             vec!["--add-dir", "../lib", "../shared"],
-            None,
         ),
         (
             vec!["--allowedTools", "Bash", "Read"],
             vec!["--allowedTools", "Bash", "Read"],
-            None,
         ),
         (
             vec!["--add-dir=../lib", "../shared"],
             vec!["--add-dir=../lib", "../shared"],
-            None,
         ),
         (
             vec!["--debug", "hooks", "--allowed-tools", "Bash", "Read"],
             vec!["--debug", "hooks", "--allowed-tools", "Bash", "Read"],
-            None,
         ),
         (
             vec!["fix the tests", "--allowedTools", "Bash", "Read"],
             vec!["--allowedTools", "Bash", "Read"],
-            Some("fix the tests"),
         ),
         (
             vec!["--model", "opus", "fix the tests"],
             vec!["--model", "opus"],
-            Some("fix the tests"),
         ),
         (
             vec!["--add-dir", "../lib", "--", "-literal prompt"],
             vec!["--add-dir", "../lib"],
-            Some("-literal prompt"),
         ),
     ] {
         let f = Fixture::new();
@@ -258,16 +251,10 @@ fn assert_recovery_resume(continue_request: bool) {
         let args: Vec<_> = given.iter().map(std::ffi::OsString::from).collect();
         let resumed = recovery.resume_args(&args, "s").unwrap();
         let delivered = resumed.last().unwrap().to_str().unwrap();
-        assert!(delivered.contains(&prompt), "recovery omitted: {resumed:?}");
         let mut expected: Vec<_> = kept.iter().map(std::ffi::OsString::from).collect();
         expected.extend(["--resume".into(), "s".into(), "--".into()]);
         assert_eq!(&resumed[..resumed.len() - 1], expected);
-        if let (true, Some(original)) = (continue_request, original) {
-            assert!(delivered.ends_with(original));
-            assert_eq!(delivered.matches(original).count(), 1);
-        } else {
-            assert_eq!(delivered, prompt);
-        }
+        assert_eq!(delivered, prompt, "only the generated prompt may be sent");
         assert_eq!(
             f.report(&recovery, f.jobs(), delivered),
             "crons intact: 2 jobs"
@@ -281,7 +268,7 @@ fn renewal_recovery_does_not_resubmit_initial_task() {
 }
 
 #[test]
-fn failover_recovery_preserves_initial_task_for_continuation() {
+fn failover_recovery_continues_without_resubmitting_initial_task() {
     assert_recovery_resume(true);
 }
 
@@ -293,8 +280,12 @@ fn a_different_positional_prompt_does_not_verify_failover_recovery() {
     recovery
         .resume_args(&["original request".into()], "s")
         .unwrap();
+    let with_replayed_prompt = format!(
+        "{}\n\nOriginal user prompt (verbatim):\noriginal request",
+        recovery.prompt()
+    );
     assert_eq!(
-        f.report(&recovery, f.jobs(), &recovery.prompt()),
+        f.report(&recovery, f.jobs(), &with_replayed_prompt),
         "cron recovery unverified: no post-restart CronList"
     );
 }

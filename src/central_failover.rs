@@ -187,10 +187,8 @@ pub(super) fn choose(
 /// The prompt a moved session resumes with, so the failed turn continues.
 pub(super) const RECOVERY_PROMPT: &str = "Continue the previous request.";
 
-/// Claude Code flags (2.1.295 `--help` and the CLI reference) that take exactly one value.
-/// Flags with many values or an optional value are left out on purpose: after them, an
-/// argument may be a prompt.
-pub(super) const VALUE_FLAGS: &[&str] = &[
+/// Scalar options already trusted for the optional recovery note.
+const NOTE_VALUE_FLAGS: &[&str] = &[
     "--agent",
     "--agents",
     "--append-system-prompt",
@@ -217,62 +215,94 @@ pub(super) const VALUE_FLAGS: &[&str] = &[
     "--system-prompt-snapshot",
 ];
 
-/// The arguments of a moved session: the user's arguments resumed on `session`, plus the
-/// recovery prompt so the failed turn continues. None for a one-shot run.
-pub(super) fn resume_args(args: &[OsString], session: &str) -> Option<Vec<OsString>> {
+// Additional scalar options from Claude Code 2.1.332's root option declarations.
+// Preserve their values without expanding when the legacy optional note is sent.
+const OTHER_VALUE_FLAGS: &[&str] = &[
+    "--advisor",
+    "--agent-color",
+    "--agent-id",
+    "--agent-name",
+    "--agent-type",
+    "--append-subagent-system-prompt",
+    "--append-subagent-system-prompt-file",
+    "--attach-serve",
+    "--client-data-url",
+    "--correlation-id",
+    "--deep-link-cwd-b64",
+    "--deep-link-last-fetch",
+    "--deep-link-repo",
+    "--fast-mode",
+    "--forward-home-settings",
+    "--inherit-permission-mode",
+    "--initialize-fields",
+    "--lead-verify-key",
+    "--managed-settings",
+    "--max-thinking-tokens",
+    "--max-turns",
+    "--messaging-socket-path",
+    "--metadata",
+    "--on-branch",
+    "--parent-session-id",
+    "--permission-prompt-tool",
+    "--plan-mode-instructions",
+    "--plugin-dir-no-mcp",
+    "--pool",
+    "--prefill",
+    "--prefill-b64",
+    "--proactivity",
+    "--project-config-root",
+    "--ref",
+    "--resume-drops-turn",
+    "--resume-session-at",
+    "--rewind-files",
+    "--runner-declares",
+    "--sdk-url",
+    "--session-began-as-copy",
+    "--setting-sources",
+    "--settings",
+    "--task-budget",
+    "--team-name",
+    "--teammate-mode",
+    "--thinking",
+    "--thinking-display",
+    "--watch-artifact",
+    "--watch-artifact-no-autoreact",
+    "--workload",
+];
+
+pub(super) fn takes_one_value(flag: &str) -> bool {
+    NOTE_VALUE_FLAGS.contains(&flag) || OTHER_VALUE_FLAGS.contains(&flag)
+}
+
+/// Resume on the new account without resubmitting the original prompt.
+pub(super) fn resume_args(args: &[OsString], session: &str) -> Result<Vec<OsString>> {
     prompted_resume(args, session, RECOVERY_PROMPT)
 }
 
-/// The user's arguments resumed on `session` (`renew::relaunch_args`), plus `prompt`. Claude
-/// takes one prompt, so `prompt` is added only when no argument can be a prompt: every
-/// argument that does not start with `-` follows a flag of `VALUE_FLAGS`. Otherwise the
-/// arguments stay as they are. None for a one-shot run.
+/// Drop the launch prompt. Keep the optional recovery note only for launches that did not
+/// supply a prompt or loose values to variadic or optional flags.
 pub(super) fn prompted_resume(
     args: &[OsString],
     session: &str,
     prompt: &str,
-) -> Option<Vec<OsString>> {
-    let mut resumed = super::renew::relaunch_args(args, session)?;
-    // `relaunch_args` ends with `--resume <session>`.
-    let user = &resumed[..resumed.len() - 2];
-    let mut after_value_flag = false;
-    let mut maybe_prompt = false;
-    for arg in user {
-        let text = arg.to_string_lossy();
-        if text.starts_with('-') {
-            after_value_flag = VALUE_FLAGS.contains(&text.as_ref());
-        } else {
-            maybe_prompt |= !after_value_flag;
-            after_value_flag = false;
-        }
+) -> Result<Vec<OsString>> {
+    let (mut args, allow_note) = resumed_options(args, session)?;
+    if allow_note {
+        args.push(prompt.into());
     }
-    if !maybe_prompt {
-        resumed.push(prompt.into());
-    }
-    Some(resumed)
+    Ok(args)
 }
 
 /// Card recovery requires a delivered prompt, even with variadic flags or an initial
-/// user prompt. Keep option values intact and deliver one positional prompt after `--`.
-/// Forward the original task only when continuing it. The caller verifies the exact text.
+/// user prompt. Preserve option values and deliver only the generated prompt after `--`.
 pub(super) fn required_prompted_resume(
     args: &[OsString],
     session: &str,
-    recovery: &str,
-    continue_request: bool,
-) -> Result<(Vec<OsString>, String)> {
-    let (mut options, original) = resumed_options(args, session)?;
-    let prompt = match original.filter(|_| continue_request) {
-        Some(original) => format!(
-            "{recovery}\n\nOriginal user prompt (verbatim):\n{}",
-            original
-                .to_str()
-                .context("Claude prompt is not valid UTF-8")?
-        ),
-        None => recovery.to_owned(),
-    };
-    options.extend(["--".into(), prompt.clone().into()]);
-    Ok((options, prompt))
+    recovery: String,
+) -> Result<Vec<OsString>> {
+    let (mut args, _) = resumed_options(args, session)?;
+    args.extend(["--".into(), recovery.into()]);
+    Ok(args)
 }
 
 /// Resume the existing conversation without submitting the original task again.
@@ -280,8 +310,30 @@ pub(super) fn unprompted_resume(args: &[OsString], session: &str) -> Result<Vec<
     Ok(resumed_options(args, session)?.0)
 }
 
-fn resumed_options(args: &[OsString], session: &str) -> Result<(Vec<OsString>, Option<OsString>)> {
-    // Claude Code 2.1.319 --help: these consume all following non-option values.
+/// A failed resume may start fresh. Delimit the initial request so dropping a selector
+/// or replacing the launch model cannot turn it into an option value.
+pub(super) fn fresh_args(args: &[OsString]) -> Result<Vec<OsString>> {
+    let mut launch = parse_launch_args(args)?;
+    if let Some(prompt) = launch.prompt {
+        launch.args.extend(["--".into(), prompt.clone()]);
+    }
+    Ok(launch.args)
+}
+
+struct LaunchArgs<'a> {
+    args: Vec<OsString>,
+    prompt: Option<&'a OsString>,
+    allow_note: bool,
+}
+
+fn resumed_options(args: &[OsString], session: &str) -> Result<(Vec<OsString>, bool)> {
+    let mut launch = parse_launch_args(args)?;
+    launch.args.extend(["--resume".into(), session.into()]);
+    Ok((launch.args, launch.allow_note && launch.prompt.is_none()))
+}
+
+fn parse_launch_args(args: &[OsString]) -> Result<LaunchArgs<'_>> {
+    // These consume all following non-option values.
     const MANY: &[&str] = &[
         "--add-dir",
         "--allowedTools",
@@ -289,6 +341,8 @@ fn resumed_options(args: &[OsString], session: &str) -> Result<(Vec<OsString>, O
         "--disallowedTools",
         "--disallowed-tools",
         "--betas",
+        "--channels",
+        "--dangerously-load-development-channels",
         "--file",
         "--mcp-config",
         "--tools",
@@ -299,61 +353,60 @@ fn resumed_options(args: &[OsString], session: &str) -> Result<(Vec<OsString>, O
         "--debug",
         "--from-pr",
         "--prompt-suggestions",
+        "--rc",
+        "--remote",
         "--remote-control",
         "--teleport",
         "-w",
         "--worktree",
     ];
-    let end = args
-        .iter()
-        .position(|arg| arg == "--")
-        .unwrap_or(args.len());
-    let mut user = super::renew::relaunch_args(&args[..end], session)
-        .context("cron recovery cannot restart a one-shot run")?;
-    user.truncate(user.len() - 2);
     let mut options = Vec::new();
     let mut original = None;
-    let mut rest = user.iter().peekable();
+    let mut allow_note = true;
+    let mut rest = args.iter().peekable();
     while let Some(arg) = rest.next() {
-        let text = arg.to_string_lossy();
-        if text.starts_with('-') {
+        if arg == "--" {
+            for value in rest {
+                if original.replace(value).is_some() {
+                    bail!("Claude launch has more than one positional prompt");
+                }
+            }
+            break;
+        }
+        if super::renew::looks_like_option(arg) {
+            let text = arg.to_string_lossy();
+            if super::renew::omit_session_arg(&text, &mut rest)? {
+                continue;
+            }
             options.push(arg.clone());
             let (flag, assigned) = text
                 .split_once('=')
                 .map_or((text.as_ref(), false), |(flag, _)| (flag, true));
             if MANY.contains(&flag) {
-                while rest
-                    .peek()
-                    .is_some_and(|next| !next.to_string_lossy().starts_with('-'))
+                while let Some(value) = rest.next_if(|next| !super::renew::looks_like_option(next))
                 {
-                    options.push(rest.next().unwrap().clone());
+                    options.push(value.clone());
+                    allow_note = false;
                 }
-            } else if !assigned
-                && (VALUE_FLAGS.contains(&flag)
-                    || matches!(flag, "--settings" | "--setting-sources"))
-            {
+            } else if !assigned && takes_one_value(flag) {
                 options.push(rest.next().context("Claude option has no value")?.clone());
+                allow_note &= NOTE_VALUE_FLAGS.contains(&flag);
             } else if !assigned
                 && OPTIONAL.contains(&flag)
-                && rest
-                    .peek()
-                    .is_some_and(|next| !next.to_string_lossy().starts_with('-'))
+                && let Some(value) = rest.next_if(|next| !super::renew::looks_like_option(next))
             {
-                options.push(rest.next().unwrap().clone());
+                options.push(value.clone());
+                allow_note = false;
             }
         } else if original.replace(arg).is_some() {
             bail!("Claude launch has more than one positional prompt");
         }
     }
-    if end < args.len() {
-        for arg in &args[end + 1..] {
-            if original.replace(arg).is_some() {
-                bail!("Claude launch has more than one positional prompt");
-            }
-        }
-    }
-    options.extend(["--resume".into(), session.into()]);
-    Ok((options, original.cloned()))
+    Ok(LaunchArgs {
+        args: options,
+        prompt: original,
+        allow_note,
+    })
 }
 
 /// The time limit for confirming one limit. It starts when Claude is first idle enough to
@@ -624,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn the_recovery_prompt_is_added_only_when_no_argument_can_be_a_prompt() {
+    fn launches_without_a_prompt_keep_the_existing_recovery_note_policy() {
         let resumed = |args: &[&str]| resume_args(&os(args), "S").unwrap();
         // Every argument is a flag or a known flag's value: the prompt continues the turn.
         assert_eq!(
@@ -650,20 +703,59 @@ mod tests {
                 "{flag}"
             );
         }
-        // An argument that can be a prompt (or a value of a many-value flag): the arguments
-        // stay as they are and no second prompt is added.
+        // Do not add an optional recovery prompt for loose values of optional/variadic flags.
         for args in [
-            &["fix the tests"][..],
-            &["--dangerously-skip-permissions", "fix the tests"],
-            &["--verbose", "fix the tests"],
-            &["--add-dir", "../lib", "../shared"],
+            &["--add-dir", "../lib", "../shared"][..],
             &["--allowedTools", "Bash", "Read"],
+            &["--debug", "hooks"],
         ] {
             let mut expected = os(args);
             expected.extend(os(&["--resume", "S"]));
             assert_eq!(resumed(args), expected, "{args:?}");
         }
-        assert_eq!(resume_args(&os(&["-p", "hi"]), "S"), None);
+        assert!(resume_args(&os(&["-p", "hi"]), "S").is_err());
+    }
+
+    #[test]
+    fn a_resume_discards_the_launch_prompt_but_keeps_option_values() {
+        for (given, kept) in [
+            (&["first request"][..], &[][..]),
+            (&["-"], &[]),
+            (&["--verbose", "first request"], &["--verbose"]),
+            (
+                &["first request", "--add-dir=../lib", "../shared"],
+                &["--add-dir=../lib", "../shared"],
+            ),
+            (
+                &["--allowed-tools", "Read", "--", "--print"],
+                &["--allowed-tools", "Read"],
+            ),
+            (
+                &["--add-dir", "../lib", "--resume", "old", "first request"],
+                &["--add-dir", "../lib"],
+            ),
+            (
+                &["--system-prompt", "--continue", "first request"],
+                &["--system-prompt", "--continue"],
+            ),
+            (
+                &[
+                    "--permission-prompt-tool",
+                    "mcp__test__permit",
+                    "first request",
+                ],
+                &["--permission-prompt-tool", "mcp__test__permit"],
+            ),
+        ] {
+            let mut expected = os(kept);
+            expected.extend(os(&["--resume", "S"]));
+            assert_eq!(resume_args(&os(given), "S").unwrap(), expected, "{given:?}");
+            assert_eq!(
+                prompted_resume(&os(given), "S", "renewal note").unwrap(),
+                expected,
+                "{given:?}"
+            );
+        }
     }
 
     #[test]

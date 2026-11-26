@@ -321,6 +321,9 @@ This applies to authentication recovery, renewal, account failover and Operator 
 If a permitted resume fails before starting its conversation, the fresh-session fallback
 keeps that same selected model.
 
+Automatic resumes omit the original positional launch prompt. The first launch and a
+permitted fresh-session fallback keep it.
+
 For a Fleet Operator, `HERDR_TAB_ID` selects the matching `operator_tab` in
 `~/Code/.fleet/*/operator.md`. Only lines that start with `operator_tab:` name an owner.
 Repeated values count as one owner; two different values make a populated card ambiguous.
@@ -365,11 +368,9 @@ and virtual calls alone produces the notice
 `cron recovery unverified: verifier cannot read Code Mode`.
 Results stay outside the live terminal. The log contains no saved prompt contents.
 Recovery preserves option values, including multi-value `--add-dir` and `--allowedTools`.
-Failover includes the original task verbatim in its single delivered recovery prompt.
-Renewal omits the original task and stops after restoring crons and any eligible check.
-Verification matches that delivered text using a digest held in memory. If launch
-arguments cannot be classified as one prompt, recovery is disarmed with a skipped notice
-and the ordinary resume path continues.
+After restoring crons and any eligible check, failover continues from the conversation
+history without copying the original launch prompt. Renewal stops there.
+Verification matches the generated text using a digest held in memory.
 Extra copies of saved jobs prevent a verified result; unrelated jobs are preserved and are
 outside the saved-job count.
 The transcript read is limited to 8 MiB after the previous recorded position. An ambiguous
@@ -377,8 +378,9 @@ card, an unreadable saved prompt, a malformed entry, or a recovery-arm failure p
 `cron recovery skipped: <reason>` and falls back to the ordinary resume arguments.
 Recovery after this session's authentication failure omits the original task and the legacy
 cron catch-up note. Its matching saved-card recovery uses the same check-only exception.
-Other renewals and failovers with no matching card keep their existing
-note; first launches and manual resumes do not use this recovery. Optional cron recovery
+With no matching card, renewals and failovers may send their usual note if the initial
+launch had no prompt and the argument shape permits it. First launches and manual resumes
+do not use this recovery. Optional cron recovery
 never aborts a restart. Cards with no saved crons follow the same rules. Unreadable unrelated cards produce a
 discovery warning and do not stop ordinary renewal. Saved paths support absolute paths,
 paths relative to the card, `~/`, `$HOME/`, and `${HOME}/`; other variables and `~user`
