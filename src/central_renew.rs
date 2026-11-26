@@ -230,7 +230,7 @@ pub(super) fn launch_session(args: &[OsString]) -> Option<&str> {
         if arg == "--" {
             break;
         }
-        if super::failover::VALUE_FLAGS.contains(&arg) {
+        if super::failover::takes_one_value(arg) {
             rest.next();
             continue;
         }
@@ -246,7 +246,7 @@ pub(super) fn launch_session(args: &[OsString]) -> Option<&str> {
         }
         let value = assigned
             .or_else(|| {
-                rest.next_if(|value| !starts_with_dash(value))
+                rest.next_if(|value| !looks_like_option(value))
                     .and_then(|value| value.to_str())
             })
             .filter(|value| is_session_uuid(value));
@@ -277,49 +277,47 @@ fn is_session_uuid(value: &str) -> bool {
         })
 }
 
-/// The relaunch arguments: the user's arguments without resume, continue, session-id and
-/// fork forms, plus `--resume <session>`. None for a one-shot `-p`/`--print` run.
-pub(super) fn relaunch_args(args: &[OsString], session: &str) -> Option<Vec<OsString>> {
-    let mut out = Vec::new();
+/// Only an actual print flag marks a one-shot run, not an option value or literal prompt.
+pub(super) fn is_one_shot(args: &[OsString]) -> bool {
     let mut rest = args.iter().peekable();
     while let Some(arg) = rest.next() {
         let text = arg.to_string_lossy();
-        match text.as_ref() {
-            "-p" | "--print" => return None,
-            "--session-id" => {
-                rest.next();
-            }
-            // `--resume`/`-r` take an optional session id; only a value that is not a flag is one.
-            "--resume" | "-r" => {
-                if rest.peek().is_some_and(|next| !starts_with_dash(next)) {
-                    rest.next();
-                }
-            }
-            "-c" | "--continue" | "--fork-session" => {}
-            other
-                if other.starts_with("--resume=")
-                    || other.starts_with("--session-id=")
-                    || other.starts_with("--print=") =>
-            {
-                if other.starts_with("--print=") {
-                    return None;
-                }
-            }
-            _ => out.push(arg.clone()),
+        if text == "--" {
+            break;
+        }
+        if super::failover::takes_one_value(&text) {
+            rest.next();
+        } else if omit_session_arg(&text, &mut rest).is_err() {
+            return true;
         }
     }
-    out.push("--resume".into());
-    out.push(session.into());
-    Some(out)
+    false
 }
 
-/// The user's arguments without resume, continue, session-id and fork forms: a new session
-/// after a failed resume. None for a one-shot `-p`/`--print` run.
-pub(super) fn fresh_args(args: &[OsString]) -> Option<Vec<OsString>> {
-    let mut out = relaunch_args(args, "")?;
-    // `relaunch_args` ends with `--resume <session>`.
-    out.truncate(out.len() - 2);
-    Some(out)
+/// Consume session selectors as they appear, before removing them can change option grouping.
+pub(super) fn omit_session_arg(
+    arg: &str,
+    rest: &mut std::iter::Peekable<std::slice::Iter<'_, OsString>>,
+) -> anyhow::Result<bool> {
+    let (flag, assigned) = arg
+        .split_once('=')
+        .map_or((arg, false), |(flag, _)| (flag, true));
+    match flag {
+        "-p" | "--print" => anyhow::bail!("cannot restart a one-shot run"),
+        "--session-id" => {
+            if !assigned {
+                rest.next();
+            }
+        }
+        "--resume" | "-r" => {
+            if !assigned {
+                rest.next_if(|next| !looks_like_option(next));
+            }
+        }
+        "-c" | "--continue" | "--fork-session" if !assigned => {}
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 /// The hook location belongs to the active conversation; never retain its contents.
@@ -542,7 +540,7 @@ pub(super) fn keep_live_model(args: &mut Vec<OsString>, model: Option<&str>) {
             rest.next();
         } else if !text.starts_with("--model=") {
             out.push(arg.clone());
-            if super::failover::VALUE_FLAGS.contains(&text.as_ref()) {
+            if super::failover::takes_one_value(&text) {
                 out.extend(rest.next().cloned());
             }
         }
@@ -550,8 +548,9 @@ pub(super) fn keep_live_model(args: &mut Vec<OsString>, model: Option<&str>) {
     *args = out;
 }
 
-fn starts_with_dash(arg: &OsStr) -> bool {
-    arg.to_string_lossy().starts_with('-')
+pub(super) fn looks_like_option(arg: &OsStr) -> bool {
+    let bytes = arg.as_encoded_bytes();
+    bytes.len() > 1 && bytes[0] == b'-'
 }
 
 pub(super) struct Inputs<'a> {
@@ -1235,26 +1234,26 @@ mod tests {
     }
 
     #[test]
-    fn relaunch_args_strip_every_resume_form_and_add_one() {
-        let got = relaunch_args(
-            &os(&[
-                "--dangerously-skip-permissions",
-                "--resume",
-                "old-1",
-                "--model",
-                "opus",
-                "-c",
-                "--continue",
-                "--resume=old-2",
-                "--session-id",
-                "fixed",
-                "--session-id=fixed2",
-                "--fork-session",
-                "-r",
-                "0b7a5c1e-1111-2222-3333-444455556666",
-            ]),
-            "s-9",
-        )
+    fn fresh_args_strip_session_selectors_but_keep_the_prompt() {
+        use super::super::failover::fresh_args;
+
+        let got = fresh_args(&os(&[
+            "--dangerously-skip-permissions",
+            "--resume",
+            "old-1",
+            "--model",
+            "opus",
+            "-c",
+            "--continue",
+            "--resume=old-2",
+            "--session-id",
+            "fixed",
+            "--session-id=fixed2",
+            "--fork-session",
+            "-r",
+            "0b7a5c1e-1111-2222-3333-444455556666",
+            "first request",
+        ]))
         .unwrap();
         assert_eq!(
             got,
@@ -1262,22 +1261,28 @@ mod tests {
                 "--dangerously-skip-permissions",
                 "--model",
                 "opus",
-                "--resume",
-                "s-9"
+                "--",
+                "first request"
             ])
         );
         // A bare -r (interactive picker) takes no value; the next flag stays.
         assert_eq!(
-            relaunch_args(&os(&["-r", "--verbose"]), "s").unwrap(),
-            os(&["--verbose", "--resume", "s"])
+            fresh_args(&os(&["-r", "--verbose"])).unwrap(),
+            os(&["--verbose"])
         );
         // A bare --resume (interactive picker) takes no value either.
         assert_eq!(
-            relaunch_args(&os(&["--resume", "--model", "opus"]), "s").unwrap(),
-            os(&["--model", "opus", "--resume", "s"])
+            fresh_args(&os(&["--resume", "--model", "opus"])).unwrap(),
+            os(&["--model", "opus"])
         );
-        assert!(relaunch_args(&os(&["-p", "hi"]), "s").is_none());
-        assert!(relaunch_args(&os(&["--print"]), "s").is_none());
+        let literal_flags = os(&["--system-prompt", "--resume=example", "--", "--print"]);
+        assert_eq!(fresh_args(&literal_flags).unwrap(), literal_flags);
+        assert!(!is_one_shot(&literal_flags));
+        for print in ["-p", "--print"] {
+            let args = os(&[print, "hi"]);
+            assert!(is_one_shot(&args));
+            assert!(fresh_args(&args).is_err());
+        }
     }
 
     fn inputs<'a>(idle: &'a Idle) -> Inputs<'a> {

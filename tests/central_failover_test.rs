@@ -726,6 +726,100 @@ fn a_failed_failover_resume_keeps_the_live_model_when_starting_fresh() {
 }
 
 #[test]
+fn a_failover_resumes_without_resending_the_launch_prompt() {
+    const PROMPT: &str = "Synthetic first request that was already submitted";
+    let mut env = Env::new();
+    env.fake.lock().unwrap().weekly_limit = true;
+    env.limit_crons = true;
+
+    let output = env.run_with(
+        &["server", "run", "work", "--failover"],
+        "3",
+        &[
+            "--settings",
+            r#"{"alwaysThinkingEnabled":false}"#,
+            "--dangerously-skip-permissions",
+            PROMPT,
+        ],
+    );
+    assert_eq!(output.status.code(), Some(7), "{:?}", output);
+    let runs = env.runs();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["token"], "token-work");
+    assert_eq!(runs[1]["token"], "token-spare");
+    for run in &runs {
+        assert_eq!(run["args"][0], "--settings");
+        assert_eq!(run["settings"]["alwaysThinkingEnabled"], false);
+    }
+    assert_eq!(
+        &runs[0]["args"].as_array().unwrap()[2..],
+        ["--model", "opus", "--dangerously-skip-permissions", PROMPT]
+    );
+    assert_eq!(
+        &runs[1]["args"].as_array().unwrap()[2..],
+        [
+            "--model",
+            "opus",
+            "--dangerously-skip-permissions",
+            "--resume",
+            "sess-1"
+        ],
+        "the resumed child must not receive a positional prompt"
+    );
+}
+
+#[test]
+fn a_failed_failover_resume_keeps_the_prompt_only_for_the_fresh_fallback() {
+    const PROMPT: &str = "Synthetic launch request";
+    // A selector or launch model can separate a variadic value from the actual prompt.
+    for separator in [["--resume", "old"], ["--model", "opus"]] {
+        let mut env = Env::new();
+        env.fake.lock().unwrap().weekly_limit = true;
+        env.limit_crons = true;
+        env.fail_resume = true;
+        private_write(
+            &env.home.path().join("live-model.jsonl"),
+            &json!({"type":"assistant","sessionId":"sess-1","message":{"model":"claude-fable-5-1"}})
+                .to_string(),
+        );
+
+        let output = env.run_with(
+            &["server", "run", "work", "--failover"],
+            "3",
+            &["--add-dir", "../lib", separator[0], separator[1], PROMPT],
+        );
+        assert_eq!(output.status.code(), Some(7), "{output:?}");
+        let runs = env.runs();
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[1]["token"], "token-spare");
+        assert_eq!(runs[2]["token"], "token-spare");
+        assert_eq!(
+            &runs[1]["args"].as_array().unwrap()[2..],
+            [
+                "--model",
+                "claude-fable-5-1",
+                "--add-dir",
+                "../lib",
+                "--resume",
+                "sess-1"
+            ]
+        );
+        assert_eq!(
+            &runs[2]["args"].as_array().unwrap()[2..],
+            [
+                "--model",
+                "claude-fable-5-1",
+                "--add-dir",
+                "../lib",
+                "--",
+                PROMPT
+            ],
+            "separator before the prompt: {separator:?}"
+        );
+    }
+}
+
+#[test]
 fn weekly_limited_idle_cron_turns_failover_within_two_minutes() {
     let mut env = Env::new();
     env.fake.lock().unwrap().weekly_limit = true;

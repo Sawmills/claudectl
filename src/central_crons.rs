@@ -556,13 +556,10 @@ impl Recovery {
         args: &[std::ffi::OsString],
         session: &str,
     ) -> Result<Vec<std::ffi::OsString>> {
-        let (args, prompt) = super::failover::required_prompted_resume(
-            args,
-            session,
-            &self.prompt(),
-            self.continue_request,
-        )?;
-        self.launched_prompt = Some(Sha256::digest(prompt.as_bytes()).into());
+        let prompt = self.prompt();
+        let digest = Sha256::digest(prompt.as_bytes()).into();
+        let args = super::failover::required_prompted_resume(args, session, prompt)?;
+        self.launched_prompt = Some(digest);
         Ok(args)
     }
 
