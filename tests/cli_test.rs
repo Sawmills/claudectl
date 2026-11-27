@@ -387,10 +387,16 @@ fn run_help_discloses_quiet_window_and_residual_race() {
             .unwrap();
         assert!(output.status.success());
         let help = String::from_utf8(output.stdout).unwrap();
-        assert!(help.contains("restarts immediately"));
+        assert!(help.contains("this session's own authentication failure"));
         assert!(help.contains("same session and account"));
+        assert!(help.contains("Token expiry alone follows renewal"));
         assert!(help.contains("A new revision alone does not restart a healthy session"));
         assert!(help.contains("five minutes of the held token's expiry"));
+        assert!(help.contains("running turns and the quiet window"));
+        assert!(help.contains("Recent typing can defer a restart"));
+        assert!(help.contains("CLAUDECTL_RESTART_MAX_WAIT_SECS (600 seconds by default)"));
+        assert!(help.contains("post-cron cooldown"));
+        assert!(!help.contains("restarts immediately"));
         assert!(help.contains("Request failover when the account reaches a usage limit"));
         assert!(help.contains("Ordinary failover requires ten minutes of observed quiet"));
         assert!(help.contains("full weekly account window"));

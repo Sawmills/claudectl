@@ -32,15 +32,17 @@ Verified, missing, duplicate, skipped, and unverified results stay in this log
 after the run exits. They never print over Claude's terminal or enter its input.
 The log contains no tokens or saved prompt contents.
 
-Authentication failure or expiry restarts the same conversation on the same account
-immediately, once a replacement token is available. Turns, background tasks, typing,
-production markers and unrelated hook errors do not defer that recovery. Other renewals
-become eligible only within five minutes of the held token's expiry and retain workload
-and quiet admission. A new revision alone starts neither a restart nor its deadline.
-Explicit production holds block every restart until hold end, including auth recovery. Unknown SessionEnd
-intent also prevents restart, with one failure record while that uncertainty persists. Account failover still
-requires ten continuous minutes of observed quiet. A forced restart can discard a draft
-or background task. Recovery omits the original task and restores saved-card cron definitions.
+Authentication recovery requires this conversation's own authentication failure and tries
+to resume it on the same account with a replacement token. Expiry alone follows renewal,
+which becomes eligible only within five minutes of the held token's expiry. A new revision
+alone starts neither a restart nor its deadline. Running turns, background tasks, typing
+and the quiet window can defer recovery and renewal until their configured deadline
+(`CLAUDECTL_RESTART_MAX_WAIT_SECS`, 600 seconds by default).
+Explicit production holds block every restart until hold end. Unknown SessionEnd intent
+also prevents restart, with one failure record while that uncertainty persists. Ordinary
+account failover still requires ten continuous minutes of observed quiet. A forced restart
+can discard a draft or background task. Recovery omits the original task and restores
+saved-card cron definitions.
 After the final CronList readback confirms those jobs, it may run an identified saved check
 prompt once when its schedule has a fire after the card's op-check checkpoint mtime and
 at or before recovery.

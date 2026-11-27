@@ -248,8 +248,9 @@ An expired grant or pending migration still follows the existing leased refresh 
 verification path. Supplying the exact current `previous_revision` still forces rotation;
 a stale revision returns the available unexpired successor.
 
-A new child can start near token expiry. Authentication failure or expiry immediately
-starts recovery on the same session and account, once a replacement token is available.
+A new child can start near token expiry. The session's own authentication failure starts
+authentication recovery. Expiry alone follows renewal. Both require restart admission
+and a usable replacement token.
 Same-account renewal and authentication recovery resume the last admitted live conversation,
 including a later in-app `/resume`. The original `--resume <UUID>` or `--session-id <UUID>`
 does not override that current conversation. Recovery also follows a newer conversation
@@ -266,20 +267,20 @@ expiry retain their existing reason labels.
 
 An ordinary renewal is eligible only within five minutes of the held token's expiry.
 A new token revision alone does not request a restart or start its deadline.
-The ten-minute deadline clock starts at the five-minute margin, so actual expiry
-starts recovery before that deadline. Eligible renewal uses observed quiet when possible.
+The deadline clock starts in that five-minute margin. Reaching expiry does not reset
+the clock or change the restart cause. Eligible renewal uses observed quiet when possible.
 Until a usable successor is
 obtained, the server is observed at most thirty seconds apart, including during work.
-Entering authentication or expiry recovery revalidates a cached successor. A fresh
+Entering authentication recovery or detecting expiry revalidates a cached successor. A fresh
 authentication failure cannot use a candidate checked before that failure. Before
 signaling, reobserve any candidate retained through a long workload or hold wait.
 Account failover retains its ten-minute quiet requirement and has no forced deadline.
-Authentication failure or expiry overrides ordinary workload blockers immediately. Explicit
-production holds prevent every restart until hold end, including authentication recovery
-and expiry. A missing normal exit-intent marker means no exit is pending; a known intent
-publication, read or parse failure is unknown lifecycle evidence and prevents both forced
-signaling and relaunch. It records one recovery failure while the uncertainty persists.
-Unrelated hook, terminal, task and production-marker errors do not defer auth recovery.
+Before their deadline, authentication recovery and renewal respect workload blockers and
+recent typing. Once the deadline passes, ordinary workload checks can be bypassed, but
+the post-cron cooldown still applies. Explicit production holds prevent every restart
+until hold end. A missing normal exit-intent marker means no exit is pending. A known
+intent publication, read or parse failure is unknown lifecycle evidence and prevents both
+forced signaling and relaunch. It records one recovery failure while the uncertainty persists.
 
 Forced restarts can discard a running turn, background task or draft input. An explicit
 session exit and user interruption still end the run; claudectl does not invent a session
@@ -479,7 +480,7 @@ starting the production step. Lane skill/runbook adoption is a separate rollout.
 An explicit hold blocks every restart until it is ended, even after token expiry or an
 authentication failure. When a hold blocks dead-token recovery or an overdue renewal,
 claudectl writes at most one `restart_blocked_by_hold` event per ten minutes naming the
-run and hold reason. Ending the hold allows either restart immediately.
+run and hold reason. Ending the hold removes that veto. Other restart checks still apply.
 
 When the lane exports `HERDR_TAB_ID` (or `HERDR_PANE_ID`), the monitor consumes that lane's
 `[starting]`/`STARTING NOW` and matching `[done]`/`DONE` markers from the optional goal file
@@ -570,10 +571,10 @@ directory.
 While Claude runs, the client refreshes usage about every five minutes in a background
 worker, including one-shot runs and pending recovery. Safe observing reads continue during work at most thirty seconds apart until a usable
 replacement is cached; recovery and long waits require a fresh observation before use.
-Authentication failure and expiry recover on the next five-second monitor tick plus
-replacement-token I/O. Ordinary renewal requires the real five-minute expiry margin;
-failover keeps its observed-quiet policy. On server outage, the
-running token works until provider expiry or rejection, and recovery errors are counted.
+The monitor evaluates restart admission every five seconds. A restart still needs a usable
+replacement token. Renewal requires the real five-minute expiry margin, and failover keeps
+its observed-quiet policy. On server outage, the running token works until provider expiry
+or rejection, and recovery errors are counted.
 Revocation stops new acquisitions; it cannot revoke an access token already delivered.
 
 `status --cached` and `statusline ACCOUNT_ID` read local files only. Native Claude
