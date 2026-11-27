@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Shared help for explicit settings in both run commands.
+/// Shared settings and restart help for both run commands.
 pub const RUN_SETTINGS_HELP: &str =
     "Pass settings after -- with --settings <JSON-or-file> (repeatable).
 Objects merge in argument order; hooks append to claudectl's generated hooks.
@@ -18,11 +18,17 @@ Claude validates the settings schema. An invalid value such as model: 5 can make
 Claude ignore the WHOLE settings file, including claudectl's renewal/failover hooks.
 Test settings with your installed Claude version before rollout.
 
-After authentication failure or token expiry, Claude restarts immediately on the
-same session and account. Workload blockers and typing do not defer recovery.
+Authentication recovery requires this session's own authentication failure and
+tries to resume the same session and account with a replacement token.
+Token expiry alone follows renewal.
 A new revision alone does not restart a healthy session.
-Ordinary renewal starts only within five minutes of the held token's expiry,
-with workload and observed-quiet admission. Its deadline starts in that margin.
+Renewal becomes eligible within five minutes of the held token's expiry, and its
+deadline starts in that margin.
+Both wait for running turns and the quiet window. Recent typing can defer a restart.
+After CLAUDECTL_RESTART_MAX_WAIT_SECS (600 seconds by default), either can force a
+restart if a replacement token is available.
+Every automatic restart honors the post-cron cooldown
+(CLAUDECTL_RESTART_CRON_COOLDOWN_SECS, 120 seconds by default).
 An explicit production hold blocks every restart until hold end, including auth recovery.
 Unknown SessionEnd intent also vetoes restart and records one recovery failure.
 Hold-blocked notices name the hold at most once per ten minutes.

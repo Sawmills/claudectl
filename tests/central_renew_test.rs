@@ -319,6 +319,15 @@ impl Fixture {
         )
     }
     fn with_args(mode: &str, life_ms: i64, tty: bool, args: &[&str]) -> Self {
+        Self::with_restart_deadline(mode, life_ms, tty, args, Some("1"))
+    }
+    fn with_restart_deadline(
+        mode: &str,
+        life_ms: i64,
+        tty: bool,
+        args: &[&str],
+        max_wait_secs: Option<&str>,
+    ) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
         if mode == "auth_crons" {
@@ -416,7 +425,6 @@ impl Fixture {
             .env("TERM", "xterm")
             .env("CLAUDECTL_ALLOW_INSECURE_LOOPBACK", "1")
             .env("CLAUDECTL_TEST_RENEW_FAST", "1")
-            .env("CLAUDECTL_RESTART_MAX_WAIT_SECS", "1")
             .env("TMPDIR", home.path().join("tmp"))
             .env(
                 "FAKE_MODE",
@@ -435,6 +443,9 @@ impl Fixture {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(seconds) = max_wait_secs {
+            command.env("CLAUDECTL_RESTART_MAX_WAIT_SECS", seconds);
+        }
         if mode == "auth_crons" {
             command
                 .env("HERDR_TAB_ID", "model-test-tab")
@@ -1571,6 +1582,61 @@ fn a_revoked_idle_child_automatically_resumes_the_same_session_and_account() {
     std::fs::write(f.home.path().join("release"), "").unwrap();
     let output = f.child.take().unwrap().wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(23));
+}
+
+#[test]
+fn run_help_matches_auth_recovery_after_a_revoked_grant() {
+    let mut f = Fixture::with_restart_deadline(
+        "auth_recovery",
+        600_000,
+        false,
+        &["--model", "opus", "--resume", "s"],
+        None,
+    );
+    f.wait("quiet_window", "deferred");
+    let first = f.run();
+    f.revoke();
+    std::fs::write(f.home.path().join("provider-probe"), "").unwrap();
+    let blocked = f.wait("quiet_window", "blocked");
+    assert_eq!(blocked["cause"], "auth_recovery");
+    assert_eq!(blocked["attention_required"], true);
+    let journal = f.journal();
+    let decision = journal
+        .iter()
+        .find(|row| {
+            row["cause"] == "auth_recovery"
+                && row["reason"] == "quiet_window"
+                && row["stage"] == "blocked"
+                && row["session_id"] == "s"
+        })
+        .expect("quiet-window decision for the failed session");
+    let failure = decision["auth_failed_at"].as_i64().unwrap();
+    assert!(failure < first["session"]["expires_at"].as_i64().unwrap());
+    assert_eq!(decision["held_revision"], "revision-1");
+    assert!(
+        f.state
+            .lock()
+            .unwrap()
+            .provider_requests
+            .iter()
+            .any(|req| { req["status"] == 401 && req["revoked"] == true })
+    );
+    f.finish();
+
+    let help = Command::new(assert_cmd::cargo::cargo_bin("claudectl"))
+        .args(["run", "--help"])
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(
+        !help.contains("Claude restarts immediately"),
+        "run help promises an immediate restart, but a revoked grant produced \
+         auth_recovery/quiet_window/blocked (attention_required=true, held={}, observed={})",
+        decision["held_revision"],
+        decision["current_revision"]
+    );
 }
 
 #[test]
